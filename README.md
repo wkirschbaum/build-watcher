@@ -24,7 +24,9 @@ A background daemon that monitors GitHub Actions builds and sends desktop notifi
 
 #### macOS
 
-- **osascript** — pre-installed on all Macs. Used for desktop notifications.
+- **terminal-notifier** (recommended) — enables click-to-open URLs on notifications. Install via `brew install terminal-notifier`.
+- **osascript** — pre-installed fallback. Notifications work but clicking them opens Script Editor instead of the URL.
+- The daemon auto-detects which backend is available at startup, preferring `terminal-notifier`.
 - The installer sets up a **launchd** service that starts on login and auto-restarts on failure.
 
 #### Linux (Ubuntu/Debian)
