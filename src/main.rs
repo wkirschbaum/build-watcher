@@ -41,10 +41,21 @@ fn parse_watch_key(key: &str) -> (&str, &str) {
     key.rsplit_once('#').unwrap_or((key, "main"))
 }
 
-/// Persisted state: just the high-water mark per repo/branch.
+/// Info about the last completed build.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LastBuild {
+    run_id: u64,
+    conclusion: String,
+    workflow: String,
+    title: String,
+}
+
+/// Persisted state per repo/branch.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersistedWatch {
     last_seen_run_id: u64,
+    #[serde(default)]
+    last_build: Option<LastBuild>,
 }
 
 type PersistedWatches = HashMap<String, PersistedWatch>;
@@ -65,6 +76,7 @@ pub struct WatchEntry {
     last_seen_run_id: u64,
     active_runs: HashMap<u64, String>,       // run_id -> status
     failure_counts: HashMap<u64, u8>,         // run_id -> consecutive failure count
+    last_build: Option<LastBuild>,
 }
 
 type Watches = Arc<Mutex<HashMap<String, WatchEntry>>>;
@@ -73,7 +85,7 @@ async fn save_watches(watches: &Watches) {
     let persisted: PersistedWatches = {
         let w = watches.lock().await;
         w.iter()
-            .map(|(k, v)| (k.clone(), PersistedWatch { last_seen_run_id: v.last_seen_run_id }))
+            .map(|(k, v)| (k.clone(), PersistedWatch { last_seen_run_id: v.last_seen_run_id, last_build: v.last_build.clone() }))
             .collect()
     };
     save_persisted(&persisted);
@@ -110,6 +122,15 @@ impl RunInfo {
 
     fn url(&self, repo: &str) -> String {
         format!("https://github.com/{repo}/actions/runs/{}", self.id)
+    }
+
+    fn to_last_build(&self) -> LastBuild {
+        LastBuild {
+            run_id: self.id,
+            conclusion: self.conclusion.clone(),
+            workflow: self.workflow.clone(),
+            title: self.title.clone(),
+        }
     }
 }
 
@@ -289,14 +310,18 @@ impl BuildWatcher {
             .iter()
             .map(|(key, entry)| {
                 let (repo, branch) = parse_watch_key(key);
+                let last = entry.last_build.as_ref().map(|b| {
+                    format!(" (last: {} — {}: {})", b.conclusion, b.workflow, b.title)
+                }).unwrap_or_default();
+
                 if entry.active_runs.is_empty() {
-                    format!("- {repo} [{branch}] — idle, watching for new builds (last seen: {})", entry.last_seen_run_id)
+                    format!("- {repo} [{branch}] — idle{last}")
                 } else {
                     let run_list: Vec<String> = entry.active_runs
                         .iter()
                         .map(|(id, status)| format!("{id} ({status})"))
                         .collect();
-                    format!("- {repo} [{branch}] — {} active: {}", entry.active_runs.len(), run_list.join(", "))
+                    format!("- {repo} [{branch}] — {} active: {}{last}", entry.active_runs.len(), run_list.join(", "))
                 }
             })
             .collect();
@@ -441,6 +466,8 @@ async fn start_watch(
         .map(|r| (r.id, r.status.clone()))
         .collect();
 
+    let last_completed = runs.iter().find(|r| r.is_completed());
+
     let msg = if active.is_empty() {
         let latest = &runs[0]; // gh returns newest first
         format!(
@@ -458,6 +485,7 @@ async fn start_watch(
         last_seen_run_id: max_id,
         active_runs: active,
         failure_counts: HashMap::new(),
+        last_build: last_completed.map(|r| r.to_last_build()),
     };
 
     {
@@ -582,6 +610,7 @@ async fn poll_active_runs(
             let mut w = watches.lock().await;
             if let Some(entry) = w.get_mut(key) {
                 entry.active_runs.remove(&run_id);
+                entry.last_build = Some(run.to_last_build());
             }
             changed = true;
         } else {
@@ -660,9 +689,11 @@ async fn check_for_new_runs(
     let mut w = watches.lock().await;
     if let Some(entry) = w.get_mut(key) {
         entry.last_seen_run_id = new_max;
-        // Track new in-progress runs
+        // Track new in-progress runs, record completed ones
         for run in &new_runs {
-            if !run.is_completed() {
+            if run.is_completed() {
+                entry.last_build = Some(run.to_last_build());
+            } else {
                 entry.active_runs.insert(run.id, run.status.clone());
             }
         }
@@ -756,6 +787,7 @@ async fn main() -> Result<()> {
             last_seen_run_id: v.last_seen_run_id,
             active_runs: HashMap::new(),
             failure_counts: HashMap::new(),
+            last_build: v.last_build,
         }))
         .collect();
 
