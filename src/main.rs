@@ -901,6 +901,17 @@ async fn startup_watches(watches: &Watches, config: &SharedConfig) {
 
 // -- Main --
 
+async fn bind_with_fallback(preferred: u16) -> Result<tokio::net::TcpListener> {
+    for port in preferred..=preferred.saturating_add(9) {
+        match tokio::net::TcpListener::bind(format!("127.0.0.1:{port}")).await {
+            Ok(l) => return Ok(l),
+            Err(_) if port < preferred.saturating_add(9) => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    unreachable!()
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -961,9 +972,18 @@ async fn main() -> Result<()> {
         );
 
     let router = axum::Router::new().nest_service("/mcp", service);
-    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{port}")).await?;
+    let listener = bind_with_fallback(port).await?;
+    let bound_port = listener.local_addr()?.port();
 
-    tracing::info!("build-watcher listening on http://127.0.0.1:{port}/mcp");
+    // Write the actual port to the state dir so tooling can discover it
+    let port_file = state_dir().join("port");
+    let _ = std::fs::write(&port_file, bound_port.to_string());
+
+    if bound_port != port {
+        tracing::warn!("Port {port} was occupied, using port {bound_port} instead");
+        tracing::warn!("Re-run install.sh to update the MCP URL in ~/.claude.json");
+    }
+    tracing::info!("build-watcher listening on http://127.0.0.1:{bound_port}/mcp");
 
     axum::serve(listener, router)
         .with_graceful_shutdown(async move {

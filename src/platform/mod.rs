@@ -1,3 +1,4 @@
+#[cfg(target_os = "macos")]
 use std::process::Command;
 use std::sync::OnceLock;
 
@@ -45,6 +46,7 @@ pub fn default_config_dir() -> String {
 }
 
 /// Check if a command exists on PATH.
+#[cfg(target_os = "macos")]
 fn has_command(cmd: &str) -> bool {
     Command::new("which")
         .arg(cmd)
