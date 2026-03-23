@@ -481,7 +481,7 @@ impl BuildWatcher {
     #[tool(description = "Send a test desktop notification to verify notifications are working")]
     async fn test_notification(&self) -> Result<CallToolResult, McpError> {
         platform::send_notification(
-            "Build Watcher Test",
+            "🔔 Build Watcher Test",
             "If you see this, notifications are working!",
             NotificationLevel::Normal,
             None,
@@ -742,8 +742,9 @@ async fn poll_active_runs(
 
         if run.is_completed() {
             let level = if run.succeeded() { notif.build_success } else { notif.build_failure };
+            let emoji = if run.succeeded() { "✅" } else { "❌" };
             platform::send_notification(
-                &format!("Build {}: {repo} [{branch}]", run.conclusion),
+                &format!("{emoji} Build {}: {repo} [{branch}]", run.conclusion),
                 &format!("{}: {} ({})", run.workflow, run.title, run.short_sha()),
                 level,
                 Some(&run.url(repo)),
@@ -809,7 +810,7 @@ async fn check_for_new_runs(
     for run in &new_runs {
         tracing::info!("New build detected for {key}: run {} {} ({}: {})", run.id, run.short_sha(), run.workflow, run.title);
         platform::send_notification(
-            &format!("Build started: {repo} [{branch}]"),
+            &format!("🔨 Build started: {repo} [{branch}]"),
             &format!("{}: {} ({})", run.workflow, run.title, run.short_sha()),
             notif.build_started,
             Some(&run.url(repo)),
@@ -818,8 +819,9 @@ async fn check_for_new_runs(
         // If it already completed between polls, also notify completion
         if run.is_completed() {
             let level = if run.succeeded() { notif.build_success } else { notif.build_failure };
+            let emoji = if run.succeeded() { "✅" } else { "❌" };
             platform::send_notification(
-                &format!("Build {}: {repo} [{branch}]", run.conclusion),
+                &format!("{emoji} Build {}: {repo} [{branch}]", run.conclusion),
                 &format!("{}: {} ({})", run.workflow, run.title, run.short_sha()),
                 level,
                 Some(&run.url(repo)),
