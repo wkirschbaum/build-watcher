@@ -1,0 +1,13 @@
+[Unit]
+Description=Build Watcher MCP Server
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=@@BINARY_PATH@@
+Restart=on-failure
+RestartSec=5
+Environment=RUST_LOG=build_watcher=info
+
+[Install]
+WantedBy=default.target

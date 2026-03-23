@@ -2,8 +2,10 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PLATFORM_DIR="$SCRIPT_DIR/src/platform"
 BINARY_NAME="build-watcher"
 INSTALL_DIR="$HOME/.local/bin"
+BINARY_PATH="$INSTALL_DIR/$BINARY_NAME"
 CLAUDE_CONFIG="$HOME/.claude.json"
 PORT=8417
 OS="$(uname -s)"
@@ -24,6 +26,30 @@ fi
 
 cp "$SCRIPT_DIR/target/release/$BINARY_NAME" "$INSTALL_DIR/$BINARY_NAME"
 
+# -- Seed config file if missing --
+
+CONFIG_DIR="$HOME/.config/build-watcher"
+CONFIG_FILE="$CONFIG_DIR/config.json"
+mkdir -p "$CONFIG_DIR"
+
+if [ ! -f "$CONFIG_FILE" ]; then
+  echo "==> Creating default config at $CONFIG_FILE..."
+  cat > "$CONFIG_FILE" <<'CONFJSON'
+{
+  "default_branches": ["main"],
+  "notifications": {
+    "build_started": "normal",
+    "build_success": "normal",
+    "build_failure": "critical"
+  },
+  "repos": {}
+}
+CONFJSON
+  echo "  Edit $CONFIG_FILE to add repos, or use the watch_builds MCP tool."
+else
+  echo "==> Config already exists at $CONFIG_FILE"
+fi
+
 # -- Platform-specific service install --
 
 if [ "$OS" = "Darwin" ]; then
@@ -32,35 +58,9 @@ if [ "$OS" = "Darwin" ]; then
   PLIST_PATH="$PLIST_DIR/com.build-watcher.plist"
   mkdir -p "$PLIST_DIR"
 
-  cat > "$PLIST_PATH" <<EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key>
-  <string>com.build-watcher</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>$INSTALL_DIR/$BINARY_NAME</string>
-  </array>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>RUST_LOG</key>
-    <string>build_watcher=info</string>
-    <key>PATH</key>
-    <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
-  </dict>
-  <key>RunAtLoad</key>
-  <true/>
-  <key>KeepAlive</key>
-  <true/>
-  <key>StandardOutPath</key>
-  <string>$HOME/Library/Logs/build-watcher.log</string>
-  <key>StandardErrorPath</key>
-  <string>$HOME/Library/Logs/build-watcher.log</string>
-</dict>
-</plist>
-EOF
+  sed -e "s|@@BINARY_PATH@@|$BINARY_PATH|g" \
+      -e "s|@@HOME@@|$HOME|g" \
+      "$PLATFORM_DIR/macos/com.build-watcher.plist" > "$PLIST_PATH"
 
   launchctl bootout "gui/$(id -u)" "$PLIST_PATH" 2>/dev/null || true
   launchctl bootstrap "gui/$(id -u)" "$PLIST_PATH"
@@ -71,21 +71,8 @@ else
   SYSTEMD_DIR="$HOME/.config/systemd/user"
   mkdir -p "$SYSTEMD_DIR"
 
-  cat > "$SYSTEMD_DIR/$BINARY_NAME.service" <<EOF
-[Unit]
-Description=Build Watcher MCP Server
-After=network.target
-
-[Service]
-Type=simple
-ExecStart=$INSTALL_DIR/$BINARY_NAME
-Restart=on-failure
-RestartSec=5
-Environment=RUST_LOG=build_watcher=info
-
-[Install]
-WantedBy=default.target
-EOF
+  sed -e "s|@@BINARY_PATH@@|$BINARY_PATH|g" \
+      "$PLATFORM_DIR/linux/build-watcher.service" > "$SYSTEMD_DIR/$BINARY_NAME.service"
 
   systemctl --user daemon-reload
   systemctl --user enable --now "$BINARY_NAME.service"
@@ -154,6 +141,7 @@ echo "Done! build-watcher is installed and running."
 echo ""
 echo "  Binary:   $INSTALL_DIR/$BINARY_NAME"
 echo "  MCP:      http://127.0.0.1:$PORT/mcp"
+echo "  Config:   $CONFIG_FILE"
 echo "  State:    ~/.local/state/build-watcher/watches.json"
 echo ""
 echo "All Claude Code sessions share the same watcher daemon."
