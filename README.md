@@ -9,9 +9,9 @@ A background daemon that monitors GitHub Actions builds and sends desktop notifi
 - **Notifies on build completion** — success or failure, with a link to the GitHub Actions run.
 - **Runs independently** — the daemon runs as a system service, not tied to any Claude Code session.
 - **Tracks concurrent builds** — detects and monitors multiple simultaneous builds on the same branch.
-- **Polls efficiently** — active builds are polled every 10 seconds; idle repos are checked for new builds every 1 minute.
+- **Configurable polling** — active builds poll every 10s, idle repos check every 60s by default. Both intervals are configurable.
 - **Configurable notification levels** — control urgency per event (started, success, failure) or suppress entirely.
-- **Config-driven** — repos, branches, and notification settings are stored in a config file that persists across restarts. The config is normalized on startup, so new fields are automatically added with defaults.
+- **Config-driven** — repos, branches, polling intervals, and notification settings are stored in a config file that persists across restarts. The config is normalized on startup, so new fields are automatically added with defaults.
 
 ## Requirements
 
@@ -83,6 +83,8 @@ The config file lives at `~/.config/build-watcher/config.json` (or `$CONFIGURATI
 ```json
 {
   "default_branches": ["main"],
+  "active_poll_seconds": 10,
+  "idle_poll_seconds": 60,
   "notifications": {
     "build_started": "normal",
     "build_success": "normal",
@@ -98,6 +100,8 @@ The config file lives at `~/.config/build-watcher/config.json` (or `$CONFIGURATI
 ```
 
 - **`default_branches`** — branches to watch when a repo has no explicit override (default: `["main"]`).
+- **`active_poll_seconds`** — how often (in seconds) to poll active in-progress builds (default: `10`).
+- **`idle_poll_seconds`** — how often (in seconds) to check for new builds on idle repos (default: `60`).
 - **`notifications`** — per-event notification levels. Each event can be set to one of:
   - `"off"` — suppress the notification entirely.
   - `"low"` — subtle notification (Linux: low urgency; macOS: Glass sound).
@@ -180,8 +184,8 @@ Re-run the install script — it stops the service, rebuilds, installs the new b
 2. On startup, it reads `config.json` (normalizing any missing fields) and begins watching all configured repos.
 3. For each repo/branch, it fetches the 10 most recent GitHub Actions runs using `gh run list`.
 4. It records the highest run ID seen (`last_seen_run_id`) as a high-water mark. Any run with an ID above this is considered new.
-5. New in-progress runs are tracked in memory and polled via `gh run view` every 10 seconds until completion.
+5. New in-progress runs are tracked in memory and polled via `gh run view` at the configured `active_poll_seconds` interval (default: 10s) until completion.
 6. When a build completes, a notification is sent with the appropriate urgency level based on the `notifications` config.
-7. Every 1 minute, idle watches re-check `gh run list` for new runs. If a build started and completed between checks, both "started" and "completed" notifications are sent.
+7. At the configured `idle_poll_seconds` interval (default: 60s), idle watches re-check `gh run list` for new runs. If a build started and completed between checks, both "started" and "completed" notifications are sent.
 8. Multiple concurrent builds on the same branch are tracked independently.
 9. The `last_seen_run_id` is persisted to `watches.json` so new-run detection survives restarts. Active run tracking is in-memory only and rediscovered on startup.

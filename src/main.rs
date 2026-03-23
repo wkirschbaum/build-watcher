@@ -24,8 +24,6 @@ use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
 const DEFAULT_PORT: u16 = 8417;
-const ACTIVE_POLL_SECS: u64 = 10;
-const IDLE_POLL_SECS: u64 = 60;
 const GH_TIMEOUT: Duration = Duration::from_secs(30);
 
 type SharedConfig = Arc<Mutex<Config>>;
@@ -374,6 +372,11 @@ impl BuildWatcher {
 
         lines.push(format!("Default branches: {:?}", config.default_branches));
         lines.push(format!(
+            "\nPolling:\n  active builds: every {}s\n  idle repos: every {}s",
+            config.active_poll_seconds,
+            config.idle_poll_seconds,
+        ));
+        lines.push(format!(
             "\nNotifications:\n  build_started: {}\n  build_success: {}\n  build_failure: {}",
             config.notifications.build_started,
             config.notifications.build_success,
@@ -524,7 +527,12 @@ async fn poll_repo(watches: Watches, config: SharedConfig, key: String) {
             }
         };
 
-        let delay = if has_active { ACTIVE_POLL_SECS } else { IDLE_POLL_SECS };
+        let (active_poll_secs, idle_poll_secs, notif) = {
+            let cfg = config.lock().await;
+            (cfg.active_poll_seconds, cfg.idle_poll_seconds, cfg.notifications.clone())
+        };
+
+        let delay = if has_active { active_poll_secs } else { idle_poll_secs };
         tokio::time::sleep(Duration::from_secs(delay)).await;
 
         // Check if still watched
@@ -536,15 +544,13 @@ async fn poll_repo(watches: Watches, config: SharedConfig, key: String) {
             }
         }
 
-        let notif = config.lock().await.notifications.clone();
-
         // Poll active runs every cycle
         if has_active {
             poll_active_runs(&watches, &key, &repo, &branch, &notif).await;
         }
 
         // Check for new runs at the idle interval regardless of active state
-        if last_new_run_check.elapsed() >= Duration::from_secs(IDLE_POLL_SECS) {
+        if last_new_run_check.elapsed() >= Duration::from_secs(idle_poll_secs) {
             check_for_new_runs(&watches, &key, &repo, &branch, &notif).await;
             last_new_run_check = tokio::time::Instant::now();
         }

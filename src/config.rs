@@ -149,8 +149,20 @@ pub struct Config {
     pub default_branches: Vec<String>,
     #[serde(default)]
     pub notifications: NotificationConfig,
+    #[serde(default = "default_active_poll_seconds")]
+    pub active_poll_seconds: u64,
+    #[serde(default = "default_idle_poll_seconds")]
+    pub idle_poll_seconds: u64,
     #[serde(default)]
     pub repos: HashMap<String, RepoConfig>,
+}
+
+fn default_active_poll_seconds() -> u64 {
+    10
+}
+
+fn default_idle_poll_seconds() -> u64 {
+    60
 }
 
 fn default_branches() -> Vec<String> {
@@ -162,6 +174,8 @@ impl Default for Config {
         Self {
             default_branches: default_branches(),
             notifications: NotificationConfig::default(),
+            active_poll_seconds: default_active_poll_seconds(),
+            idle_poll_seconds: default_idle_poll_seconds(),
             repos: HashMap::new(),
         }
     }
