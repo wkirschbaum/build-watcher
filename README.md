@@ -66,15 +66,16 @@ stop watching floatpays/moneyclub
 
 Or use the MCP tools directly:
 
-| Tool                  | Description                                         |
-| --------------------- | --------------------------------------------------- |
-| `watch_builds`        | Add repos to watch (owner/repo format)              |
-| `stop_watches`        | Remove repos from config and stop watching          |
-| `list_watches`        | Show all watched repos and their status             |
-| `configure_branches`  | Set custom branches for a specific repo             |
-| `set_default_branches`| Change the default branches (applies to all repos)  |
-| `get_config`          | Show current configuration                          |
-| `test_notification`   | Send a test notification to verify setup            |
+| Tool                       | Description                                         |
+| -------------------------- | --------------------------------------------------- |
+| `watch_builds`             | Add repos to watch (owner/repo format)              |
+| `stop_watches`             | Remove repos from config and stop watching          |
+| `list_watches`             | Show all watched repos and their status             |
+| `configure_branches`       | Set custom branches for a specific repo             |
+| `set_default_branches`     | Change the default branches (applies to all repos)  |
+| `configure_notifications`  | Set notification levels (global, per-repo, or per-branch) |
+| `get_config`               | Show current configuration                          |
+| `test_notification`        | Send a test notification to verify setup            |
 
 ## Configuration
 
@@ -93,7 +94,19 @@ The config file lives at `~/.config/build-watcher/config.json` (or `$CONFIGURATI
   "repos": {
     "floatpays/benefits": {},
     "floatpays/moneyclub": {
-      "branches": ["main", "develop"]
+      "branches": ["main", "release"],
+      "notifications": {
+        "build_started": "off"
+      },
+      "branch_notifications": {
+        "release": {
+          "notifications": {
+            "build_started": "off",
+            "build_success": "normal",
+            "build_failure": "off"
+          }
+        }
+      }
     }
   }
 }
@@ -102,7 +115,7 @@ The config file lives at `~/.config/build-watcher/config.json` (or `$CONFIGURATI
 - **`default_branches`** — branches to watch when a repo has no explicit override (default: `["main"]`).
 - **`active_poll_seconds`** — how often (in seconds) to poll active in-progress builds (default: `10`).
 - **`idle_poll_seconds`** — how often (in seconds) to check for new builds on idle repos (default: `60`).
-- **`notifications`** — per-event notification levels. Each event can be set to one of:
+- **`notifications`** — global per-event notification levels. Each event can be set to one of:
   - `"off"` — suppress the notification entirely.
   - `"low"` — subtle notification (Linux: low urgency; macOS: Glass sound).
   - `"normal"` — standard notification (Linux: normal urgency; macOS: Glass sound).
@@ -111,6 +124,8 @@ The config file lives at `~/.config/build-watcher/config.json` (or `$CONFIGURATI
 - **`repos`** — each key is an `owner/repo` to watch. Presence in the map means "watch this repo".
   - If `branches` is empty or omitted, `default_branches` is used.
   - If `branches` is set, only those branches are watched for that repo.
+  - **`notifications`** — optional per-repo notification overrides. Only set the events you want to change; unset events inherit from the global config.
+  - **`branch_notifications`** — optional per-branch notification overrides. Each key is a branch name with its own `notifications` block. Branch overrides take priority over repo overrides, which take priority over global settings.
 
 Repos are added/removed automatically when you use `watch_builds` and `stop_watches`. You can also edit the config file directly and restart the service.
 

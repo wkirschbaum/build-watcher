@@ -118,6 +118,23 @@ pub struct NotificationConfig {
     pub build_failure: NotificationLevel,
 }
 
+/// Optional per-event notification overrides. `None` means inherit from parent.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct NotificationOverrides {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_started: Option<NotificationLevel>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_success: Option<NotificationLevel>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_failure: Option<NotificationLevel>,
+}
+
+impl NotificationOverrides {
+    pub fn is_empty(&self) -> bool {
+        self.build_started.is_none() && self.build_success.is_none() && self.build_failure.is_none()
+    }
+}
+
 fn default_normal() -> NotificationLevel {
     NotificationLevel::Normal
 }
@@ -136,11 +153,22 @@ impl Default for NotificationConfig {
     }
 }
 
+/// Per-branch notification overrides.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BranchConfig {
+    #[serde(default, skip_serializing_if = "NotificationOverrides::is_empty")]
+    pub notifications: NotificationOverrides,
+}
+
 /// Per-repo settings. Presence in the map means the repo is watched.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RepoConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub branches: Vec<String>,
+    #[serde(default, skip_serializing_if = "NotificationOverrides::is_empty")]
+    pub notifications: NotificationOverrides,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub branch_notifications: HashMap<String, BranchConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -182,6 +210,29 @@ impl Default for Config {
 }
 
 impl Config {
+    /// Resolve effective notification levels for a repo/branch.
+    /// Priority: branch_notifications > repo notifications > global notifications.
+    pub fn notifications_for(&self, repo: &str, branch: &str) -> NotificationConfig {
+        let global = &self.notifications;
+        let repo_cfg = self.repos.get(repo);
+        let repo_overrides = repo_cfg.map(|r| &r.notifications);
+        let branch_overrides = repo_cfg
+            .and_then(|r| r.branch_notifications.get(branch))
+            .map(|b| &b.notifications);
+
+        NotificationConfig {
+            build_started: branch_overrides.and_then(|o| o.build_started)
+                .or_else(|| repo_overrides.and_then(|o| o.build_started))
+                .unwrap_or(global.build_started),
+            build_success: branch_overrides.and_then(|o| o.build_success)
+                .or_else(|| repo_overrides.and_then(|o| o.build_success))
+                .unwrap_or(global.build_success),
+            build_failure: branch_overrides.and_then(|o| o.build_failure)
+                .or_else(|| repo_overrides.and_then(|o| o.build_failure))
+                .unwrap_or(global.build_failure),
+        }
+    }
+
     pub fn branches_for(&self, repo: &str) -> &[String] {
         self.repos
             .get(repo)

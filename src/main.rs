@@ -46,6 +46,10 @@ pub struct LastBuild {
     conclusion: String,
     workflow: String,
     title: String,
+    #[serde(default)]
+    head_sha: String,
+    #[serde(default)]
+    event: String,
 }
 
 /// Persisted state per repo/branch.
@@ -97,6 +101,8 @@ struct RunInfo {
     conclusion: String,
     title: String,
     workflow: String,
+    head_sha: String,
+    event: String,
 }
 
 impl RunInfo {
@@ -107,7 +113,13 @@ impl RunInfo {
             conclusion: value["conclusion"].as_str().unwrap_or("").to_string(),
             title: value["displayTitle"].as_str().unwrap_or("unknown").to_string(),
             workflow: value["workflowName"].as_str().unwrap_or("unknown").to_string(),
+            head_sha: value["headSha"].as_str().unwrap_or("").to_string(),
+            event: value["event"].as_str().unwrap_or("").to_string(),
         })
+    }
+
+    fn short_sha(&self) -> &str {
+        if self.head_sha.len() >= 7 { &self.head_sha[..7] } else { &self.head_sha }
     }
 
     fn is_completed(&self) -> bool {
@@ -128,6 +140,8 @@ impl RunInfo {
             conclusion: self.conclusion.clone(),
             workflow: self.workflow.clone(),
             title: self.title.clone(),
+            head_sha: self.head_sha.clone(),
+            event: self.event.clone(),
         }
     }
 }
@@ -138,7 +152,7 @@ async fn gh_recent_runs(repo: &str, branch: &str) -> Result<Vec<RunInfo>, String
         tokio::process::Command::new("gh")
             .args([
                 "run", "list", "--repo", repo, "--branch", branch, "--limit", "10", "--json",
-                "databaseId,status,conclusion,displayTitle,workflowName",
+                "databaseId,status,conclusion,displayTitle,workflowName,headSha,headBranch,event",
             ])
             .output(),
     )
@@ -163,7 +177,7 @@ async fn gh_run_status(repo: &str, run_id: u64) -> Result<RunInfo, String> {
         tokio::process::Command::new("gh")
             .args([
                 "run", "view", &run_id.to_string(), "--repo", repo,
-                "--json", "databaseId,status,conclusion,displayTitle,workflowName",
+                "--json", "databaseId,status,conclusion,displayTitle,workflowName,headSha,headBranch,event",
             ])
             .output(),
     )
@@ -208,6 +222,41 @@ struct ConfigureBranchesParams {
 struct SetDefaultBranchesParams {
     /// Default branches to watch when no per-repo config exists (e.g. ["main"])
     branches: Vec<String>,
+}
+
+/// Valid notification level values
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+enum NotificationLevelParam {
+    Off,
+    Low,
+    Normal,
+    Critical,
+}
+
+impl NotificationLevelParam {
+    fn to_level(&self) -> NotificationLevel {
+        match self {
+            Self::Off => NotificationLevel::Off,
+            Self::Low => NotificationLevel::Low,
+            Self::Normal => NotificationLevel::Normal,
+            Self::Critical => NotificationLevel::Critical,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct ConfigureNotificationsParams {
+    /// Optional: GitHub repo in "owner/repo" format. If omitted, sets global defaults.
+    repo: Option<String>,
+    /// Optional: branch name. Requires repo. If omitted with repo, sets repo-level defaults.
+    branch: Option<String>,
+    /// Notification level for build started events (off, low, normal, critical)
+    build_started: Option<NotificationLevelParam>,
+    /// Notification level for build success events (off, low, normal, critical)
+    build_success: Option<NotificationLevelParam>,
+    /// Notification level for build failure events (off, low, normal, critical)
+    build_failure: Option<NotificationLevelParam>,
 }
 
 #[derive(Clone)]
@@ -309,7 +358,10 @@ impl BuildWatcher {
             .map(|(key, entry)| {
                 let (repo, branch) = parse_watch_key(key);
                 let last = entry.last_build.as_ref().map(|b| {
-                    format!(" (last: {} — {}: {})", b.conclusion, b.workflow, b.title)
+                    let sha = if b.head_sha.len() >= 7 { &b.head_sha[..7] } else { &b.head_sha };
+                    let event_str = if b.event.is_empty() { String::new() } else { format!(", {}", b.event) };
+                    let sha_str = if sha.is_empty() { String::new() } else { format!(" {sha}") };
+                    format!(" (last: {}{} — {}: {}{})", b.conclusion, event_str, b.workflow, b.title, sha_str)
                 }).unwrap_or_default();
 
                 if entry.active_runs.is_empty() {
@@ -336,10 +388,13 @@ impl BuildWatcher {
         Parameters(params): Parameters<ConfigureBranchesParams>,
     ) -> Result<CallToolResult, McpError> {
         let mut config = self.config.lock().await;
+        let existing = config.repos.get(&params.repo).cloned().unwrap_or_default();
         config.repos.insert(
             params.repo.clone(),
             RepoConfig {
                 branches: params.branches.clone(),
+                notifications: existing.notifications,
+                branch_notifications: existing.branch_notifications,
             },
         );
         save_config(&config);
@@ -395,6 +450,24 @@ impl BuildWatcher {
                 } else {
                     lines.push(format!("  {repo}: {:?}", rc.branches));
                 }
+                if !rc.notifications.is_empty() {
+                    let parts: Vec<String> = [
+                        rc.notifications.build_started.map(|l| format!("started: {l}")),
+                        rc.notifications.build_success.map(|l| format!("success: {l}")),
+                        rc.notifications.build_failure.map(|l| format!("failure: {l}")),
+                    ].into_iter().flatten().collect();
+                    lines.push(format!("    notifications: {}", parts.join(", ")));
+                }
+                for (branch, bc) in &rc.branch_notifications {
+                    if !bc.notifications.is_empty() {
+                        let parts: Vec<String> = [
+                            bc.notifications.build_started.map(|l| format!("started: {l}")),
+                            bc.notifications.build_success.map(|l| format!("success: {l}")),
+                            bc.notifications.build_failure.map(|l| format!("failure: {l}")),
+                        ].into_iter().flatten().collect();
+                        lines.push(format!("    [{branch}] notifications: {}", parts.join(", ")));
+                    }
+                }
             }
         }
 
@@ -417,6 +490,67 @@ impl BuildWatcher {
             "Test notification sent. You should see it on your desktop.",
         )]))
     }
+
+    #[tool(description = "Configure notification levels. Scope depends on which params are set: global (no repo/branch), per-repo (repo only), or per-branch (repo + branch). Only the events you specify are changed; others keep their current value. Levels: off, low, normal, critical. Examples: 'only notify me on failure for benefits' or 'on the release branch, only notify on success'.")]
+    async fn configure_notifications(
+        &self,
+        Parameters(params): Parameters<ConfigureNotificationsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        if params.branch.is_some() && params.repo.is_none() {
+            return Ok(CallToolResult::success(vec![Content::text(
+                "Error: branch requires repo to be set",
+            )]));
+        }
+
+        if params.build_started.is_none() && params.build_success.is_none() && params.build_failure.is_none() {
+            return Ok(CallToolResult::success(vec![Content::text(
+                "Error: at least one of build_started, build_success, or build_failure must be set",
+            )]));
+        }
+
+        let mut config = self.config.lock().await;
+
+        let scope = match (&params.repo, &params.branch) {
+            (None, _) => {
+                // Global
+                if let Some(ref l) = params.build_started { config.notifications.build_started = l.to_level(); }
+                if let Some(ref l) = params.build_success { config.notifications.build_success = l.to_level(); }
+                if let Some(ref l) = params.build_failure { config.notifications.build_failure = l.to_level(); }
+                "global".to_string()
+            }
+            (Some(repo), None) => {
+                // Per-repo
+                let rc = config.repos.entry(repo.clone()).or_default();
+                if let Some(ref l) = params.build_started { rc.notifications.build_started = Some(l.to_level()); }
+                if let Some(ref l) = params.build_success { rc.notifications.build_success = Some(l.to_level()); }
+                if let Some(ref l) = params.build_failure { rc.notifications.build_failure = Some(l.to_level()); }
+                repo.clone()
+            }
+            (Some(repo), Some(branch)) => {
+                // Per-branch
+                let rc = config.repos.entry(repo.clone()).or_default();
+                let bc = rc.branch_notifications.entry(branch.clone()).or_default();
+                if let Some(ref l) = params.build_started { bc.notifications.build_started = Some(l.to_level()); }
+                if let Some(ref l) = params.build_success { bc.notifications.build_success = Some(l.to_level()); }
+                if let Some(ref l) = params.build_failure { bc.notifications.build_failure = Some(l.to_level()); }
+                format!("{repo} [{branch}]")
+            }
+        };
+
+        save_config(&config);
+
+        // Show effective config for the scope
+        let effective = match (&params.repo, &params.branch) {
+            (Some(repo), Some(branch)) => config.notifications_for(repo, branch),
+            (Some(repo), None) => config.notifications_for(repo, &config.default_branches[0]),
+            _ => config.notifications.clone(),
+        };
+
+        Ok(CallToolResult::success(vec![Content::text(format!(
+            "Updated notifications for {scope}:\n  build_started: {}\n  build_success: {}\n  build_failure: {}",
+            effective.build_started, effective.build_success, effective.build_failure,
+        ))]))
+    }
 }
 
 #[tool_handler]
@@ -428,7 +562,10 @@ impl ServerHandler for BuildWatcher {
                 "Monitors GitHub Actions builds and sends desktop notifications on completion. \
                  Use watch_builds with one or more repos in 'owner/repo' format to start watching. \
                  Use configure_branches to set which branches to watch per repo, or \
-                 set_default_branches to change the default (main). Use get_config to see current settings.",
+                 set_default_branches to change the default (main). \
+                 Use configure_notifications to control which events trigger notifications — \
+                 set scope with repo and branch params (global if omitted, per-repo, or per-branch). \
+                 Levels: off, low, normal, critical. Use get_config to see current settings.",
             )
     }
 
@@ -474,8 +611,8 @@ async fn start_watch(
     let msg = if active.is_empty() {
         let latest = &runs[0]; // gh returns newest first
         format!(
-            "{repo} [{branch}]: latest build already completed ({}), watching for new builds\n  {}: {}\n  {}",
-            latest.conclusion, latest.workflow, latest.title, latest.url(repo)
+            "{repo} [{branch}]: latest build already completed ({}), watching for new builds\n  {}: {} {}\n  {}",
+            latest.conclusion, latest.workflow, latest.title, latest.short_sha(), latest.url(repo)
         )
     } else {
         format!(
@@ -529,7 +666,7 @@ async fn poll_repo(watches: Watches, config: SharedConfig, key: String) {
 
         let (active_poll_secs, idle_poll_secs, notif) = {
             let cfg = config.lock().await;
-            (cfg.active_poll_seconds, cfg.idle_poll_seconds, cfg.notifications.clone())
+            (cfg.active_poll_seconds, cfg.idle_poll_seconds, cfg.notifications_for(&repo, &branch))
         };
 
         let delay = if has_active { active_poll_secs } else { idle_poll_secs };
@@ -607,11 +744,11 @@ async fn poll_active_runs(
             let level = if run.succeeded() { notif.build_success } else { notif.build_failure };
             platform::send_notification(
                 &format!("Build {}: {repo} [{branch}]", run.conclusion),
-                &format!("{}: {}", run.workflow, run.title),
+                &format!("{}: {} ({})", run.workflow, run.title, run.short_sha()),
                 level,
                 Some(&run.url(repo)),
             );
-            tracing::info!("Build completed for {key} run {run_id}: {}", run.conclusion);
+            tracing::info!("Build completed for {key} run {run_id} {}: {}", run.short_sha(), run.conclusion);
 
             let mut w = watches.lock().await;
             if let Some(entry) = w.get_mut(key) {
@@ -670,10 +807,10 @@ async fn check_for_new_runs(
     let new_max = new_runs.iter().map(|r| r.id).max().unwrap();
 
     for run in &new_runs {
-        tracing::info!("New build detected for {key}: run {} ({}: {})", run.id, run.workflow, run.title);
+        tracing::info!("New build detected for {key}: run {} {} ({}: {})", run.id, run.short_sha(), run.workflow, run.title);
         platform::send_notification(
             &format!("Build started: {repo} [{branch}]"),
-            &format!("{}: {}", run.workflow, run.title),
+            &format!("{}: {} ({})", run.workflow, run.title, run.short_sha()),
             notif.build_started,
             Some(&run.url(repo)),
         );
@@ -683,11 +820,11 @@ async fn check_for_new_runs(
             let level = if run.succeeded() { notif.build_success } else { notif.build_failure };
             platform::send_notification(
                 &format!("Build {}: {repo} [{branch}]", run.conclusion),
-                &format!("{}: {}", run.workflow, run.title),
+                &format!("{}: {} ({})", run.workflow, run.title, run.short_sha()),
                 level,
                 Some(&run.url(repo)),
             );
-            tracing::info!("Build already completed for {key} run {}: {}", run.id, run.conclusion);
+            tracing::info!("Build already completed for {key} run {} {}: {}", run.id, run.short_sha(), run.conclusion);
         }
     }
 
