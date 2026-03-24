@@ -717,13 +717,9 @@ async fn poll_active_runs(
                 notif.build_failure
             };
             let emoji = if run.succeeded() { "✅" } else { "❌" };
-            let repo_name = repo.split('/').nth(1).unwrap_or(repo);
             platform::send_notification(
-                &format!("Github Build [{repo_name}]"),
-                &format!(
-                    "{emoji} {} on {branch}\n{}: {}",
-                    run.conclusion, run.workflow, run.title
-                ),
+                &format!("{emoji} Build {} [{branch}]", run.conclusion),
+                &format!("{}: {}", run.workflow, run.title),
                 level,
                 Some(&run.url(repo)),
                 Some(key),
@@ -805,10 +801,9 @@ async fn check_for_new_runs(
             run.workflow,
             run.title
         );
-        let repo_name = repo.split('/').nth(1).unwrap_or(repo);
         platform::send_notification(
-            &format!("Github Build [{repo_name}]"),
-            &format!("🔨 started on {branch}\n{}: {}", run.workflow, run.title),
+            &format!("🔨 Build started [{branch}]"),
+            &format!("{}: {}", run.workflow, run.title),
             notif.build_started,
             Some(&run.url(repo)),
             Some(key),
@@ -823,11 +818,8 @@ async fn check_for_new_runs(
             };
             let emoji = if run.succeeded() { "✅" } else { "❌" };
             platform::send_notification(
-                &format!("Github Build [{repo_name}]"),
-                &format!(
-                    "{emoji} {} on {branch}\n{}: {}",
-                    run.conclusion, run.workflow, run.title
-                ),
+                &format!("{emoji} Build {} [{branch}]", run.conclusion),
+                &format!("{}: {}", run.workflow, run.title),
                 level,
                 Some(&run.url(repo)),
                 Some(key),
