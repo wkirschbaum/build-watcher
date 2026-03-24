@@ -12,15 +12,51 @@ use crate::watcher::{
     SharedConfig, Watches, parse_watch_key, save_watches, start_watch, watch_key,
 };
 
+/// Deserialize a `Vec<String>` that may arrive as either a proper JSON array
+/// or as a JSON-encoded string (e.g. `"[\"a\",\"b\"]"`). Some MCP clients
+/// double-encode array parameters; this handles both forms transparently.
+fn deserialize_string_or_vec<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de;
+
+    struct StringOrVec;
+
+    impl<'de> de::Visitor<'de> for StringOrVec {
+        type Value = Vec<String>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a string array or a JSON-encoded string array")
+        }
+
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+            serde_json::from_str(v).map_err(de::Error::custom)
+        }
+
+        fn visit_seq<A: de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+            let mut vec = Vec::new();
+            while let Some(item) = seq.next_element()? {
+                vec.push(item);
+            }
+            Ok(vec)
+        }
+    }
+
+    deserializer.deserialize_any(StringOrVec)
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 struct WatchBuildsParams {
     /// List of GitHub repos in "owner/repo" format
+    #[serde(deserialize_with = "deserialize_string_or_vec")]
     repos: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct StopWatchesParams {
     /// List of GitHub repos in "owner/repo" format
+    #[serde(deserialize_with = "deserialize_string_or_vec")]
     repos: Vec<String>,
 }
 
@@ -29,12 +65,14 @@ struct ConfigureBranchesParams {
     /// GitHub repo in "owner/repo" format
     repo: String,
     /// Branches to watch for this repo (e.g. ["main", "develop"])
+    #[serde(deserialize_with = "deserialize_string_or_vec")]
     branches: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct SetDefaultBranchesParams {
     /// Default branches to watch when no per-repo config exists (e.g. ["main"])
+    #[serde(deserialize_with = "deserialize_string_or_vec")]
     branches: Vec<String>,
 }
 

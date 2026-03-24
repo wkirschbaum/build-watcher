@@ -165,7 +165,7 @@ mod tests {
             "status": "completed",
             "conclusion": "success",
             "displayTitle": "Fix login bug",
-            "workflowName": "CI",
+            "workflowName": "Lint and Test",
             "headSha": "abc1234def5678",
             "event": "push"
         })
@@ -178,7 +178,7 @@ mod tests {
         assert_eq!(run.status, "completed");
         assert_eq!(run.conclusion, "success");
         assert_eq!(run.title, "Fix login bug");
-        assert_eq!(run.workflow, "CI");
+        assert_eq!(run.workflow, "Lint and Test");
         assert_eq!(run.head_sha, "abc1234def5678");
         assert_eq!(run.event, "push");
     }
@@ -246,7 +246,7 @@ mod tests {
         let lb = run.to_last_build();
         assert_eq!(lb.run_id, 123456789);
         assert_eq!(lb.conclusion, "success");
-        assert_eq!(lb.workflow, "CI");
+        assert_eq!(lb.workflow, "Lint and Test");
         assert_eq!(lb.title, "Fix login bug");
         assert_eq!(lb.head_sha, "abc1234def5678");
         assert_eq!(lb.event, "push");
