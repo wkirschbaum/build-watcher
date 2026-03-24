@@ -326,6 +326,17 @@ pub fn load_config() -> (Config, bool) {
     (Config::default(), false)
 }
 
+/// Load config and re-save to normalize the schema (adds missing fields).
+/// Skips re-save when the primary was corrupt or missing to avoid overwriting
+/// a user-edited file with defaults.
+pub fn load_and_normalize() -> Config {
+    let (cfg, primary_ok) = load_config();
+    if primary_ok && let Err(e) = save_config(&cfg) {
+        tracing::error!("Failed to save config on startup: {e}");
+    }
+    cfg
+}
+
 pub fn save_config(config: &Config) -> Result<(), PersistError> {
     save_json(config_dir().join("config.json"), config)
 }

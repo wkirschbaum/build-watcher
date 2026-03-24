@@ -1,17 +1,114 @@
+use anyhow::Result;
 use rmcp::handler::server::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, Content, Implementation, ServerCapabilities, ServerInfo};
+use rmcp::transport::streamable_http_server::{
+    StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
+};
 use rmcp::{ErrorData as McpError, ServerHandler, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
 use serde::Deserialize;
+use tokio_util::sync::CancellationToken;
 
 use crate::config::{
     NotificationLevel, NotificationOverrides, PersistError, RepoConfig, config_dir, save_config,
+    state_dir,
 };
 use crate::github::{validate_branch, validate_repo};
 use crate::watcher::{
     SharedConfig, WatcherHandle, Watches, parse_watch_key, save_watches, start_watch, watch_key,
 };
+
+const DEFAULT_PORT: u16 = 8417;
+
+/// Bind to the preferred port, trying up to 9 consecutive ports on conflict.
+async fn bind_with_fallback(preferred: u16) -> Result<tokio::net::TcpListener> {
+    for port in preferred..=preferred.saturating_add(9) {
+        match tokio::net::TcpListener::bind(format!("127.0.0.1:{port}")).await {
+            Ok(l) => return Ok(l),
+            Err(_) if port < preferred.saturating_add(9) => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    unreachable!()
+}
+
+/// Build the axum router with the MCP StreamableHttpService.
+fn build_router(
+    watches: Watches,
+    config: SharedConfig,
+    handle: WatcherHandle,
+    ct: &CancellationToken,
+) -> axum::Router {
+    let http_config = StreamableHttpServerConfig {
+        stateful_mode: false,
+        json_response: true,
+        sse_keep_alive: None,
+        cancellation_token: ct.child_token(),
+        ..Default::default()
+    };
+
+    let service: StreamableHttpService<BuildWatcher, LocalSessionManager> =
+        StreamableHttpService::new(
+            move || {
+                Ok(BuildWatcher::new(
+                    watches.clone(),
+                    config.clone(),
+                    handle.clone(),
+                ))
+            },
+            Default::default(),
+            http_config,
+        );
+
+    axum::Router::new().nest_service("/mcp", service)
+}
+
+/// Run the MCP HTTP server with graceful shutdown.
+///
+/// Binds to the configured port, writes a port-discovery file, serves until
+/// ctrl-c, then shuts down pollers and persists state.
+pub async fn serve(
+    watches: Watches,
+    config: SharedConfig,
+    handle: WatcherHandle,
+    ct: CancellationToken,
+) -> Result<()> {
+    let port: u16 = std::env::var("BUILD_WATCHER_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(DEFAULT_PORT);
+
+    let router = build_router(watches.clone(), config, handle.clone(), &ct);
+    let listener = bind_with_fallback(port).await?;
+    let bound_port = listener.local_addr()?.port();
+
+    let port_file = state_dir().join("port");
+    if let Err(e) = std::fs::write(&port_file, bound_port.to_string()) {
+        tracing::warn!("Failed to write port file {}: {e}", port_file.display());
+    }
+
+    if bound_port != port {
+        tracing::warn!("Port {port} was occupied, using port {bound_port} instead");
+        tracing::warn!("Re-run install.sh to update the MCP URL in ~/.claude.json");
+    }
+    tracing::info!("build-watcher listening on http://127.0.0.1:{bound_port}/mcp");
+
+    axum::serve(listener, router)
+        .with_graceful_shutdown(async move {
+            tokio::signal::ctrl_c().await.ok();
+            tracing::info!("Shutting down...");
+            ct.cancel();
+        })
+        .await?;
+
+    handle.shutdown().await;
+    save_watches(&watches).await;
+    let _ = std::fs::remove_file(&port_file);
+    tracing::info!("State saved, goodbye.");
+
+    Ok(())
+}
 
 fn persist_warning(result: Result<(), PersistError>) -> Option<String> {
     match result {

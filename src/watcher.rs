@@ -561,3 +561,23 @@ pub async fn startup_watches(watches: &Watches, config: &SharedConfig, handle: &
 
     futures::future::join_all(new_futures).await;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn watch_key_format() {
+        assert_eq!(watch_key("alice/myapp", "main"), "alice/myapp#main");
+    }
+
+    #[test]
+    fn parse_watch_key_splits_correctly() {
+        assert_eq!(parse_watch_key("alice/myapp#main"), ("alice/myapp", "main"));
+    }
+
+    #[test]
+    fn parse_watch_key_falls_back_to_main() {
+        assert_eq!(parse_watch_key("alice/myapp"), ("alice/myapp", "main"));
+    }
+}
