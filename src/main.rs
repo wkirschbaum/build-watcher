@@ -737,7 +737,7 @@ async fn poll_active_runs(
             let emoji = if run.succeeded() { "✅" } else { "❌" };
             platform::send_notification(
                 &format!("{emoji} Build {}: {display} [{branch}]", run.conclusion),
-                &format!("{}: {} ({})", run.workflow, run.title, run.short_sha()),
+                &format!("{}: {}", run.workflow, run.title),
                 level,
                 Some(&run.url(repo)),
                 Some(repo),
@@ -823,7 +823,7 @@ async fn check_for_new_runs(
         );
         platform::send_notification(
             &format!("🔨 Build started: {display} [{branch}]"),
-            &format!("{}: {} ({})", run.workflow, run.title, run.short_sha()),
+            &format!("{}: {}", run.workflow, run.title),
             notif.build_started,
             Some(&run.url(repo)),
             Some(repo),
@@ -839,7 +839,7 @@ async fn check_for_new_runs(
             let emoji = if run.succeeded() { "✅" } else { "❌" };
             platform::send_notification(
                 &format!("{emoji} Build {}: {display} [{branch}]", run.conclusion),
-                &format!("{}: {} ({})", run.workflow, run.title, run.short_sha()),
+                &format!("{}: {}", run.workflow, run.title),
                 level,
                 Some(&run.url(repo)),
                 Some(repo),

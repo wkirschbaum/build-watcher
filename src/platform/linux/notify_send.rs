@@ -1,6 +1,5 @@
 use std::collections::HashMap;
-use std::process::Command;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use crate::config::NotificationLevel;
 use crate::platform::Notifier;
@@ -9,14 +8,17 @@ use crate::platform::Notifier;
 ///
 /// Uses `--print-id` / `--replace-id` to stack notifications per group (project),
 /// so each watched repo has its own notification slot.
+///
+/// When a URL is provided, adds an `--action open=Open` button. Clicking it opens
+/// the URL via `xdg-open`. Requires notify-send ≥ 0.8 (libnotify).
 pub struct NotifySend {
-    ids: Mutex<HashMap<String, u32>>,
+    ids: Arc<Mutex<HashMap<String, u32>>>,
 }
 
 impl NotifySend {
     pub fn new() -> Self {
         Self {
-            ids: Mutex::new(HashMap::new()),
+            ids: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -46,40 +48,69 @@ impl Notifier for NotifySend {
             NotificationLevel::Critical => "critical",
             NotificationLevel::Off => unreachable!(),
         };
-        let notification_body = match url {
-            Some(u) => format!("{body}\n{u}"),
-            None => body.to_string(),
-        };
 
-        let mut cmd = Command::new("notify-send");
-        cmd.args([
-            "--app-name",
-            "Build Watcher",
-            "--urgency",
-            urgency,
-            "--icon",
-            icon,
-            "--category",
-            category,
-            "--expire-time",
-            expire_ms,
-            "--print-id",
-        ]);
+        let mut args = vec![
+            "--app-name".to_string(),
+            "Build Watcher".to_string(),
+            "--urgency".to_string(),
+            urgency.to_string(),
+            "--icon".to_string(),
+            icon.to_string(),
+            "--category".to_string(),
+            category.to_string(),
+            "--expire-time".to_string(),
+            expire_ms.to_string(),
+            "--print-id".to_string(),
+        ];
 
         let key = group.unwrap_or("build-watcher").to_string();
-        let mut ids = self.ids.lock().unwrap();
-        if let Some(&id) = ids.get(&key) {
-            cmd.args(["--replace-id", &id.to_string()]);
-        }
-
-        cmd.args([title, &notification_body]);
-
-        if let Ok(output) = cmd.output()
-            && let Ok(id) = String::from_utf8_lossy(&output.stdout)
-                .trim()
-                .parse::<u32>()
         {
-            ids.insert(key, id);
+            let ids = self.ids.lock().unwrap();
+            if let Some(&id) = ids.get(&key) {
+                args.push("--replace-id".to_string());
+                args.push(id.to_string());
+            }
         }
+
+        if url.is_some() {
+            args.push("--action".to_string());
+            args.push("open=Open".to_string());
+        }
+
+        args.push(title.to_string());
+        args.push(body.to_string());
+
+        let url_owned = url.map(str::to_string);
+        let ids = Arc::clone(&self.ids);
+
+        tokio::spawn(async move {
+            let Ok(output) = tokio::process::Command::new("notify-send")
+                .args(&args)
+                .output()
+                .await
+            else {
+                return;
+            };
+
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let mut lines = stdout.lines();
+
+            // First line: notification ID from --print-id
+            if let Some(id_str) = lines.next()
+                && let Ok(id) = id_str.trim().parse::<u32>()
+            {
+                ids.lock().unwrap().insert(key, id);
+            }
+
+            // Second line: action name from --action (only present if user clicked)
+            if let Some(action) = lines.next()
+                && action.trim() == "open"
+                && let Some(url) = url_owned
+            {
+                let _ = tokio::process::Command::new("xdg-open")
+                    .arg(&url)
+                    .spawn();
+            }
+        });
     }
 }
