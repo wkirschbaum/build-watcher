@@ -434,7 +434,8 @@ impl BuildWatcher {
             NotificationLevel::Normal,
             None,
             None,
-        );
+        )
+        .await;
         Ok(CallToolResult::success(vec![Content::text(
             "Test notification sent. You should see it on your desktop.",
         )]))

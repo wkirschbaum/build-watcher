@@ -1,3 +1,6 @@
+use std::future::Future;
+use std::pin::Pin;
+
 use crate::config::NotificationLevel;
 use crate::platform::Notifier;
 
@@ -17,6 +20,7 @@ impl Notifier for NullNotifier {
         _level: NotificationLevel,
         _url: Option<&str>,
         _group: Option<&str>,
-    ) {
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(async {})
     }
 }

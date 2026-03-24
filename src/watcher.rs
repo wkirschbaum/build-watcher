@@ -193,7 +193,7 @@ fn spawn_poller(watches: Watches, config: SharedConfig, handle: &WatcherHandle, 
     });
 }
 
-fn notify_build_complete(
+async fn notify_build_complete(
     run: &RunInfo,
     repo: &str,
     branch: &str,
@@ -212,7 +212,8 @@ fn notify_build_complete(
         level,
         Some(&run.url(repo)),
         Some(&group),
-    );
+    )
+    .await;
 }
 
 #[tracing::instrument(skip_all, fields(key))]
@@ -327,7 +328,7 @@ async fn poll_active_runs(
                 w.contains_key(key)
             };
             if still_watched {
-                notify_build_complete(&run, repo, branch, key, notif);
+                notify_build_complete(&run, repo, branch, key, notif).await;
             }
 
             tracing::info!(
@@ -453,11 +454,12 @@ async fn check_for_new_runs(
             notif.build_started,
             Some(&run.url(repo)),
             Some(&group),
-        );
+        )
+        .await;
 
         // If it already completed between polls, also notify completion
         if run.is_completed() {
-            notify_build_complete(run, repo, branch, key, notif);
+            notify_build_complete(run, repo, branch, key, notif).await;
             tracing::info!(
                 key,
                 run_id = run.id,

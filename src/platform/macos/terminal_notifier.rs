@@ -1,3 +1,5 @@
+use std::future::Future;
+use std::pin::Pin;
 use std::process::{Command, Stdio};
 
 use crate::config::NotificationLevel;
@@ -33,7 +35,7 @@ impl Notifier for TerminalNotifier {
         level: NotificationLevel,
         url: Option<&str>,
         group: Option<&str>,
-    ) {
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         let sound = super::notification_sound(level);
         let mut cmd = Command::new("terminal-notifier");
         cmd.args([
@@ -53,5 +55,6 @@ impl Notifier for TerminalNotifier {
             Ok(child) => super::reap_with_timeout(child, "terminal-notifier"),
             Err(e) => tracing::warn!("Failed to spawn terminal-notifier: {e}"),
         }
+        Box::pin(async {})
     }
 }

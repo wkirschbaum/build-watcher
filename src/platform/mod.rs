@@ -1,3 +1,5 @@
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::OnceLock;
 
 use crate::config::NotificationLevel;
@@ -30,7 +32,7 @@ pub trait Notifier: Send + Sync {
         level: NotificationLevel,
         url: Option<&str>,
         group: Option<&str>,
-    );
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
 }
 
 static INSTANCE: OnceLock<Box<dyn Notifier>> = OnceLock::new();
@@ -51,7 +53,7 @@ fn notifier() -> &'static dyn Notifier {
     })
 }
 
-pub fn send_notification(
+pub async fn send_notification(
     title: &str,
     body: &str,
     level: NotificationLevel,
@@ -61,7 +63,7 @@ pub fn send_notification(
     if level == NotificationLevel::Off {
         return;
     }
-    notifier().send(title, body, level, url, group);
+    notifier().send(title, body, level, url, group).await;
 }
 
 /// Default state directory when STATE_DIRECTORY is not set.

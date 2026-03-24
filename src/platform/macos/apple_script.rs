@@ -1,3 +1,5 @@
+use std::future::Future;
+use std::pin::Pin;
 use std::process::Command;
 
 use crate::config::NotificationLevel;
@@ -21,7 +23,7 @@ impl Notifier for AppleScriptNotifier {
         level: NotificationLevel,
         _url: Option<&str>,
         _group: Option<&str>,
-    ) {
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         let sound = super::notification_sound(level);
         let title = escape_applescript(title);
         let body = escape_applescript(body);
@@ -31,6 +33,7 @@ impl Notifier for AppleScriptNotifier {
             Ok(child) => super::reap_with_timeout(child, "osascript"),
             Err(e) => tracing::warn!("Failed to spawn osascript: {e}"),
         }
+        Box::pin(async {})
     }
 }
 

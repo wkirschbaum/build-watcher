@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 
@@ -13,9 +15,8 @@ use crate::platform::Notifier;
 /// so each branch has its own notification slot. Requires notify-send ≥ 0.8 (libnotify).
 ///
 /// When a URL is provided, adds an `--action open=Open` button and embeds a clickable
-/// link in the body. The notification ID is read from the first line of stdout immediately
-/// after display (before `--wait` blocks), ensuring the replace-id is available for the
-/// next notification without waiting for the user to dismiss the current one.
+/// link in the body. The notification ID is read from stdout and stored before returning,
+/// ensuring the replace-id is available for the next notification.
 pub struct NotifySend {
     ids: Arc<Mutex<HashMap<String, u32>>>,
 }
@@ -40,7 +41,7 @@ impl Notifier for NotifySend {
         level: NotificationLevel,
         url: Option<&str>,
         group: Option<&str>,
-    ) {
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         let (icon, category, expire_ms) = match level {
             NotificationLevel::Low => ("emblem-synchronizing", "transfer", "4000"),
             NotificationLevel::Normal => ("emblem-ok", "transfer.complete", "6000"),
@@ -79,7 +80,8 @@ impl Notifier for NotifySend {
             }
         }
 
-        if url.is_some() {
+        let has_url = url.is_some();
+        if has_url {
             args.push("--wait".to_string());
             args.push("--action".to_string());
             args.push("open=Open".to_string());
@@ -97,7 +99,7 @@ impl Notifier for NotifySend {
         let url_owned = url.map(str::to_string);
         let ids = Arc::clone(&self.ids);
 
-        tokio::spawn(async move {
+        Box::pin(async move {
             let mut child = match tokio::process::Command::new("notify-send")
                 .args(&args)
                 .stdout(Stdio::piped())
@@ -113,8 +115,9 @@ impl Notifier for NotifySend {
 
             let mut lines = BufReader::new(child.stdout.take().expect("stdout is piped")).lines();
 
-            // First line: notification ID, printed immediately on display before --wait blocks.
-            // Store it right away so the next notification can use --replace-id.
+            // Read the notification ID before returning — this ensures --replace-id is
+            // available for the next call, even when multiple notifications fire in rapid
+            // succession (e.g. several builds completing on the same poll cycle).
             match lines.next_line().await {
                 Ok(Some(line)) => {
                     if let Ok(id) = line.trim().parse::<u32>() {
@@ -127,30 +130,35 @@ impl Notifier for NotifySend {
                 Err(e) => tracing::warn!("Failed to read notify-send output: {e}"),
             }
 
-            // Second line: action name, only written when the user clicks a button.
-            match lines.next_line().await {
-                Ok(Some(action)) => {
-                    if action.trim() == "open"
-                        && let Some(url) = url_owned
-                    {
-                        match tokio::process::Command::new("xdg-open").arg(&url).spawn() {
-                            Ok(mut child) => {
-                                if let Err(e) = child.wait().await {
-                                    tracing::warn!("xdg-open failed: {e}");
+            // The --wait / action handling runs in the background so we don't block the caller.
+            if has_url {
+                tokio::spawn(async move {
+                    // Second line: action name, only written when the user clicks a button.
+                    match lines.next_line().await {
+                        Ok(Some(action)) => {
+                            if action.trim() == "open"
+                                && let Some(url) = url_owned
+                            {
+                                match tokio::process::Command::new("xdg-open").arg(&url).spawn() {
+                                    Ok(mut child) => {
+                                        if let Err(e) = child.wait().await {
+                                            tracing::warn!("xdg-open failed: {e}");
+                                        }
+                                    }
+                                    Err(e) => tracing::warn!("Failed to spawn xdg-open: {e}"),
                                 }
                             }
-                            Err(e) => tracing::warn!("Failed to spawn xdg-open: {e}"),
                         }
+                        Ok(None) => {}
+                        Err(e) => tracing::warn!("Failed to read notify-send action: {e}"),
                     }
-                }
-                Ok(None) => {}
-                Err(e) => tracing::warn!("Failed to read notify-send action: {e}"),
-            }
 
-            if let Err(e) = child.wait().await {
-                tracing::warn!("notify-send exited with error: {e}");
+                    if let Err(e) = child.wait().await {
+                        tracing::warn!("notify-send exited with error: {e}");
+                    }
+                });
             }
-        });
+        })
     }
 }
 
