@@ -85,7 +85,17 @@ impl Notifier for NotifySend {
         }
 
         args.push(title.to_string());
-        args.push(body.to_string());
+        // When a URL is present, embed a short link in the body so the user can open
+        // the build directly — clicking the notification itself just dismisses it.
+        // libnotify supports <a href> markup in the body.
+        let display_body = match url {
+            Some(u) => {
+                let run_id = u.rsplit('/').next().unwrap_or(u);
+                format!("{body}\n<a href=\"{u}\">#{run_id}</a>")
+            }
+            None => body.to_string(),
+        };
+        args.push(display_body);
 
         let url_owned = url.map(str::to_string);
         let ids = Arc::clone(&self.ids);
