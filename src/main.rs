@@ -19,10 +19,11 @@ async fn main() -> Result<()> {
 
     let config = Arc::new(Mutex::new(config::load_and_normalize()));
     let watches = Arc::new(Mutex::new(watcher::load_watches()));
+    let pause: watcher::PauseState = Arc::new(Mutex::new(None));
 
     let ct = CancellationToken::new();
     let handle = watcher::WatcherHandle::new(ct.clone());
-    watcher::startup_watches(&watches, &config, &handle).await;
+    watcher::startup_watches(&watches, &config, &handle, &pause).await;
 
-    server::serve(watches, config, handle, ct).await
+    server::serve(watches, config, handle, pause, ct).await
 }

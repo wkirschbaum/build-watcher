@@ -217,6 +217,8 @@ pub struct BranchConfig {
 pub struct RepoConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub branches: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workflows: Vec<String>,
     #[serde(default, skip_serializing_if = "NotificationOverrides::is_empty")]
     pub notifications: NotificationOverrides,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
@@ -286,6 +288,15 @@ impl Config {
                 .or_else(|| repo_overrides.and_then(|o| o.build_failure))
                 .unwrap_or(global.build_failure),
         }
+    }
+
+    /// Workflow filter for a repo. Empty slice means all workflows.
+    pub fn workflows_for(&self, repo: &str) -> &[String] {
+        self.repos
+            .get(repo)
+            .filter(|r| !r.workflows.is_empty())
+            .map(|r| r.workflows.as_slice())
+            .unwrap_or(&[])
     }
 
     pub fn branches_for(&self, repo: &str) -> &[String] {

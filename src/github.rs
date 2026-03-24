@@ -45,8 +45,9 @@ pub struct LastBuild {
 }
 
 impl LastBuild {
-    pub fn short_sha(&self) -> &str {
-        short_sha(&self.head_sha)
+    /// Human-friendly title: "PR: <title>" for pull_request events, else "<title> <sha>".
+    pub fn display_title(&self) -> String {
+        display_title(&self.event, &self.title, &self.head_sha)
     }
 }
 
@@ -108,6 +109,11 @@ impl RunInfo {
 
     pub fn short_sha(&self) -> &str {
         short_sha(&self.head_sha)
+    }
+
+    /// Human-friendly title: "PR: <title>" for pull_request events, else "<title> <sha>".
+    pub fn display_title(&self) -> String {
+        display_title(&self.event, &self.title, &self.head_sha)
     }
 
     pub fn is_completed(&self) -> bool {
@@ -222,6 +228,84 @@ pub async fn gh_run_status(repo: &str, run_id: u64) -> Result<RunInfo, GhError> 
     RunInfo::from_gh_json(raw).ok_or_else(|| GhError::MissingFields {
         repo: repo.to_string(),
     })
+}
+
+fn display_title(event: &str, title: &str, head_sha: &str) -> String {
+    if event.starts_with("pull_request") {
+        format!("PR: {title}")
+    } else {
+        let sha = short_sha(head_sha);
+        if sha.is_empty() {
+            title.to_string()
+        } else {
+            format!("{title} ({sha})")
+        }
+    }
+}
+
+/// Fetch the failing job and step names for a completed run.
+/// Returns a human-readable string like "Job: Build / Step: Run tests", or None on error.
+pub async fn gh_failing_steps(repo: &str, run_id: u64) -> Option<String> {
+    #[derive(Debug, Deserialize)]
+    struct GhStep {
+        name: String,
+        conclusion: String,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct GhJob {
+        name: String,
+        conclusion: String,
+        steps: Vec<GhStep>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct GhJobsResponse {
+        jobs: Vec<GhJob>,
+    }
+
+    let output = tokio::time::timeout(
+        GH_TIMEOUT,
+        tokio::process::Command::new("gh")
+            .args([
+                "run",
+                "view",
+                &run_id.to_string(),
+                "--repo",
+                repo,
+                "--json",
+                "jobs",
+            ])
+            .output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let resp: GhJobsResponse = serde_json::from_slice(&output.stdout).ok()?;
+    let mut failures: Vec<String> = Vec::new();
+
+    for job in &resp.jobs {
+        if job.conclusion == "failure" {
+            let step = job
+                .steps
+                .iter()
+                .find(|s| s.conclusion == "failure")
+                .map(|s| format!("{} / {}", job.name, s.name))
+                .unwrap_or_else(|| job.name.clone());
+            failures.push(step);
+        }
+    }
+
+    if failures.is_empty() {
+        None
+    } else {
+        Some(failures.join(", "))
+    }
 }
 
 /// Validates that a branch name contains only safe characters.

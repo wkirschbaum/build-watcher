@@ -16,7 +16,8 @@ use crate::config::{
 };
 use crate::github::{validate_branch, validate_repo};
 use crate::watcher::{
-    SharedConfig, WatcherHandle, Watches, parse_watch_key, save_watches, start_watch, watch_key,
+    PauseState, SharedConfig, WatcherHandle, Watches, parse_watch_key, save_watches, start_watch,
+    watch_key,
 };
 
 const DEFAULT_PORT: u16 = 8417;
@@ -38,6 +39,7 @@ fn build_router(
     watches: Watches,
     config: SharedConfig,
     handle: WatcherHandle,
+    pause: PauseState,
     ct: &CancellationToken,
 ) -> axum::Router {
     let http_config = StreamableHttpServerConfig {
@@ -55,6 +57,7 @@ fn build_router(
                     watches.clone(),
                     config.clone(),
                     handle.clone(),
+                    pause.clone(),
                 ))
             },
             Default::default(),
@@ -72,6 +75,7 @@ pub async fn serve(
     watches: Watches,
     config: SharedConfig,
     handle: WatcherHandle,
+    pause: PauseState,
     ct: CancellationToken,
 ) -> Result<()> {
     let port: u16 = std::env::var("BUILD_WATCHER_PORT")
@@ -79,7 +83,7 @@ pub async fn serve(
         .and_then(|p| p.parse().ok())
         .unwrap_or(DEFAULT_PORT);
 
-    let router = build_router(watches.clone(), config, handle.clone(), &ct);
+    let router = build_router(watches.clone(), config, handle.clone(), pause, &ct);
     let listener = bind_with_fallback(port).await?;
     let bound_port = listener.local_addr()?.port();
 
@@ -200,22 +204,44 @@ struct ConfigureNotificationsParams {
     build_failure: Option<NotificationLevel>,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+struct ConfigureWorkflowsParams {
+    /// GitHub repo in "owner/repo" format
+    repo: String,
+    /// Workflow names to watch (e.g. ["CI", "Deploy"]). Empty list means all workflows.
+    #[serde(deserialize_with = "deserialize_string_or_vec")]
+    workflows: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct PauseNotificationsParams {
+    /// Minutes to pause notifications. Omit or 0 to pause until restart.
+    minutes: Option<u64>,
+}
+
 #[derive(Clone)]
 pub struct BuildWatcher {
     tool_router: ToolRouter<Self>,
     watches: Watches,
     config: SharedConfig,
     handle: WatcherHandle,
+    pause: PauseState,
 }
 
 #[tool_router]
 impl BuildWatcher {
-    pub(crate) fn new(watches: Watches, config: SharedConfig, handle: WatcherHandle) -> Self {
+    pub(crate) fn new(
+        watches: Watches,
+        config: SharedConfig,
+        handle: WatcherHandle,
+        pause: PauseState,
+    ) -> Self {
         Self {
             tool_router: Self::tool_router(),
             watches,
             config,
             handle,
+            pause,
         }
     }
 
@@ -256,6 +282,7 @@ impl BuildWatcher {
                     &self.watches,
                     &self.config,
                     &self.handle,
+                    &self.pause,
                     repo,
                     branch,
                     &key,
@@ -353,7 +380,17 @@ impl BuildWatcher {
             )]));
         }
 
-        let mut lines: Vec<String> = watches
+        let paused = {
+            let p = self.pause.lock().await;
+            p.is_some_and(|deadline| tokio::time::Instant::now() < deadline)
+        };
+
+        let mut lines: Vec<String> = Vec::new();
+        if paused {
+            lines.push("⏸ Notifications paused\n".to_string());
+        }
+
+        let mut watch_lines: Vec<String> = watches
             .iter()
             .map(|(key, entry)| {
                 let (repo, branch) = parse_watch_key(key);
@@ -361,20 +398,11 @@ impl BuildWatcher {
                     .last_build
                     .as_ref()
                     .map(|b| {
-                        let sha = b.short_sha();
-                        let event_str = if b.event.is_empty() {
-                            String::new()
-                        } else {
-                            format!(", {}", b.event)
-                        };
-                        let sha_str = if sha.is_empty() {
-                            String::new()
-                        } else {
-                            format!(" {sha}")
-                        };
                         format!(
-                            " (last: {}{} — {}: {}{})",
-                            b.conclusion, event_str, b.workflow, b.title, sha_str
+                            " (last: {} — {}: {})",
+                            b.conclusion,
+                            b.workflow,
+                            b.display_title()
                         )
                     })
                     .unwrap_or_default();
@@ -385,7 +413,16 @@ impl BuildWatcher {
                     let run_list: Vec<String> = entry
                         .active_runs
                         .iter()
-                        .map(|(id, status)| format!("{id} ({status})"))
+                        .map(|(id, active)| {
+                            let elapsed = active.started_at.elapsed();
+                            let secs = elapsed.as_secs();
+                            let time = if secs < 60 {
+                                format!("{secs}s")
+                            } else {
+                                format!("{}m {}s", secs / 60, secs % 60)
+                            };
+                            format!("{id} ({}, {time})", active.status)
+                        })
                         .collect();
                     format!(
                         "- {repo} [{branch}] — {} active: {}{last}",
@@ -395,7 +432,8 @@ impl BuildWatcher {
                 }
             })
             .collect();
-        lines.sort();
+        watch_lines.sort();
+        lines.extend(watch_lines);
 
         Ok(CallToolResult::success(vec![Content::text(
             lines.join("\n"),
@@ -429,6 +467,7 @@ impl BuildWatcher {
             params.repo.clone(),
             RepoConfig {
                 branches: params.branches.clone(),
+                workflows: existing.workflows,
                 notifications: existing.notifications,
                 branch_notifications: existing.branch_notifications,
             },
@@ -472,6 +511,15 @@ impl BuildWatcher {
         let config = self.config.lock().await;
         let mut lines = Vec::new();
 
+        // Pause status
+        let paused = {
+            let p = self.pause.lock().await;
+            p.is_some_and(|deadline| tokio::time::Instant::now() < deadline)
+        };
+        if paused {
+            lines.push("⏸ Notifications: PAUSED".to_string());
+        }
+
         lines.push(format!("Default branches: {:?}", config.default_branches));
         lines.push(format!(
             "\nPolling:\n  active builds: every {}s\n  idle repos: every {}s",
@@ -495,6 +543,9 @@ impl BuildWatcher {
                     lines.push(format!("  {repo}: (default branches)"));
                 } else {
                     lines.push(format!("  {repo}: {:?}", rc.branches));
+                }
+                if !rc.workflows.is_empty() {
+                    lines.push(format!("    workflows: {:?}", rc.workflows));
                 }
                 if !rc.notifications.is_empty() {
                     lines.push(format!(
@@ -536,6 +587,78 @@ impl BuildWatcher {
         Ok(CallToolResult::success(vec![Content::text(
             "Test notification sent. You should see it on your desktop.",
         )]))
+    }
+
+    #[tool(
+        description = "Configure which workflows to watch for a repo. Only matching workflow names will trigger notifications. Empty list means all workflows (default). Matching is case-insensitive."
+    )]
+    async fn configure_workflows(
+        &self,
+        Parameters(params): Parameters<ConfigureWorkflowsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        if let Err(e) = validate_repo(&params.repo) {
+            return Ok(CallToolResult::error(vec![Content::text(e)]));
+        }
+
+        let mut config = self.config.lock().await;
+        let Some(rc) = config.repos.get_mut(&params.repo) else {
+            return Ok(CallToolResult::error(vec![Content::text(format!(
+                "{} is not being watched — use watch_builds first",
+                params.repo
+            ))]));
+        };
+        rc.workflows = params.workflows.clone();
+        let mut msg = if params.workflows.is_empty() {
+            format!("{}: watching all workflows", params.repo)
+        } else {
+            format!(
+                "{}: watching workflows {:?}\nApplies to new builds immediately.",
+                params.repo, params.workflows
+            )
+        };
+        if let Some(warning) = persist_warning(save_config(&config)) {
+            msg.push_str(&warning);
+        }
+
+        Ok(CallToolResult::success(vec![Content::text(msg)]))
+    }
+
+    #[tool(
+        description = "Temporarily pause all desktop notifications. Specify minutes to auto-resume, or omit for indefinite (until resume_notifications or restart). Builds are still tracked — only notifications are suppressed."
+    )]
+    async fn pause_notifications(
+        &self,
+        Parameters(params): Parameters<PauseNotificationsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let mut p = self.pause.lock().await;
+        let msg = match params.minutes {
+            Some(mins) if mins > 0 => {
+                *p = Some(tokio::time::Instant::now() + std::time::Duration::from_secs(mins * 60));
+                format!("Notifications paused for {mins} minutes")
+            }
+            _ => {
+                // Effectively forever (136 years)
+                *p = Some(
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(u32::MAX as u64),
+                );
+                "Notifications paused until resume or restart".to_string()
+            }
+        };
+
+        Ok(CallToolResult::success(vec![Content::text(msg)]))
+    }
+
+    #[tool(description = "Resume desktop notifications after a pause")]
+    async fn resume_notifications(&self) -> Result<CallToolResult, McpError> {
+        let mut p = self.pause.lock().await;
+        let was_paused = p.is_some_and(|deadline| tokio::time::Instant::now() < deadline);
+        *p = None;
+        let msg = if was_paused {
+            "Notifications resumed"
+        } else {
+            "Notifications were not paused"
+        };
+        Ok(CallToolResult::success(vec![Content::text(msg)]))
     }
 
     #[tool(
@@ -663,9 +786,12 @@ impl ServerHandler for BuildWatcher {
                  Use watch_builds with one or more repos in 'owner/repo' format to start watching. \
                  Use configure_branches to set which branches to watch per repo, or \
                  set_default_branches to change the default (main). \
+                 Use configure_workflows to filter which workflows to watch per repo. \
                  Use configure_notifications to control which events trigger notifications — \
                  set scope with repo and branch params (global if omitted, per-repo, or per-branch). \
-                 Levels: off, low, normal, critical. Use get_config to see current settings.",
+                 Levels: off, low, normal, critical. \
+                 Use pause_notifications/resume_notifications to temporarily suppress notifications. \
+                 Use get_config to see current settings.",
             )
     }
 

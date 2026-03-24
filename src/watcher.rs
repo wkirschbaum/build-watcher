@@ -9,11 +9,19 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
 use crate::config::{Config, NotificationConfig, load_json, save_json, state_dir};
-use crate::github::{GhError, LastBuild, RunInfo, gh_recent_runs, gh_run_status};
+use crate::github::{GhError, LastBuild, RunInfo, gh_failing_steps, gh_recent_runs, gh_run_status};
 use crate::platform;
 
 pub type SharedConfig = Arc<Mutex<Config>>;
 pub type Watches = Arc<Mutex<HashMap<String, WatchEntry>>>;
+pub type PauseState = Arc<Mutex<Option<Instant>>>;
+
+/// Runtime state for an in-progress run, including when we first saw it.
+#[derive(Debug, Clone)]
+pub struct ActiveRun {
+    pub status: String,
+    pub started_at: Instant,
+}
 
 // -- Watch key helpers --
 //
@@ -68,7 +76,7 @@ const MAX_GH_FAILURES: u8 = 5;
 #[derive(Debug, Clone)]
 pub struct WatchEntry {
     last_seen_run_id: u64,
-    pub active_runs: HashMap<u64, String>,
+    pub active_runs: HashMap<u64, ActiveRun>,
     failure_counts: HashMap<u64, u8>,
     pub last_build: Option<LastBuild>,
 }
@@ -94,10 +102,14 @@ impl WatchEntry {
         !self.active_runs.is_empty()
     }
 
-    fn record_completion(&mut self, run: &RunInfo) {
-        self.active_runs.remove(&run.id);
+    fn record_completion(&mut self, run: &RunInfo) -> Option<Duration> {
+        let elapsed = self
+            .active_runs
+            .remove(&run.id)
+            .map(|a| a.started_at.elapsed());
         self.failure_counts.remove(&run.id);
         self.last_build = Some(run.to_last_build());
+        elapsed
     }
 
     fn clear_failure_count(&mut self, run_id: u64) {
@@ -120,11 +132,11 @@ impl WatchEntry {
     }
 
     fn update_status(&mut self, run_id: u64, new_status: String) {
-        if let Some(old) = self.active_runs.get(&run_id)
-            && *old != new_status
+        if let Some(active) = self.active_runs.get_mut(&run_id)
+            && active.status != new_status
         {
-            tracing::debug!(run_id, old = %old, new = %new_status, "Run status changed");
-            self.active_runs.insert(run_id, new_status);
+            tracing::debug!(run_id, old = %active.status, new = %new_status, "Run status changed");
+            active.status = new_status;
         }
     }
 
@@ -138,7 +150,13 @@ impl WatchEntry {
             if run.is_completed() {
                 self.last_build = Some(run.to_last_build());
             } else {
-                self.active_runs.insert(run.id, run.status.clone());
+                self.active_runs.insert(
+                    run.id,
+                    ActiveRun {
+                        status: run.status.clone(),
+                        started_at: Instant::now(),
+                    },
+                );
             }
         }
     }
@@ -169,11 +187,12 @@ impl WatcherHandle {
 
 // -- Starting watches --
 
-#[tracing::instrument(skip(watches, config, handle), fields(%repo, %branch))]
+#[tracing::instrument(skip(watches, config, handle, pause), fields(%repo, %branch))]
 pub async fn start_watch(
     watches: &Watches,
     config: &SharedConfig,
     handle: &WatcherHandle,
+    pause: &PauseState,
     repo: &str,
     branch: &str,
     key: &str,
@@ -185,29 +204,59 @@ pub async fn start_watch(
         }
     }
 
-    let runs = gh_recent_runs(repo, branch)
+    let all_runs = gh_recent_runs(repo, branch)
         .await
         .map_err(|e| e.to_string())?;
-    if runs.is_empty() {
+    if all_runs.is_empty() {
         return Err(format!("{repo} [{branch}]: no workflow runs found"));
     }
 
+    let workflow_filter: Vec<String> = {
+        let cfg = config.lock().await;
+        cfg.workflows_for(repo).to_vec()
+    };
+    let runs: Vec<&RunInfo> = if workflow_filter.is_empty() {
+        all_runs.iter().collect()
+    } else {
+        all_runs
+            .iter()
+            .filter(|r| {
+                workflow_filter
+                    .iter()
+                    .any(|w| r.workflow.eq_ignore_ascii_case(w))
+            })
+            .collect()
+    };
+    if runs.is_empty() {
+        return Err(format!(
+            "{repo} [{branch}]: no runs match workflow filter {workflow_filter:?}"
+        ));
+    }
+
     let max_id = runs.iter().map(|r| r.id).max().expect("runs is non-empty");
-    let active: HashMap<u64, String> = runs
+    let now = Instant::now();
+    let active: HashMap<u64, ActiveRun> = runs
         .iter()
         .filter(|r| !r.is_completed())
-        .map(|r| (r.id, r.status.clone()))
+        .map(|r| {
+            (
+                r.id,
+                ActiveRun {
+                    status: r.status.clone(),
+                    started_at: now,
+                },
+            )
+        })
         .collect();
     let last_completed = runs.iter().find(|r| r.is_completed());
 
     let msg = if active.is_empty() {
-        let latest = &runs[0];
+        let latest = runs[0];
         format!(
-            "{repo} [{branch}]: latest build already completed ({}), watching for new builds\n  {}: {} {}\n  {}",
+            "{repo} [{branch}]: latest build already completed ({}), watching for new builds\n  {}: {}\n  {}",
             latest.conclusion,
             latest.workflow,
-            latest.title,
-            latest.short_sha(),
+            latest.display_title(),
             latest.url(repo),
         )
     } else {
@@ -221,7 +270,7 @@ pub async fn start_watch(
         last_seen_run_id: max_id,
         active_runs: active,
         failure_counts: HashMap::new(),
-        last_build: last_completed.map(|r| r.to_last_build()),
+        last_build: last_completed.map(|r| (*r).to_last_build()),
     };
 
     {
@@ -234,15 +283,22 @@ pub async fn start_watch(
     }
     save_watches(watches).await;
 
-    spawn_poller(watches, config, handle, key.to_string());
+    spawn_poller(watches, config, handle, pause, key.to_string());
     Ok(msg)
 }
 
-fn spawn_poller(watches: &Watches, config: &SharedConfig, handle: &WatcherHandle, key: String) {
+fn spawn_poller(
+    watches: &Watches,
+    config: &SharedConfig,
+    handle: &WatcherHandle,
+    pause: &PauseState,
+    key: String,
+) {
     let poller = Poller {
         key,
         watches: watches.clone(),
         config: config.clone(),
+        pause: pause.clone(),
         token: handle.cancel.child_token(),
     };
     handle.tracker.spawn(poller.run());
@@ -255,10 +311,31 @@ struct Poller {
     key: String,
     watches: Watches,
     config: SharedConfig,
+    pause: PauseState,
     token: CancellationToken,
 }
 
+fn format_duration(d: Duration) -> String {
+    let secs = d.as_secs();
+    if secs < 60 {
+        format!("{secs}s")
+    } else {
+        let mins = secs / 60;
+        let rem = secs % 60;
+        if rem == 0 {
+            format!("{mins}m")
+        } else {
+            format!("{mins}m {rem}s")
+        }
+    }
+}
+
 impl Poller {
+    async fn is_paused(&self) -> bool {
+        let p = self.pause.lock().await;
+        p.is_some_and(|deadline| Instant::now() < deadline)
+    }
+
     fn repo_and_branch(&self) -> (String, String) {
         let (repo, branch) = parse_watch_key(&self.key);
         (repo.to_string(), branch.to_string())
@@ -297,7 +374,7 @@ impl Poller {
                 None => return,
             };
 
-            let (active_secs, idle_secs, notif) = self.read_config(&repo, &branch).await;
+            let (active_secs, idle_secs, notif, workflows) = self.read_config(&repo, &branch).await;
             let delay = if has_active { active_secs } else { idle_secs };
 
             if !self.cancellable_sleep(Duration::from_secs(delay)).await {
@@ -314,7 +391,8 @@ impl Poller {
             let due =
                 last_new_run_check.is_none_or(|t| t.elapsed() >= Duration::from_secs(idle_secs));
             if due {
-                self.check_for_new_runs(&repo, &branch, &notif).await;
+                self.check_for_new_runs(&repo, &branch, &notif, &workflows)
+                    .await;
                 last_new_run_check = Some(Instant::now());
             }
         }
@@ -331,12 +409,17 @@ impl Poller {
         }
     }
 
-    async fn read_config(&self, repo: &str, branch: &str) -> (u64, u64, NotificationConfig) {
+    async fn read_config(
+        &self,
+        repo: &str,
+        branch: &str,
+    ) -> (u64, u64, NotificationConfig, Vec<String>) {
         let cfg = self.config.lock().await;
         (
             cfg.active_poll_seconds,
             cfg.idle_poll_seconds,
             cfg.notifications_for(repo, branch),
+            cfg.workflows_for(repo).to_vec(),
         )
     }
 
@@ -375,8 +458,17 @@ impl Poller {
             };
 
             if run.is_completed() {
+                // Extract duration before removing from active_runs
+                let elapsed = {
+                    let w = self.watches.lock().await;
+                    w.get(&self.key)
+                        .and_then(|e| e.active_runs.get(&run_id))
+                        .map(|a| a.started_at.elapsed())
+                };
+
                 if self.is_active().await {
-                    self.notify_completion(&run, repo, branch, notif).await;
+                    self.notify_completion(&run, repo, branch, notif, elapsed)
+                        .await;
                 }
 
                 tracing::info!(
@@ -404,7 +496,13 @@ impl Poller {
     }
 
     /// Check for runs newer than our high-water mark. Notify starts (and immediate completions).
-    async fn check_for_new_runs(&self, repo: &str, branch: &str, notif: &NotificationConfig) {
+    async fn check_for_new_runs(
+        &self,
+        repo: &str,
+        branch: &str,
+        notif: &NotificationConfig,
+        workflows: &[String],
+    ) {
         let last_seen = {
             let w = self.watches.lock().await;
             match w.get(&self.key) {
@@ -421,8 +519,17 @@ impl Poller {
             }
         };
 
-        let new_runs: Vec<&RunInfo> = runs.iter().filter(|r| r.id > last_seen).collect();
-        if new_runs.is_empty() {
+        let new_runs: Vec<&RunInfo> = runs
+            .iter()
+            .filter(|r| r.id > last_seen)
+            .filter(|r| {
+                workflows.is_empty() || workflows.iter().any(|w| r.workflow.eq_ignore_ascii_case(w))
+            })
+            .collect();
+        // Still bump the high-water mark from all runs (not just filtered) to avoid
+        // re-checking filtered-out runs on every poll cycle.
+        let all_new: Vec<&RunInfo> = runs.iter().filter(|r| r.id > last_seen).collect();
+        if new_runs.is_empty() && all_new.is_empty() {
             return;
         }
 
@@ -439,7 +546,7 @@ impl Poller {
             self.notify_started(run, repo, branch, notif).await;
 
             if run.is_completed() {
-                self.notify_completion(run, repo, branch, notif).await;
+                self.notify_completion(run, repo, branch, notif, None).await;
                 tracing::info!(
                     key = self.key, run_id = run.id,
                     sha = run.short_sha(), conclusion = %run.conclusion,
@@ -451,7 +558,12 @@ impl Poller {
         {
             let mut w = self.watches.lock().await;
             if let Some(entry) = w.get_mut(&self.key) {
+                // Incorporate only filtered runs for active tracking, but bump
+                // high-water mark from all new runs.
                 entry.incorporate_new_runs(&new_runs);
+                if let Some(max_id) = all_new.iter().map(|r| r.id).max() {
+                    entry.last_seen_run_id = entry.last_seen_run_id.max(max_id);
+                }
             }
         }
         save_watches(&self.watches).await;
@@ -471,10 +583,13 @@ impl Poller {
         branch: &str,
         notif: &NotificationConfig,
     ) {
+        if self.is_paused().await {
+            return;
+        }
         let group = self.notification_group(run);
         platform::send_notification(
             &format!("🔨 {} - started", run.workflow),
-            &format!("[{branch}] {}", run.title),
+            &format!("[{branch}] {}", run.display_title()),
             notif.build_started,
             Some(&run.url(repo)),
             Some(&group),
@@ -488,16 +603,35 @@ impl Poller {
         repo: &str,
         branch: &str,
         notif: &NotificationConfig,
+        elapsed: Option<Duration>,
     ) {
+        if self.is_paused().await {
+            return;
+        }
         let (emoji, level) = if run.succeeded() {
             ("✅", notif.build_success)
         } else {
             ("❌", notif.build_failure)
         };
+
+        let duration_str = elapsed.map(|d| format!(" in {}", format_duration(d)));
+
+        let mut body = format!("[{branch}] {}", run.display_title());
+        if let Some(ds) = &duration_str {
+            body.push_str(ds);
+        }
+
+        // Fetch failing step context for failed builds (best-effort)
+        if !run.succeeded()
+            && let Some(steps) = gh_failing_steps(repo, run.id).await
+        {
+            body.push_str(&format!("\nFailed: {steps}"));
+        }
+
         let group = self.notification_group(run);
         platform::send_notification(
             &format!("{emoji} {} - {}", run.workflow, run.conclusion),
-            &format!("[{branch}] {}", run.title),
+            &body,
             level,
             Some(&run.url(repo)),
             Some(&group),
@@ -508,14 +642,19 @@ impl Poller {
 
 // -- Startup --
 
-pub async fn startup_watches(watches: &Watches, config: &SharedConfig, handle: &WatcherHandle) {
+pub async fn startup_watches(
+    watches: &Watches,
+    config: &SharedConfig,
+    handle: &WatcherHandle,
+    pause: &PauseState,
+) {
     let snapshot: Vec<String> = {
         let w = watches.lock().await;
         w.keys().cloned().collect()
     };
 
-    recover_existing_watches(watches, config, handle, &snapshot).await;
-    start_new_config_watches(watches, config, handle, &snapshot).await;
+    recover_existing_watches(watches, config, handle, pause, &snapshot).await;
+    start_new_config_watches(watches, config, handle, pause, &snapshot).await;
 }
 
 /// Resume persisted watches and recover any in-progress runs from GitHub.
@@ -523,6 +662,7 @@ async fn recover_existing_watches(
     watches: &Watches,
     config: &SharedConfig,
     handle: &WatcherHandle,
+    pause: &PauseState,
     snapshot: &[String],
 ) {
     let futures: Vec<_> = snapshot
@@ -544,7 +684,13 @@ async fn recover_existing_watches(
                 for run in &runs {
                     if !run.is_completed() && !entry.active_runs.contains_key(&run.id) {
                         tracing::info!(key, run_id = run.id, "Recovering in-progress run");
-                        entry.active_runs.insert(run.id, run.status.clone());
+                        entry.active_runs.insert(
+                            run.id,
+                            ActiveRun {
+                                status: run.status.clone(),
+                                started_at: Instant::now(),
+                            },
+                        );
                     }
                 }
                 // Bump high-water mark so check_for_new_runs doesn't re-notify.
@@ -556,7 +702,7 @@ async fn recover_existing_watches(
             tracing::warn!(key, error = %e, "Could not recover runs");
         }
 
-        spawn_poller(watches, config, handle, key);
+        spawn_poller(watches, config, handle, pause, key);
     }
 }
 
@@ -565,6 +711,7 @@ async fn start_new_config_watches(
     watches: &Watches,
     config: &SharedConfig,
     handle: &WatcherHandle,
+    pause: &PauseState,
     snapshot: &[String],
 ) {
     let new_watches: Vec<(String, String, String)> = {
@@ -590,8 +737,9 @@ async fn start_new_config_watches(
             let watches = watches.clone();
             let config = config.clone();
             let handle = handle.clone();
+            let pause = pause.clone();
             async move {
-                match start_watch(&watches, &config, &handle, &repo, &branch, &key).await {
+                match start_watch(&watches, &config, &handle, &pause, &repo, &branch, &key).await {
                     Ok(msg) | Err(msg) => tracing::info!("{msg}"),
                 }
             }
@@ -619,12 +767,19 @@ mod tests {
         }
     }
 
+    fn make_active(status: &str) -> ActiveRun {
+        ActiveRun {
+            status: status.to_string(),
+            started_at: Instant::now(),
+        }
+    }
+
     fn make_entry() -> WatchEntry {
         WatchEntry {
             last_seen_run_id: 100,
             active_runs: HashMap::from([
-                (101, "in_progress".to_string()),
-                (102, "queued".to_string()),
+                (101, make_active("in_progress")),
+                (102, make_active("queued")),
             ]),
             failure_counts: HashMap::new(),
             last_build: None,
@@ -722,7 +877,7 @@ mod tests {
 
         entry.update_status(101, "queued".to_string());
 
-        assert_eq!(entry.active_runs[&101], "queued");
+        assert_eq!(entry.active_runs[&101].status, "queued");
     }
 
     #[test]
@@ -731,7 +886,7 @@ mod tests {
 
         entry.update_status(101, "in_progress".to_string());
 
-        assert_eq!(entry.active_runs[&101], "in_progress");
+        assert_eq!(entry.active_runs[&101].status, "in_progress");
     }
 
     #[test]
@@ -752,7 +907,7 @@ mod tests {
         entry.incorporate_new_runs(&new_runs);
 
         assert_eq!(entry.last_seen_run_id, 200);
-        assert_eq!(entry.active_runs[&200], "in_progress");
+        assert_eq!(entry.active_runs[&200].status, "in_progress");
         assert!(entry.last_build.is_none());
     }
 
@@ -794,7 +949,7 @@ mod tests {
         entry.incorporate_new_runs(&new_runs);
 
         assert_eq!(entry.last_seen_run_id, 201);
-        assert_eq!(entry.active_runs[&201], "in_progress");
+        assert_eq!(entry.active_runs[&201].status, "in_progress");
         assert!(!entry.active_runs.contains_key(&200));
         assert_eq!(entry.last_build.unwrap().run_id, 200);
     }
