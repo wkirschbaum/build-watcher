@@ -86,12 +86,9 @@ impl Notifier for NotifySend {
 
         args.push(title.to_string());
 
-        // Embed a clickable link in the body — libnotify supports <a href> markup.
+        // Append the plain URL on a second line — most notification daemons auto-link it.
         let display_body = match url {
-            Some(u) => {
-                let run_id = u.rsplit('/').next().unwrap_or(u);
-                format!("{body}\n<a href=\"{u}\">#{run_id}</a>")
-            }
+            Some(u) => format!("{body}\n{u}"),
             None => body.to_string(),
         };
         args.push(display_body);
@@ -132,11 +129,17 @@ impl Notifier for NotifySend {
             // Second line: action name, only written when the user clicks a button.
             match lines.next_line().await {
                 Ok(Some(action)) => {
-                    if action.trim() == "open"
-                        && let Some(url) = url_owned
-                        && let Err(e) = tokio::process::Command::new("xdg-open").arg(&url).spawn()
-                    {
-                        tracing::warn!("Failed to spawn xdg-open: {e}");
+                    if action.trim() == "open" {
+                        if let Some(url) = url_owned {
+                            match tokio::process::Command::new("xdg-open").arg(&url).spawn() {
+                                Ok(mut child) => {
+                                    if let Err(e) = child.wait().await {
+                                        tracing::warn!("xdg-open failed: {e}");
+                                    }
+                                }
+                                Err(e) => tracing::warn!("Failed to spawn xdg-open: {e}"),
+                            }
+                        }
                     }
                 }
                 Ok(None) => {}

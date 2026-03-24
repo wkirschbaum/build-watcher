@@ -63,9 +63,9 @@ pub fn save_json<T: Serialize>(path: PathBuf, value: &T) {
         return;
     }
 
-    // Verify the draft parses back before committing
+    // Verify the draft parses back as valid JSON before committing
     match std::fs::read_to_string(&draft) {
-        Ok(readback) if readback == data => {}
+        Ok(readback) if serde_json::from_str::<serde_json::Value>(&readback).is_ok() => {}
         _ => {
             tracing::error!("Draft verification failed for {}", draft.display());
             let _ = std::fs::remove_file(&draft);
@@ -261,25 +261,6 @@ impl Config {
         }
     }
 
-    /// Migrate repos from watches.json if config has none yet.
-    pub fn migrate_from_watches(&mut self, watch_keys: &[String]) {
-        if !self.repos.is_empty() {
-            return;
-        }
-        let mut migrated = 0;
-        for key in watch_keys {
-            if let Some((repo, _)) = key.rsplit_once('#') {
-                self.repos.entry(repo.to_string()).or_default();
-                migrated += 1;
-            }
-        }
-        if migrated > 0 {
-            tracing::info!(
-                "Migrated {} repos from watches into config",
-                self.repos.len()
-            );
-        }
-    }
 }
 
 pub fn load_config() -> Config {

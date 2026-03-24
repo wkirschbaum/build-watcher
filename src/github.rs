@@ -3,6 +3,8 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 const GH_TIMEOUT: Duration = Duration::from_secs(30);
+const GH_JSON_FIELDS: &str =
+    "databaseId,status,conclusion,displayTitle,workflowName,headSha,headBranch,event";
 
 /// Summary of the last completed build, persisted across restarts.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -15,6 +17,16 @@ pub struct LastBuild {
     pub head_sha: String,
     #[serde(default)]
     pub event: String,
+}
+
+impl LastBuild {
+    pub fn short_sha(&self) -> &str {
+        if self.head_sha.len() >= 7 {
+            &self.head_sha[..7]
+        } else {
+            &self.head_sha
+        }
+    }
 }
 
 /// A GitHub Actions run as returned by the `gh` CLI.
@@ -93,7 +105,7 @@ pub async fn gh_recent_runs(repo: &str, branch: &str) -> Result<Vec<RunInfo>, St
                 "--limit",
                 "10",
                 "--json",
-                "databaseId,status,conclusion,displayTitle,workflowName,headSha,headBranch,event",
+                GH_JSON_FIELDS,
             ])
             .output(),
     )
@@ -123,7 +135,7 @@ pub async fn gh_run_status(repo: &str, run_id: u64) -> Result<RunInfo, String> {
                 "--repo",
                 repo,
                 "--json",
-                "databaseId,status,conclusion,displayTitle,workflowName,headSha,headBranch,event",
+                GH_JSON_FIELDS,
             ])
             .output(),
     )

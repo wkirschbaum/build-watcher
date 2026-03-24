@@ -242,11 +242,7 @@ impl BuildWatcher {
                     .last_build
                     .as_ref()
                     .map(|b| {
-                        let sha = if b.head_sha.len() >= 7 {
-                            &b.head_sha[..7]
-                        } else {
-                            &b.head_sha
-                        };
+                        let sha = b.short_sha();
                         let event_str = if b.event.is_empty() {
                             String::new()
                         } else {
@@ -359,41 +355,16 @@ impl BuildWatcher {
                     lines.push(format!("  {repo}: {:?}", rc.branches));
                 }
                 if !rc.notifications.is_empty() {
-                    let parts: Vec<String> = [
-                        rc.notifications
-                            .build_started
-                            .map(|l| format!("started: {l}")),
-                        rc.notifications
-                            .build_success
-                            .map(|l| format!("success: {l}")),
-                        rc.notifications
-                            .build_failure
-                            .map(|l| format!("failure: {l}")),
-                    ]
-                    .into_iter()
-                    .flatten()
-                    .collect();
-                    lines.push(format!("    notifications: {}", parts.join(", ")));
+                    lines.push(format!(
+                        "    notifications: {}",
+                        format_notification_overrides(&rc.notifications)
+                    ));
                 }
                 for (branch, bc) in &rc.branch_notifications {
                     if !bc.notifications.is_empty() {
-                        let parts: Vec<String> = [
-                            bc.notifications
-                                .build_started
-                                .map(|l| format!("started: {l}")),
-                            bc.notifications
-                                .build_success
-                                .map(|l| format!("success: {l}")),
-                            bc.notifications
-                                .build_failure
-                                .map(|l| format!("failure: {l}")),
-                        ]
-                        .into_iter()
-                        .flatten()
-                        .collect();
                         lines.push(format!(
                             "    [{branch}] notifications: {}",
-                            parts.join(", ")
+                            format_notification_overrides(&bc.notifications)
                         ));
                     }
                 }
@@ -432,8 +403,8 @@ impl BuildWatcher {
         Parameters(params): Parameters<ConfigureNotificationsParams>,
     ) -> Result<CallToolResult, McpError> {
         if params.branch.is_some() && params.repo.is_none() {
-            return Ok(CallToolResult::success(vec![Content::text(
-                "Error: branch requires repo to be set",
+            return Ok(CallToolResult::error(vec![Content::text(
+                "branch requires repo to be set",
             )]));
         }
 
@@ -441,8 +412,8 @@ impl BuildWatcher {
             && params.build_success.is_none()
             && params.build_failure.is_none()
         {
-            return Ok(CallToolResult::success(vec![Content::text(
-                "Error: at least one of build_started, build_success, or build_failure must be set",
+            return Ok(CallToolResult::error(vec![Content::text(
+                "at least one of build_started, build_success, or build_failure must be set",
             )]));
         }
 
@@ -464,7 +435,11 @@ impl BuildWatcher {
             }
             (Some(repo), None) => {
                 // Per-repo
-                let rc = config.repos.entry(repo.clone()).or_default();
+                let Some(rc) = config.repos.get_mut(repo) else {
+                    return Ok(CallToolResult::error(vec![Content::text(format!(
+                        "{repo} is not being watched — use watch_builds first"
+                    ))]));
+                };
                 if let Some(l) = params.build_started {
                     rc.notifications.build_started = Some(l);
                 }
@@ -478,7 +453,11 @@ impl BuildWatcher {
             }
             (Some(repo), Some(branch)) => {
                 // Per-branch
-                let rc = config.repos.entry(repo.clone()).or_default();
+                let Some(rc) = config.repos.get_mut(repo) else {
+                    return Ok(CallToolResult::error(vec![Content::text(format!(
+                        "{repo} is not being watched — use watch_builds first"
+                    ))]));
+                };
                 let bc = rc.branch_notifications.entry(branch.clone()).or_default();
                 if let Some(l) = params.build_started {
                     bc.notifications.build_started = Some(l);
@@ -498,7 +477,10 @@ impl BuildWatcher {
         // Show effective config for the scope
         let effective = match (&params.repo, &params.branch) {
             (Some(repo), Some(branch)) => config.notifications_for(repo, branch),
-            (Some(repo), None) => config.notifications_for(repo, &config.default_branches[0]),
+            (Some(repo), None) => config.notifications_for(
+                repo,
+                config.default_branches.first().map_or("main", |s| s.as_str()),
+            ),
             _ => config.notifications.clone(),
         };
 
@@ -532,6 +514,18 @@ impl ServerHandler for BuildWatcher {
     ) -> Result<ServerInfo, McpError> {
         Ok(self.get_info())
     }
+}
+
+fn format_notification_overrides(overrides: &config::NotificationOverrides) -> String {
+    [
+        overrides.build_started.map(|l| format!("started: {l}")),
+        overrides.build_success.map(|l| format!("success: {l}")),
+        overrides.build_failure.map(|l| format!("failure: {l}")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(", ")
 }
 
 // -- Watch logic --
@@ -590,6 +584,11 @@ async fn start_watch(
 
     {
         let mut w = watches.lock().await;
+        // Re-check inside the lock: a concurrent call may have inserted while we
+        // were making the gh network call above.
+        if w.contains_key(key) {
+            return Ok(format!("{repo} [{branch}]: already being watched"));
+        }
         w.insert(key.to_string(), entry);
     }
     save_watches(watches).await;
@@ -603,6 +602,27 @@ fn spawn_poller(watches: Watches, config: SharedConfig, key: String) {
     tokio::spawn(async move {
         poll_repo(watches, config, key).await;
     });
+}
+
+fn notify_build_complete(
+    run: &RunInfo,
+    repo: &str,
+    branch: &str,
+    key: &str,
+    notif: &NotificationConfig,
+) {
+    let (emoji, level) = if run.succeeded() {
+        ("✅", notif.build_success)
+    } else {
+        ("❌", notif.build_failure)
+    };
+    platform::send_notification(
+        &format!("{emoji} {} - {}", run.workflow, run.conclusion),
+        &format!("[{branch}] {}", run.title),
+        level,
+        Some(&run.url(repo)),
+        Some(key),
+    );
 }
 
 async fn poll_repo(watches: Watches, config: SharedConfig, key: String) {
@@ -711,19 +731,7 @@ async fn poll_active_runs(
         };
 
         if run.is_completed() {
-            let level = if run.succeeded() {
-                notif.build_success
-            } else {
-                notif.build_failure
-            };
-            let emoji = if run.succeeded() { "✅" } else { "❌" };
-            platform::send_notification(
-                &format!("{emoji} Build {} [{branch}]", run.conclusion),
-                &format!("[{}] {}", run.workflow, run.title),
-                level,
-                Some(&run.url(repo)),
-                Some(key),
-            );
+            notify_build_complete(&run, repo, branch, key, notif);
             tracing::info!(
                 "Build completed for {key} run {run_id} {}: {}",
                 run.short_sha(),
@@ -802,8 +810,8 @@ async fn check_for_new_runs(
             run.title
         );
         platform::send_notification(
-            &format!("🔨 Build started [{branch}]"),
-            &format!("[{}] {}", run.workflow, run.title),
+            &format!("🔨 {} - started", run.workflow),
+            &format!("[{branch}] {}", run.title),
             notif.build_started,
             Some(&run.url(repo)),
             Some(key),
@@ -811,19 +819,7 @@ async fn check_for_new_runs(
 
         // If it already completed between polls, also notify completion
         if run.is_completed() {
-            let level = if run.succeeded() {
-                notif.build_success
-            } else {
-                notif.build_failure
-            };
-            let emoji = if run.succeeded() { "✅" } else { "❌" };
-            platform::send_notification(
-                &format!("{emoji} Build {} [{branch}]", run.conclusion),
-                &format!("[{}] {}", run.workflow, run.title),
-                level,
-                Some(&run.url(repo)),
-                Some(key),
-            );
+            notify_build_complete(run, repo, branch, key, notif);
             tracing::info!(
                 "Build already completed for {key} run {} {}: {}",
                 run.id,
@@ -837,8 +833,9 @@ async fn check_for_new_runs(
     let mut w = watches.lock().await;
     if let Some(entry) = w.get_mut(key) {
         entry.last_seen_run_id = new_max;
-        // Track new in-progress runs, record completed ones
-        for run in &new_runs {
+        // Track new in-progress runs, record completed ones (iterate oldest→newest so
+        // the highest-id completed run ends up as last_build)
+        for run in new_runs.iter().rev() {
             if run.is_completed() {
                 entry.last_build = Some(run.to_last_build());
             } else {
@@ -926,12 +923,8 @@ async fn main() -> Result<()> {
         .and_then(|p| p.parse().ok())
         .unwrap_or(DEFAULT_PORT);
 
-    let mut cfg = load_config();
+    let cfg = load_config();
     let persisted = load_watches();
-
-    // Migrate repos from watches.json into config on first run
-    let watch_keys: Vec<String> = persisted.keys().cloned().collect();
-    cfg.migrate_from_watches(&watch_keys);
 
     // Re-save config on startup to normalize schema (adds missing fields with defaults)
     save_config(&cfg);
@@ -1006,6 +999,7 @@ async fn main() -> Result<()> {
         .await?;
 
     save_watches(&watches).await;
+    let _ = std::fs::remove_file(&port_file);
     tracing::info!("State saved, goodbye.");
 
     Ok(())
