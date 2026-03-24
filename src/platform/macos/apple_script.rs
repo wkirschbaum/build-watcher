@@ -30,7 +30,20 @@ impl Notifier for AppleScriptNotifier {
         match Command::new("osascript").args(["-e", &script]).spawn() {
             Ok(mut child) => {
                 std::thread::spawn(move || {
-                    let _ = child.wait();
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                    loop {
+                        match child.try_wait() {
+                            Ok(Some(_)) => break,
+                            Ok(None) if std::time::Instant::now() >= deadline => {
+                                let _ = child.kill();
+                                let _ = child.wait();
+                                tracing::warn!("osascript timed out, killed");
+                                break;
+                            }
+                            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(200)),
+                            Err(_) => break,
+                        }
+                    }
                 });
             }
             Err(e) => tracing::warn!("Failed to spawn osascript: {e}"),
