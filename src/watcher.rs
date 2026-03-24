@@ -211,22 +211,27 @@ pub async fn start_watch(
         return Err(format!("{repo} [{branch}]: no workflow runs found"));
     }
 
-    let workflow_filter: Vec<String> = {
+    let (workflow_filter, ignored_workflows): (Vec<String>, Vec<String>) = {
         let cfg = config.lock().await;
-        cfg.workflows_for(repo).to_vec()
+        (
+            cfg.workflows_for(repo).to_vec(),
+            cfg.ignored_workflows.clone(),
+        )
     };
-    let runs: Vec<&RunInfo> = if workflow_filter.is_empty() {
-        all_runs.iter().collect()
-    } else {
-        all_runs
-            .iter()
-            .filter(|r| {
-                workflow_filter
+    let runs: Vec<&RunInfo> = all_runs
+        .iter()
+        .filter(|r| {
+            !ignored_workflows
+                .iter()
+                .any(|i| r.workflow.eq_ignore_ascii_case(i))
+        })
+        .filter(|r| {
+            workflow_filter.is_empty()
+                || workflow_filter
                     .iter()
                     .any(|w| r.workflow.eq_ignore_ascii_case(w))
-            })
-            .collect()
-    };
+        })
+        .collect();
     if runs.is_empty() {
         return Err(format!(
             "{repo} [{branch}]: no runs match workflow filter {workflow_filter:?}"
@@ -374,7 +379,8 @@ impl Poller {
                 None => return,
             };
 
-            let (active_secs, idle_secs, notif, workflows) = self.read_config(&repo, &branch).await;
+            let (active_secs, idle_secs, notif, workflows, ignored) =
+                self.read_config(&repo, &branch).await;
             let delay = if has_active { active_secs } else { idle_secs };
 
             if !self.cancellable_sleep(Duration::from_secs(delay)).await {
@@ -391,7 +397,7 @@ impl Poller {
             let due =
                 last_new_run_check.is_none_or(|t| t.elapsed() >= Duration::from_secs(idle_secs));
             if due {
-                self.check_for_new_runs(&repo, &branch, &notif, &workflows)
+                self.check_for_new_runs(&repo, &branch, &notif, &workflows, &ignored)
                     .await;
                 last_new_run_check = Some(Instant::now());
             }
@@ -413,13 +419,14 @@ impl Poller {
         &self,
         repo: &str,
         branch: &str,
-    ) -> (u64, u64, NotificationConfig, Vec<String>) {
+    ) -> (u64, u64, NotificationConfig, Vec<String>, Vec<String>) {
         let cfg = self.config.lock().await;
         (
             cfg.active_poll_seconds,
             cfg.idle_poll_seconds,
             cfg.notifications_for(repo, branch),
             cfg.workflows_for(repo).to_vec(),
+            cfg.ignored_workflows.clone(),
         )
     }
 
@@ -502,6 +509,7 @@ impl Poller {
         branch: &str,
         notif: &NotificationConfig,
         workflows: &[String],
+        ignored: &[String],
     ) {
         let last_seen = {
             let w = self.watches.lock().await;
@@ -522,6 +530,7 @@ impl Poller {
         let new_runs: Vec<&RunInfo> = runs
             .iter()
             .filter(|r| r.id > last_seen)
+            .filter(|r| !ignored.iter().any(|i| r.workflow.eq_ignore_ascii_case(i)))
             .filter(|r| {
                 workflows.is_empty() || workflows.iter().any(|w| r.workflow.eq_ignore_ascii_case(w))
             })

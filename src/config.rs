@@ -229,6 +229,8 @@ pub struct RepoConfig {
 pub struct Config {
     #[serde(default = "default_branches")]
     pub default_branches: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ignored_workflows: Vec<String>,
     #[serde(default)]
     pub notifications: NotificationConfig,
     #[serde(default = "default_active_poll_seconds")]
@@ -255,6 +257,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             default_branches: default_branches(),
+            ignored_workflows: Vec::new(),
             notifications: NotificationConfig::default(),
             active_poll_seconds: default_active_poll_seconds(),
             idle_poll_seconds: default_idle_poll_seconds(),
