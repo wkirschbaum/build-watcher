@@ -1,33 +1,49 @@
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::platform;
 
-// -- Directories --
+// -- Directories (computed once) --
 
-pub fn state_dir() -> PathBuf {
-    let dir = PathBuf::from(
-        std::env::var("STATE_DIRECTORY").unwrap_or_else(|_| platform::default_state_dir()),
-    );
-    std::fs::create_dir_all(&dir).ok();
-    dir
+static STATE_DIR: OnceLock<PathBuf> = OnceLock::new();
+static CONFIG_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+fn init_dir(dir: &Path) {
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        tracing::error!("Failed to create directory {}: {e}", dir.display());
+    }
 }
 
-pub fn config_dir() -> PathBuf {
-    let dir = PathBuf::from(
-        std::env::var("CONFIGURATION_DIRECTORY").unwrap_or_else(|_| platform::default_config_dir()),
-    );
-    std::fs::create_dir_all(&dir).ok();
-    dir
+pub fn state_dir() -> &'static Path {
+    STATE_DIR.get_or_init(|| {
+        let dir = PathBuf::from(
+            std::env::var("STATE_DIRECTORY").unwrap_or_else(|_| platform::default_state_dir()),
+        );
+        init_dir(&dir);
+        dir
+    })
+}
+
+pub fn config_dir() -> &'static Path {
+    CONFIG_DIR.get_or_init(|| {
+        let dir = PathBuf::from(
+            std::env::var("CONFIGURATION_DIRECTORY")
+                .unwrap_or_else(|_| platform::default_config_dir()),
+        );
+        init_dir(&dir);
+        dir
+    })
 }
 
 // -- Safe JSON persistence --
 //
-// The write sequence is: serialize → write to .draft → parse .draft back to
-// confirm it is valid JSON → rename current file to .bak → rename .draft to
+// The write sequence is: serialize → write to .draft → fsync → parse .draft back
+// to confirm it is valid JSON → rename current file to .bak → rename .draft to
 // the target path.
 //
 // This means a crash at any point leaves either the previous file or the
@@ -54,28 +70,53 @@ fn try_parse_file<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
     serde_json::from_str(&data).ok()
 }
 
-pub fn save_json<T: Serialize>(path: PathBuf, value: &T) {
-    let data = match serde_json::to_string_pretty(value) {
-        Ok(d) => d,
-        Err(e) => {
-            tracing::error!("Failed to serialize {}: {e}", path.display());
-            return;
-        }
-    };
+#[derive(Debug, thiserror::Error)]
+pub enum PersistError {
+    #[error("failed to serialize: {0}")]
+    Serialize(#[from] serde_json::Error),
+    #[error("failed to write {path}: {source}")]
+    Write {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("draft verification failed for {0}")]
+    Verify(PathBuf),
+    #[error("failed to rename {from} to {to}: {source}")]
+    Rename {
+        from: PathBuf,
+        to: PathBuf,
+        source: std::io::Error,
+    },
+}
+
+pub fn save_json<T: Serialize>(path: PathBuf, value: &T) -> Result<(), PersistError> {
+    let data = serde_json::to_string_pretty(value)?;
 
     let draft = path.with_extension("json.draft");
-    if std::fs::write(&draft, &data).is_err() {
-        tracing::error!("Failed to write draft {}", draft.display());
-        return;
+
+    // Write and fsync the draft file
+    {
+        let mut file = std::fs::File::create(&draft).map_err(|e| PersistError::Write {
+            path: draft.clone(),
+            source: e,
+        })?;
+        file.write_all(data.as_bytes())
+            .map_err(|e| PersistError::Write {
+                path: draft.clone(),
+                source: e,
+            })?;
+        file.sync_all().map_err(|e| PersistError::Write {
+            path: draft.clone(),
+            source: e,
+        })?;
     }
 
     // Verify the draft parses back as valid JSON before committing
     match std::fs::read_to_string(&draft) {
         Ok(readback) if serde_json::from_str::<serde_json::Value>(&readback).is_ok() => {}
         _ => {
-            tracing::error!("Draft verification failed for {}", draft.display());
             let _ = std::fs::remove_file(&draft);
-            return;
+            return Err(PersistError::Verify(draft));
         }
     }
 
@@ -83,10 +124,16 @@ pub fn save_json<T: Serialize>(path: PathBuf, value: &T) {
     let bak = path.with_extension("json.bak");
     let _ = std::fs::rename(&path, &bak);
     if let Err(e) = std::fs::rename(&draft, &path) {
-        tracing::error!("Failed to promote draft to {}: {e}", path.display());
         // Try to restore backup
         let _ = std::fs::rename(&bak, &path);
+        return Err(PersistError::Rename {
+            from: draft,
+            to: path,
+            source: e,
+        });
     }
+
+    Ok(())
 }
 
 // -- Configuration --
@@ -262,10 +309,133 @@ impl Config {
     }
 }
 
-pub fn load_config() -> Config {
-    load_json(config_dir().join("config.json")).unwrap_or_default()
+/// Load config from disk. Returns the config and whether the primary file was valid
+/// (as opposed to falling back to backup or defaults). Callers should only re-save
+/// to normalize schema when the primary loaded successfully.
+pub fn load_config() -> (Config, bool) {
+    let path = config_dir().join("config.json");
+    if let Some(val) = try_parse_file::<Config>(&path) {
+        return (val, true);
+    }
+    let bak = path.with_extension("json.bak");
+    if let Some(val) = try_parse_file::<Config>(&bak) {
+        tracing::warn!("Primary config corrupt, recovered from backup");
+        let _ = std::fs::copy(&bak, &path);
+        return (val, false);
+    }
+    (Config::default(), false)
 }
 
-pub fn save_config(config: &Config) {
-    save_json(config_dir().join("config.json"), config);
+pub fn save_config(config: &Config) -> Result<(), PersistError> {
+    save_json(config_dir().join("config.json"), config)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn notifications_for_global_defaults() {
+        let config = Config::default();
+        let n = config.notifications_for("any/repo", "main");
+        assert_eq!(n.build_started, NotificationLevel::Normal);
+        assert_eq!(n.build_success, NotificationLevel::Normal);
+        assert_eq!(n.build_failure, NotificationLevel::Critical);
+    }
+
+    #[test]
+    fn notifications_for_repo_override() {
+        let mut config = Config::default();
+        config.repos.insert(
+            "alice/app".to_string(),
+            RepoConfig {
+                notifications: NotificationOverrides {
+                    build_started: Some(NotificationLevel::Off),
+                    build_success: None,
+                    build_failure: Some(NotificationLevel::Low),
+                },
+                ..Default::default()
+            },
+        );
+        let n = config.notifications_for("alice/app", "main");
+        assert_eq!(n.build_started, NotificationLevel::Off);
+        assert_eq!(n.build_success, NotificationLevel::Normal); // inherited from global
+        assert_eq!(n.build_failure, NotificationLevel::Low);
+    }
+
+    #[test]
+    fn notifications_for_branch_override() {
+        let mut config = Config::default();
+        let mut branch_notifications = HashMap::new();
+        branch_notifications.insert(
+            "release".to_string(),
+            BranchConfig {
+                notifications: NotificationOverrides {
+                    build_started: Some(NotificationLevel::Off),
+                    build_success: Some(NotificationLevel::Critical),
+                    build_failure: None,
+                },
+            },
+        );
+        config.repos.insert(
+            "alice/app".to_string(),
+            RepoConfig {
+                notifications: NotificationOverrides {
+                    build_failure: Some(NotificationLevel::Low),
+                    ..Default::default()
+                },
+                branch_notifications,
+                ..Default::default()
+            },
+        );
+        let n = config.notifications_for("alice/app", "release");
+        assert_eq!(n.build_started, NotificationLevel::Off); // from branch
+        assert_eq!(n.build_success, NotificationLevel::Critical); // from branch
+        assert_eq!(n.build_failure, NotificationLevel::Low); // from repo (branch is None)
+    }
+
+    #[test]
+    fn save_load_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("bw-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+
+        let mut config = Config::default();
+        config.repos.insert(
+            "alice/app".to_string(),
+            RepoConfig {
+                branches: vec!["main".to_string(), "release".to_string()],
+                ..Default::default()
+            },
+        );
+
+        save_json(path.clone(), &config).unwrap();
+        let loaded: Config = load_json(path.clone()).unwrap();
+        assert_eq!(loaded.repos.len(), 1);
+        assert_eq!(
+            loaded.repos["alice/app"].branches,
+            vec!["main".to_string(), "release".to_string()]
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn load_falls_back_to_backup() {
+        let dir = std::env::temp_dir().join(format!("bw-test-bak-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        let bak = dir.join("config.json.bak");
+
+        let config = Config::default();
+        // Write backup only
+        std::fs::write(&bak, serde_json::to_string_pretty(&config).unwrap()).unwrap();
+        // Write corrupt primary
+        std::fs::write(&path, "not json").unwrap();
+
+        let loaded: Config = load_json(path).unwrap();
+        assert_eq!(loaded.default_branches, vec!["main".to_string()]);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

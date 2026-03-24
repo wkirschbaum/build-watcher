@@ -80,6 +80,7 @@ impl Notifier for NotifySend {
         }
 
         if url.is_some() {
+            args.push("--wait".to_string());
             args.push("--action".to_string());
             args.push("open=Open".to_string());
         }

@@ -15,7 +15,9 @@ use macos as imp;
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 compile_error!("Unsupported platform: only Linux and macOS are supported");
 
+#[cfg(test)]
 mod universal;
+#[cfg(test)]
 #[allow(unused_imports)]
 pub use universal::NullNotifier;
 
@@ -33,8 +35,9 @@ pub trait Notifier: Send + Sync {
 
 static INSTANCE: OnceLock<Box<dyn Notifier>> = OnceLock::new();
 
-/// Override the notifier backend. Must be called before any notification is sent.
-/// Subsequent calls are silently ignored (OnceLock semantics).
+/// Override the notifier backend for testing. Must be called before any
+/// notification is sent. Subsequent calls are silently ignored (OnceLock semantics).
+#[cfg(test)]
 #[allow(dead_code)]
 pub fn init(notifier: Box<dyn Notifier>) {
     INSTANCE.set(notifier).ok();

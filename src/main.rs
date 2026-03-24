@@ -15,7 +15,7 @@ use server::BuildWatcher;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
-use watcher::{SharedConfig, Watches, load_watches, save_watches, startup_watches};
+use watcher::{SharedConfig, WatcherHandle, Watches, load_watches, save_watches, startup_watches};
 
 const DEFAULT_PORT: u16 = 8417;
 
@@ -41,18 +41,24 @@ async fn main() -> Result<()> {
         .and_then(|p| p.parse().ok())
         .unwrap_or(DEFAULT_PORT);
 
-    let cfg = load_config();
+    let (cfg, primary_ok) = load_config();
 
-    // Re-save config on startup to normalize schema (adds missing fields with defaults)
-    save_config(&cfg);
+    // Re-save only when the primary file loaded successfully — this normalizes
+    // the schema (adds missing fields). We skip re-save when the primary was
+    // corrupt or missing to avoid overwriting a user-edited file with defaults.
+    if primary_ok && let Err(e) = save_config(&cfg) {
+        tracing::error!("Failed to save config on startup: {e}");
+    }
 
     let config: SharedConfig = Arc::new(Mutex::new(cfg));
     let watches: Watches = Arc::new(Mutex::new(load_watches()));
 
-    // Auto-watch all repos from config (resumes existing, starts new)
-    startup_watches(&watches, &config).await;
-
     let ct = CancellationToken::new();
+    let handle = WatcherHandle::new(ct.clone());
+
+    // Auto-watch all repos from config (resumes existing, starts new)
+    startup_watches(&watches, &config, &handle).await;
+
     let http_config = StreamableHttpServerConfig {
         stateful_mode: false,
         json_response: true,
@@ -63,12 +69,14 @@ async fn main() -> Result<()> {
 
     let watches_for_factory = watches.clone();
     let config_for_factory = config.clone();
+    let handle_for_factory = handle.clone();
     let service: StreamableHttpService<BuildWatcher, LocalSessionManager> =
         StreamableHttpService::new(
             move || {
                 Ok(BuildWatcher::new(
                     watches_for_factory.clone(),
                     config_for_factory.clone(),
+                    handle_for_factory.clone(),
                 ))
             },
             Default::default(),
@@ -99,6 +107,8 @@ async fn main() -> Result<()> {
         })
         .await?;
 
+    // Wait for all pollers to finish before saving state
+    handle.shutdown().await;
     save_watches(&watches).await;
     let _ = std::fs::remove_file(&port_file);
     tracing::info!("State saved, goodbye.");

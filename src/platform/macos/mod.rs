@@ -33,3 +33,24 @@ pub(super) fn notification_sound(level: NotificationLevel) -> &'static str {
         "Glass"
     }
 }
+
+/// Reaps a child process in a background thread with a 10-second timeout.
+/// Prevents zombie processes from accumulating when Notifier::send is synchronous.
+pub(super) fn reap_with_timeout(mut child: std::process::Child, name: &'static str) {
+    std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) if std::time::Instant::now() >= deadline => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    tracing::warn!("{name} timed out, killed");
+                    break;
+                }
+                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(200)),
+                Err(_) => break,
+            }
+        }
+    });
+}

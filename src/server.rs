@@ -6,11 +6,24 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 
 use crate::config::{
-    NotificationLevel, NotificationOverrides, RepoConfig, config_dir, save_config,
+    NotificationLevel, NotificationOverrides, PersistError, RepoConfig, config_dir, save_config,
 };
+use crate::github::{validate_branch, validate_repo};
 use crate::watcher::{
-    SharedConfig, Watches, parse_watch_key, save_watches, start_watch, watch_key,
+    SharedConfig, WatcherHandle, Watches, parse_watch_key, save_watches, start_watch, watch_key,
 };
+
+fn persist_warning(result: Result<(), PersistError>) -> Option<String> {
+    match result {
+        Ok(()) => None,
+        Err(e) => {
+            tracing::error!("Failed to save config: {e}");
+            Some(format!(
+                "\n⚠️ Warning: config could not be saved to disk: {e}"
+            ))
+        }
+    }
+}
 
 /// Deserialize a `Vec<String>` that may arrive as either a proper JSON array
 /// or as a JSON-encoded string (e.g. `"[\"a\",\"b\"]"`). Some MCP clients
@@ -95,15 +108,17 @@ pub struct BuildWatcher {
     tool_router: ToolRouter<Self>,
     watches: Watches,
     config: SharedConfig,
+    handle: WatcherHandle,
 }
 
 #[tool_router]
 impl BuildWatcher {
-    pub(crate) fn new(watches: Watches, config: SharedConfig) -> Self {
+    pub(crate) fn new(watches: Watches, config: SharedConfig, handle: WatcherHandle) -> Self {
         Self {
             tool_router: Self::tool_router(),
             watches,
             config,
+            handle,
         }
     }
 
@@ -114,6 +129,13 @@ impl BuildWatcher {
         &self,
         Parameters(params): Parameters<WatchBuildsParams>,
     ) -> Result<CallToolResult, McpError> {
+        // Validate all repo names upfront
+        for repo in &params.repos {
+            if let Err(e) = validate_repo(repo) {
+                return Ok(CallToolResult::error(vec![Content::text(e)]));
+            }
+        }
+
         // Read branch config without modifying it yet. We only add a repo to the
         // persisted config after at least one branch successfully starts — this way a
         // typo'd repo name (or a repo with no workflow runs) doesn't end up permanently
@@ -133,7 +155,16 @@ impl BuildWatcher {
             let mut any_started = false;
             for branch in branches {
                 let key = watch_key(repo, branch);
-                match start_watch(&self.watches, &self.config, repo, branch, &key).await {
+                match start_watch(
+                    &self.watches,
+                    &self.config,
+                    &self.handle,
+                    repo,
+                    branch,
+                    &key,
+                )
+                .await
+                {
                     Ok(msg) => {
                         any_started = true;
                         results.push(msg);
@@ -151,7 +182,9 @@ impl BuildWatcher {
         if !started_repos.is_empty() {
             let mut config = self.config.lock().await;
             config.add_repos(&started_repos);
-            save_config(&config);
+            if let Some(warning) = persist_warning(save_config(&config)) {
+                results.push(warning);
+            }
         }
 
         Ok(CallToolResult::success(vec![Content::text(
@@ -205,7 +238,9 @@ impl BuildWatcher {
             };
             results.push(msg);
         }
-        save_config(&config);
+        if let Some(warning) = persist_warning(save_config(&config)) {
+            results.push(warning);
+        }
 
         Ok(CallToolResult::success(vec![Content::text(
             results.join("\n"),
@@ -277,6 +312,15 @@ impl BuildWatcher {
         &self,
         Parameters(params): Parameters<ConfigureBranchesParams>,
     ) -> Result<CallToolResult, McpError> {
+        if let Err(e) = validate_repo(&params.repo) {
+            return Ok(CallToolResult::error(vec![Content::text(e)]));
+        }
+        for branch in &params.branches {
+            if let Err(e) = validate_branch(branch) {
+                return Ok(CallToolResult::error(vec![Content::text(e)]));
+            }
+        }
+
         let mut config = self.config.lock().await;
         let Some(existing) = config.repos.get(&params.repo).cloned() else {
             return Ok(CallToolResult::error(vec![Content::text(format!(
@@ -292,12 +336,15 @@ impl BuildWatcher {
                 branch_notifications: existing.branch_notifications,
             },
         );
-        save_config(&config);
-
-        Ok(CallToolResult::success(vec![Content::text(format!(
+        let mut msg = format!(
             "Set {}: watching branches {:?}\nRestart watches with watch_builds to apply.",
             params.repo, params.branches,
-        ))]))
+        );
+        if let Some(warning) = persist_warning(save_config(&config)) {
+            msg.push_str(&warning);
+        }
+
+        Ok(CallToolResult::success(vec![Content::text(msg)]))
     }
 
     #[tool(description = "Set the default branches to watch for repos without per-repo config.")]
@@ -305,14 +352,20 @@ impl BuildWatcher {
         &self,
         Parameters(params): Parameters<SetDefaultBranchesParams>,
     ) -> Result<CallToolResult, McpError> {
+        for branch in &params.branches {
+            if let Err(e) = validate_branch(branch) {
+                return Ok(CallToolResult::error(vec![Content::text(e)]));
+            }
+        }
+
         let mut config = self.config.lock().await;
         config.default_branches = params.branches;
-        save_config(&config);
+        let mut msg = format!("Default branches set to {:?}", config.default_branches);
+        if let Some(warning) = persist_warning(save_config(&config)) {
+            msg.push_str(&warning);
+        }
 
-        Ok(CallToolResult::success(vec![Content::text(format!(
-            "Default branches set to {:?}",
-            config.default_branches,
-        ))]))
+        Ok(CallToolResult::success(vec![Content::text(msg)]))
     }
 
     #[tool(
@@ -409,6 +462,17 @@ impl BuildWatcher {
             )]));
         }
 
+        if let Some(repo) = &params.repo
+            && let Err(e) = validate_repo(repo)
+        {
+            return Ok(CallToolResult::error(vec![Content::text(e)]));
+        }
+        if let Some(branch) = &params.branch
+            && let Err(e) = validate_branch(branch)
+        {
+            return Ok(CallToolResult::error(vec![Content::text(e)]));
+        }
+
         let mut config = self.config.lock().await;
 
         let scope = match (&params.repo, &params.branch) {
@@ -464,7 +528,7 @@ impl BuildWatcher {
             }
         };
 
-        save_config(&config);
+        let save_warning = persist_warning(save_config(&config));
 
         // Show effective config for the scope
         let effective = match (&params.repo, &params.branch) {
@@ -479,10 +543,15 @@ impl BuildWatcher {
             _ => config.notifications.clone(),
         };
 
-        Ok(CallToolResult::success(vec![Content::text(format!(
+        let mut msg = format!(
             "Updated notifications for {scope}:\n  build_started: {}\n  build_success: {}\n  build_failure: {}",
             effective.build_started, effective.build_success, effective.build_failure,
-        ))]))
+        );
+        if let Some(warning) = save_warning {
+            msg.push_str(&warning);
+        }
+
+        Ok(CallToolResult::success(vec![Content::text(msg)]))
     }
 }
 
@@ -521,4 +590,40 @@ fn format_notification_overrides(overrides: &NotificationOverrides) -> String {
     .flatten()
     .collect::<Vec<_>>()
     .join(", ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::deserialize_string_or_vec;
+
+    #[test]
+    fn deserialize_proper_array() {
+        let json = r#"["alice/app","bob/lib"]"#;
+        let mut de = serde_json::Deserializer::from_str(json);
+        let result = deserialize_string_or_vec(&mut de).unwrap();
+        assert_eq!(result, vec!["alice/app", "bob/lib"]);
+    }
+
+    #[test]
+    fn deserialize_stringified_array() {
+        let json = r#""[\"alice/app\",\"bob/lib\"]""#;
+        let mut de = serde_json::Deserializer::from_str(json);
+        let result = deserialize_string_or_vec(&mut de).unwrap();
+        assert_eq!(result, vec!["alice/app", "bob/lib"]);
+    }
+
+    #[test]
+    fn deserialize_empty_array() {
+        let json = r#"[]"#;
+        let mut de = serde_json::Deserializer::from_str(json);
+        let result = deserialize_string_or_vec(&mut de).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn deserialize_invalid_string_errors() {
+        let json = r#""not json""#;
+        let mut de = serde_json::Deserializer::from_str(json);
+        assert!(deserialize_string_or_vec(&mut de).is_err());
+    }
 }

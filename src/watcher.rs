@@ -4,9 +4,11 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 
 use crate::config::{Config, NotificationConfig, load_json, save_json, state_dir};
-use crate::github::{LastBuild, RunInfo, gh_recent_runs, gh_run_status};
+use crate::github::{GhError, LastBuild, RunInfo, gh_recent_runs, gh_run_status};
 use crate::platform;
 
 pub type SharedConfig = Arc<Mutex<Config>>;
@@ -51,8 +53,8 @@ pub fn load_watches() -> HashMap<String, WatchEntry> {
         .collect()
 }
 
-fn save_persisted(watches: &PersistedWatches) {
-    save_json(state_dir().join("watches.json"), watches);
+fn save_persisted(watches: &PersistedWatches) -> Result<(), crate::config::PersistError> {
+    save_json(state_dir().join("watches.json"), watches)
 }
 
 pub async fn save_watches(watches: &Watches) {
@@ -70,7 +72,9 @@ pub async fn save_watches(watches: &Watches) {
             })
             .collect()
     };
-    save_persisted(&persisted);
+    if let Err(e) = save_persisted(&persisted) {
+        tracing::error!("Failed to save watches: {e}");
+    }
 }
 
 const MAX_GH_FAILURES: u8 = 5;
@@ -86,11 +90,35 @@ pub struct WatchEntry {
 
 pub type Watches = Arc<Mutex<HashMap<String, WatchEntry>>>;
 
+/// Shared handle for managing poller lifecycle.
+#[derive(Clone)]
+pub struct WatcherHandle {
+    pub tracker: TaskTracker,
+    pub cancel: CancellationToken,
+}
+
+impl WatcherHandle {
+    pub fn new(cancel: CancellationToken) -> Self {
+        Self {
+            tracker: TaskTracker::new(),
+            cancel,
+        }
+    }
+
+    /// Wait for all pollers to finish (call after cancellation).
+    pub async fn shutdown(&self) {
+        self.tracker.close();
+        self.tracker.wait().await;
+    }
+}
+
 // -- Watch logic --
 
+#[tracing::instrument(skip(watches, config, handle), fields(%repo, %branch))]
 pub async fn start_watch(
     watches: &Watches,
     config: &SharedConfig,
+    handle: &WatcherHandle,
     repo: &str,
     branch: &str,
     key: &str,
@@ -102,7 +130,9 @@ pub async fn start_watch(
         }
     }
 
-    let runs = gh_recent_runs(repo, branch).await?;
+    let runs = gh_recent_runs(repo, branch)
+        .await
+        .map_err(|e| e.to_string())?;
     if runs.is_empty() {
         return Err(format!("{repo} [{branch}]: no workflow runs found"));
     }
@@ -151,14 +181,15 @@ pub async fn start_watch(
     }
     save_watches(watches).await;
 
-    spawn_poller(watches.clone(), config.clone(), key.to_string());
+    spawn_poller(watches.clone(), config.clone(), handle, key.to_string());
 
     Ok(msg)
 }
 
-fn spawn_poller(watches: Watches, config: SharedConfig, key: String) {
-    tokio::spawn(async move {
-        poll_repo(watches, config, key).await;
+fn spawn_poller(watches: Watches, config: SharedConfig, handle: &WatcherHandle, key: String) {
+    let token = handle.cancel.child_token();
+    handle.tracker.spawn(async move {
+        poll_repo(watches, config, key, token).await;
     });
 }
 
@@ -184,7 +215,8 @@ fn notify_build_complete(
     );
 }
 
-async fn poll_repo(watches: Watches, config: SharedConfig, key: String) {
+#[tracing::instrument(skip_all, fields(key))]
+async fn poll_repo(watches: Watches, config: SharedConfig, key: String, token: CancellationToken) {
     let (repo, branch) = parse_watch_key(&key);
     let repo = repo.to_string();
     let branch = branch.to_string();
@@ -217,20 +249,28 @@ async fn poll_repo(watches: Watches, config: SharedConfig, key: String) {
         } else {
             idle_poll_secs
         };
-        tokio::time::sleep(Duration::from_secs(delay)).await;
+
+        // Cancellation-aware sleep: wake immediately on token cancel
+        tokio::select! {
+            () = tokio::time::sleep(Duration::from_secs(delay)) => {}
+            () = token.cancelled() => {
+                tracing::info!(key, "Shutting down poller");
+                return;
+            }
+        }
 
         // Check if still watched
         {
             let w = watches.lock().await;
             if !w.contains_key(&key) {
-                tracing::info!("Watch cancelled for {key}");
+                tracing::info!(key, "Watch cancelled");
                 return;
             }
         }
 
         // Poll active runs every cycle
         if has_active {
-            poll_active_runs(&watches, &key, &repo, &branch, &notif).await;
+            poll_active_runs(&watches, &key, &repo, &branch, &notif, &token).await;
         }
 
         // Check for new runs at the idle interval regardless of active state
@@ -248,6 +288,7 @@ async fn poll_active_runs(
     repo: &str,
     branch: &str,
     notif: &NotificationConfig,
+    token: &CancellationToken,
 ) {
     let run_ids: Vec<u64> = {
         let w = watches.lock().await;
@@ -260,6 +301,10 @@ async fn poll_active_runs(
     let mut changed = false;
 
     for run_id in run_ids {
+        if token.is_cancelled() {
+            return;
+        }
+
         let run = match gh_run_status(repo, run_id).await {
             Ok(r) => {
                 // Reset failure count on success
@@ -270,31 +315,27 @@ async fn poll_active_runs(
                 r
             }
             Err(e) => {
-                let mut w = watches.lock().await;
-                if let Some(entry) = w.get_mut(key) {
-                    let count = entry.failure_counts.entry(run_id).or_insert(0);
-                    *count += 1;
-                    if *count >= MAX_GH_FAILURES {
-                        tracing::warn!(
-                            "Removing run {run_id} from {key} after {count} consecutive failures"
-                        );
-                        entry.active_runs.remove(&run_id);
-                        entry.failure_counts.remove(&run_id);
-                        changed = true;
-                    } else {
-                        tracing::error!("{e} (failure {count}/{MAX_GH_FAILURES})");
-                    }
-                }
+                handle_poll_failure(watches, key, run_id, &e, &mut changed).await;
                 continue;
             }
         };
 
         if run.is_completed() {
-            notify_build_complete(&run, repo, branch, key, notif);
+            // Check watch still exists before notifying (race with stop_watches)
+            let still_watched = {
+                let w = watches.lock().await;
+                w.contains_key(key)
+            };
+            if still_watched {
+                notify_build_complete(&run, repo, branch, key, notif);
+            }
+
             tracing::info!(
-                "Build completed for {key} run {run_id} {}: {}",
-                run.short_sha(),
-                run.conclusion
+                key,
+                run_id,
+                sha = run.short_sha(),
+                conclusion = %run.conclusion,
+                "Build completed"
             );
 
             let mut w = watches.lock().await;
@@ -311,9 +352,10 @@ async fn poll_active_runs(
                 && *old_status != run.status
             {
                 tracing::debug!(
-                    "Run {run_id} status changed: {} -> {}",
-                    old_status,
-                    run.status
+                    run_id,
+                    old = %old_status,
+                    new = %run.status,
+                    "Run status changed"
                 );
                 entry.active_runs.insert(run_id, run.status);
             }
@@ -322,6 +364,33 @@ async fn poll_active_runs(
 
     if changed {
         save_watches(watches).await;
+    }
+}
+
+async fn handle_poll_failure(
+    watches: &Watches,
+    key: &str,
+    run_id: u64,
+    error: &GhError,
+    changed: &mut bool,
+) {
+    let mut w = watches.lock().await;
+    if let Some(entry) = w.get_mut(key) {
+        let count = entry.failure_counts.entry(run_id).or_insert(0);
+        *count += 1;
+        if *count >= MAX_GH_FAILURES {
+            tracing::warn!(
+                key,
+                run_id,
+                count,
+                "Removing run after consecutive failures"
+            );
+            entry.active_runs.remove(&run_id);
+            entry.failure_counts.remove(&run_id);
+            *changed = true;
+        } else {
+            tracing::error!(key, run_id, count, error = %error, "Poll failure");
+        }
     }
 }
 
@@ -344,7 +413,7 @@ async fn check_for_new_runs(
     let runs = match gh_recent_runs(repo, branch).await {
         Ok(r) => r,
         Err(e) => {
-            tracing::error!("{e}");
+            tracing::error!(key, error = %e, "Failed to check for new runs");
             return;
         }
     };
@@ -360,13 +429,22 @@ async fn check_for_new_runs(
         .max()
         .expect("new_runs is non-empty");
 
+    // Check watch still exists before sending any notifications
+    {
+        let w = watches.lock().await;
+        if !w.contains_key(key) {
+            return;
+        }
+    }
+
     for run in &new_runs {
         tracing::info!(
-            "New build detected for {key}: run {} {} ({}: {})",
-            run.id,
-            run.short_sha(),
-            run.workflow,
-            run.title
+            key,
+            run_id = run.id,
+            sha = run.short_sha(),
+            workflow = %run.workflow,
+            title = %run.title,
+            "New build detected"
         );
         let group = format!("{key}#{}", run.workflow);
         platform::send_notification(
@@ -381,10 +459,11 @@ async fn check_for_new_runs(
         if run.is_completed() {
             notify_build_complete(run, repo, branch, key, notif);
             tracing::info!(
-                "Build already completed for {key} run {} {}: {}",
-                run.id,
-                run.short_sha(),
-                run.conclusion
+                key,
+                run_id = run.id,
+                sha = run.short_sha(),
+                conclusion = %run.conclusion,
+                "Build already completed"
             );
         }
     }
@@ -407,33 +486,43 @@ async fn check_for_new_runs(
     save_watches(watches).await;
 }
 
-pub async fn startup_watches(watches: &Watches, config: &SharedConfig) {
+pub async fn startup_watches(watches: &Watches, config: &SharedConfig, handle: &WatcherHandle) {
     // Resume existing watches — recover any in-progress builds that were active at shutdown
     let snapshot: Vec<String> = {
         let w = watches.lock().await;
         w.keys().cloned().collect()
     };
+
+    // Recover in-progress runs concurrently
+    let mut recover_futures = Vec::new();
     for key in &snapshot {
         let (repo, branch) = parse_watch_key(key);
-        tracing::info!("Resuming watch for {key}");
+        tracing::info!(key, "Resuming watch");
+        let repo = repo.to_string();
+        let branch = branch.to_string();
+        let key = key.clone();
+        recover_futures.push(async move { (key, gh_recent_runs(&repo, &branch).await) });
+    }
 
-        // Scan for in-progress runs we may have missed during downtime
-        match gh_recent_runs(repo, branch).await {
+    let results = futures::future::join_all(recover_futures).await;
+
+    for (key, result) in results {
+        match result {
             Ok(runs) => {
                 let mut w = watches.lock().await;
-                if let Some(entry) = w.get_mut(key) {
+                if let Some(entry) = w.get_mut(&key) {
                     for run in &runs {
                         if !run.is_completed() && !entry.active_runs.contains_key(&run.id) {
-                            tracing::info!("Recovering in-progress run {} for {key}", run.id);
+                            tracing::info!(key, run_id = run.id, "Recovering in-progress run");
                             entry.active_runs.insert(run.id, run.status.clone());
                         }
                     }
                 }
             }
-            Err(e) => tracing::warn!("Could not recover runs for {key}: {e}"),
+            Err(e) => tracing::warn!(key, error = %e, "Could not recover runs"),
         }
 
-        spawn_poller(watches.clone(), config.clone(), key.clone());
+        spawn_poller(watches.clone(), config.clone(), handle, key);
     }
 
     // Start watches for any config repos not already in state
@@ -451,10 +540,22 @@ pub async fn startup_watches(watches: &Watches, config: &SharedConfig) {
         result
     };
 
+    // Start new watches concurrently
+    let mut new_futures = Vec::new();
     for (repo, branch, key) in &new_watches {
-        tracing::info!("Starting new watch from config: {repo} [{branch}]");
-        match start_watch(watches, config, repo, branch, key).await {
-            Ok(msg) | Err(msg) => tracing::info!("{msg}"),
-        }
+        tracing::info!(repo, branch, "Starting new watch from config");
+        let watches = watches.clone();
+        let config = config.clone();
+        let handle = handle.clone();
+        let repo = repo.clone();
+        let branch = branch.clone();
+        let key = key.clone();
+        new_futures.push(async move {
+            match start_watch(&watches, &config, &handle, &repo, &branch, &key).await {
+                Ok(msg) | Err(msg) => tracing::info!("{msg}"),
+            }
+        });
     }
+
+    futures::future::join_all(new_futures).await;
 }
