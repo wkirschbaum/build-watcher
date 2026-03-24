@@ -32,8 +32,10 @@ pub fn watch_key(repo: &str, branch: &str) -> String {
     format!("{repo}#{branch}")
 }
 
+pub const DEFAULT_BRANCH: &str = "main";
+
 pub fn parse_watch_key(key: &str) -> (&str, &str) {
-    key.rsplit_once('#').unwrap_or((key, "main"))
+    key.rsplit_once('#').unwrap_or((key, DEFAULT_BRANCH))
 }
 
 // -- Watch state persistence --
@@ -331,21 +333,6 @@ struct PollConfig {
     sound_file: Option<String>,
 }
 
-fn format_duration(d: Duration) -> String {
-    let secs = d.as_secs();
-    if secs < 60 {
-        format!("{secs}s")
-    } else {
-        let mins = secs / 60;
-        let rem = secs % 60;
-        if rem == 0 {
-            format!("{mins}m")
-        } else {
-            format!("{mins}m {rem}s")
-        }
-    }
-}
-
 impl Poller {
     async fn is_paused(&self) -> bool {
         let p = self.pause.lock().await;
@@ -636,7 +623,7 @@ impl Poller {
             ("❌", pcfg.notif.build_failure)
         };
 
-        let duration_str = elapsed.map(|d| format!(" in {}", format_duration(d)));
+        let duration_str = elapsed.map(|d| format!(" in {}", crate::format::duration(d)));
 
         let mut body = format!("[{branch}] {}", run.display_title());
         if let Some(ds) = &duration_str {
@@ -711,6 +698,9 @@ async fn recover_existing_watches(
                 for run in &runs {
                     if !run.is_completed() && !entry.active_runs.contains_key(&run.id) {
                         tracing::info!(key, run_id = run.id, "Recovering in-progress run");
+                        // Note: started_at is approximate — the actual GitHub start
+                        // time is lost across restarts, so elapsed time in the
+                        // completion notification may be inaccurate for recovered runs.
                         entry.active_runs.insert(
                             run.id,
                             ActiveRun {
@@ -1022,28 +1012,6 @@ mod tests {
         assert!(restored.active_runs.is_empty());
         assert!(restored.failure_counts.is_empty());
         assert_eq!(restored.last_build.unwrap().run_id, 101);
-    }
-
-    // -- format_duration tests --
-
-    #[test]
-    fn format_duration_seconds_only() {
-        assert_eq!(format_duration(Duration::from_secs(42)), "42s");
-    }
-
-    #[test]
-    fn format_duration_minutes_and_seconds() {
-        assert_eq!(format_duration(Duration::from_secs(150)), "2m 30s");
-    }
-
-    #[test]
-    fn format_duration_exact_minutes() {
-        assert_eq!(format_duration(Duration::from_secs(120)), "2m");
-    }
-
-    #[test]
-    fn format_duration_zero() {
-        assert_eq!(format_duration(Duration::from_secs(0)), "0s");
     }
 
     // -- last_failed_build tests --

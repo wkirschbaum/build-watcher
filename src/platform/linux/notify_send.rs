@@ -147,6 +147,8 @@ impl Notifier for NotifySend {
                         ids.lock()
                             .unwrap_or_else(|e| e.into_inner())
                             .insert(key, id);
+                    } else {
+                        tracing::debug!("notify-send returned non-numeric ID: {line:?}");
                     }
                 }
                 Ok(None) => {}

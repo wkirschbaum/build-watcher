@@ -785,10 +785,8 @@ impl BuildWatcher {
                 format!("Notifications paused for {mins} minutes")
             }
             _ => {
-                // Effectively forever (136 years)
-                *p = Some(
-                    tokio::time::Instant::now() + std::time::Duration::from_secs(u32::MAX as u64),
-                );
+                const INDEFINITE: u64 = u32::MAX as u64; // ~136 years
+                *p = Some(tokio::time::Instant::now() + std::time::Duration::from_secs(INDEFINITE));
                 "Notifications paused until resume or restart".to_string()
             }
         };
@@ -1014,11 +1012,11 @@ impl BuildWatcher {
         for entry in &entries {
             let duration = entry
                 .duration_secs()
-                .map(format_secs)
+                .map(format::seconds)
                 .unwrap_or_else(|| "—".to_string());
             let age = entry
                 .age_secs()
-                .map(format_age)
+                .map(format::age)
                 .unwrap_or_else(|| "—".to_string());
             let title = entry.display_title();
 
@@ -1026,9 +1024,9 @@ impl BuildWatcher {
                 lines.push(format!(
                     "{:<12} {:<15} {:<20} {:<30} {:<10} {}",
                     entry.conclusion,
-                    truncate(&entry.branch, 13),
-                    truncate(&entry.workflow, 18),
-                    truncate(&title, 28),
+                    format::truncate(&entry.branch, 13),
+                    format::truncate(&entry.workflow, 18),
+                    format::truncate(&title, 28),
                     duration,
                     age,
                 ));
@@ -1036,8 +1034,8 @@ impl BuildWatcher {
                 lines.push(format!(
                     "{:<12} {:<20} {:<35} {:<10} {}",
                     entry.conclusion,
-                    truncate(&entry.workflow, 18),
-                    truncate(&title, 33),
+                    format::truncate(&entry.workflow, 18),
+                    format::truncate(&title, 33),
                     duration,
                     age,
                 ));
@@ -1147,7 +1145,7 @@ impl BuildWatcher {
                 config
                     .default_branches
                     .first()
-                    .map_or("main", |s| s.as_str()),
+                    .map_or(crate::watcher::DEFAULT_BRANCH, |s| s.as_str()),
             ),
             _ => config.notifications.clone(),
         };
@@ -1196,39 +1194,7 @@ impl ServerHandler for BuildWatcher {
     }
 }
 
-fn format_secs(secs: u64) -> String {
-    if secs < 60 {
-        format!("{secs}s")
-    } else {
-        let m = secs / 60;
-        let s = secs % 60;
-        if s == 0 {
-            format!("{m}m")
-        } else {
-            format!("{m}m {s}s")
-        }
-    }
-}
-
-fn format_age(secs: u64) -> String {
-    if secs < 60 {
-        "just now".to_string()
-    } else if secs < 3600 {
-        format!("{}m ago", secs / 60)
-    } else if secs < 86400 {
-        format!("{}h ago", secs / 3600)
-    } else {
-        format!("{}d ago", secs / 86400)
-    }
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    if s.len() > max {
-        format!("{}…", &s[..max - 1])
-    } else {
-        s.to_string()
-    }
-}
+use crate::format;
 
 fn format_notification_overrides(overrides: &NotificationOverrides) -> String {
     [
