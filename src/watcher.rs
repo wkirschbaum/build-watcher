@@ -8,11 +8,9 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
-use crate::config::{
-    Config, NotificationConfig, NotificationLevel, load_json, save_json, state_dir,
-};
+use crate::config::{Config, load_json, save_json, state_dir};
+use crate::events::{EventBus, RunSnapshot, WatchEvent};
 use crate::github::{GhError, LastBuild, RunInfo, gh_failing_steps, gh_recent_runs, gh_run_status};
-use crate::platform;
 
 pub type SharedConfig = Arc<Mutex<Config>>;
 pub type Watches = Arc<Mutex<HashMap<WatchKey, WatchEntry>>>;
@@ -23,6 +21,27 @@ pub type PauseState = Arc<Mutex<Option<Instant>>>;
 pub struct ActiveRun {
     pub status: String,
     pub started_at: Instant,
+    pub workflow: String,
+    pub title: String,
+    pub head_sha: String,
+    pub event: String,
+}
+
+impl ActiveRun {
+    fn from_run(run: &RunInfo) -> Self {
+        Self {
+            status: run.status.clone(),
+            started_at: Instant::now(),
+            workflow: run.workflow.clone(),
+            title: run.title.clone(),
+            head_sha: run.head_sha.clone(),
+            event: run.event.clone(),
+        }
+    }
+
+    pub fn display_title(&self) -> String {
+        crate::github::display_title(&self.event, &self.title, &self.head_sha)
+    }
 }
 
 // -- Watch key --
@@ -172,12 +191,16 @@ impl WatchEntry {
         }
     }
 
-    fn update_status(&mut self, run_id: u64, new_status: String) {
+    /// Update a run's status. Returns the old status if it changed.
+    fn update_status(&mut self, run_id: u64, new_status: &str) -> Option<String> {
         if let Some(active) = self.active_runs.get_mut(&run_id)
             && active.status != new_status
         {
-            tracing::debug!(run_id, old = %active.status, new = %new_status, "Run status changed");
-            active.status = new_status;
+            let old = std::mem::replace(&mut active.status, new_status.to_string());
+            tracing::debug!(run_id, old = %old, new = %new_status, "Run status changed");
+            Some(old)
+        } else {
+            None
         }
     }
 
@@ -191,13 +214,7 @@ impl WatchEntry {
             if run.is_completed() {
                 self.last_build = Some(run.to_last_build());
             } else {
-                self.active_runs.insert(
-                    run.id,
-                    ActiveRun {
-                        status: run.status.clone(),
-                        started_at: Instant::now(),
-                    },
-                );
+                self.active_runs.insert(run.id, ActiveRun::from_run(run));
             }
         }
     }
@@ -210,13 +227,15 @@ impl WatchEntry {
 pub struct WatcherHandle {
     pub tracker: TaskTracker,
     pub cancel: CancellationToken,
+    pub events: EventBus,
 }
 
 impl WatcherHandle {
-    pub fn new(cancel: CancellationToken) -> Self {
+    pub fn new(cancel: CancellationToken, events: EventBus) -> Self {
         Self {
             tracker: TaskTracker::new(),
             cancel,
+            events,
         }
     }
 
@@ -228,12 +247,11 @@ impl WatcherHandle {
 
 // -- Starting watches --
 
-#[tracing::instrument(skip(watches, config, handle, pause), fields(%repo, %branch))]
+#[tracing::instrument(skip(watches, config, handle), fields(%repo, %branch))]
 pub async fn start_watch(
     watches: &Watches,
     config: &SharedConfig,
     handle: &WatcherHandle,
-    pause: &PauseState,
     repo: &str,
     branch: &str,
 ) -> std::result::Result<String, String> {
@@ -267,19 +285,10 @@ pub async fn start_watch(
     }
 
     let max_id = runs.iter().map(|r| r.id).max().expect("runs is non-empty");
-    let now = Instant::now();
     let active: HashMap<u64, ActiveRun> = runs
         .iter()
         .filter(|r| !r.is_completed())
-        .map(|r| {
-            (
-                r.id,
-                ActiveRun {
-                    status: r.status.clone(),
-                    started_at: now,
-                },
-            )
-        })
+        .map(|r| (r.id, ActiveRun::from_run(r)))
         .collect();
     let last_completed = runs.iter().find(|r| r.is_completed());
 
@@ -316,23 +325,17 @@ pub async fn start_watch(
     }
     save_watches(watches).await;
 
-    spawn_poller(watches, config, handle, pause, key);
+    spawn_poller(watches, config, handle, key);
     Ok(msg)
 }
 
-fn spawn_poller(
-    watches: &Watches,
-    config: &SharedConfig,
-    handle: &WatcherHandle,
-    pause: &PauseState,
-    key: WatchKey,
-) {
+fn spawn_poller(watches: &Watches, config: &SharedConfig, handle: &WatcherHandle, key: WatchKey) {
     let poller = Poller {
         key,
         watches: watches.clone(),
         config: config.clone(),
-        pause: pause.clone(),
         token: handle.cancel.child_token(),
+        events: handle.events.clone(),
     };
     handle.tracker.spawn(poller.run());
 }
@@ -353,94 +356,6 @@ fn filter_runs<'a>(
         .collect()
 }
 
-// -- Notification event --
-
-/// The kind of build notification.
-pub enum NotificationKind {
-    Started,
-    Completed { conclusion: String },
-}
-
-/// All context needed to send a build notification.
-pub struct NotificationEvent {
-    pub kind: NotificationKind,
-    pub workflow: String,
-    pub branch: String,
-    pub title: String,
-    pub head_sha: String,
-    pub event: String,
-    pub url: String,
-    pub level: NotificationLevel,
-    pub group: String,
-    pub elapsed: Option<Duration>,
-    pub failing_steps: Option<String>,
-}
-
-impl NotificationEvent {
-    fn from_run(
-        run: &RunInfo,
-        repo: &str,
-        branch: &str,
-        group: String,
-        kind: NotificationKind,
-        level: NotificationLevel,
-    ) -> Self {
-        Self {
-            kind,
-            workflow: run.workflow.clone(),
-            branch: branch.to_string(),
-            title: run.title.clone(),
-            head_sha: run.head_sha.clone(),
-            event: run.event.clone(),
-            url: run.url(repo),
-            level,
-            group,
-            elapsed: None,
-            failing_steps: None,
-        }
-    }
-
-    fn display_title(&self) -> String {
-        crate::github::display_title(&self.event, &self.title, &self.head_sha)
-    }
-
-    fn format_title(&self) -> String {
-        match &self.kind {
-            NotificationKind::Started => format!("🔨 {} - started", self.workflow),
-            NotificationKind::Completed { conclusion } => {
-                let emoji = if conclusion == "success" {
-                    "✅"
-                } else {
-                    "❌"
-                };
-                format!("{emoji} {} - {conclusion}", self.workflow)
-            }
-        }
-    }
-
-    fn format_body(&self) -> String {
-        let mut body = format!("[{}] {}", self.branch, self.display_title());
-        if let Some(d) = self.elapsed {
-            body.push_str(&format!(" in {}", crate::format::duration(d)));
-        }
-        if let Some(steps) = &self.failing_steps {
-            body.push_str(&format!("\nFailed: {steps}"));
-        }
-        body
-    }
-
-    pub async fn send(&self) {
-        platform::send_notification(
-            &self.format_title(),
-            &self.format_body(),
-            self.level,
-            Some(&self.url),
-            Some(&self.group),
-        )
-        .await;
-    }
-}
-
 // -- Poller --
 
 /// Per-repo/branch async polling task.
@@ -448,27 +363,19 @@ struct Poller {
     key: WatchKey,
     watches: Watches,
     config: SharedConfig,
-    pause: PauseState,
     token: CancellationToken,
+    events: EventBus,
 }
 
 /// Snapshot of config values needed for a poll cycle.
 struct PollConfig {
     active_secs: u64,
     idle_secs: u64,
-    notif: NotificationConfig,
     workflows: Vec<String>,
     ignored: Vec<String>,
-    sound_on_failure: bool,
-    sound_file: Option<String>,
 }
 
 impl Poller {
-    async fn is_paused(&self) -> bool {
-        let p = self.pause.lock().await;
-        p.is_some_and(|deadline| Instant::now() < deadline)
-    }
-
     /// Returns `true` if this watch is still active. Logs and returns `false` if removed.
     async fn is_active(&self) -> bool {
         let w = self.watches.lock().await;
@@ -507,7 +414,7 @@ impl Poller {
                 None => return,
             };
 
-            let pcfg = self.read_config(&repo, &branch).await;
+            let pcfg = self.read_config(&repo).await;
             let delay = if has_active {
                 pcfg.active_secs
             } else {
@@ -545,23 +452,20 @@ impl Poller {
         }
     }
 
-    async fn read_config(&self, repo: &str, branch: &str) -> PollConfig {
+    async fn read_config(&self, repo: &str) -> PollConfig {
         let cfg = self.config.lock().await;
         PollConfig {
             active_secs: cfg.active_poll_seconds,
             idle_secs: cfg.idle_poll_seconds,
-            notif: cfg.notifications_for(repo, branch),
             workflows: cfg.workflows_for(repo).to_vec(),
             ignored: cfg.ignored_workflows.clone(),
-            sound_on_failure: cfg.sound_on_failure_for(repo),
-            sound_file: cfg.sound_on_failure.sound_file.clone(),
         }
     }
 
-    /// Poll all in-progress runs, notify on completion, handle failures.
+    /// Poll all in-progress runs, emit events on completion/status change, handle failures.
     /// The watch lock is released during each GitHub API call (high latency)
     /// and re-acquired for each state update to avoid holding it across awaits.
-    async fn poll_active_runs(&self, repo: &str, branch: &str, pcfg: &PollConfig) {
+    async fn poll_active_runs(&self, repo: &str, branch: &str, _pcfg: &PollConfig) {
         let run_ids: Vec<u64> = {
             let w = self.watches.lock().await;
             match w.get(&self.key) {
@@ -595,7 +499,6 @@ impl Poller {
             };
 
             if run.is_completed() {
-                // Extract duration before removing from active_runs
                 let elapsed = {
                     let w = self.watches.lock().await;
                     w.get(&self.key)
@@ -603,9 +506,19 @@ impl Poller {
                         .map(|a| a.started_at.elapsed())
                 };
 
+                let failing_steps = if !run.succeeded() {
+                    gh_failing_steps(repo, run.id).await
+                } else {
+                    None
+                };
+
                 if self.is_active().await {
-                    self.notify_completion(&run, repo, branch, pcfg, elapsed)
-                        .await;
+                    self.events.emit(WatchEvent::RunCompleted {
+                        run: RunSnapshot::from_run_info(&run, repo, branch),
+                        conclusion: run.conclusion.clone(),
+                        elapsed,
+                        failing_steps,
+                    });
                 }
 
                 tracing::info!(
@@ -621,8 +534,14 @@ impl Poller {
                 changed = true;
             } else {
                 let mut w = self.watches.lock().await;
-                if let Some(entry) = w.get_mut(&self.key) {
-                    entry.update_status(run_id, run.status);
+                if let Some(entry) = w.get_mut(&self.key)
+                    && let Some(old_status) = entry.update_status(run_id, &run.status)
+                {
+                    self.events.emit(WatchEvent::StatusChanged {
+                        run: RunSnapshot::from_run_info(&run, repo, branch),
+                        from: old_status,
+                        to: run.status.clone(),
+                    });
                 }
             }
         }
@@ -632,7 +551,7 @@ impl Poller {
         }
     }
 
-    /// Check for runs newer than our high-water mark. Notify starts (and immediate completions).
+    /// Check for runs newer than our high-water mark. Emit events for new and completed runs.
     async fn check_for_new_runs(&self, repo: &str, branch: &str, pcfg: &PollConfig) {
         let last_seen = {
             let w = self.watches.lock().await;
@@ -669,10 +588,21 @@ impl Poller {
                 sha = run.short_sha(), workflow = %run.workflow, title = %run.title,
                 "New build detected"
             );
-            self.notify_started(run, repo, branch, &pcfg.notif).await;
+            let snapshot = RunSnapshot::from_run_info(run, repo, branch);
+            self.events.emit(WatchEvent::RunStarted(snapshot.clone()));
 
             if run.is_completed() {
-                self.notify_completion(run, repo, branch, pcfg, None).await;
+                let failing_steps = if !run.succeeded() {
+                    gh_failing_steps(repo, run.id).await
+                } else {
+                    None
+                };
+                self.events.emit(WatchEvent::RunCompleted {
+                    run: snapshot,
+                    conclusion: run.conclusion.clone(),
+                    elapsed: None,
+                    failing_steps,
+                });
                 tracing::info!(
                     key = %self.key, run_id = run.id,
                     sha = run.short_sha(), conclusion = %run.conclusion,
@@ -694,93 +624,18 @@ impl Poller {
         }
         save_watches(&self.watches).await;
     }
-
-    // -- Notifications --
-
-    /// Notification group key: stacks notifications per workflow within a watch.
-    fn notification_group(&self, run: &RunInfo) -> String {
-        format!("{}#{}", &self.key, run.workflow)
-    }
-
-    async fn notify_started(
-        &self,
-        run: &RunInfo,
-        repo: &str,
-        branch: &str,
-        notif: &NotificationConfig,
-    ) {
-        if self.is_paused().await {
-            return;
-        }
-        let group = self.notification_group(run);
-        let event = NotificationEvent::from_run(
-            run,
-            repo,
-            branch,
-            group,
-            NotificationKind::Started,
-            notif.build_started,
-        );
-        event.send().await;
-    }
-
-    async fn notify_completion(
-        &self,
-        run: &RunInfo,
-        repo: &str,
-        branch: &str,
-        pcfg: &PollConfig,
-        elapsed: Option<Duration>,
-    ) {
-        if self.is_paused().await {
-            return;
-        }
-        let level = if run.succeeded() {
-            pcfg.notif.build_success
-        } else {
-            pcfg.notif.build_failure
-        };
-        let group = self.notification_group(run);
-        let failing_steps = if !run.succeeded() {
-            gh_failing_steps(repo, run.id).await
-        } else {
-            None
-        };
-        let mut event = NotificationEvent::from_run(
-            run,
-            repo,
-            branch,
-            group,
-            NotificationKind::Completed {
-                conclusion: run.conclusion.clone(),
-            },
-            level,
-        );
-        event.elapsed = elapsed;
-        event.failing_steps = failing_steps;
-        event.send().await;
-
-        if !run.succeeded() && pcfg.sound_on_failure {
-            platform::play_sound(pcfg.sound_file.as_deref()).await;
-        }
-    }
 }
 
 // -- Startup --
 
-pub async fn startup_watches(
-    watches: &Watches,
-    config: &SharedConfig,
-    handle: &WatcherHandle,
-    pause: &PauseState,
-) {
+pub async fn startup_watches(watches: &Watches, config: &SharedConfig, handle: &WatcherHandle) {
     let snapshot: Vec<WatchKey> = {
         let w = watches.lock().await;
         w.keys().cloned().collect()
     };
 
-    recover_existing_watches(watches, config, handle, pause, &snapshot).await;
-    start_new_config_watches(watches, config, handle, pause, &snapshot).await;
+    recover_existing_watches(watches, config, handle, &snapshot).await;
+    start_new_config_watches(watches, config, handle, &snapshot).await;
 }
 
 /// Resume persisted watches and recover any in-progress runs from GitHub.
@@ -788,7 +643,6 @@ async fn recover_existing_watches(
     watches: &Watches,
     config: &SharedConfig,
     handle: &WatcherHandle,
-    pause: &PauseState,
     snapshot: &[WatchKey],
 ) {
     let futures: Vec<_> = snapshot
@@ -813,13 +667,7 @@ async fn recover_existing_watches(
                         // Note: started_at is approximate — the actual GitHub start
                         // time is lost across restarts, so elapsed time in the
                         // completion notification may be inaccurate for recovered runs.
-                        entry.active_runs.insert(
-                            run.id,
-                            ActiveRun {
-                                status: run.status.clone(),
-                                started_at: Instant::now(),
-                            },
-                        );
+                        entry.active_runs.insert(run.id, ActiveRun::from_run(run));
                     }
                 }
                 // Bump high-water mark so check_for_new_runs doesn't re-notify.
@@ -831,7 +679,7 @@ async fn recover_existing_watches(
             tracing::warn!(key = %key, error = %e, "Could not recover runs");
         }
 
-        spawn_poller(watches, config, handle, pause, key);
+        spawn_poller(watches, config, handle, key);
     }
 }
 
@@ -840,7 +688,6 @@ async fn start_new_config_watches(
     watches: &Watches,
     config: &SharedConfig,
     handle: &WatcherHandle,
-    pause: &PauseState,
     snapshot: &[WatchKey],
 ) {
     let new_keys: Vec<WatchKey> = {
@@ -870,10 +717,8 @@ async fn start_new_config_watches(
             let watches = watches.clone();
             let config = config.clone();
             let handle = handle.clone();
-            let pause = pause.clone();
             async move {
-                match start_watch(&watches, &config, &handle, &pause, &key.repo, &key.branch).await
-                {
+                match start_watch(&watches, &config, &handle, &key.repo, &key.branch).await {
                     Ok(msg) | Err(msg) => tracing::info!("{msg}"),
                 }
             }
@@ -923,6 +768,10 @@ mod tests {
         ActiveRun {
             status: status.to_string(),
             started_at: Instant::now(),
+            workflow: "CI".to_string(),
+            title: "Test PR".to_string(),
+            head_sha: "abc1234".to_string(),
+            event: "push".to_string(),
         }
     }
 
@@ -1041,8 +890,9 @@ mod tests {
     fn update_status_changes_when_different() {
         let mut entry = make_entry();
 
-        entry.update_status(101, "queued".to_string());
+        let old = entry.update_status(101, "queued");
 
+        assert_eq!(old, Some("in_progress".to_string()));
         assert_eq!(entry.active_runs[&101].status, "queued");
     }
 
@@ -1050,8 +900,9 @@ mod tests {
     fn update_status_noop_when_same() {
         let mut entry = make_entry();
 
-        entry.update_status(101, "in_progress".to_string());
+        let old = entry.update_status(101, "in_progress");
 
+        assert!(old.is_none());
         assert_eq!(entry.active_runs[&101].status, "in_progress");
     }
 
@@ -1059,7 +910,7 @@ mod tests {
     fn update_status_noop_for_unknown_run() {
         let mut entry = make_entry();
 
-        entry.update_status(999, "completed".to_string());
+        entry.update_status(999, "completed");
 
         assert!(!entry.active_runs.contains_key(&999));
     }

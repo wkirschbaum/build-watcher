@@ -322,16 +322,7 @@ impl BuildWatcher {
         for (repo, branches) in &repo_branches {
             let mut any_started = false;
             for branch in branches {
-                match start_watch(
-                    &self.watches,
-                    &self.config,
-                    &self.handle,
-                    &self.pause,
-                    repo,
-                    branch,
-                )
-                .await
-                {
+                match start_watch(&self.watches, &self.config, &self.handle, repo, branch).await {
                     Ok(msg) => {
                         any_started = true;
                         results.push(msg);
@@ -454,10 +445,15 @@ impl BuildWatcher {
                 } else {
                     let run_list: Vec<String> = entry
                         .active_runs
-                        .iter()
-                        .map(|(id, active)| {
+                        .values()
+                        .map(|active| {
                             let time = format::duration(active.started_at.elapsed());
-                            format!("{id} ({}, {time})", active.status)
+                            format!(
+                                "{}: {} ({}, {time})",
+                                active.workflow,
+                                active.display_title(),
+                                active.status,
+                            )
                         })
                         .collect();
                     format!(

@@ -1,4 +1,5 @@
 mod config;
+mod events;
 mod format;
 mod github;
 mod platform;
@@ -21,10 +22,18 @@ async fn main() -> Result<()> {
     let config = Arc::new(Mutex::new(config::load_and_normalize()));
     let watches = Arc::new(Mutex::new(watcher::load_watches()));
     let pause: watcher::PauseState = Arc::new(Mutex::new(None));
+    let events = events::EventBus::new();
+
+    // Subscribe before starting watches so no events are missed.
+    tokio::spawn(events::run_notification_handler(
+        events.subscribe(),
+        config.clone(),
+        pause.clone(),
+    ));
 
     let ct = CancellationToken::new();
-    let handle = watcher::WatcherHandle::new(ct.clone());
-    watcher::startup_watches(&watches, &config, &handle, &pause).await;
+    let handle = watcher::WatcherHandle::new(ct.clone(), events);
+    watcher::startup_watches(&watches, &config, &handle).await;
 
     server::serve(watches, config, handle, pause, ct).await
 }
