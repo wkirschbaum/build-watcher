@@ -54,9 +54,8 @@ impl Notifier for NotifySend {
             NotificationLevel::Off => unreachable!("Off is filtered before send()"),
         };
 
-        // group is "owner/repo#branch" — extract just "repo" for the visible app name
         let key = group.unwrap_or("build-watcher").to_string();
-        let app_name = repo_name_from_group(&key).to_string();
+        let app_name = format!("Github Actions [{}]", repo_name_from_group(&key));
 
         let mut args = vec![
             "--app-name".to_string(),
