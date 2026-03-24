@@ -312,7 +312,7 @@ impl Config {
 /// Load config from disk. Returns the config and whether the primary file was valid
 /// (as opposed to falling back to backup or defaults). Callers should only re-save
 /// to normalize schema when the primary loaded successfully.
-pub fn load_config() -> (Config, bool) {
+fn load_config() -> (Config, bool) {
     let path = config_dir().join("config.json");
     if let Some(val) = try_parse_file::<Config>(&path) {
         return (val, true);

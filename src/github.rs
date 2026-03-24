@@ -224,7 +224,23 @@ pub async fn gh_run_status(repo: &str, run_id: u64) -> Result<RunInfo, GhError> 
     })
 }
 
-/// Validates that a repo string is in `owner/repo` format with safe characters.
+/// Validates that a branch name contains only safe characters.
+/// Notably rejects `#` which is used as the key delimiter in watch keys (`repo#branch`).
+pub fn validate_branch(branch: &str) -> Result<(), String> {
+    if branch.is_empty()
+        || !branch
+            .chars()
+            .all(|c| c.is_alphanumeric() || "-_./".contains(c))
+    {
+        return Err(format!(
+            "Invalid branch name: {branch:?} — expected alphanumeric, hyphen, underscore, dot, or slash characters"
+        ));
+    }
+    Ok(())
+}
+
+/// Validates that a repo name contains only safe characters.
+/// Notably rejects `#` which is used as the key delimiter in watch keys (`repo#branch`).
 pub fn validate_repo(repo: &str) -> Result<(), String> {
     let parts: Vec<&str> = repo.split('/').collect();
     if parts.len() != 2
@@ -234,20 +250,6 @@ pub fn validate_repo(repo: &str) -> Result<(), String> {
     {
         return Err(format!(
             "Invalid repo format: {repo:?} — expected \"owner/repo\" with alphanumeric, hyphen, underscore, or dot characters"
-        ));
-    }
-    Ok(())
-}
-
-/// Validates that a branch name contains only safe characters.
-pub fn validate_branch(branch: &str) -> Result<(), String> {
-    if branch.is_empty()
-        || !branch
-            .chars()
-            .all(|c| c.is_alphanumeric() || "-_./".contains(c))
-    {
-        return Err(format!(
-            "Invalid branch name: {branch:?} — expected alphanumeric, hyphen, underscore, dot, or slash characters"
         ));
     }
     Ok(())
