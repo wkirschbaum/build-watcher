@@ -1,4 +1,4 @@
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use crate::config::NotificationLevel;
 use crate::platform::Notifier;
@@ -10,14 +10,14 @@ pub struct TerminalNotifier;
 
 impl TerminalNotifier {
     pub fn is_available() -> bool {
-        std::env::var("PATH")
-            .unwrap_or_default()
-            .split(':')
-            .any(|dir| {
-                std::path::Path::new(dir)
-                    .join("terminal-notifier")
-                    .is_file()
-            })
+        // Try executing the binary — this verifies both existence and executability,
+        // and works correctly when PATH differs from the login shell (e.g. in a daemon).
+        Command::new("terminal-notifier")
+            .arg("-help")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok()
     }
 }
 
@@ -49,8 +49,13 @@ impl Notifier for TerminalNotifier {
         if let Some(url) = url {
             cmd.args(["-open", url]);
         }
-        if let Err(e) = cmd.spawn() {
-            tracing::warn!("Failed to spawn terminal-notifier: {e}");
+        match cmd.spawn() {
+            Ok(mut child) => {
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                });
+            }
+            Err(e) => tracing::warn!("Failed to spawn terminal-notifier: {e}"),
         }
     }
 }

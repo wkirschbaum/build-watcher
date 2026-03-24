@@ -27,8 +27,13 @@ impl Notifier for AppleScriptNotifier {
         let body = escape_applescript(body);
         let script =
             format!(r#"display notification "{body}" with title "{title}" sound name "{sound}""#);
-        if let Err(e) = Command::new("osascript").args(["-e", &script]).spawn() {
-            tracing::warn!("Failed to spawn osascript: {e}");
+        match Command::new("osascript").args(["-e", &script]).spawn() {
+            Ok(mut child) => {
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                });
+            }
+            Err(e) => tracing::warn!("Failed to spawn osascript: {e}"),
         }
     }
 }

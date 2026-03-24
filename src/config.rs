@@ -254,12 +254,6 @@ impl Config {
             self.repos.entry(repo.clone()).or_default();
         }
     }
-
-    pub fn remove_repos(&mut self, repos: &[String]) {
-        for repo in repos {
-            self.repos.remove(repo);
-        }
-    }
 }
 
 pub fn load_config() -> Config {

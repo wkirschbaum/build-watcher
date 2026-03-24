@@ -86,7 +86,10 @@ async fn save_watches(watches: &Watches) {
             })
             .collect()
     };
-    save_persisted(&persisted);
+    // Lock is released above; run blocking file I/O off the async executor
+    tokio::task::spawn_blocking(move || save_persisted(&persisted))
+        .await
+        .ok();
 }
 
 // -- MCP Server --
@@ -155,11 +158,10 @@ impl BuildWatcher {
         &self,
         Parameters(params): Parameters<WatchBuildsParams>,
     ) -> Result<CallToolResult, McpError> {
-        // Collect branch info and release the config lock before making gh calls
+        // Read branch config without modifying it yet — we only persist repos that
+        // successfully start watching, so a typo'd repo name doesn't linger in config.
         let repo_branches: Vec<(String, Vec<String>)> = {
-            let mut config = self.config.lock().await;
-            config.add_repos(&params.repos);
-            save_config(&config);
+            let config = self.config.lock().await;
             params
                 .repos
                 .iter()
@@ -168,14 +170,29 @@ impl BuildWatcher {
         };
 
         let mut results = Vec::new();
+        let mut started_repos: Vec<String> = Vec::new();
         for (repo, branches) in &repo_branches {
+            let mut any_started = false;
             for branch in branches {
                 let key = watch_key(repo, branch);
-                let msg = match start_watch(&self.watches, &self.config, repo, branch, &key).await {
-                    Ok(msg) | Err(msg) => msg,
-                };
-                results.push(msg);
+                match start_watch(&self.watches, &self.config, repo, branch, &key).await {
+                    Ok(msg) => {
+                        any_started = true;
+                        results.push(msg);
+                    }
+                    Err(msg) => results.push(msg),
+                }
             }
+            if any_started {
+                started_repos.push(repo.clone());
+            }
+        }
+
+        // Only persist repos that had at least one branch successfully start
+        if !started_repos.is_empty() {
+            let mut config = self.config.lock().await;
+            config.add_repos(&started_repos);
+            save_config(&config);
         }
 
         Ok(CallToolResult::success(vec![Content::text(
@@ -190,34 +207,43 @@ impl BuildWatcher {
         &self,
         Parameters(params): Parameters<StopWatchesParams>,
     ) -> Result<CallToolResult, McpError> {
-        let mut watches = self.watches.lock().await;
-        let mut results = Vec::new();
-
-        for repo in &params.repos {
-            let prefix = format!("{repo}#");
-            let keys_to_remove: Vec<String> = watches
-                .keys()
-                .filter(|k| k.starts_with(&prefix))
-                .cloned()
-                .collect();
-
-            if keys_to_remove.is_empty() {
-                results.push(format!("No active watch for {repo}"));
-            } else {
-                for key in &keys_to_remove {
-                    watches.remove(key);
-                }
-                results.push(format!(
-                    "Stopped watching {repo} ({} branches)",
-                    keys_to_remove.len()
-                ));
-            }
-        }
-        drop(watches);
+        // Remove from runtime watch map, track how many branches were active per repo
+        let removed_counts: Vec<(String, usize)> = {
+            let mut watches = self.watches.lock().await;
+            params
+                .repos
+                .iter()
+                .map(|repo| {
+                    let prefix = format!("{repo}#");
+                    let keys: Vec<String> = watches
+                        .keys()
+                        .filter(|k| k.starts_with(&prefix))
+                        .cloned()
+                        .collect();
+                    for key in &keys {
+                        watches.remove(key);
+                    }
+                    (repo.clone(), keys.len())
+                })
+                .collect()
+        };
         save_watches(&self.watches).await;
 
+        // Remove from config and build messages based on both sources of truth
         let mut config = self.config.lock().await;
-        config.remove_repos(&params.repos);
+        let mut results = Vec::new();
+        for (repo, branch_count) in removed_counts {
+            let was_in_config = config.repos.contains_key(&repo);
+            config.repos.remove(&repo);
+            let msg = match (branch_count, was_in_config) {
+                (n, _) if n > 0 => format!("Stopped watching {repo} ({n} branches)"),
+                (_, true) => {
+                    format!("{repo}: removed from config (was not actively polling)")
+                }
+                _ => format!("{repo}: not found"),
+            };
+            results.push(msg);
+        }
         save_config(&config);
 
         Ok(CallToolResult::success(vec![Content::text(
@@ -291,7 +317,12 @@ impl BuildWatcher {
         Parameters(params): Parameters<ConfigureBranchesParams>,
     ) -> Result<CallToolResult, McpError> {
         let mut config = self.config.lock().await;
-        let existing = config.repos.get(&params.repo).cloned().unwrap_or_default();
+        let Some(existing) = config.repos.get(&params.repo).cloned() else {
+            return Ok(CallToolResult::error(vec![Content::text(format!(
+                "{} is not being watched — use watch_builds first",
+                params.repo
+            ))]));
+        };
         config.repos.insert(
             params.repo.clone(),
             RepoConfig {
@@ -852,7 +883,7 @@ async fn check_for_new_runs(
 
 async fn startup_watches(watches: &Watches, config: &SharedConfig) {
     // Resume existing watches — recover any in-progress builds that were active at shutdown
-    let snapshot: Vec<String> = {
+    let snapshot: std::collections::HashSet<String> = {
         let w = watches.lock().await;
         w.keys().cloned().collect()
     };
@@ -865,6 +896,13 @@ async fn startup_watches(watches: &Watches, config: &SharedConfig) {
             Ok(runs) => {
                 let mut w = watches.lock().await;
                 if let Some(entry) = w.get_mut(key) {
+                    // Advance the high-water mark so check_for_new_runs won't re-notify
+                    // runs that were already known before the daemon stopped.
+                    if let Some(max_id) = runs.iter().map(|r| r.id).max()
+                        && max_id > entry.last_seen_run_id
+                    {
+                        entry.last_seen_run_id = max_id;
+                    }
                     for run in &runs {
                         if !run.is_completed() && !entry.active_runs.contains_key(&run.id) {
                             tracing::info!("Recovering in-progress run {} for {key}", run.id);
