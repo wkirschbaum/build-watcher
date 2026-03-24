@@ -5,6 +5,11 @@ A background daemon that monitors GitHub Actions builds and sends desktop notifi
 ## Features
 
 - Desktop notifications on build start, success, and failure — with a direct link to the run
+- Build duration shown in completion notifications
+- Failing job/step context included in failure notifications
+- PR titles displayed for pull request events
+- Per-repo workflow filtering and global workflow ignore list
+- Pause/resume notifications temporarily
 - Persistent watches that survive restarts
 - Tracks multiple concurrent builds on the same branch
 - Configurable notification urgency per event, per repo, or per branch
@@ -41,9 +46,9 @@ This builds the binary, installs it to `~/.local/bin/`, creates a default config
 From Claude Code, use natural language:
 
 ```
-watch floatpays/moneyclub
+watch wkirschbaum/build-watcher
 list my watched builds
-stop watching floatpays/moneyclub
+stop watching wkirschbaum/build-watcher
 ```
 
 Or call the MCP tools directly:
@@ -55,7 +60,12 @@ Or call the MCP tools directly:
 | `list_watches` | Show all watched repos and their status |
 | `configure_branches` | Set custom branches for a repo |
 | `set_default_branches` | Change the default branches for all repos |
+| `configure_workflows` | Filter which workflows to watch per repo |
+| `ignore_workflows` | Globally ignore workflows (e.g. Semgrep, Dependabot) |
+| `unignore_workflows` | Stop ignoring workflows |
 | `configure_notifications` | Set notification levels (global, per-repo, or per-branch) |
+| `pause_notifications` | Temporarily suppress notifications (minutes or indefinite) |
+| `resume_notifications` | Resume notifications after a pause |
 | `get_config` | Show current configuration |
 | `test_notification` | Send a test notification to verify setup |
 
@@ -73,9 +83,13 @@ Config lives at `~/.config/build-watcher/config.json`:
     "build_success": "normal",
     "build_failure": "critical"
   },
+  "ignored_workflows": ["Semgrep"],
   "repos": {
-    "floatpays/benefits": {},
-    "floatpays/moneyclub": {
+    "wkirschbaum/build-watcher": {
+      "branches": ["main"],
+      "workflows": ["CI"]
+    },
+    "wkirschbaum/elixir-ts-mode": {
       "branches": ["main", "release"],
       "notifications": {
         "build_started": "off"

@@ -763,7 +763,7 @@ impl BuildWatcher {
     }
 
     #[tool(
-        description = "Configure notification levels. Scope depends on which params are set: global (no repo/branch), per-repo (repo only), or per-branch (repo + branch). Only the events you specify are changed; others keep their current value. Levels: off, low, normal, critical. Examples: 'only notify me on failure for benefits' or 'on the release branch, only notify on success'."
+        description = "Configure notification levels. Scope depends on which params are set: global (no repo/branch), per-repo (repo only), or per-branch (repo + branch). Only the events you specify are changed; others keep their current value. Levels: off, low, normal, critical. Examples: 'only notify me on failure for build-watcher' or 'on the release branch, only notify on success'."
     )]
     async fn configure_notifications(
         &self,
