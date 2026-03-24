@@ -11,6 +11,33 @@ pub fn short_sha(sha: &str) -> &str {
     sha.get(..7).unwrap_or(sha)
 }
 
+/// Execute a `gh` CLI command with timeout. Returns raw stdout bytes on success.
+async fn gh_exec(repo: &str, args: &[&str]) -> Result<Vec<u8>, GhError> {
+    let output = tokio::time::timeout(
+        GH_TIMEOUT,
+        tokio::process::Command::new("gh").args(args).output(),
+    )
+    .await
+    .map_err(|_| GhError::Timeout {
+        repo: repo.to_string(),
+        timeout_secs: GH_TIMEOUT.as_secs(),
+    })?
+    .map_err(|e| GhError::Spawn {
+        repo: repo.to_string(),
+        source: e,
+    })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        return Err(GhError::CliError {
+            repo: repo.to_string(),
+            stderr,
+        });
+    }
+
+    Ok(output.stdout)
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum GhError {
     #[error("{repo}: gh timed out after {timeout_secs}s")]
@@ -142,85 +169,49 @@ impl RunInfo {
 
 #[tracing::instrument(skip_all, fields(%repo, %branch))]
 pub async fn gh_recent_runs(repo: &str, branch: &str) -> Result<Vec<RunInfo>, GhError> {
-    let output = tokio::time::timeout(
-        GH_TIMEOUT,
-        tokio::process::Command::new("gh")
-            .args([
-                "run",
-                "list",
-                "--repo",
-                repo,
-                "--branch",
-                branch,
-                "--limit",
-                "10",
-                "--json",
-                GH_JSON_FIELDS,
-            ])
-            .output(),
+    let stdout = gh_exec(
+        repo,
+        &[
+            "run",
+            "list",
+            "--repo",
+            repo,
+            "--branch",
+            branch,
+            "--limit",
+            "10",
+            "--json",
+            GH_JSON_FIELDS,
+        ],
     )
-    .await
-    .map_err(|_| GhError::Timeout {
-        repo: repo.to_string(),
-        timeout_secs: GH_TIMEOUT.as_secs(),
-    })?
-    .map_err(|e| GhError::Spawn {
+    .await?;
+
+    let raw: Vec<GhRunJson> = serde_json::from_slice(&stdout).map_err(|e| GhError::Parse {
         repo: repo.to_string(),
         source: e,
     })?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-        return Err(GhError::CliError {
-            repo: repo.to_string(),
-            stderr,
-        });
-    }
-
-    let raw: Vec<GhRunJson> =
-        serde_json::from_slice(&output.stdout).map_err(|e| GhError::Parse {
-            repo: repo.to_string(),
-            source: e,
-        })?;
 
     Ok(raw.into_iter().filter_map(RunInfo::from_gh_json).collect())
 }
 
 #[tracing::instrument(skip_all, fields(%repo, %run_id))]
 pub async fn gh_run_status(repo: &str, run_id: u64) -> Result<RunInfo, GhError> {
-    let output = tokio::time::timeout(
-        GH_TIMEOUT,
-        tokio::process::Command::new("gh")
-            .args([
-                "run",
-                "view",
-                &run_id.to_string(),
-                "--repo",
-                repo,
-                "--json",
-                GH_JSON_FIELDS,
-            ])
-            .output(),
+    let id_str = run_id.to_string();
+    let stdout = gh_exec(
+        repo,
+        &[
+            "run",
+            "view",
+            &id_str,
+            "--repo",
+            repo,
+            "--json",
+            GH_JSON_FIELDS,
+        ],
     )
-    .await
-    .map_err(|_| GhError::Timeout {
-        repo: repo.to_string(),
-        timeout_secs: GH_TIMEOUT.as_secs(),
-    })?
-    .map_err(|e| GhError::Spawn {
-        repo: repo.to_string(),
-        source: e,
-    })?;
+    .await?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-        return Err(GhError::CliError {
-            repo: repo.to_string(),
-            stderr,
-        });
-    }
-
-    let raw: GhRunJson = serde_json::from_slice(&output.stdout).map_err(|e| GhError::Parse {
+    let raw: GhRunJson = serde_json::from_slice(&stdout).map_err(|e| GhError::Parse {
         repo: repo.to_string(),
         source: e,
     })?;
@@ -244,7 +235,7 @@ fn display_title(event: &str, title: &str, head_sha: &str) -> String {
 }
 
 /// Fetch the failing job and step names for a completed run.
-/// Returns a human-readable string like "Job: Build / Step: Run tests", or None on error.
+/// Returns a human-readable string like "Build / Run tests", or None on error.
 pub async fn gh_failing_steps(repo: &str, run_id: u64) -> Option<String> {
     #[derive(Debug, Deserialize)]
     struct GhStep {
@@ -264,29 +255,15 @@ pub async fn gh_failing_steps(repo: &str, run_id: u64) -> Option<String> {
         jobs: Vec<GhJob>,
     }
 
-    let output = tokio::time::timeout(
-        GH_TIMEOUT,
-        tokio::process::Command::new("gh")
-            .args([
-                "run",
-                "view",
-                &run_id.to_string(),
-                "--repo",
-                repo,
-                "--json",
-                "jobs",
-            ])
-            .output(),
+    let id_str = run_id.to_string();
+    let stdout = gh_exec(
+        repo,
+        &["run", "view", &id_str, "--repo", repo, "--json", "jobs"],
     )
     .await
-    .ok()?
     .ok()?;
 
-    if !output.status.success() {
-        return None;
-    }
-
-    let resp: GhJobsResponse = serde_json::from_slice(&output.stdout).ok()?;
+    let resp: GhJobsResponse = serde_json::from_slice(&stdout).ok()?;
     let mut failures: Vec<String> = Vec::new();
 
     for job in &resp.jobs {
@@ -306,6 +283,180 @@ pub async fn gh_failing_steps(repo: &str, run_id: u64) -> Option<String> {
     } else {
         Some(failures.join(", "))
     }
+}
+
+/// Rerun a GitHub Actions run. If `failed_only` is true, only reruns failed jobs.
+pub async fn gh_run_rerun(repo: &str, run_id: u64, failed_only: bool) -> Result<String, GhError> {
+    let id_str = run_id.to_string();
+    let mut args = vec!["run", "rerun", &id_str, "--repo", repo];
+    if failed_only {
+        args.push("--failed");
+    }
+    let stdout = gh_exec(repo, &args).await?;
+    Ok(String::from_utf8_lossy(&stdout).to_string())
+}
+
+/// A build history entry with timestamps for duration/age calculation.
+#[derive(Debug)]
+pub struct HistoryEntry {
+    #[allow(dead_code)]
+    pub id: u64,
+    pub conclusion: String,
+    pub workflow: String,
+    pub title: String,
+    #[allow(dead_code)]
+    pub branch: String,
+    pub event: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+impl HistoryEntry {
+    pub fn display_title(&self) -> String {
+        display_title(&self.event, &self.title, "")
+    }
+
+    /// Duration as `updated_at - created_at`, parsed from ISO 8601 timestamps.
+    pub fn duration_secs(&self) -> Option<u64> {
+        let start = parse_iso_epoch(&self.created_at)?;
+        let end = parse_iso_epoch(&self.updated_at)?;
+        Some(end.saturating_sub(start))
+    }
+
+    /// Seconds since `created_at`.
+    pub fn age_secs(&self) -> Option<u64> {
+        let start = parse_iso_epoch(&self.created_at)?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_secs();
+        Some(now.saturating_sub(start))
+    }
+}
+
+/// Minimal ISO 8601 parser -> Unix epoch seconds. Handles "2026-03-24T10:30:00Z" format.
+fn parse_iso_epoch(s: &str) -> Option<u64> {
+    // Format: YYYY-MM-DDTHH:MM:SSZ (GitHub always returns UTC)
+    let s = s.trim().trim_end_matches('Z');
+    let (date, time) = s.split_once('T')?;
+    let parts: Vec<&str> = date.split('-').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let year: u64 = parts[0].parse().ok()?;
+    let month: u64 = parts[1].parse().ok()?;
+    let day: u64 = parts[2].parse().ok()?;
+
+    let time_parts: Vec<&str> = time.split(':').collect();
+    if time_parts.len() < 2 {
+        return None;
+    }
+    let hour: u64 = time_parts[0].parse().ok()?;
+    let min: u64 = time_parts[1].parse().ok()?;
+    let sec: u64 = time_parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(0);
+
+    // Days from epoch using a simplified calculation
+    let mut days: u64 = 0;
+    for y in 1970..year {
+        days += if y.is_multiple_of(4) && (!y.is_multiple_of(100) || y.is_multiple_of(400)) {
+            366
+        } else {
+            365
+        };
+    }
+    let is_leap = year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
+    let month_days = [
+        31,
+        if is_leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
+    for md in &month_days[..((month - 1) as usize)] {
+        days += md;
+    }
+    days += day - 1;
+
+    Some(days * 86400 + hour * 3600 + min * 60 + sec)
+}
+
+const GH_HISTORY_FIELDS: &str =
+    "databaseId,conclusion,displayTitle,workflowName,headBranch,event,createdAt,updatedAt";
+
+/// Fetch recent build history for a repo, optionally filtered by branch.
+pub async fn gh_run_list_history(
+    repo: &str,
+    branch: Option<&str>,
+    limit: u32,
+) -> Result<Vec<HistoryEntry>, GhError> {
+    #[derive(Debug, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct GhHistoryJson {
+        database_id: Option<u64>,
+        #[serde(default)]
+        conclusion: String,
+        #[serde(default)]
+        display_title: String,
+        #[serde(default)]
+        workflow_name: String,
+        #[serde(default)]
+        head_branch: String,
+        #[serde(default)]
+        event: String,
+        #[serde(default)]
+        created_at: String,
+        #[serde(default)]
+        updated_at: String,
+    }
+
+    let limit_str = limit.to_string();
+    let mut args = vec![
+        "run",
+        "list",
+        "--repo",
+        repo,
+        "--limit",
+        &limit_str,
+        "--json",
+        GH_HISTORY_FIELDS,
+    ];
+    if let Some(b) = branch {
+        args.push("--branch");
+        args.push(b);
+    }
+
+    let stdout = gh_exec(repo, &args).await?;
+    let raw: Vec<GhHistoryJson> = serde_json::from_slice(&stdout).map_err(|e| GhError::Parse {
+        repo: repo.to_string(),
+        source: e,
+    })?;
+
+    Ok(raw
+        .into_iter()
+        .filter_map(|r| {
+            Some(HistoryEntry {
+                id: r.database_id?,
+                conclusion: if r.conclusion.is_empty() {
+                    "in_progress".to_string()
+                } else {
+                    r.conclusion
+                },
+                workflow: r.workflow_name,
+                title: r.display_title,
+                branch: r.head_branch,
+                event: r.event,
+                created_at: r.created_at,
+                updated_at: r.updated_at,
+            })
+        })
+        .collect())
 }
 
 /// Validates that a branch name contains only safe characters.

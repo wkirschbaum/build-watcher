@@ -29,9 +29,32 @@ impl NotifySend {
     }
 }
 
+const DEFAULT_ERROR_SOUND: &str = "/usr/share/sounds/freedesktop/stereo/dialog-error.oga";
+
 impl Notifier for NotifySend {
     fn name(&self) -> &'static str {
         "notify-send"
+    }
+
+    fn play_sound(&self, path: Option<&str>) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        let path = path.unwrap_or(DEFAULT_ERROR_SOUND).to_string();
+        Box::pin(async move {
+            // Try paplay (PulseAudio/PipeWire) first, fall back to aplay (ALSA)
+            let result = tokio::process::Command::new("paplay")
+                .arg(&path)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .await;
+            if result.is_err() || !result.unwrap().success() {
+                let _ = tokio::process::Command::new("aplay")
+                    .arg(&path)
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .await;
+            }
+        })
     }
 
     fn send(

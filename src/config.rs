@@ -205,6 +205,16 @@ impl Default for NotificationConfig {
     }
 }
 
+/// Sound-on-failure configuration.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SoundConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Path to a .wav/.ogg file. None means use system default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sound_file: Option<String>,
+}
+
 /// Per-branch notification overrides.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BranchConfig {
@@ -219,6 +229,8 @@ pub struct RepoConfig {
     pub branches: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub workflows: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sound_on_failure: Option<bool>,
     #[serde(default, skip_serializing_if = "NotificationOverrides::is_empty")]
     pub notifications: NotificationOverrides,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
@@ -233,6 +245,8 @@ pub struct Config {
     pub ignored_workflows: Vec<String>,
     #[serde(default)]
     pub notifications: NotificationConfig,
+    #[serde(default)]
+    pub sound_on_failure: SoundConfig,
     #[serde(default = "default_active_poll_seconds")]
     pub active_poll_seconds: u64,
     #[serde(default = "default_idle_poll_seconds")]
@@ -259,6 +273,7 @@ impl Default for Config {
             default_branches: default_branches(),
             ignored_workflows: Vec::new(),
             notifications: NotificationConfig::default(),
+            sound_on_failure: SoundConfig::default(),
             active_poll_seconds: default_active_poll_seconds(),
             idle_poll_seconds: default_idle_poll_seconds(),
             repos: HashMap::new(),
@@ -291,6 +306,14 @@ impl Config {
                 .or_else(|| repo_overrides.and_then(|o| o.build_failure))
                 .unwrap_or(global.build_failure),
         }
+    }
+
+    /// Whether sound on failure is enabled for a repo (repo override > global).
+    pub fn sound_on_failure_for(&self, repo: &str) -> bool {
+        self.repos
+            .get(repo)
+            .and_then(|r| r.sound_on_failure)
+            .unwrap_or(self.sound_on_failure.enabled)
     }
 
     /// Workflow filter for a repo. Empty slice means all workflows.

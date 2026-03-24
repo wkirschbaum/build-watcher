@@ -14,10 +14,10 @@ use crate::config::{
     NotificationLevel, NotificationOverrides, PersistError, RepoConfig, config_dir, save_config,
     state_dir,
 };
-use crate::github::{validate_branch, validate_repo};
+use crate::github::{gh_run_list_history, gh_run_rerun, validate_branch, validate_repo};
 use crate::watcher::{
-    PauseState, SharedConfig, WatcherHandle, Watches, parse_watch_key, save_watches, start_watch,
-    watch_key,
+    PauseState, SharedConfig, WatcherHandle, Watches, last_failed_build, parse_watch_key,
+    save_watches, start_watch, watch_key,
 };
 
 const DEFAULT_PORT: u16 = 8417;
@@ -231,6 +231,37 @@ struct UnignoreWorkflowsParams {
 struct PauseNotificationsParams {
     /// Minutes to pause notifications. Omit or 0 to pause until restart.
     minutes: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct ConfigureSoundParams {
+    /// Enable or disable failure sound globally
+    enabled: Option<bool>,
+    /// Custom sound file path (absolute). Omit to use system default.
+    sound_file: Option<String>,
+    /// Optional repo to override sound setting per-repo
+    repo: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct RerunBuildParams {
+    /// GitHub repo in "owner/repo" format
+    repo: String,
+    /// Run ID to rerun. Omit to rerun the last failed build.
+    run_id: Option<u64>,
+    /// If true, only rerun failed jobs within the run (default: false)
+    #[serde(default)]
+    failed_only: bool,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct BuildHistoryParams {
+    /// GitHub repo in "owner/repo" format
+    repo: String,
+    /// Optional branch filter. If omitted, shows all branches.
+    branch: Option<String>,
+    /// Number of builds to show (default: 10, max: 50)
+    limit: Option<u32>,
 }
 
 #[derive(Clone)]
@@ -482,6 +513,7 @@ impl BuildWatcher {
             RepoConfig {
                 branches: params.branches.clone(),
                 workflows: existing.workflows,
+                sound_on_failure: existing.sound_on_failure,
                 notifications: existing.notifications,
                 branch_notifications: existing.branch_notifications,
             },
@@ -544,6 +576,21 @@ impl BuildWatcher {
             config.notifications.build_started,
             config.notifications.build_success,
             config.notifications.build_failure,
+        ));
+
+        lines.push(format!(
+            "\nSound on failure: {}{}",
+            if config.sound_on_failure.enabled {
+                "enabled"
+            } else {
+                "disabled"
+            },
+            config
+                .sound_on_failure
+                .sound_file
+                .as_ref()
+                .map(|p| format!(" ({p})"))
+                .unwrap_or_default()
         ));
 
         if !config.ignored_workflows.is_empty() {
@@ -763,6 +810,209 @@ impl BuildWatcher {
     }
 
     #[tool(
+        description = "Configure the sound-on-failure feature. Disabled by default. When enabled, plays an audio alert when builds fail. Set globally or per-repo."
+    )]
+    async fn configure_sound(
+        &self,
+        Parameters(params): Parameters<ConfigureSoundParams>,
+    ) -> Result<CallToolResult, McpError> {
+        if let Some(repo) = &params.repo
+            && let Err(e) = validate_repo(repo)
+        {
+            return Ok(CallToolResult::error(vec![Content::text(e)]));
+        }
+
+        let mut config = self.config.lock().await;
+        let mut msg = String::new();
+
+        if let Some(repo) = &params.repo {
+            let Some(rc) = config.repos.get_mut(repo) else {
+                return Ok(CallToolResult::error(vec![Content::text(format!(
+                    "{repo} is not being watched — use watch_builds first"
+                ))]));
+            };
+            if let Some(enabled) = params.enabled {
+                rc.sound_on_failure = Some(enabled);
+                msg = format!(
+                    "{repo}: sound on failure {}",
+                    if enabled { "enabled" } else { "disabled" }
+                );
+            }
+        } else {
+            if let Some(enabled) = params.enabled {
+                config.sound_on_failure.enabled = enabled;
+                msg = format!(
+                    "Sound on failure globally {}",
+                    if enabled { "enabled" } else { "disabled" }
+                );
+            }
+            if let Some(path) = &params.sound_file {
+                config.sound_on_failure.sound_file = if path.is_empty() {
+                    None
+                } else {
+                    Some(path.clone())
+                };
+                if !msg.is_empty() {
+                    msg.push('\n');
+                }
+                msg.push_str(&format!(
+                    "Sound file: {}",
+                    config
+                        .sound_on_failure
+                        .sound_file
+                        .as_deref()
+                        .unwrap_or("(system default)")
+                ));
+            }
+        }
+
+        if msg.is_empty() {
+            msg = format!(
+                "Sound on failure: {}\nSound file: {}",
+                if config.sound_on_failure.enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                },
+                config
+                    .sound_on_failure
+                    .sound_file
+                    .as_deref()
+                    .unwrap_or("(system default)")
+            );
+        }
+        if let Some(warning) = persist_warning(save_config(&config)) {
+            msg.push_str(&warning);
+        }
+
+        Ok(CallToolResult::success(vec![Content::text(msg)]))
+    }
+
+    #[tool(
+        description = "Rerun a GitHub Actions build. Specify a run_id, or omit to rerun the last failed build for the repo. Set failed_only to only rerun failed jobs."
+    )]
+    async fn rerun_build(
+        &self,
+        Parameters(params): Parameters<RerunBuildParams>,
+    ) -> Result<CallToolResult, McpError> {
+        if let Err(e) = validate_repo(&params.repo) {
+            return Ok(CallToolResult::error(vec![Content::text(e)]));
+        }
+
+        let run_id = if let Some(id) = params.run_id {
+            id
+        } else {
+            let watches = self.watches.lock().await;
+            match last_failed_build(&watches, &params.repo) {
+                Some((key, build)) => {
+                    let (_, branch) = parse_watch_key(&key);
+                    tracing::info!(
+                        repo = params.repo,
+                        branch,
+                        run_id = build.run_id,
+                        "Rerunning last failed build"
+                    );
+                    build.run_id
+                }
+                None => {
+                    return Ok(CallToolResult::error(vec![Content::text(format!(
+                        "No recent failed build found for {}",
+                        params.repo
+                    ))]));
+                }
+            }
+        };
+
+        match gh_run_rerun(&params.repo, run_id, params.failed_only).await {
+            Ok(_) => {
+                let url = format!("https://github.com/{}/actions/runs/{run_id}", params.repo);
+                let kind = if params.failed_only {
+                    "failed jobs"
+                } else {
+                    "all jobs"
+                };
+                Ok(CallToolResult::success(vec![Content::text(format!(
+                    "Rerunning {kind} for run {run_id}\n{url}"
+                ))]))
+            }
+            Err(e) => Ok(CallToolResult::error(vec![Content::text(e.to_string())])),
+        }
+    }
+
+    #[tool(
+        description = "Show recent build history for a repo. Displays conclusion, workflow, title, duration, and age. Optionally filter by branch."
+    )]
+    async fn build_history(
+        &self,
+        Parameters(params): Parameters<BuildHistoryParams>,
+    ) -> Result<CallToolResult, McpError> {
+        if let Err(e) = validate_repo(&params.repo) {
+            return Ok(CallToolResult::error(vec![Content::text(e)]));
+        }
+        if let Some(branch) = &params.branch
+            && let Err(e) = validate_branch(branch)
+        {
+            return Ok(CallToolResult::error(vec![Content::text(e)]));
+        }
+
+        let limit = params.limit.unwrap_or(10).min(50);
+        let entries = match gh_run_list_history(&params.repo, params.branch.as_deref(), limit).await
+        {
+            Ok(e) => e,
+            Err(e) => return Ok(CallToolResult::error(vec![Content::text(e.to_string())])),
+        };
+
+        if entries.is_empty() {
+            return Ok(CallToolResult::success(vec![Content::text(
+                "No builds found",
+            )]));
+        }
+
+        let mut lines = Vec::new();
+        lines.push(format!(
+            "{:<12} {:<20} {:<35} {:<10} {}",
+            "Conclusion", "Workflow", "Title", "Duration", "When"
+        ));
+        lines.push(format!(
+            "{:<12} {:<20} {:<35} {:<10} {}",
+            "───────────",
+            "────────────────────",
+            "───────────────────────────────────",
+            "──────────",
+            "─────"
+        ));
+
+        for entry in &entries {
+            let duration = entry
+                .duration_secs()
+                .map(format_secs)
+                .unwrap_or_else(|| "—".to_string());
+            let age = entry
+                .age_secs()
+                .map(format_age)
+                .unwrap_or_else(|| "—".to_string());
+            let title = entry.display_title();
+            let title_truncated = if title.len() > 33 {
+                format!("{}…", &title[..32])
+            } else {
+                title
+            };
+            lines.push(format!(
+                "{:<12} {:<20} {:<35} {:<10} {}",
+                entry.conclusion,
+                truncate(&entry.workflow, 18),
+                title_truncated,
+                duration,
+                age,
+            ));
+        }
+
+        Ok(CallToolResult::success(vec![Content::text(
+            lines.join("\n"),
+        )]))
+    }
+
+    #[tool(
         description = "Configure notification levels. Scope depends on which params are set: global (no repo/branch), per-repo (repo only), or per-branch (repo + branch). Only the events you specify are changed; others keep their current value. Levels: off, low, normal, critical. Examples: 'only notify me on failure for build-watcher' or 'on the release branch, only notify on success'."
     )]
     async fn configure_notifications(
@@ -893,6 +1143,9 @@ impl ServerHandler for BuildWatcher {
                  set scope with repo and branch params (global if omitted, per-repo, or per-branch). \
                  Levels: off, low, normal, critical. \
                  Use pause_notifications/resume_notifications to temporarily suppress notifications. \
+                 Use configure_sound to enable/disable audio alerts on failure. \
+                 Use rerun_build to rerun a failed build (or the last failed build for a repo). \
+                 Use build_history to see recent builds for a repo. \
                  Use get_config to see current settings.",
             )
     }
@@ -903,6 +1156,40 @@ impl ServerHandler for BuildWatcher {
         _context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<ServerInfo, McpError> {
         Ok(self.get_info())
+    }
+}
+
+fn format_secs(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else {
+        let m = secs / 60;
+        let s = secs % 60;
+        if s == 0 {
+            format!("{m}m")
+        } else {
+            format!("{m}m {s}s")
+        }
+    }
+}
+
+fn format_age(secs: u64) -> String {
+    if secs < 60 {
+        "just now".to_string()
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else if secs < 86400 {
+        format!("{}h ago", secs / 3600)
+    } else {
+        format!("{}d ago", secs / 86400)
+    }
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.len() > max {
+        format!("{}…", &s[..max - 1])
+    } else {
+        s.to_string()
     }
 }
 

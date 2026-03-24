@@ -9,6 +9,9 @@ A background daemon that monitors GitHub Actions builds and sends desktop notifi
 - Failing job/step context included in failure notifications
 - PR titles displayed for pull request events
 - Per-repo workflow filtering and global workflow ignore list
+- Optional audio alert on build failure (disabled by default)
+- Rerun failed builds directly from Claude Code
+- Build history summary with duration and age
 - Pause/resume notifications temporarily
 - Persistent watches that survive restarts
 - Tracks multiple concurrent builds on the same branch
@@ -64,8 +67,11 @@ Or call the MCP tools directly:
 | `ignore_workflows` | Globally ignore workflows (e.g. Semgrep, Dependabot) |
 | `unignore_workflows` | Stop ignoring workflows |
 | `configure_notifications` | Set notification levels (global, per-repo, or per-branch) |
+| `configure_sound` | Enable/disable audio alert on build failure |
 | `pause_notifications` | Temporarily suppress notifications (minutes or indefinite) |
 | `resume_notifications` | Resume notifications after a pause |
+| `rerun_build` | Rerun a failed build (specific ID or last failed) |
+| `build_history` | Show recent builds for a repo with duration and age |
 | `get_config` | Show current configuration |
 | `test_notification` | Send a test notification to verify setup |
 

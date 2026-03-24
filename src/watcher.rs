@@ -320,6 +320,17 @@ struct Poller {
     token: CancellationToken,
 }
 
+/// Snapshot of config values needed for a poll cycle.
+struct PollConfig {
+    active_secs: u64,
+    idle_secs: u64,
+    notif: NotificationConfig,
+    workflows: Vec<String>,
+    ignored: Vec<String>,
+    sound_on_failure: bool,
+    sound_file: Option<String>,
+}
+
 fn format_duration(d: Duration) -> String {
     let secs = d.as_secs();
     if secs < 60 {
@@ -379,9 +390,12 @@ impl Poller {
                 None => return,
             };
 
-            let (active_secs, idle_secs, notif, workflows, ignored) =
-                self.read_config(&repo, &branch).await;
-            let delay = if has_active { active_secs } else { idle_secs };
+            let pcfg = self.read_config(&repo, &branch).await;
+            let delay = if has_active {
+                pcfg.active_secs
+            } else {
+                pcfg.idle_secs
+            };
 
             if !self.cancellable_sleep(Duration::from_secs(delay)).await {
                 return;
@@ -391,14 +405,13 @@ impl Poller {
             }
 
             if has_active {
-                self.poll_active_runs(&repo, &branch, &notif).await;
+                self.poll_active_runs(&repo, &branch, &pcfg).await;
             }
 
-            let due =
-                last_new_run_check.is_none_or(|t| t.elapsed() >= Duration::from_secs(idle_secs));
+            let due = last_new_run_check
+                .is_none_or(|t| t.elapsed() >= Duration::from_secs(pcfg.idle_secs));
             if due {
-                self.check_for_new_runs(&repo, &branch, &notif, &workflows, &ignored)
-                    .await;
+                self.check_for_new_runs(&repo, &branch, &pcfg).await;
                 last_new_run_check = Some(Instant::now());
             }
         }
@@ -415,23 +428,21 @@ impl Poller {
         }
     }
 
-    async fn read_config(
-        &self,
-        repo: &str,
-        branch: &str,
-    ) -> (u64, u64, NotificationConfig, Vec<String>, Vec<String>) {
+    async fn read_config(&self, repo: &str, branch: &str) -> PollConfig {
         let cfg = self.config.lock().await;
-        (
-            cfg.active_poll_seconds,
-            cfg.idle_poll_seconds,
-            cfg.notifications_for(repo, branch),
-            cfg.workflows_for(repo).to_vec(),
-            cfg.ignored_workflows.clone(),
-        )
+        PollConfig {
+            active_secs: cfg.active_poll_seconds,
+            idle_secs: cfg.idle_poll_seconds,
+            notif: cfg.notifications_for(repo, branch),
+            workflows: cfg.workflows_for(repo).to_vec(),
+            ignored: cfg.ignored_workflows.clone(),
+            sound_on_failure: cfg.sound_on_failure_for(repo),
+            sound_file: cfg.sound_on_failure.sound_file.clone(),
+        }
     }
 
     /// Poll all in-progress runs, notify on completion, handle failures.
-    async fn poll_active_runs(&self, repo: &str, branch: &str, notif: &NotificationConfig) {
+    async fn poll_active_runs(&self, repo: &str, branch: &str, pcfg: &PollConfig) {
         let run_ids: Vec<u64> = {
             let w = self.watches.lock().await;
             match w.get(&self.key) {
@@ -474,7 +485,7 @@ impl Poller {
                 };
 
                 if self.is_active().await {
-                    self.notify_completion(&run, repo, branch, notif, elapsed)
+                    self.notify_completion(&run, repo, branch, pcfg, elapsed)
                         .await;
                 }
 
@@ -503,14 +514,7 @@ impl Poller {
     }
 
     /// Check for runs newer than our high-water mark. Notify starts (and immediate completions).
-    async fn check_for_new_runs(
-        &self,
-        repo: &str,
-        branch: &str,
-        notif: &NotificationConfig,
-        workflows: &[String],
-        ignored: &[String],
-    ) {
+    async fn check_for_new_runs(&self, repo: &str, branch: &str, pcfg: &PollConfig) {
         let last_seen = {
             let w = self.watches.lock().await;
             match w.get(&self.key) {
@@ -530,9 +534,18 @@ impl Poller {
         let new_runs: Vec<&RunInfo> = runs
             .iter()
             .filter(|r| r.id > last_seen)
-            .filter(|r| !ignored.iter().any(|i| r.workflow.eq_ignore_ascii_case(i)))
             .filter(|r| {
-                workflows.is_empty() || workflows.iter().any(|w| r.workflow.eq_ignore_ascii_case(w))
+                !pcfg
+                    .ignored
+                    .iter()
+                    .any(|i| r.workflow.eq_ignore_ascii_case(i))
+            })
+            .filter(|r| {
+                pcfg.workflows.is_empty()
+                    || pcfg
+                        .workflows
+                        .iter()
+                        .any(|w| r.workflow.eq_ignore_ascii_case(w))
             })
             .collect();
         // Still bump the high-water mark from all runs (not just filtered) to avoid
@@ -552,10 +565,10 @@ impl Poller {
                 sha = run.short_sha(), workflow = %run.workflow, title = %run.title,
                 "New build detected"
             );
-            self.notify_started(run, repo, branch, notif).await;
+            self.notify_started(run, repo, branch, &pcfg.notif).await;
 
             if run.is_completed() {
-                self.notify_completion(run, repo, branch, notif, None).await;
+                self.notify_completion(run, repo, branch, pcfg, None).await;
                 tracing::info!(
                     key = self.key, run_id = run.id,
                     sha = run.short_sha(), conclusion = %run.conclusion,
@@ -611,16 +624,16 @@ impl Poller {
         run: &RunInfo,
         repo: &str,
         branch: &str,
-        notif: &NotificationConfig,
+        pcfg: &PollConfig,
         elapsed: Option<Duration>,
     ) {
         if self.is_paused().await {
             return;
         }
         let (emoji, level) = if run.succeeded() {
-            ("✅", notif.build_success)
+            ("✅", pcfg.notif.build_success)
         } else {
-            ("❌", notif.build_failure)
+            ("❌", pcfg.notif.build_failure)
         };
 
         let duration_str = elapsed.map(|d| format!(" in {}", format_duration(d)));
@@ -646,6 +659,11 @@ impl Poller {
             Some(&group),
         )
         .await;
+
+        // Play sound on failure if enabled
+        if !run.succeeded() && pcfg.sound_on_failure {
+            platform::play_sound(pcfg.sound_file.as_deref()).await;
+        }
     }
 }
 
@@ -756,6 +774,25 @@ async fn start_new_config_watches(
         .collect();
 
     futures::future::join_all(futures).await;
+}
+
+/// Find the most recent failed build across all branches of a repo.
+pub fn last_failed_build<'a>(
+    watches: &'a HashMap<String, WatchEntry>,
+    repo: &str,
+) -> Option<(String, &'a LastBuild)> {
+    let prefix = format!("{repo}#");
+    watches
+        .iter()
+        .filter(|(k, _)| k.starts_with(&prefix))
+        .filter_map(|(k, entry)| {
+            entry
+                .last_build
+                .as_ref()
+                .filter(|b| b.conclusion != "success")
+                .map(|b| (k.clone(), b))
+        })
+        .max_by_key(|(_, b)| b.run_id)
 }
 
 // -- Tests --
