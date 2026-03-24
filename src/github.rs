@@ -223,7 +223,7 @@ pub async fn gh_run_status(repo: &str, run_id: u64) -> Result<RunInfo, GhError> 
 
 /// Format a human-readable title. PR events (pull_request, pull_request_target)
 /// show "PR: <title>", push events show "<title> (<sha>)".
-fn display_title(event: &str, title: &str, head_sha: &str) -> String {
+pub(crate) fn display_title(event: &str, title: &str, head_sha: &str) -> String {
     if event.starts_with("pull_request") {
         format!("PR: {title}")
     } else {

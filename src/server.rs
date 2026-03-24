@@ -16,8 +16,8 @@ use crate::config::{
 };
 use crate::github::{gh_run_list_history, gh_run_rerun, validate_branch, validate_repo};
 use crate::watcher::{
-    PauseState, SharedConfig, WatcherHandle, Watches, last_failed_build, parse_watch_key,
-    save_watches, start_watch, watch_key,
+    PauseState, SharedConfig, WatchKey, WatcherHandle, Watches, last_failed_build, save_watches,
+    start_watch,
 };
 
 const DEFAULT_PORT: u16 = 8417;
@@ -322,7 +322,6 @@ impl BuildWatcher {
         for (repo, branches) in &repo_branches {
             let mut any_started = false;
             for branch in branches {
-                let key = watch_key(repo, branch);
                 match start_watch(
                     &self.watches,
                     &self.config,
@@ -330,7 +329,6 @@ impl BuildWatcher {
                     &self.pause,
                     repo,
                     branch,
-                    &key,
                 )
                 .await
                 {
@@ -377,10 +375,9 @@ impl BuildWatcher {
                 .repos
                 .iter()
                 .map(|repo| {
-                    let prefix = format!("{repo}#");
-                    let keys: Vec<String> = watches
+                    let keys: Vec<WatchKey> = watches
                         .keys()
-                        .filter(|k| k.starts_with(&prefix))
+                        .filter(|k| k.matches_repo(repo))
                         .cloned()
                         .collect();
                     for key in &keys {
@@ -438,7 +435,7 @@ impl BuildWatcher {
         let mut watch_lines: Vec<String> = watches
             .iter()
             .map(|(key, entry)| {
-                let (repo, branch) = parse_watch_key(key);
+                let (repo, branch) = (&key.repo, &key.branch);
                 let last = entry
                     .last_build
                     .as_ref()
@@ -909,10 +906,9 @@ impl BuildWatcher {
             let watches = self.watches.lock().await;
             match last_failed_build(&watches, &params.repo) {
                 Some((key, build)) => {
-                    let (_, branch) = parse_watch_key(&key);
                     tracing::info!(
                         repo = params.repo,
-                        branch,
+                        branch = key.branch,
                         run_id = build.run_id,
                         "Rerunning last failed build"
                     );
@@ -1145,7 +1141,7 @@ impl BuildWatcher {
                 config
                     .default_branches
                     .first()
-                    .map_or(crate::watcher::DEFAULT_BRANCH, |s| s.as_str()),
+                    .map_or("main", |s| s.as_str()),
             ),
             _ => config.notifications.clone(),
         };
