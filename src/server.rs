@@ -974,7 +974,12 @@ impl BuildWatcher {
             )]));
         }
 
-        let show_branch = params.branch.is_none();
+        let distinct_branches = entries
+            .iter()
+            .map(|e| &e.branch)
+            .collect::<std::collections::HashSet<_>>()
+            .len();
+        let show_branch = params.branch.is_none() && distinct_branches > 1;
         let mut lines = Vec::new();
 
         if show_branch {
