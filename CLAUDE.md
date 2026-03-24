@@ -12,8 +12,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 cargo build --release       # Build release binary
 cargo build                 # Build debug binary
 cargo test --verbose        # Run tests
+cargo fmt                   # Format code
+cargo clippy                # Lint
 ./install.sh                # Build, install, and configure as a system service
 ```
+
+**Before every commit:** run `cargo fmt && cargo clippy && cargo test` and fix all issues first.
 
 **Environment variables:**
 - `BUILD_WATCHER_PORT` (default: `8417`) — HTTP port for the MCP server

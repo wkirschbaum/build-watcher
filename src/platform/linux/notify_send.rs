@@ -49,9 +49,20 @@ impl Notifier for NotifySend {
             NotificationLevel::Off => unreachable!(),
         };
 
+        let key = group.unwrap_or("build-watcher").to_string();
+        // key is "owner/repo#branch" — extract just "repo" for the app name
+        let app_name = key
+            .split('/')
+            .nth(1)
+            .unwrap_or(&key)
+            .split('#')
+            .next()
+            .unwrap_or(&key)
+            .to_string();
+
         let mut args = vec![
             "--app-name".to_string(),
-            "Build Watcher".to_string(),
+            app_name,
             "--urgency".to_string(),
             urgency.to_string(),
             "--icon".to_string(),
@@ -63,7 +74,6 @@ impl Notifier for NotifySend {
             "--print-id".to_string(),
         ];
 
-        let key = group.unwrap_or("build-watcher").to_string();
         {
             let ids = self.ids.lock().unwrap();
             if let Some(&id) = ids.get(&key) {
@@ -107,9 +117,7 @@ impl Notifier for NotifySend {
                 && action.trim() == "open"
                 && let Some(url) = url_owned
             {
-                let _ = tokio::process::Command::new("xdg-open")
-                    .arg(&url)
-                    .spawn();
+                let _ = tokio::process::Command::new("xdg-open").arg(&url).spawn();
             }
         });
     }

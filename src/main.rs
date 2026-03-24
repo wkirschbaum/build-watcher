@@ -662,23 +662,6 @@ async fn poll_repo(watches: Watches, config: SharedConfig, key: String) {
     }
 }
 
-/// Returns the display name for a repo: just the repo part (after `/`) if it's unique among
-/// all currently watched repos, or the full `owner/repo` if another owner has the same repo name.
-async fn repo_display_name(repo: &str, watches: &Watches) -> String {
-    let repo_name = repo.split('/').nth(1).unwrap_or(repo);
-    let w = watches.lock().await;
-    let conflict = w
-        .keys()
-        .filter_map(|k| k.split('#').next())
-        .filter(|r| r.split('/').nth(1) == Some(repo_name))
-        .any(|r| r != repo);
-    if conflict {
-        repo.to_string()
-    } else {
-        repo_name.to_string()
-    }
-}
-
 /// Poll all active runs for a watch. Notifies on completion and removes finished runs.
 async fn poll_active_runs(
     watches: &Watches,
@@ -687,7 +670,6 @@ async fn poll_active_runs(
     branch: &str,
     notif: &NotificationConfig,
 ) {
-    let display = repo_display_name(repo, watches).await;
     let run_ids: Vec<u64> = {
         let w = watches.lock().await;
         match w.get(key) {
@@ -736,11 +718,11 @@ async fn poll_active_runs(
             };
             let emoji = if run.succeeded() { "✅" } else { "❌" };
             platform::send_notification(
-                &format!("{emoji} Build {}: {display} [{branch}]", run.conclusion),
+                &format!("{emoji} Build {} [{branch}]", run.conclusion),
                 &format!("{}: {}", run.workflow, run.title),
                 level,
                 Some(&run.url(repo)),
-                Some(repo),
+                Some(key),
             );
             tracing::info!(
                 "Build completed for {key} run {run_id} {}: {}",
@@ -811,8 +793,6 @@ async fn check_for_new_runs(
         .max()
         .expect("new_runs is non-empty");
 
-    let display = repo_display_name(repo, watches).await;
-
     for run in &new_runs {
         tracing::info!(
             "New build detected for {key}: run {} {} ({}: {})",
@@ -822,11 +802,11 @@ async fn check_for_new_runs(
             run.title
         );
         platform::send_notification(
-            &format!("🔨 Build started: {display} [{branch}]"),
+            &format!("🔨 Build started [{branch}]"),
             &format!("{}: {}", run.workflow, run.title),
             notif.build_started,
             Some(&run.url(repo)),
-            Some(repo),
+            Some(key),
         );
 
         // If it already completed between polls, also notify completion
@@ -838,11 +818,11 @@ async fn check_for_new_runs(
             };
             let emoji = if run.succeeded() { "✅" } else { "❌" };
             platform::send_notification(
-                &format!("{emoji} Build {}: {display} [{branch}]", run.conclusion),
+                &format!("{emoji} Build {} [{branch}]", run.conclusion),
                 &format!("{}: {}", run.workflow, run.title),
                 level,
                 Some(&run.url(repo)),
-                Some(repo),
+                Some(key),
             );
             tracing::info!(
                 "Build already completed for {key} run {} {}: {}",
@@ -1031,27 +1011,7 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-    use std::sync::Arc;
-    use tokio::sync::Mutex;
-
     use super::*;
-
-    fn make_watches(keys: &[&str]) -> Watches {
-        let mut map = HashMap::new();
-        for &key in keys {
-            map.insert(
-                key.to_string(),
-                WatchEntry {
-                    last_seen_run_id: 0,
-                    active_runs: HashMap::new(),
-                    failure_counts: HashMap::new(),
-                    last_build: None,
-                },
-            );
-        }
-        Arc::new(Mutex::new(map))
-    }
 
     #[test]
     fn watch_key_format() {
@@ -1066,37 +1026,5 @@ mod tests {
     #[test]
     fn parse_watch_key_falls_back_to_main() {
         assert_eq!(parse_watch_key("alice/myapp"), ("alice/myapp", "main"));
-    }
-
-    #[tokio::test]
-    async fn repo_display_name_unique_shows_repo_only() {
-        let watches = make_watches(&["alice/myapp#main"]);
-        assert_eq!(repo_display_name("alice/myapp", &watches).await, "myapp");
-    }
-
-    #[tokio::test]
-    async fn repo_display_name_conflict_shows_full_name() {
-        let watches = make_watches(&["alice/myapp#main", "bob/myapp#main"]);
-        assert_eq!(
-            repo_display_name("alice/myapp", &watches).await,
-            "alice/myapp"
-        );
-        assert_eq!(repo_display_name("bob/myapp", &watches).await, "bob/myapp");
-    }
-
-    #[tokio::test]
-    async fn repo_display_name_different_repos_same_owner_no_conflict() {
-        let watches = make_watches(&["alice/myapp#main", "alice/otherapp#main"]);
-        assert_eq!(repo_display_name("alice/myapp", &watches).await, "myapp");
-        assert_eq!(
-            repo_display_name("alice/otherapp", &watches).await,
-            "otherapp"
-        );
-    }
-
-    #[tokio::test]
-    async fn repo_display_name_multiple_branches_same_repo_no_conflict() {
-        let watches = make_watches(&["alice/myapp#main", "alice/myapp#develop"]);
-        assert_eq!(repo_display_name("alice/myapp", &watches).await, "myapp");
     }
 }
