@@ -987,7 +987,9 @@ async fn main() -> Result<()> {
 
     // Write the actual port to the state dir so tooling can discover it
     let port_file = state_dir().join("port");
-    let _ = std::fs::write(&port_file, bound_port.to_string());
+    if let Err(e) = std::fs::write(&port_file, bound_port.to_string()) {
+        tracing::warn!("Failed to write port file {}: {e}", port_file.display());
+    }
 
     if bound_port != port {
         tracing::warn!("Port {port} was occupied, using port {bound_port} instead");

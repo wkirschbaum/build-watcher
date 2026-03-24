@@ -34,11 +34,7 @@ impl Notifier for TerminalNotifier {
         url: Option<&str>,
         group: Option<&str>,
     ) {
-        let sound = if level == NotificationLevel::Critical {
-            "Basso"
-        } else {
-            "Glass"
-        };
+        let sound = super::notification_sound(level);
         let mut cmd = Command::new("terminal-notifier");
         cmd.args([
             "-title",
@@ -53,6 +49,8 @@ impl Notifier for TerminalNotifier {
         if let Some(url) = url {
             cmd.args(["-open", url]);
         }
-        let _ = cmd.spawn();
+        if let Err(e) = cmd.spawn() {
+            tracing::warn!("Failed to spawn terminal-notifier: {e}");
+        }
     }
 }

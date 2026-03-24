@@ -70,3 +70,11 @@ pub fn default_state_dir() -> String {
 pub fn default_config_dir() -> String {
     imp::default_config_dir()
 }
+
+/// Returns the user's home directory, falling back to `/tmp` with a warning if `HOME` is unset.
+pub(super) fn home_dir() -> String {
+    std::env::var("HOME").unwrap_or_else(|_| {
+        tracing::warn!("HOME is not set; falling back to /tmp for state/config directories");
+        "/tmp".to_string()
+    })
+}
