@@ -1023,4 +1023,83 @@ mod tests {
         assert!(restored.failure_counts.is_empty());
         assert_eq!(restored.last_build.unwrap().run_id, 101);
     }
+
+    // -- format_duration tests --
+
+    #[test]
+    fn format_duration_seconds_only() {
+        assert_eq!(format_duration(Duration::from_secs(42)), "42s");
+    }
+
+    #[test]
+    fn format_duration_minutes_and_seconds() {
+        assert_eq!(format_duration(Duration::from_secs(150)), "2m 30s");
+    }
+
+    #[test]
+    fn format_duration_exact_minutes() {
+        assert_eq!(format_duration(Duration::from_secs(120)), "2m");
+    }
+
+    #[test]
+    fn format_duration_zero() {
+        assert_eq!(format_duration(Duration::from_secs(0)), "0s");
+    }
+
+    // -- last_failed_build tests --
+
+    #[test]
+    fn last_failed_build_finds_failure() {
+        let mut watches = HashMap::new();
+        let mut entry = make_entry();
+        let run = make_run(200, "completed", "failure");
+        entry.record_completion(&run);
+        watches.insert("alice/app#main".to_string(), entry);
+
+        let result = last_failed_build(&watches, "alice/app");
+        assert!(result.is_some());
+        let (key, build) = result.unwrap();
+        assert_eq!(key, "alice/app#main");
+        assert_eq!(build.run_id, 200);
+    }
+
+    #[test]
+    fn last_failed_build_ignores_success() {
+        let mut watches = HashMap::new();
+        let mut entry = make_entry();
+        let run = make_run(200, "completed", "success");
+        entry.record_completion(&run);
+        watches.insert("alice/app#main".to_string(), entry);
+
+        assert!(last_failed_build(&watches, "alice/app").is_none());
+    }
+
+    #[test]
+    fn last_failed_build_picks_most_recent() {
+        let mut watches = HashMap::new();
+
+        let mut entry1 = make_entry();
+        let run1 = make_run(100, "completed", "failure");
+        entry1.record_completion(&run1);
+        watches.insert("alice/app#main".to_string(), entry1);
+
+        let mut entry2 = make_entry();
+        let run2 = make_run(200, "completed", "failure");
+        entry2.record_completion(&run2);
+        watches.insert("alice/app#develop".to_string(), entry2);
+
+        let (_, build) = last_failed_build(&watches, "alice/app").unwrap();
+        assert_eq!(build.run_id, 200);
+    }
+
+    #[test]
+    fn last_failed_build_ignores_other_repos() {
+        let mut watches = HashMap::new();
+        let mut entry = make_entry();
+        let run = make_run(200, "completed", "failure");
+        entry.record_completion(&run);
+        watches.insert("bob/other#main".to_string(), entry);
+
+        assert!(last_failed_build(&watches, "alice/app").is_none());
+    }
 }

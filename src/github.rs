@@ -298,13 +298,12 @@ pub async fn gh_run_rerun(repo: &str, run_id: u64, failed_only: bool) -> Result<
 
 /// A build history entry with timestamps for duration/age calculation.
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct HistoryEntry {
-    #[allow(dead_code)]
     pub id: u64,
     pub conclusion: String,
     pub workflow: String,
     pub title: String,
-    #[allow(dead_code)]
     pub branch: String,
     pub event: String,
     pub created_at: String,
@@ -353,7 +352,11 @@ fn parse_iso_epoch(s: &str) -> Option<u64> {
     }
     let hour: u64 = time_parts[0].parse().ok()?;
     let min: u64 = time_parts[1].parse().ok()?;
-    let sec: u64 = time_parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(0);
+    // Handle fractional seconds (e.g. "30.123")
+    let sec: u64 = time_parts
+        .get(2)
+        .and_then(|s| s.split('.').next()?.parse().ok())
+        .unwrap_or(0);
 
     // Days from epoch using a simplified calculation
     let mut days: u64 = 0;
@@ -638,5 +641,64 @@ mod tests {
     fn validate_branch_rejects_invalid() {
         assert!(validate_branch("").is_err());
         assert!(validate_branch("branch name").is_err());
+    }
+
+    #[test]
+    fn display_title_for_push_event() {
+        let run = run_from_value(&sample_json()).unwrap();
+        assert_eq!(run.display_title(), "Fix login bug (abc1234)");
+    }
+
+    #[test]
+    fn display_title_for_pr_event() {
+        let mut v = sample_json();
+        v["event"] = json!("pull_request");
+        let run = run_from_value(&v).unwrap();
+        assert_eq!(run.display_title(), "PR: Fix login bug");
+    }
+
+    #[test]
+    fn display_title_for_empty_sha() {
+        let mut v = sample_json();
+        v["headSha"] = json!("");
+        let run = run_from_value(&v).unwrap();
+        assert_eq!(run.display_title(), "Fix login bug");
+    }
+
+    #[test]
+    fn last_build_display_title() {
+        let run = run_from_value(&sample_json()).unwrap();
+        let lb = run.to_last_build();
+        assert_eq!(lb.display_title(), "Fix login bug (abc1234)");
+    }
+
+    #[test]
+    fn parse_iso_epoch_basic() {
+        // 2024-01-01T00:00:00Z = known epoch value
+        let epoch = parse_iso_epoch("2024-01-01T00:00:00Z");
+        assert!(epoch.is_some());
+        // 2024-01-01 is 19723 days after 1970-01-01
+        assert_eq!(epoch.unwrap(), 19723 * 86400);
+    }
+
+    #[test]
+    fn parse_iso_epoch_with_fractional_seconds() {
+        let a = parse_iso_epoch("2024-01-01T12:30:45Z");
+        let b = parse_iso_epoch("2024-01-01T12:30:45.123Z");
+        assert_eq!(a, b); // fractional seconds are ignored
+    }
+
+    #[test]
+    fn parse_iso_epoch_returns_none_for_invalid() {
+        assert!(parse_iso_epoch("").is_none());
+        assert!(parse_iso_epoch("not-a-date").is_none());
+        assert!(parse_iso_epoch("2024-01-01").is_none()); // no time component
+    }
+
+    #[test]
+    fn parse_iso_epoch_duration_calculation() {
+        let start = parse_iso_epoch("2024-01-01T10:00:00Z").unwrap();
+        let end = parse_iso_epoch("2024-01-01T10:05:30Z").unwrap();
+        assert_eq!(end - start, 330); // 5m 30s = 330 seconds
     }
 }

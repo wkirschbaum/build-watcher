@@ -822,6 +822,12 @@ impl BuildWatcher {
             return Ok(CallToolResult::error(vec![Content::text(e)]));
         }
 
+        if params.repo.is_some() && params.sound_file.is_some() {
+            return Ok(CallToolResult::error(vec![Content::text(
+                "sound_file can only be set globally, not per-repo",
+            )]));
+        }
+
         let mut config = self.config.lock().await;
         let mut msg = String::new();
 
@@ -968,19 +974,37 @@ impl BuildWatcher {
             )]));
         }
 
+        let show_branch = params.branch.is_none();
         let mut lines = Vec::new();
-        lines.push(format!(
-            "{:<12} {:<20} {:<35} {:<10} {}",
-            "Conclusion", "Workflow", "Title", "Duration", "When"
-        ));
-        lines.push(format!(
-            "{:<12} {:<20} {:<35} {:<10} {}",
-            "───────────",
-            "────────────────────",
-            "───────────────────────────────────",
-            "──────────",
-            "─────"
-        ));
+
+        if show_branch {
+            lines.push(format!(
+                "{:<12} {:<15} {:<20} {:<30} {:<10} {}",
+                "Conclusion", "Branch", "Workflow", "Title", "Duration", "When"
+            ));
+            lines.push(format!(
+                "{:<12} {:<15} {:<20} {:<30} {:<10} {}",
+                "───────────",
+                "───────────────",
+                "────────────────────",
+                "──────────────────────────────",
+                "──────────",
+                "─────"
+            ));
+        } else {
+            lines.push(format!(
+                "{:<12} {:<20} {:<35} {:<10} {}",
+                "Conclusion", "Workflow", "Title", "Duration", "When"
+            ));
+            lines.push(format!(
+                "{:<12} {:<20} {:<35} {:<10} {}",
+                "───────────",
+                "────────────────────",
+                "───────────────────────────────────",
+                "──────────",
+                "─────"
+            ));
+        }
 
         for entry in &entries {
             let duration = entry
@@ -992,19 +1016,27 @@ impl BuildWatcher {
                 .map(format_age)
                 .unwrap_or_else(|| "—".to_string());
             let title = entry.display_title();
-            let title_truncated = if title.len() > 33 {
-                format!("{}…", &title[..32])
+
+            if show_branch {
+                lines.push(format!(
+                    "{:<12} {:<15} {:<20} {:<30} {:<10} {}",
+                    entry.conclusion,
+                    truncate(&entry.branch, 13),
+                    truncate(&entry.workflow, 18),
+                    truncate(&title, 28),
+                    duration,
+                    age,
+                ));
             } else {
-                title
-            };
-            lines.push(format!(
-                "{:<12} {:<20} {:<35} {:<10} {}",
-                entry.conclusion,
-                truncate(&entry.workflow, 18),
-                title_truncated,
-                duration,
-                age,
-            ));
+                lines.push(format!(
+                    "{:<12} {:<20} {:<35} {:<10} {}",
+                    entry.conclusion,
+                    truncate(&entry.workflow, 18),
+                    truncate(&title, 33),
+                    duration,
+                    age,
+                ));
+            }
         }
 
         Ok(CallToolResult::success(vec![Content::text(
