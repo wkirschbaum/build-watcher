@@ -19,9 +19,9 @@ pub trait Notifier: Send + Sync {
     fn send(&self, title: &str, body: &str, level: NotificationLevel, url: Option<&str>);
 }
 
-fn notifier() -> &'static Box<dyn Notifier> {
+fn notifier() -> &'static dyn Notifier {
     static INSTANCE: OnceLock<Box<dyn Notifier>> = OnceLock::new();
-    INSTANCE.get_or_init(|| {
+    &**INSTANCE.get_or_init(|| {
         let n = imp::detect();
         tracing::info!("Using notification backend: {}", n.name());
         n

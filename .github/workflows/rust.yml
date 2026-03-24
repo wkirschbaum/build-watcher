@@ -10,10 +10,25 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build:
-
+  lint:
     runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install tools
+      uses: taiki-e/install-action@v2
+      with:
+        tool: cargo-audit,cargo-machete
+    - name: Check formatting
+      run: cargo fmt --check
+    - name: Clippy
+      run: cargo clippy -- -D warnings
+    - name: Unused dependencies
+      run: cargo machete
+    - name: Security audit
+      run: cargo audit
 
+  build:
+    runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
     - name: Build

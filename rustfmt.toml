@@ -1,0 +1,4 @@
+edition = "2024"
+
+# Prefer { x } over { x: x } in struct literals
+use_field_init_shorthand = true

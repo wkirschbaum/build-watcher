@@ -1,6 +1,7 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::platform;
@@ -9,8 +10,7 @@ use crate::platform;
 
 pub fn state_dir() -> PathBuf {
     let dir = PathBuf::from(
-        std::env::var("STATE_DIRECTORY")
-            .unwrap_or_else(|_| platform::default_state_dir()),
+        std::env::var("STATE_DIRECTORY").unwrap_or_else(|_| platform::default_state_dir()),
     );
     std::fs::create_dir_all(&dir).ok();
     dir
@@ -18,8 +18,7 @@ pub fn state_dir() -> PathBuf {
 
 pub fn config_dir() -> PathBuf {
     let dir = PathBuf::from(
-        std::env::var("CONFIGURATION_DIRECTORY")
-            .unwrap_or_else(|_| platform::default_config_dir()),
+        std::env::var("CONFIGURATION_DIRECTORY").unwrap_or_else(|_| platform::default_config_dir()),
     );
     std::fs::create_dir_all(&dir).ok();
     dir
@@ -44,7 +43,7 @@ pub fn load_json<T: serde::de::DeserializeOwned>(path: PathBuf) -> Option<T> {
     None
 }
 
-fn try_parse_file<T: serde::de::DeserializeOwned>(path: &PathBuf) -> Option<T> {
+fn try_parse_file<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
     let data = std::fs::read_to_string(path).ok()?;
     serde_json::from_str(&data).ok()
 }
@@ -87,7 +86,7 @@ pub fn save_json<T: Serialize>(path: PathBuf, value: &T) {
 // -- Configuration --
 
 /// Notification urgency level.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum NotificationLevel {
     Off,
@@ -221,13 +220,16 @@ impl Config {
             .map(|b| &b.notifications);
 
         NotificationConfig {
-            build_started: branch_overrides.and_then(|o| o.build_started)
+            build_started: branch_overrides
+                .and_then(|o| o.build_started)
                 .or_else(|| repo_overrides.and_then(|o| o.build_started))
                 .unwrap_or(global.build_started),
-            build_success: branch_overrides.and_then(|o| o.build_success)
+            build_success: branch_overrides
+                .and_then(|o| o.build_success)
                 .or_else(|| repo_overrides.and_then(|o| o.build_success))
                 .unwrap_or(global.build_success),
-            build_failure: branch_overrides.and_then(|o| o.build_failure)
+            build_failure: branch_overrides
+                .and_then(|o| o.build_failure)
                 .or_else(|| repo_overrides.and_then(|o| o.build_failure))
                 .unwrap_or(global.build_failure),
         }
@@ -272,7 +274,10 @@ impl Config {
             }
         }
         if migrated > 0 {
-            tracing::info!("Migrated {} repos from watches into config", self.repos.len());
+            tracing::info!(
+                "Migrated {} repos from watches into config",
+                self.repos.len()
+            );
         }
     }
 }
