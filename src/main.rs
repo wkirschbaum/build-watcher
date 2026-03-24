@@ -85,8 +85,10 @@ async fn save_watches(watches: &Watches) {
                 )
             })
             .collect()
+        // Lock drops here before any I/O begins.
     };
-    // Lock is released above; run blocking file I/O off the async executor
+    // File I/O is blocking; running it on spawn_blocking keeps the tokio
+    // executor free while the write and fsync complete.
     tokio::task::spawn_blocking(move || save_persisted(&persisted))
         .await
         .ok();
@@ -158,8 +160,10 @@ impl BuildWatcher {
         &self,
         Parameters(params): Parameters<WatchBuildsParams>,
     ) -> Result<CallToolResult, McpError> {
-        // Read branch config without modifying it yet — we only persist repos that
-        // successfully start watching, so a typo'd repo name doesn't linger in config.
+        // Read branch config without modifying it yet. We only add a repo to the
+        // persisted config after at least one branch successfully starts — this way a
+        // typo'd repo name (or a repo with no workflow runs) doesn't end up permanently
+        // in config, which would cause failed retries on every daemon restart.
         let repo_branches: Vec<(String, Vec<String>)> = {
             let config = self.config.lock().await;
             params
@@ -188,7 +192,8 @@ impl BuildWatcher {
             }
         }
 
-        // Only persist repos that had at least one branch successfully start
+        // Persist only the repos that actually got a poller running. Repos whose
+        // every branch failed (e.g. no runs, bad name) are not saved.
         if !started_repos.is_empty() {
             let mut config = self.config.lock().await;
             config.add_repos(&started_repos);
@@ -207,7 +212,9 @@ impl BuildWatcher {
         &self,
         Parameters(params): Parameters<StopWatchesParams>,
     ) -> Result<CallToolResult, McpError> {
-        // Remove from runtime watch map, track how many branches were active per repo
+        // Phase 1: remove from the runtime watch map. The polling tasks detect the
+        // missing key on their next iteration and exit cleanly — no explicit
+        // cancellation is needed.
         let removed_counts: Vec<(String, usize)> = {
             let mut watches = self.watches.lock().await;
             params
@@ -229,7 +236,9 @@ impl BuildWatcher {
         };
         save_watches(&self.watches).await;
 
-        // Remove from config and build messages based on both sources of truth
+        // Phase 2: remove from config. We check both sources of truth here so the
+        // response message is accurate — a repo can be in config but have no active
+        // poller if a previous watch_builds call failed partway through.
         let mut config = self.config.lock().await;
         let mut results = Vec::new();
         for (repo, branch_count) in removed_counts {
@@ -618,8 +627,10 @@ async fn start_watch(
 
     {
         let mut w = watches.lock().await;
-        // Re-check inside the lock: a concurrent call may have inserted while we
-        // were making the gh network call above.
+        // Re-check inside the lock. Between the first check above and here the lock
+        // was dropped for the gh network call, so a concurrent watch_builds for the
+        // same key could have inserted in the meantime. Without this second check,
+        // two pollers would run for the same repo/branch sending duplicate notifications.
         if w.contains_key(key) {
             return Ok(format!("{repo} [{branch}]: already being watched"));
         }
@@ -664,9 +675,14 @@ async fn poll_repo(watches: Watches, config: SharedConfig, key: String) {
     let repo = repo.to_string();
     let branch = branch.to_string();
 
+    // Tracks when we last scanned for brand-new runs. We check for new runs at
+    // the idle interval even when builds are active, to catch runs that start
+    // while we're already polling others.
     let mut last_new_run_check = tokio::time::Instant::now();
 
     loop {
+        // Snapshot active state and config before sleeping. Both locks are
+        // released before the sleep so they don't block other tasks.
         let has_active = {
             let w = watches.lock().await;
             match w.get(&key) {
@@ -687,6 +703,9 @@ async fn poll_repo(watches: Watches, config: SharedConfig, key: String) {
             )
         };
 
+        // Use a faster poll rate when builds are actively running so completions
+        // are detected quickly. Drop back to a slower rate when idle to avoid
+        // hammering the GitHub API unnecessarily.
         let delay = if has_active {
             active_poll_secs
         } else {
@@ -694,7 +713,9 @@ async fn poll_repo(watches: Watches, config: SharedConfig, key: String) {
         };
         tokio::time::sleep(Duration::from_secs(delay)).await;
 
-        // Check if still watched
+        // Re-check after the sleep — the watch may have been stopped while we
+        // were waiting. Pollers exit by observing the key is gone; there is no
+        // explicit cancellation signal.
         {
             let w = watches.lock().await;
             if !w.contains_key(&key) {
@@ -724,6 +745,8 @@ async fn poll_active_runs(
     branch: &str,
     notif: &NotificationConfig,
 ) {
+    // Snapshot the run IDs before making any network calls so we don't hold
+    // the lock while waiting for the GitHub API.
     let run_ids: Vec<u64> = {
         let w = watches.lock().await;
         match w.get(key) {
@@ -732,12 +755,14 @@ async fn poll_active_runs(
         }
     };
 
+    // Only save state when something actually changed to avoid unnecessary I/O.
     let mut changed = false;
 
     for run_id in run_ids {
         let run = match gh_run_status(repo, run_id).await {
             Ok(r) => {
-                // Reset failure count on success
+                // A successful API response clears the per-run failure streak so
+                // transient errors don't accumulate toward the eviction threshold.
                 let mut w = watches.lock().await;
                 if let Some(entry) = w.get_mut(key) {
                     entry.failure_counts.remove(&run_id);
@@ -750,6 +775,8 @@ async fn poll_active_runs(
                     let count = entry.failure_counts.entry(run_id).or_insert(0);
                     *count += 1;
                     if *count >= MAX_GH_FAILURES {
+                        // Give up on this run after too many consecutive failures.
+                        // It may have been deleted, expired, or the API is broken.
                         tracing::warn!(
                             "Removing run {run_id} from {key} after {count} consecutive failures"
                         );
@@ -867,8 +894,9 @@ async fn check_for_new_runs(
     let mut w = watches.lock().await;
     if let Some(entry) = w.get_mut(key) {
         entry.last_seen_run_id = new_max;
-        // Track new in-progress runs, record completed ones (iterate oldest→newest so
-        // the highest-id completed run ends up as last_build)
+        // gh returns runs newest-first so new_runs is also newest-first. Iterating
+        // in reverse (oldest→newest) ensures the last assignment to last_build is
+        // the run with the highest ID — i.e. the most recent completed run.
         for run in new_runs.iter().rev() {
             if run.is_completed() {
                 entry.last_build = Some(run.to_last_build());
@@ -877,12 +905,17 @@ async fn check_for_new_runs(
             }
         }
     }
+    // Drop the lock explicitly before saving: save_watches re-acquires it
+    // internally, and holding it here would deadlock.
     drop(w);
     save_watches(watches).await;
 }
 
 async fn startup_watches(watches: &Watches, config: &SharedConfig) {
     // Resume existing watches — recover any in-progress builds that were active at shutdown
+    //
+    // Use a HashSet so the "is this key already being watched?" check below is O(1)
+    // rather than O(n) on a Vec.
     let snapshot: std::collections::HashSet<String> = {
         let w = watches.lock().await;
         w.keys().cloned().collect()
@@ -891,13 +924,15 @@ async fn startup_watches(watches: &Watches, config: &SharedConfig) {
         let (repo, branch) = parse_watch_key(key);
         tracing::info!("Resuming watch for {key}");
 
-        // Scan for in-progress runs we may have missed during downtime
+        // Scan recent runs to recover any that were in-progress when the daemon stopped.
         match gh_recent_runs(repo, branch).await {
             Ok(runs) => {
                 let mut w = watches.lock().await;
                 if let Some(entry) = w.get_mut(key) {
-                    // Advance the high-water mark so check_for_new_runs won't re-notify
-                    // runs that were already known before the daemon stopped.
+                    // Advance last_seen_run_id to the most recent run visible now.
+                    // Without this, check_for_new_runs would treat any run that
+                    // started while we were offline as brand-new and fire a
+                    // spurious "started" notification on the first idle poll.
                     if let Some(max_id) = runs.iter().map(|r| r.id).max()
                         && max_id > entry.last_seen_run_id
                     {

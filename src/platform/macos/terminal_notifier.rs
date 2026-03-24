@@ -51,6 +51,8 @@ impl Notifier for TerminalNotifier {
         }
         match cmd.spawn() {
             Ok(mut child) => {
+                // Same reap-with-timeout pattern as AppleScriptNotifier: background
+                // thread prevents zombies; 10-second deadline handles a hung daemon.
                 std::thread::spawn(move || {
                     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
                     loop {

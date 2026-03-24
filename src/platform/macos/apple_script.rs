@@ -29,6 +29,10 @@ impl Notifier for AppleScriptNotifier {
             format!(r#"display notification "{body}" with title "{title}" sound name "{sound}""#);
         match Command::new("osascript").args(["-e", &script]).spawn() {
             Ok(mut child) => {
+                // Notifier::send is synchronous so we can't await here. A background
+                // thread reaps the child to prevent zombie processes. The 10-second
+                // deadline guards against a hung notification daemon leaving threads
+                // alive indefinitely.
                 std::thread::spawn(move || {
                     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
                     loop {

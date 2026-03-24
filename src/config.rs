@@ -25,8 +25,14 @@ pub fn config_dir() -> PathBuf {
 }
 
 // -- Safe JSON persistence --
-// Writes to a .draft file, validates it parses back, then renames over the target.
-// On load, falls back to .bak if the primary file is corrupt.
+//
+// The write sequence is: serialize → write to .draft → parse .draft back to
+// confirm it is valid JSON → rename current file to .bak → rename .draft to
+// the target path.
+//
+// This means a crash at any point leaves either the previous file or the
+// backup intact — we never end up with a half-written primary. On load we
+// transparently fall back to .bak if the primary is missing or corrupt.
 
 pub fn load_json<T: serde::de::DeserializeOwned>(path: PathBuf) -> Option<T> {
     if let Some(val) = try_parse_file::<T>(&path) {
