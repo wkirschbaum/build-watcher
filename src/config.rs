@@ -42,13 +42,13 @@ pub fn config_dir() -> &'static Path {
 
 // -- Safe JSON persistence --
 //
-// The write sequence is: serialize → write to .draft → fsync → parse .draft back
-// to confirm it is valid JSON → rename current file to .bak → rename .draft to
-// the target path.
+// Crash-safe write sequence:
+// 1. Serialize → write to .draft → fsync  (crash here: .draft lost, primary intact)
+// 2. Parse .draft back to verify           (crash here: .draft orphaned, primary intact)
+// 3. Rename primary → .bak                 (crash here: .bak exists, load recovers from it)
+// 4. Rename .draft → primary               (crash here: primary missing, load recovers from .bak)
 //
-// This means a crash at any point leaves either the previous file or the
-// backup intact — we never end up with a half-written primary. On load we
-// transparently fall back to .bak if the primary is missing or corrupt.
+// On load, we transparently fall back to .bak if the primary is missing or corrupt.
 
 pub fn load_json<T: serde::de::DeserializeOwned>(path: PathBuf) -> Option<T> {
     if let Some(val) = try_parse_file::<T>(&path) {
@@ -283,28 +283,28 @@ impl Default for Config {
 
 impl Config {
     /// Resolve effective notification levels for a repo/branch.
-    /// Priority: branch_notifications > repo notifications > global notifications.
+    /// Priority: branch overrides > repo overrides > global defaults.
     pub fn notifications_for(&self, repo: &str, branch: &str) -> NotificationConfig {
         let global = &self.notifications;
         let repo_cfg = self.repos.get(repo);
-        let repo_overrides = repo_cfg.map(|r| &r.notifications);
-        let branch_overrides = repo_cfg
+        let repo_notif = repo_cfg.map(|r| &r.notifications);
+        let branch_notif = repo_cfg
             .and_then(|r| r.branch_notifications.get(branch))
             .map(|b| &b.notifications);
 
+        let resolve = |get_field: fn(&NotificationOverrides) -> Option<NotificationLevel>,
+                       global_val: NotificationLevel|
+         -> NotificationLevel {
+            branch_notif
+                .and_then(get_field)
+                .or_else(|| repo_notif.and_then(get_field))
+                .unwrap_or(global_val)
+        };
+
         NotificationConfig {
-            build_started: branch_overrides
-                .and_then(|o| o.build_started)
-                .or_else(|| repo_overrides.and_then(|o| o.build_started))
-                .unwrap_or(global.build_started),
-            build_success: branch_overrides
-                .and_then(|o| o.build_success)
-                .or_else(|| repo_overrides.and_then(|o| o.build_success))
-                .unwrap_or(global.build_success),
-            build_failure: branch_overrides
-                .and_then(|o| o.build_failure)
-                .or_else(|| repo_overrides.and_then(|o| o.build_failure))
-                .unwrap_or(global.build_failure),
+            build_started: resolve(|o| o.build_started, global.build_started),
+            build_success: resolve(|o| o.build_success, global.build_success),
+            build_failure: resolve(|o| o.build_failure, global.build_failure),
         }
     }
 

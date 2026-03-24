@@ -456,13 +456,7 @@ impl BuildWatcher {
                         .active_runs
                         .iter()
                         .map(|(id, active)| {
-                            let elapsed = active.started_at.elapsed();
-                            let secs = elapsed.as_secs();
-                            let time = if secs < 60 {
-                                format!("{secs}s")
-                            } else {
-                                format!("{}m {}s", secs / 60, secs % 60)
-                            };
+                            let time = format::duration(active.started_at.elapsed());
                             format!("{id} ({}, {time})", active.status)
                         })
                         .collect();
@@ -1080,53 +1074,26 @@ impl BuildWatcher {
 
         let scope = match (&params.repo, &params.branch) {
             (None, _) => {
-                // Global
-                if let Some(l) = params.build_started {
-                    config.notifications.build_started = l;
-                }
-                if let Some(l) = params.build_success {
-                    config.notifications.build_success = l;
-                }
-                if let Some(l) = params.build_failure {
-                    config.notifications.build_failure = l;
-                }
+                apply_notification_levels(&mut config.notifications, &params);
                 "global".to_string()
             }
             (Some(repo), None) => {
-                // Per-repo
                 let Some(rc) = config.repos.get_mut(repo) else {
                     return Ok(CallToolResult::error(vec![Content::text(format!(
                         "{repo} is not being watched — use watch_builds first"
                     ))]));
                 };
-                if let Some(l) = params.build_started {
-                    rc.notifications.build_started = Some(l);
-                }
-                if let Some(l) = params.build_success {
-                    rc.notifications.build_success = Some(l);
-                }
-                if let Some(l) = params.build_failure {
-                    rc.notifications.build_failure = Some(l);
-                }
+                apply_notification_overrides(&mut rc.notifications, &params);
                 repo.clone()
             }
             (Some(repo), Some(branch)) => {
-                // Per-branch
                 let Some(rc) = config.repos.get_mut(repo) else {
                     return Ok(CallToolResult::error(vec![Content::text(format!(
                         "{repo} is not being watched — use watch_builds first"
                     ))]));
                 };
                 let bc = rc.branch_notifications.entry(branch.clone()).or_default();
-                if let Some(l) = params.build_started {
-                    bc.notifications.build_started = Some(l);
-                }
-                if let Some(l) = params.build_success {
-                    bc.notifications.build_success = Some(l);
-                }
-                if let Some(l) = params.build_failure {
-                    bc.notifications.build_failure = Some(l);
-                }
+                apply_notification_overrides(&mut bc.notifications, &params);
                 format!("{repo} [{branch}]")
             }
         };
@@ -1191,6 +1158,38 @@ impl ServerHandler for BuildWatcher {
 }
 
 use crate::format;
+
+/// Apply notification level params to a global NotificationConfig (sets values directly).
+fn apply_notification_levels(
+    notif: &mut crate::config::NotificationConfig,
+    params: &ConfigureNotificationsParams,
+) {
+    if let Some(l) = params.build_started {
+        notif.build_started = l;
+    }
+    if let Some(l) = params.build_success {
+        notif.build_success = l;
+    }
+    if let Some(l) = params.build_failure {
+        notif.build_failure = l;
+    }
+}
+
+/// Apply notification level params to an override struct (sets Option values).
+fn apply_notification_overrides(
+    overrides: &mut NotificationOverrides,
+    params: &ConfigureNotificationsParams,
+) {
+    if let Some(l) = params.build_started {
+        overrides.build_started = Some(l);
+    }
+    if let Some(l) = params.build_success {
+        overrides.build_success = Some(l);
+    }
+    if let Some(l) = params.build_failure {
+        overrides.build_failure = Some(l);
+    }
+}
 
 fn format_notification_overrides(overrides: &NotificationOverrides) -> String {
     [

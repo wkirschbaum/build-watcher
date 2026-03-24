@@ -491,6 +491,10 @@ impl Poller {
         }
     }
 
+    /// Main poller loop. Two polling modes:
+    /// - Active runs exist: poll their status every `active_secs` (fast, ~10s)
+    /// - No active runs: check for new runs every `idle_secs` (slow, ~60s)
+    /// New-run checks always happen at least every `idle_secs`, even during active polling.
     #[tracing::instrument(skip_all, fields(key = %self.key))]
     async fn run(self) {
         let repo = self.key.repo.clone();
@@ -555,6 +559,8 @@ impl Poller {
     }
 
     /// Poll all in-progress runs, notify on completion, handle failures.
+    /// The watch lock is released during each GitHub API call (high latency)
+    /// and re-acquired for each state update to avoid holding it across awaits.
     async fn poll_active_runs(&self, repo: &str, branch: &str, pcfg: &PollConfig) {
         let run_ids: Vec<u64> = {
             let w = self.watches.lock().await;
@@ -644,6 +650,9 @@ impl Poller {
             }
         };
 
+        // unseen = all runs newer than our high-water mark (owned)
+        // new_runs = unseen runs that pass workflow filters (borrowed from unseen)
+        // We track both because the high-water mark must advance past filtered-out runs too.
         let unseen: Vec<RunInfo> = runs.into_iter().filter(|r| r.id > last_seen).collect();
         let new_runs = filter_runs(&unseen, &pcfg.workflows, &pcfg.ignored);
         if new_runs.is_empty() && unseen.is_empty() {
