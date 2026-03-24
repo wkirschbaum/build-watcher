@@ -1,4 +1,5 @@
 mod config;
+mod github;
 mod platform;
 
 use std::collections::HashMap;
@@ -10,6 +11,7 @@ use config::{
     Config, NotificationConfig, NotificationLevel, RepoConfig, config_dir, load_config, load_json,
     save_config, save_json, state_dir,
 };
+use github::{LastBuild, RunInfo, gh_recent_runs, gh_run_status};
 use rmcp::handler::server::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, Content, Implementation, ServerCapabilities, ServerInfo};
@@ -24,7 +26,6 @@ use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
 const DEFAULT_PORT: u16 = 8417;
-const GH_TIMEOUT: Duration = Duration::from_secs(30);
 
 type SharedConfig = Arc<Mutex<Config>>;
 
@@ -37,19 +38,6 @@ fn watch_key(repo: &str, branch: &str) -> String {
 
 fn parse_watch_key(key: &str) -> (&str, &str) {
     key.rsplit_once('#').unwrap_or((key, "main"))
-}
-
-/// Info about the last completed build.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct LastBuild {
-    run_id: u64,
-    conclusion: String,
-    workflow: String,
-    title: String,
-    #[serde(default)]
-    head_sha: String,
-    #[serde(default)]
-    event: String,
 }
 
 /// Persisted state per repo/branch.
@@ -99,132 +87,6 @@ async fn save_watches(watches: &Watches) {
             .collect()
     };
     save_persisted(&persisted);
-}
-
-// -- GitHub CLI helpers --
-
-struct RunInfo {
-    id: u64,
-    status: String,
-    conclusion: String,
-    title: String,
-    workflow: String,
-    head_sha: String,
-    event: String,
-}
-
-impl RunInfo {
-    fn from_json(value: &serde_json::Value) -> Option<Self> {
-        Some(Self {
-            id: value["databaseId"].as_u64()?,
-            status: value["status"].as_str().unwrap_or("unknown").to_string(),
-            conclusion: value["conclusion"].as_str().unwrap_or("").to_string(),
-            title: value["displayTitle"]
-                .as_str()
-                .unwrap_or("unknown")
-                .to_string(),
-            workflow: value["workflowName"]
-                .as_str()
-                .unwrap_or("unknown")
-                .to_string(),
-            head_sha: value["headSha"].as_str().unwrap_or("").to_string(),
-            event: value["event"].as_str().unwrap_or("").to_string(),
-        })
-    }
-
-    fn short_sha(&self) -> &str {
-        if self.head_sha.len() >= 7 {
-            &self.head_sha[..7]
-        } else {
-            &self.head_sha
-        }
-    }
-
-    fn is_completed(&self) -> bool {
-        self.status == "completed"
-    }
-
-    fn succeeded(&self) -> bool {
-        self.conclusion == "success"
-    }
-
-    fn url(&self, repo: &str) -> String {
-        format!("https://github.com/{repo}/actions/runs/{}", self.id)
-    }
-
-    fn to_last_build(&self) -> LastBuild {
-        LastBuild {
-            run_id: self.id,
-            conclusion: self.conclusion.clone(),
-            workflow: self.workflow.clone(),
-            title: self.title.clone(),
-            head_sha: self.head_sha.clone(),
-            event: self.event.clone(),
-        }
-    }
-}
-
-async fn gh_recent_runs(repo: &str, branch: &str) -> Result<Vec<RunInfo>, String> {
-    let output = tokio::time::timeout(
-        GH_TIMEOUT,
-        tokio::process::Command::new("gh")
-            .args([
-                "run",
-                "list",
-                "--repo",
-                repo,
-                "--branch",
-                branch,
-                "--limit",
-                "10",
-                "--json",
-                "databaseId,status,conclusion,displayTitle,workflowName,headSha,headBranch,event",
-            ])
-            .output(),
-    )
-    .await
-    .map_err(|_| format!("{repo}: gh timed out after {}s", GH_TIMEOUT.as_secs()))?
-    .map_err(|e| format!("{repo}: failed to run gh: {e}"))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("{repo}: gh error: {stderr}"));
-    }
-
-    let values: Vec<serde_json::Value> =
-        serde_json::from_slice(&output.stdout).map_err(|e| format!("{repo}: parse error: {e}"))?;
-
-    Ok(values.iter().filter_map(RunInfo::from_json).collect())
-}
-
-async fn gh_run_status(repo: &str, run_id: u64) -> Result<RunInfo, String> {
-    let output = tokio::time::timeout(
-        GH_TIMEOUT,
-        tokio::process::Command::new("gh")
-            .args([
-                "run",
-                "view",
-                &run_id.to_string(),
-                "--repo",
-                repo,
-                "--json",
-                "databaseId,status,conclusion,displayTitle,workflowName,headSha,headBranch,event",
-            ])
-            .output(),
-    )
-    .await
-    .map_err(|_| format!("{repo}: gh timed out after {}s", GH_TIMEOUT.as_secs()))?
-    .map_err(|e| format!("{repo}: failed to run gh: {e}"))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("{repo}: gh error: {stderr}"));
-    }
-
-    let value: serde_json::Value =
-        serde_json::from_slice(&output.stdout).map_err(|e| format!("{repo}: parse error: {e}"))?;
-
-    RunInfo::from_json(&value).ok_or_else(|| format!("{repo}: missing fields in response"))
 }
 
 // -- MCP Server --
@@ -555,6 +417,7 @@ impl BuildWatcher {
             "If you see this, notifications are working!",
             NotificationLevel::Normal,
             None,
+            None,
         );
         Ok(CallToolResult::success(vec![Content::text(
             "Test notification sent. You should see it on your desktop.",
@@ -799,6 +662,23 @@ async fn poll_repo(watches: Watches, config: SharedConfig, key: String) {
     }
 }
 
+/// Returns the display name for a repo: just the repo part (after `/`) if it's unique among
+/// all currently watched repos, or the full `owner/repo` if another owner has the same repo name.
+async fn repo_display_name(repo: &str, watches: &Watches) -> String {
+    let repo_name = repo.split('/').nth(1).unwrap_or(repo);
+    let w = watches.lock().await;
+    let conflict = w
+        .keys()
+        .filter_map(|k| k.split('#').next())
+        .filter(|r| r.split('/').nth(1) == Some(repo_name))
+        .any(|r| r != repo);
+    if conflict {
+        repo.to_string()
+    } else {
+        repo_name.to_string()
+    }
+}
+
 /// Poll all active runs for a watch. Notifies on completion and removes finished runs.
 async fn poll_active_runs(
     watches: &Watches,
@@ -807,6 +687,7 @@ async fn poll_active_runs(
     branch: &str,
     notif: &NotificationConfig,
 ) {
+    let display = repo_display_name(repo, watches).await;
     let run_ids: Vec<u64> = {
         let w = watches.lock().await;
         match w.get(key) {
@@ -855,10 +736,11 @@ async fn poll_active_runs(
             };
             let emoji = if run.succeeded() { "✅" } else { "❌" };
             platform::send_notification(
-                &format!("{emoji} Build {}: {repo} [{branch}]", run.conclusion),
+                &format!("{emoji} Build {}: {display} [{branch}]", run.conclusion),
                 &format!("{}: {} ({})", run.workflow, run.title, run.short_sha()),
                 level,
                 Some(&run.url(repo)),
+                Some(repo),
             );
             tracing::info!(
                 "Build completed for {key} run {run_id} {}: {}",
@@ -929,6 +811,8 @@ async fn check_for_new_runs(
         .max()
         .expect("new_runs is non-empty");
 
+    let display = repo_display_name(repo, watches).await;
+
     for run in &new_runs {
         tracing::info!(
             "New build detected for {key}: run {} {} ({}: {})",
@@ -938,10 +822,11 @@ async fn check_for_new_runs(
             run.title
         );
         platform::send_notification(
-            &format!("🔨 Build started: {repo} [{branch}]"),
+            &format!("🔨 Build started: {display} [{branch}]"),
             &format!("{}: {} ({})", run.workflow, run.title, run.short_sha()),
             notif.build_started,
             Some(&run.url(repo)),
+            Some(repo),
         );
 
         // If it already completed between polls, also notify completion
@@ -953,10 +838,11 @@ async fn check_for_new_runs(
             };
             let emoji = if run.succeeded() { "✅" } else { "❌" };
             platform::send_notification(
-                &format!("{emoji} Build {}: {repo} [{branch}]", run.conclusion),
+                &format!("{emoji} Build {}: {display} [{branch}]", run.conclusion),
                 &format!("{}: {} ({})", run.workflow, run.title, run.short_sha()),
                 level,
                 Some(&run.url(repo)),
+                Some(repo),
             );
             tracing::info!(
                 "Build already completed for {key} run {} {}: {}",
@@ -1141,4 +1027,76 @@ async fn main() -> Result<()> {
     tracing::info!("State saved, goodbye.");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    use super::*;
+
+    fn make_watches(keys: &[&str]) -> Watches {
+        let mut map = HashMap::new();
+        for &key in keys {
+            map.insert(
+                key.to_string(),
+                WatchEntry {
+                    last_seen_run_id: 0,
+                    active_runs: HashMap::new(),
+                    failure_counts: HashMap::new(),
+                    last_build: None,
+                },
+            );
+        }
+        Arc::new(Mutex::new(map))
+    }
+
+    #[test]
+    fn watch_key_format() {
+        assert_eq!(watch_key("alice/myapp", "main"), "alice/myapp#main");
+    }
+
+    #[test]
+    fn parse_watch_key_splits_correctly() {
+        assert_eq!(parse_watch_key("alice/myapp#main"), ("alice/myapp", "main"));
+    }
+
+    #[test]
+    fn parse_watch_key_falls_back_to_main() {
+        assert_eq!(parse_watch_key("alice/myapp"), ("alice/myapp", "main"));
+    }
+
+    #[tokio::test]
+    async fn repo_display_name_unique_shows_repo_only() {
+        let watches = make_watches(&["alice/myapp#main"]);
+        assert_eq!(repo_display_name("alice/myapp", &watches).await, "myapp");
+    }
+
+    #[tokio::test]
+    async fn repo_display_name_conflict_shows_full_name() {
+        let watches = make_watches(&["alice/myapp#main", "bob/myapp#main"]);
+        assert_eq!(
+            repo_display_name("alice/myapp", &watches).await,
+            "alice/myapp"
+        );
+        assert_eq!(repo_display_name("bob/myapp", &watches).await, "bob/myapp");
+    }
+
+    #[tokio::test]
+    async fn repo_display_name_different_repos_same_owner_no_conflict() {
+        let watches = make_watches(&["alice/myapp#main", "alice/otherapp#main"]);
+        assert_eq!(repo_display_name("alice/myapp", &watches).await, "myapp");
+        assert_eq!(
+            repo_display_name("alice/otherapp", &watches).await,
+            "otherapp"
+        );
+    }
+
+    #[tokio::test]
+    async fn repo_display_name_multiple_branches_same_repo_no_conflict() {
+        let watches = make_watches(&["alice/myapp#main", "alice/myapp#develop"]);
+        assert_eq!(repo_display_name("alice/myapp", &watches).await, "myapp");
+    }
 }

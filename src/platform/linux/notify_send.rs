@@ -1,17 +1,39 @@
+use std::collections::HashMap;
 use std::process::Command;
+use std::sync::Mutex;
 
 use crate::config::NotificationLevel;
 use crate::platform::Notifier;
 
 /// Linux desktop notifications via `notify-send`.
-pub struct NotifySend;
+///
+/// Uses `--print-id` / `--replace-id` to stack notifications per group (project),
+/// so each watched repo has its own notification slot.
+pub struct NotifySend {
+    ids: Mutex<HashMap<String, u32>>,
+}
+
+impl NotifySend {
+    pub fn new() -> Self {
+        Self {
+            ids: Mutex::new(HashMap::new()),
+        }
+    }
+}
 
 impl Notifier for NotifySend {
     fn name(&self) -> &'static str {
         "notify-send"
     }
 
-    fn send(&self, title: &str, body: &str, level: NotificationLevel, url: Option<&str>) {
+    fn send(
+        &self,
+        title: &str,
+        body: &str,
+        level: NotificationLevel,
+        url: Option<&str>,
+        group: Option<&str>,
+    ) {
         let (icon, category, expire_ms) = match level {
             NotificationLevel::Low => ("emblem-synchronizing", "transfer", "4000"),
             NotificationLevel::Normal => ("emblem-ok", "transfer.complete", "6000"),
@@ -28,21 +50,36 @@ impl Notifier for NotifySend {
             Some(u) => format!("{body}\n{u}"),
             None => body.to_string(),
         };
-        let _ = Command::new("notify-send")
-            .args([
-                "--app-name",
-                "Build Watcher",
-                "--urgency",
-                urgency,
-                "--icon",
-                icon,
-                "--category",
-                category,
-                "--expire-time",
-                expire_ms,
-                title,
-                &notification_body,
-            ])
-            .spawn();
+
+        let mut cmd = Command::new("notify-send");
+        cmd.args([
+            "--app-name",
+            "Build Watcher",
+            "--urgency",
+            urgency,
+            "--icon",
+            icon,
+            "--category",
+            category,
+            "--expire-time",
+            expire_ms,
+            "--print-id",
+        ]);
+
+        let key = group.unwrap_or("build-watcher").to_string();
+        let mut ids = self.ids.lock().unwrap();
+        if let Some(&id) = ids.get(&key) {
+            cmd.args(["--replace-id", &id.to_string()]);
+        }
+
+        cmd.args([title, &notification_body]);
+
+        if let Ok(output) = cmd.output()
+            && let Ok(id) = String::from_utf8_lossy(&output.stdout)
+                .trim()
+                .parse::<u32>()
+        {
+            ids.insert(key, id);
+        }
     }
 }

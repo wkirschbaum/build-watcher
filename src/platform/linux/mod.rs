@@ -14,5 +14,5 @@ pub fn default_config_dir() -> String {
 }
 
 pub fn detect() -> Box<dyn Notifier> {
-    Box::new(NotifySend)
+    Box::new(NotifySend::new())
 }

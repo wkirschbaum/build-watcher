@@ -13,7 +13,11 @@ impl TerminalNotifier {
         std::env::var("PATH")
             .unwrap_or_default()
             .split(':')
-            .any(|dir| std::path::Path::new(dir).join("terminal-notifier").is_file())
+            .any(|dir| {
+                std::path::Path::new(dir)
+                    .join("terminal-notifier")
+                    .is_file()
+            })
     }
 }
 
@@ -22,7 +26,14 @@ impl Notifier for TerminalNotifier {
         "terminal-notifier"
     }
 
-    fn send(&self, title: &str, body: &str, level: NotificationLevel, url: Option<&str>) {
+    fn send(
+        &self,
+        title: &str,
+        body: &str,
+        level: NotificationLevel,
+        url: Option<&str>,
+        group: Option<&str>,
+    ) {
         let sound = if level == NotificationLevel::Critical {
             "Basso"
         } else {
@@ -37,7 +48,7 @@ impl Notifier for TerminalNotifier {
             "-sound",
             sound,
             "-group",
-            "build-watcher",
+            group.unwrap_or("build-watcher"),
         ]);
         if let Some(url) = url {
             cmd.args(["-open", url]);

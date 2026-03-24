@@ -10,5 +10,13 @@ impl Notifier for NullNotifier {
         "null"
     }
 
-    fn send(&self, _title: &str, _body: &str, _level: NotificationLevel, _url: Option<&str>) {}
+    fn send(
+        &self,
+        _title: &str,
+        _body: &str,
+        _level: NotificationLevel,
+        _url: Option<&str>,
+        _group: Option<&str>,
+    ) {
+    }
 }

@@ -13,7 +13,14 @@ impl Notifier for AppleScriptNotifier {
         "osascript"
     }
 
-    fn send(&self, title: &str, body: &str, level: NotificationLevel, _url: Option<&str>) {
+    fn send(
+        &self,
+        title: &str,
+        body: &str,
+        level: NotificationLevel,
+        _url: Option<&str>,
+        _group: Option<&str>,
+    ) {
         let sound = if level == NotificationLevel::Critical {
             "Basso"
         } else {

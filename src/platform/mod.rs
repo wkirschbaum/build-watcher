@@ -21,7 +21,14 @@ pub use null::NullNotifier;
 
 pub trait Notifier: Send + Sync {
     fn name(&self) -> &'static str;
-    fn send(&self, title: &str, body: &str, level: NotificationLevel, url: Option<&str>);
+    fn send(
+        &self,
+        title: &str,
+        body: &str,
+        level: NotificationLevel,
+        url: Option<&str>,
+        group: Option<&str>,
+    );
 }
 
 static INSTANCE: OnceLock<Box<dyn Notifier>> = OnceLock::new();
@@ -41,11 +48,17 @@ fn notifier() -> &'static dyn Notifier {
     })
 }
 
-pub fn send_notification(title: &str, body: &str, level: NotificationLevel, url: Option<&str>) {
+pub fn send_notification(
+    title: &str,
+    body: &str,
+    level: NotificationLevel,
+    url: Option<&str>,
+    group: Option<&str>,
+) {
     if level == NotificationLevel::Off {
         return;
     }
-    notifier().send(title, body, level, url);
+    notifier().send(title, body, level, url, group);
 }
 
 /// Default state directory when STATE_DIRECTORY is not set.
