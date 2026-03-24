@@ -35,8 +35,9 @@ pub fn age(secs: u64) -> String {
 
 /// Truncate a string to `max` characters, appending "…" if truncated.
 pub fn truncate(s: &str, max: usize) -> String {
-    if s.len() > max {
-        format!("{}…", &s[..max - 1])
+    if s.chars().count() > max {
+        let truncated: String = s.chars().take(max - 1).collect();
+        format!("{truncated}…")
     } else {
         s.to_string()
     }

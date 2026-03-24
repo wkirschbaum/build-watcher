@@ -347,6 +347,9 @@ fn parse_iso_epoch(s: &str) -> Option<u64> {
     let year: u64 = parts[0].parse().ok()?;
     let month: u64 = parts[1].parse().ok()?;
     let day: u64 = parts[2].parse().ok()?;
+    if !(1..=12).contains(&month) || day == 0 {
+        return None;
+    }
 
     let time_parts: Vec<&str> = time.split(':').collect();
     if time_parts.len() < 2 {

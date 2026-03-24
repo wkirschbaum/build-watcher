@@ -21,8 +21,11 @@ if [ "$OS" = "Darwin" ]; then
   PLIST_PATH="$HOME/Library/LaunchAgents/com.build-watcher.plist"
   [ -f "$PLIST_PATH" ] && launchctl bootout "gui/$(id -u)" "$PLIST_PATH" 2>/dev/null || true
 else
-  systemctl --user stop "$BINARY_NAME.service" 2>/dev/null || true
+  systemctl --user disable --now "$BINARY_NAME.service" 2>/dev/null || true
 fi
+# Kill any orphan processes not managed by the service (e.g. leftover from MCP clients)
+pkill -f "$BINARY_PATH" 2>/dev/null || true
+sleep 0.5
 
 cp "$SCRIPT_DIR/target/release/$BINARY_NAME" "$INSTALL_DIR/$BINARY_NAME"
 
@@ -48,6 +51,17 @@ CONFJSON
   echo "  Edit $CONFIG_FILE to add repos, or use the watch_builds MCP tool."
 else
   echo "==> Config already exists at $CONFIG_FILE"
+fi
+
+# -- Install .desktop file (Linux) --
+
+echo "==> Installing desktop entry..."
+if [ "$OS" != "Darwin" ]; then
+  DESKTOP_DIR="$HOME/.local/share/applications"
+  mkdir -p "$DESKTOP_DIR"
+  cp "$SCRIPT_DIR/build-watcher.desktop" "$DESKTOP_DIR/build-watcher.desktop"
+  command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database "$DESKTOP_DIR" 2>/dev/null || true
+  echo "  Desktop:  $DESKTOP_DIR/build-watcher.desktop"
 fi
 
 # -- Platform-specific service install --
