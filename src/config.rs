@@ -260,7 +260,6 @@ impl Config {
             self.repos.remove(repo);
         }
     }
-
 }
 
 pub fn load_config() -> Config {

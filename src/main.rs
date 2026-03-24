@@ -479,7 +479,10 @@ impl BuildWatcher {
             (Some(repo), Some(branch)) => config.notifications_for(repo, branch),
             (Some(repo), None) => config.notifications_for(
                 repo,
-                config.default_branches.first().map_or("main", |s| s.as_str()),
+                config
+                    .default_branches
+                    .first()
+                    .map_or("main", |s| s.as_str()),
             ),
             _ => config.notifications.clone(),
         };

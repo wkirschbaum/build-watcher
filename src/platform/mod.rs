@@ -15,9 +15,9 @@ use macos as imp;
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 compile_error!("Unsupported platform: only Linux and macOS are supported");
 
-mod null;
+mod universal;
 #[allow(unused_imports)]
-pub use null::NullNotifier;
+pub use universal::NullNotifier;
 
 pub trait Notifier: Send + Sync {
     fn name(&self) -> &'static str;

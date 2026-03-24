@@ -129,16 +129,16 @@ impl Notifier for NotifySend {
             // Second line: action name, only written when the user clicks a button.
             match lines.next_line().await {
                 Ok(Some(action)) => {
-                    if action.trim() == "open" {
-                        if let Some(url) = url_owned {
-                            match tokio::process::Command::new("xdg-open").arg(&url).spawn() {
-                                Ok(mut child) => {
-                                    if let Err(e) = child.wait().await {
-                                        tracing::warn!("xdg-open failed: {e}");
-                                    }
+                    if action.trim() == "open"
+                        && let Some(url) = url_owned
+                    {
+                        match tokio::process::Command::new("xdg-open").arg(&url).spawn() {
+                            Ok(mut child) => {
+                                if let Err(e) = child.wait().await {
+                                    tracing::warn!("xdg-open failed: {e}");
                                 }
-                                Err(e) => tracing::warn!("Failed to spawn xdg-open: {e}"),
                             }
+                            Err(e) => tracing::warn!("Failed to spawn xdg-open: {e}"),
                         }
                     }
                 }
