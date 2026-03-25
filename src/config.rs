@@ -239,6 +239,8 @@ pub struct BranchConfig {
 /// Per-repo settings. Presence in the map means the repo is watched.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RepoConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alias: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub branches: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -340,10 +342,13 @@ impl Config {
         repos
     }
 
-    /// Returns just the repo name (e.g. `"bar"`) when it is unique among all watched
-    /// repos, or the full `"owner/repo"` string when another watched repo shares the
-    /// same name (e.g. both `"foo/bar"` and `"zoo/bar"` are watched).
-    pub fn short_repo<'a>(&self, repo: &'a str) -> &'a str {
+    /// Returns the display name for a repo. If an alias is set, returns it.
+    /// Otherwise returns just the repo name (e.g. `"bar"`) when it is unique among
+    /// all watched repos, or the full `"owner/repo"` when another repo shares the name.
+    pub fn short_repo<'a>(&'a self, repo: &'a str) -> &'a str {
+        if let Some(alias) = self.repos.get(repo).and_then(|r| r.alias.as_deref()) {
+            return alias;
+        }
         let Some((_, name)) = repo.rsplit_once('/') else {
             return repo;
         };
@@ -575,5 +580,41 @@ mod tests {
         assert_eq!(loaded.default_branches, vec!["main".to_string()]);
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn config_with_repos(repos: &[&str]) -> Config {
+        let mut config = Config::default();
+        for repo in repos {
+            config.repos.insert(repo.to_string(), RepoConfig::default());
+        }
+        config
+    }
+
+    #[test]
+    fn short_repo_unique_name_returns_short() {
+        let config = config_with_repos(&["alice/app"]);
+        assert_eq!(config.short_repo("alice/app"), "app");
+    }
+
+    #[test]
+    fn short_repo_ambiguous_name_returns_full() {
+        let config = config_with_repos(&["alice/app", "bob/app"]);
+        assert_eq!(config.short_repo("alice/app"), "alice/app");
+        assert_eq!(config.short_repo("bob/app"), "bob/app");
+    }
+
+    #[test]
+    fn short_repo_alias_overrides_auto_name() {
+        let mut config = config_with_repos(&["alice/app"]);
+        config.repos.get_mut("alice/app").unwrap().alias = Some("API".to_string());
+        assert_eq!(config.short_repo("alice/app"), "API");
+    }
+
+    #[test]
+    fn short_repo_alias_overrides_even_when_ambiguous() {
+        let mut config = config_with_repos(&["alice/app", "bob/app"]);
+        config.repos.get_mut("alice/app").unwrap().alias = Some("Alice API".to_string());
+        assert_eq!(config.short_repo("alice/app"), "Alice API");
+        assert_eq!(config.short_repo("bob/app"), "bob/app"); // still ambiguous, no alias
     }
 }

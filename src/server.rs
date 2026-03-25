@@ -218,6 +218,14 @@ struct ConfigureNotificationsParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+struct SetAliasParams {
+    /// GitHub repo in "owner/repo" format
+    repo: String,
+    /// Short display name shown in notification titles. Set to null or omit to clear the alias.
+    alias: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 struct ConfigureWorkflowsParams {
     /// GitHub repo in "owner/repo" format
     repo: String,
@@ -633,10 +641,14 @@ impl BuildWatcher {
             lines.push("\nRepos:".to_string());
             for repo in watched {
                 let rc = &config.repos[repo];
+                let label = config.short_repo(repo);
                 if rc.branches.is_empty() {
                     lines.push(format!("  {repo}: (default branches)"));
                 } else {
                     lines.push(format!("  {repo}: {:?}", rc.branches));
+                }
+                if let Some(alias) = &rc.alias {
+                    lines.push(format!("    alias: \"{alias}\" (shown as \"{label}\")"));
                 }
                 if !rc.workflows.is_empty() {
                     lines.push(format!("    workflows: {:?}", rc.workflows));
@@ -819,6 +831,37 @@ impl BuildWatcher {
         Ok(CallToolResult::success(vec![Content::text(
             "Test notification sent. You should see it on your desktop.",
         )]))
+    }
+
+    #[tool(
+        description = "Set a display alias for a repo. The alias replaces the repo name in notification titles. Pass alias=null to clear and restore the default name."
+    )]
+    async fn set_alias(
+        &self,
+        Parameters(params): Parameters<SetAliasParams>,
+    ) -> Result<CallToolResult, McpError> {
+        if let Err(e) = validate_repo(&params.repo) {
+            return Ok(CallToolResult::error(vec![Content::text(e)]));
+        }
+
+        let mut config = self.config.lock().await;
+        let Some(rc) = config.repos.get_mut(&params.repo) else {
+            return Ok(CallToolResult::error(vec![Content::text(format!(
+                "{} is not being watched — use watch_builds first",
+                params.repo
+            ))]));
+        };
+        let mut msg = if let Some(alias) = &params.alias {
+            rc.alias = Some(alias.clone());
+            format!("{}: alias set to \"{}\"", params.repo, alias)
+        } else {
+            rc.alias = None;
+            format!("{}: alias cleared", params.repo)
+        };
+        if let Some(warning) = persist_warning(save_config(&config)) {
+            msg.push_str(&warning);
+        }
+        Ok(CallToolResult::success(vec![Content::text(msg)]))
     }
 
     #[tool(
