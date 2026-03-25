@@ -215,3 +215,102 @@ async fn handle_notification(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_snapshot() -> RunSnapshot {
+        RunSnapshot {
+            repo: "alice/app".to_string(),
+            branch: "main".to_string(),
+            run_id: 12345,
+            workflow: "CI".to_string(),
+            title: "Fix login bug".to_string(),
+            event: "push".to_string(),
+        }
+    }
+
+    #[test]
+    fn run_snapshot_url() {
+        let snap = make_snapshot();
+        assert_eq!(
+            snap.url(),
+            "https://github.com/alice/app/actions/runs/12345"
+        );
+    }
+
+    #[test]
+    fn run_snapshot_display_title_push() {
+        let snap = make_snapshot();
+        assert_eq!(snap.display_title(), "Fix login bug");
+    }
+
+    #[test]
+    fn run_snapshot_display_title_pr() {
+        let mut snap = make_snapshot();
+        snap.event = "pull_request".to_string();
+        assert_eq!(snap.display_title(), "PR: Fix login bug");
+    }
+
+    #[test]
+    fn run_snapshot_notification_group() {
+        let snap = make_snapshot();
+        assert_eq!(snap.notification_group(), "alice/app#main#CI");
+    }
+
+    #[test]
+    fn effective_level_run_started() {
+        let config = config::Config::default();
+        let snap = make_snapshot();
+        let event = WatchEvent::RunStarted(snap);
+        assert_eq!(
+            effective_level(&event, &config),
+            config::NotificationLevel::Normal
+        );
+    }
+
+    #[test]
+    fn effective_level_run_completed_success() {
+        let config = config::Config::default();
+        let event = WatchEvent::RunCompleted {
+            run: make_snapshot(),
+            conclusion: "success".to_string(),
+            elapsed: None,
+            failing_steps: None,
+        };
+        assert_eq!(
+            effective_level(&event, &config),
+            config::NotificationLevel::Normal
+        );
+    }
+
+    #[test]
+    fn effective_level_run_completed_failure() {
+        let config = config::Config::default();
+        let event = WatchEvent::RunCompleted {
+            run: make_snapshot(),
+            conclusion: "failure".to_string(),
+            elapsed: None,
+            failing_steps: None,
+        };
+        assert_eq!(
+            effective_level(&event, &config),
+            config::NotificationLevel::Critical
+        );
+    }
+
+    #[test]
+    fn effective_level_status_changed_is_off() {
+        let config = config::Config::default();
+        let event = WatchEvent::StatusChanged {
+            run: make_snapshot(),
+            from: "queued".to_string(),
+            to: "in_progress".to_string(),
+        };
+        assert_eq!(
+            effective_level(&event, &config),
+            config::NotificationLevel::Off
+        );
+    }
+}

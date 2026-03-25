@@ -63,6 +63,7 @@ pub(crate) fn count_api_calls(watches: &HashMap<WatchKey, WatchEntry>) -> u64 {
 pub(crate) fn compute_intervals(
     rate_limit: Option<&RateLimit>,
     api_calls_per_cycle: u64,
+    now: u64,
 ) -> (u64, u64) {
     let calls = api_calls_per_cycle.max(1);
     let Some(rl) = rate_limit else {
@@ -77,7 +78,7 @@ pub(crate) fn compute_intervals(
         return (MIN_ACTIVE_SECS * scale, MIN_IDLE_SECS * scale);
     }
 
-    let seconds_until_reset = rl.reset.saturating_sub(crate::config::unix_now()).max(1);
+    let seconds_until_reset = rl.reset.saturating_sub(now).max(1);
 
     // Spread remaining budget evenly: min_interval = calls * secs / remaining.
     // checked_div handles remaining == 0 by waiting out the full reset window.
@@ -102,10 +103,10 @@ pub struct ActiveRun {
 }
 
 impl ActiveRun {
-    fn from_run(run: &RunInfo) -> Self {
+    fn from_run(run: &RunInfo, now: Instant) -> Self {
         Self {
             status: run.status.clone(),
-            started_at: Instant::now(),
+            started_at: now,
             workflow: run.workflow.clone(),
             title: run.title.clone(),
             event: run.event.clone(),
@@ -289,7 +290,8 @@ impl WatchEntry {
             if run.is_completed() {
                 self.last_build = Some(run.to_last_build());
             } else {
-                self.active_runs.insert(run.id, ActiveRun::from_run(run));
+                self.active_runs
+                    .insert(run.id, ActiveRun::from_run(run, Instant::now()));
             }
         }
     }
@@ -365,10 +367,11 @@ pub async fn start_watch(
             "{repo} [{branch}]: filtered runs unexpectedly empty"
         ));
     };
+    let now = Instant::now();
     let active: HashMap<u64, ActiveRun> = runs
         .iter()
         .filter(|r| !r.is_completed())
-        .map(|r| (r.id, ActiveRun::from_run(r)))
+        .map(|r| (r.id, ActiveRun::from_run(r, now)))
         .collect();
     let last_completed = runs.iter().find(|r| r.is_completed());
 
@@ -564,7 +567,8 @@ impl Poller {
             let w = self.watches.lock().await;
             count_api_calls(&w)
         };
-        let (active_secs, idle_secs) = compute_intervals(rate_limit.as_ref(), api_calls);
+        let (active_secs, idle_secs) =
+            compute_intervals(rate_limit.as_ref(), api_calls, crate::config::unix_now());
         let cfg = self.config.lock().await;
         PollConfig {
             active_secs,
@@ -788,6 +792,7 @@ async fn recover_existing_watches(
             };
             let filtered = filter_runs(&runs, &workflow_filter, &ignored_workflows);
 
+            let now = Instant::now();
             let mut w = watches.lock().await;
             if let Some(entry) = w.get_mut(&key) {
                 for run in &filtered {
@@ -796,7 +801,9 @@ async fn recover_existing_watches(
                         // Note: started_at is approximate — the actual GitHub start
                         // time is lost across restarts, so elapsed time in the
                         // completion notification may be inaccurate for recovered runs.
-                        entry.active_runs.insert(run.id, ActiveRun::from_run(run));
+                        entry
+                            .active_runs
+                            .insert(run.id, ActiveRun::from_run(run, now));
                     }
                 }
                 // Bump high-water mark from all runs (not just filtered) so
@@ -1249,22 +1256,20 @@ mod tests {
 
     // -- compute_intervals --
 
+    const T: u64 = 1_000_000; // fixed "now" for deterministic tests
+
     fn make_rate_limit(remaining: u64, limit: u64, secs_until_reset: u64) -> RateLimit {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
         RateLimit {
             limit,
             remaining,
-            reset: now + secs_until_reset,
+            reset: T + secs_until_reset,
             used: limit.saturating_sub(remaining),
         }
     }
 
     #[test]
     fn compute_intervals_no_data_returns_fallback() {
-        let (active, idle) = compute_intervals(None, 1);
+        let (active, idle) = compute_intervals(None, 1, T);
         assert_eq!(active, FALLBACK_ACTIVE_SECS);
         assert_eq!(idle, FALLBACK_IDLE_SECS);
     }
@@ -1274,22 +1279,22 @@ mod tests {
         let rl = make_rate_limit(3000, 5000, 3600); // 60% remaining — above 50%
 
         // 1 api call: sqrt(1) = 1 → bare floor
-        let (active, idle) = compute_intervals(Some(&rl), 1);
+        let (active, idle) = compute_intervals(Some(&rl), 1, T);
         assert_eq!(active, MIN_ACTIVE_SECS);
         assert_eq!(idle, MIN_IDLE_SECS);
 
         // 3 api calls: sqrt(3) = 1 → ×1
-        let (active, idle) = compute_intervals(Some(&rl), 3);
+        let (active, idle) = compute_intervals(Some(&rl), 3, T);
         assert_eq!(active, MIN_ACTIVE_SECS);
         assert_eq!(idle, MIN_IDLE_SECS);
 
         // 6 api calls: sqrt(6) = 2 → ×2
-        let (active, idle) = compute_intervals(Some(&rl), 6);
+        let (active, idle) = compute_intervals(Some(&rl), 6, T);
         assert_eq!(active, MIN_ACTIVE_SECS * 2);
         assert_eq!(idle, MIN_IDLE_SECS * 2);
 
         // 10 api calls: sqrt(10) = 3 → ×3
-        let (active, idle) = compute_intervals(Some(&rl), 10);
+        let (active, idle) = compute_intervals(Some(&rl), 10, T);
         assert_eq!(active, MIN_ACTIVE_SECS * 3);
         assert_eq!(idle, MIN_IDLE_SECS * 3);
     }
@@ -1301,7 +1306,7 @@ mod tests {
         // rate_limited = (1 * 3600) / 2500 = 1s
         // active = max(15, 1) = 15s, idle = max(60, 1) = 60s
         let rl = make_rate_limit(2500, 5000, 3600);
-        let (active, idle) = compute_intervals(Some(&rl), 1);
+        let (active, idle) = compute_intervals(Some(&rl), 1, T);
         assert_eq!(active, 15);
         assert_eq!(idle, 60);
     }
@@ -1312,7 +1317,7 @@ mod tests {
         // rate_limited = (1 * 3600) / 500 = 7s
         // active = max(15, 7) = 15s, idle = max(60, 7) = 60s
         let rl = make_rate_limit(500, 5000, 3600);
-        let (active, idle) = compute_intervals(Some(&rl), 1);
+        let (active, idle) = compute_intervals(Some(&rl), 1, T);
         assert_eq!(active, 15);
         assert_eq!(idle, 60);
     }
@@ -1322,7 +1327,7 @@ mod tests {
         // 500/5000 remaining, 10 api calls (e.g. 5 watches + 5 active runs), 3600s
         // rate_limited = (10 * 3600) / 500 = 72s
         let rl = make_rate_limit(500, 5000, 3600);
-        let (active, idle) = compute_intervals(Some(&rl), 10);
+        let (active, idle) = compute_intervals(Some(&rl), 10, T);
         assert_eq!(active, 72);
         assert_eq!(idle, 72);
     }
@@ -1330,17 +1335,16 @@ mod tests {
     #[test]
     fn compute_intervals_zero_remaining_waits_for_reset() {
         let rl = make_rate_limit(0, 5000, 3600);
-        let (active, idle) = compute_intervals(Some(&rl), 1);
-        // Both should be approximately seconds_until_reset (±1s for timing)
-        assert!((3599..=3601).contains(&active), "active={active}");
-        assert_eq!(active, idle);
+        let (active, idle) = compute_intervals(Some(&rl), 1, T);
+        assert_eq!(active, 3600);
+        assert_eq!(idle, 3600);
     }
 
     #[test]
     fn compute_intervals_zero_calls_treated_as_one() {
         let rl = make_rate_limit(500, 5000, 3600);
-        let (a0, i0) = compute_intervals(Some(&rl), 0);
-        let (a1, i1) = compute_intervals(Some(&rl), 1);
+        let (a0, i0) = compute_intervals(Some(&rl), 0, T);
+        let (a1, i1) = compute_intervals(Some(&rl), 1, T);
         assert_eq!(a0, a1);
         assert_eq!(i0, i1);
     }

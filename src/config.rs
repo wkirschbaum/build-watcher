@@ -633,4 +633,104 @@ mod tests {
         assert_eq!(config.short_repo("alice/app"), "Alice API");
         assert_eq!(config.short_repo("bob/app"), "bob/app"); // still ambiguous, no alias
     }
+
+    #[test]
+    fn workflows_for_returns_empty_when_no_config() {
+        let config = Config::default();
+        assert!(config.workflows_for("unknown/repo").is_empty());
+    }
+
+    #[test]
+    fn workflows_for_returns_empty_when_repo_has_no_filter() {
+        let config = config_with_repos(&["alice/app"]);
+        assert!(config.workflows_for("alice/app").is_empty());
+    }
+
+    #[test]
+    fn workflows_for_returns_configured_workflows() {
+        let mut config = config_with_repos(&["alice/app"]);
+        config.repos.get_mut("alice/app").unwrap().workflows =
+            vec!["CI".to_string(), "Deploy".to_string()];
+        assert_eq!(
+            config.workflows_for("alice/app"),
+            &["CI".to_string(), "Deploy".to_string()]
+        );
+    }
+
+    #[test]
+    fn branches_for_returns_defaults_when_no_config() {
+        let config = Config::default();
+        assert_eq!(config.branches_for("unknown/repo"), &["main".to_string()]);
+    }
+
+    #[test]
+    fn branches_for_returns_defaults_when_repo_has_no_branches() {
+        let config = config_with_repos(&["alice/app"]);
+        assert_eq!(config.branches_for("alice/app"), &["main".to_string()]);
+    }
+
+    #[test]
+    fn branches_for_returns_configured_branches() {
+        let mut config = config_with_repos(&["alice/app"]);
+        config.repos.get_mut("alice/app").unwrap().branches =
+            vec!["main".to_string(), "develop".to_string()];
+        assert_eq!(
+            config.branches_for("alice/app"),
+            &["main".to_string(), "develop".to_string()]
+        );
+    }
+
+    #[test]
+    fn add_repos_inserts_new() {
+        let mut config = Config::default();
+        config.add_repos(&["alice/app".to_string(), "bob/lib".to_string()]);
+        assert!(config.repos.contains_key("alice/app"));
+        assert!(config.repos.contains_key("bob/lib"));
+    }
+
+    #[test]
+    fn add_repos_does_not_overwrite_existing() {
+        let mut config = Config::default();
+        config.repos.insert(
+            "alice/app".to_string(),
+            RepoConfig {
+                alias: Some("API".to_string()),
+                ..Default::default()
+            },
+        );
+        config.add_repos(&["alice/app".to_string()]);
+        assert_eq!(config.repos["alice/app"].alias.as_deref(), Some("API"));
+    }
+
+    #[test]
+    fn watched_repos_returns_sorted() {
+        let config = config_with_repos(&["zoo/app", "alice/lib", "bob/api"]);
+        let repos: Vec<&str> = config
+            .watched_repos()
+            .into_iter()
+            .map(|s| s.as_str())
+            .collect();
+        assert_eq!(repos, vec!["alice/lib", "bob/api", "zoo/app"]);
+    }
+
+    #[test]
+    fn watched_repos_empty_when_no_repos() {
+        let config = Config::default();
+        assert!(config.watched_repos().is_empty());
+    }
+
+    #[test]
+    fn notification_overrides_is_empty_when_all_none() {
+        let overrides = NotificationOverrides::default();
+        assert!(overrides.is_empty());
+    }
+
+    #[test]
+    fn notification_overrides_is_not_empty_with_any_set() {
+        let overrides = NotificationOverrides {
+            build_started: Some(NotificationLevel::Off),
+            ..Default::default()
+        };
+        assert!(!overrides.is_empty());
+    }
 }

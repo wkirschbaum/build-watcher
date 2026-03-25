@@ -595,13 +595,14 @@ impl BuildWatcher {
         // Acquire rate_limit and watches before config. Pollers never hold all
         // three simultaneously, but we keep the same outer ordering
         // (rate_limit → watches → config) to avoid potential deadlocks.
+        let now = crate::config::unix_now();
         let (active_secs, idle_secs, rate_limit_line) = {
             let rl = self.rate_limit.lock().await;
             let w = self.watches.lock().await;
             let api_calls = count_api_calls(&w);
             drop(w);
-            let (active, idle) = compute_intervals(rl.as_ref(), api_calls);
-            let line = format_rate_limit_line(rl.as_ref(), active, idle);
+            let (active, idle) = compute_intervals(rl.as_ref(), api_calls, now);
+            let line = format_rate_limit_line(rl.as_ref(), active, idle, now);
             (active, idle, line)
         };
 
@@ -699,6 +700,7 @@ impl BuildWatcher {
     )]
     async fn get_stats(&self) -> Result<CallToolResult, McpError> {
         // Lock order: rate_limit → watches → pause → config (matches poller order).
+        let now = crate::config::unix_now();
         let rl = self.rate_limit.lock().await;
         let (watches_snap, api_calls) = {
             let w = self.watches.lock().await;
@@ -709,7 +711,7 @@ impl BuildWatcher {
             let calls = count_api_calls(&w);
             (snap, calls)
         };
-        let (active_secs, idle_secs) = compute_intervals(rl.as_ref(), api_calls);
+        let (active_secs, idle_secs) = compute_intervals(rl.as_ref(), api_calls, now);
         let throttled = active_secs > MIN_ACTIVE_SECS || idle_secs > MIN_IDLE_SECS;
 
         let paused = {
@@ -752,7 +754,7 @@ impl BuildWatcher {
             None => lines
                 .push("  (no data yet — first refresh happens after the first poll)".to_string()),
             Some(rl) => {
-                let mins_left = rl.reset.saturating_sub(crate::config::unix_now()) / 60;
+                let mins_left = rl.reset.saturating_sub(now) / 60;
                 let pct = rl.remaining * 100 / rl.limit.max(1);
                 lines.push(format!(
                     "  Remaining : {} / {} ({}%)",
@@ -1156,12 +1158,13 @@ impl BuildWatcher {
             ));
         }
 
+        let now = crate::config::unix_now();
         for entry in &entries {
             let duration = entry
                 .duration_secs()
                 .map_or_else(|| "—".to_string(), format::seconds);
             let age = entry
-                .age_secs()
+                .age_secs(now)
                 .map_or_else(|| "—".to_string(), format::age);
             let title = entry.display_title();
 
@@ -1372,11 +1375,12 @@ fn format_rate_limit_line(
     rl: Option<&crate::github::RateLimit>,
     active_secs: u64,
     idle_secs: u64,
+    now: u64,
 ) -> String {
     let Some(rl) = rl else {
         return "unknown (no watches active yet)".to_string();
     };
-    let mins_left = rl.reset.saturating_sub(crate::config::unix_now()) / 60;
+    let mins_left = rl.reset.saturating_sub(now) / 60;
     let throttled = active_secs > MIN_ACTIVE_SECS || idle_secs > MIN_IDLE_SECS;
     let throttle_note = if throttled { " [throttled]" } else { "" };
     format!(
@@ -1430,5 +1434,85 @@ mod tests {
         let json = r#""not json""#;
         let mut de = serde_json::Deserializer::from_str(json);
         assert!(deserialize_string_or_vec(&mut de).is_err());
+    }
+
+    #[test]
+    fn validate_hhmm_accepts_valid() {
+        assert!(super::validate_hhmm("00:00").is_ok());
+        assert!(super::validate_hhmm("23:59").is_ok());
+        assert!(super::validate_hhmm("12:30").is_ok());
+    }
+
+    #[test]
+    fn validate_hhmm_rejects_invalid() {
+        assert!(super::validate_hhmm("24:00").is_err());
+        assert!(super::validate_hhmm("12:60").is_err());
+        assert!(super::validate_hhmm("noon").is_err());
+        assert!(super::validate_hhmm("12").is_err());
+        assert!(super::validate_hhmm("ab:cd").is_err());
+    }
+
+    #[test]
+    fn format_rate_limit_line_no_data() {
+        let line = super::format_rate_limit_line(None, 15, 60, 0);
+        assert_eq!(line, "unknown (no watches active yet)");
+    }
+
+    #[test]
+    fn format_rate_limit_line_normal() {
+        let now = 1_000_000;
+        let rl = crate::github::RateLimit {
+            limit: 5000,
+            remaining: 4500,
+            reset: now + 3600,
+            used: 500,
+        };
+        let line = super::format_rate_limit_line(Some(&rl), 15, 60, now);
+        assert_eq!(line, "4500/5000 remaining (resets in 60m)");
+    }
+
+    #[test]
+    fn format_rate_limit_line_throttled() {
+        let now = 1_000_000;
+        let rl = crate::github::RateLimit {
+            limit: 5000,
+            remaining: 100,
+            reset: now + 3600,
+            used: 4900,
+        };
+        let line = super::format_rate_limit_line(Some(&rl), 72, 72, now);
+        assert!(line.contains("[throttled]"));
+    }
+
+    #[test]
+    fn format_notification_overrides_all_set() {
+        use crate::config::{NotificationLevel, NotificationOverrides};
+        let overrides = NotificationOverrides {
+            build_started: Some(NotificationLevel::Off),
+            build_success: Some(NotificationLevel::Normal),
+            build_failure: Some(NotificationLevel::Critical),
+        };
+        let s = super::format_notification_overrides(&overrides);
+        assert_eq!(s, "started: off, success: normal, failure: critical");
+    }
+
+    #[test]
+    fn format_notification_overrides_partial() {
+        use crate::config::{NotificationLevel, NotificationOverrides};
+        let overrides = NotificationOverrides {
+            build_started: None,
+            build_success: None,
+            build_failure: Some(NotificationLevel::Low),
+        };
+        let s = super::format_notification_overrides(&overrides);
+        assert_eq!(s, "failure: low");
+    }
+
+    #[test]
+    fn format_notification_overrides_empty() {
+        use crate::config::NotificationOverrides;
+        let overrides = NotificationOverrides::default();
+        let s = super::format_notification_overrides(&overrides);
+        assert_eq!(s, "");
     }
 }

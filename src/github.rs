@@ -320,10 +320,9 @@ impl HistoryEntry {
         Some(end.saturating_sub(start))
     }
 
-    /// Seconds since `created_at`.
-    pub fn age_secs(&self) -> Option<u64> {
+    /// Seconds since `created_at`, given the current Unix epoch.
+    pub fn age_secs(&self, now: u64) -> Option<u64> {
         let start = parse_iso_epoch(&self.created_at)?;
-        let now = crate::config::unix_now();
         Some(now.saturating_sub(start))
     }
 }
@@ -730,5 +729,65 @@ mod tests {
     fn parse_iso_epoch_rejects_invalid_time() {
         assert!(parse_iso_epoch("2024-01-01T24:00:00Z").is_none());
         assert!(parse_iso_epoch("2024-01-01T12:60:00Z").is_none());
+    }
+
+    #[test]
+    fn history_entry_display_title_push() {
+        let entry = HistoryEntry {
+            id: 1,
+            conclusion: "success".to_string(),
+            workflow: "CI".to_string(),
+            title: "Update deps".to_string(),
+            branch: "main".to_string(),
+            event: "push".to_string(),
+            created_at: "2024-01-01T10:00:00Z".to_string(),
+            updated_at: "2024-01-01T10:05:00Z".to_string(),
+        };
+        assert_eq!(entry.display_title(), "Update deps");
+    }
+
+    #[test]
+    fn history_entry_display_title_pr() {
+        let entry = HistoryEntry {
+            id: 1,
+            conclusion: "success".to_string(),
+            workflow: "CI".to_string(),
+            title: "Fix bug".to_string(),
+            branch: "main".to_string(),
+            event: "pull_request".to_string(),
+            created_at: String::new(),
+            updated_at: String::new(),
+        };
+        assert_eq!(entry.display_title(), "PR: Fix bug");
+    }
+
+    #[test]
+    fn history_entry_duration_secs() {
+        let entry = HistoryEntry {
+            id: 1,
+            conclusion: "success".to_string(),
+            workflow: "CI".to_string(),
+            title: "Test".to_string(),
+            branch: "main".to_string(),
+            event: "push".to_string(),
+            created_at: "2024-01-01T10:00:00Z".to_string(),
+            updated_at: "2024-01-01T10:05:30Z".to_string(),
+        };
+        assert_eq!(entry.duration_secs(), Some(330)); // 5m 30s
+    }
+
+    #[test]
+    fn history_entry_duration_secs_invalid_timestamps() {
+        let entry = HistoryEntry {
+            id: 1,
+            conclusion: "success".to_string(),
+            workflow: "CI".to_string(),
+            title: "Test".to_string(),
+            branch: "main".to_string(),
+            event: "push".to_string(),
+            created_at: "invalid".to_string(),
+            updated_at: "2024-01-01T10:05:30Z".to_string(),
+        };
+        assert_eq!(entry.duration_secs(), None);
     }
 }
