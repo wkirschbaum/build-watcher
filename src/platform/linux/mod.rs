@@ -1,7 +1,8 @@
 use crate::config::NotificationLevel;
 use crate::platform::Notifier;
 
-mod notify_send;
+#[allow(clippy::too_many_arguments)] // D-Bus Notify method has 8 params per spec
+mod dbus;
 
 /// Shared notification properties derived from a `NotificationLevel`.
 #[derive(Debug, PartialEq)]
@@ -54,8 +55,13 @@ pub fn default_config_dir() -> String {
     format!("{home}/.config/build-watcher")
 }
 
-pub fn detect() -> Box<dyn Notifier> {
-    Box::new(notify_send::NotifySend::new())
+pub async fn detect() -> Box<dyn Notifier> {
+    match dbus::DbusNotifier::new().await {
+        Ok(n) => Box::new(n),
+        Err(e) => {
+            panic!("D-Bus session bus unavailable: {e}");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -102,11 +108,5 @@ mod tests {
     #[test]
     fn app_name_from_group_no_hash_returns_whole_string() {
         assert_eq!(app_name_from_group(Some("build-watcher")), "build-watcher");
-    }
-
-    #[test]
-    fn detect_returns_a_notifier() {
-        let notifier = detect();
-        assert_eq!(notifier.name(), "notify-send");
     }
 }

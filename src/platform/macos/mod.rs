@@ -17,7 +17,7 @@ pub fn default_config_dir() -> String {
     format!("{home}/Library/Application Support/build-watcher/config")
 }
 
-pub fn detect() -> Box<dyn Notifier> {
+pub async fn detect() -> Box<dyn Notifier> {
     if TerminalNotifier::is_available() {
         Box::new(TerminalNotifier)
     } else {

@@ -14,8 +14,8 @@ use crate::platform;
 pub fn unix_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+        .expect("system clock before Unix epoch")
+        .as_secs()
 }
 
 // -- Directories (computed once) --
@@ -104,7 +104,7 @@ pub async fn save_json_async<T: Serialize + Send + 'static>(
     path: PathBuf,
     value: T,
 ) -> Result<(), PersistError> {
-    match tokio::task::spawn_blocking(move || save_json(path, &value)).await {
+    match tokio::task::spawn_blocking(move || save_json(&path, &value)).await {
         Ok(result) => result,
         Err(e) => {
             tracing::error!("save_json_async: blocking task panicked: {e}");
@@ -115,7 +115,7 @@ pub async fn save_json_async<T: Serialize + Send + 'static>(
     }
 }
 
-pub fn save_json<T: Serialize>(path: PathBuf, value: &T) -> Result<(), PersistError> {
+pub fn save_json<T: Serialize>(path: &Path, value: &T) -> Result<(), PersistError> {
     let data = serde_json::to_string_pretty(value)?;
 
     let draft = path.with_extension("json.draft");
@@ -148,18 +148,18 @@ pub fn save_json<T: Serialize>(path: PathBuf, value: &T) -> Result<(), PersistEr
 
     // Backup current file, then promote draft
     let bak = path.with_extension("json.bak");
-    if let Err(e) = std::fs::rename(&path, &bak) {
+    if let Err(e) = std::fs::rename(path, &bak) {
         // Not fatal — the file may not exist yet (first save)
         if path.exists() {
             tracing::warn!("Failed to create backup {}: {e}", bak.display());
         }
     }
-    if let Err(e) = std::fs::rename(&draft, &path) {
+    if let Err(e) = std::fs::rename(&draft, path) {
         // Try to restore backup
-        let _ = std::fs::rename(&bak, &path);
+        let _ = std::fs::rename(&bak, path);
         return Err(PersistError::Rename {
             from: draft,
-            to: path,
+            to: path.to_path_buf(),
             source: e,
         });
     }
@@ -440,7 +440,7 @@ pub fn load_and_normalize() -> Config {
 }
 
 pub fn save_config(config: &Config) -> Result<(), PersistError> {
-    save_json(config_dir().join("config.json"), config)
+    save_json(&config_dir().join("config.json"), config)
 }
 
 pub async fn save_config_async(config: &Config) -> Result<(), PersistError> {
@@ -568,7 +568,7 @@ mod tests {
             },
         );
 
-        save_json(path.clone(), &config).unwrap();
+        save_json(&path, &config).unwrap();
         let loaded: Config = load_json(&path).unwrap();
         assert_eq!(loaded.repos.len(), 1);
         assert_eq!(

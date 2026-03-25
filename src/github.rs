@@ -302,8 +302,8 @@ pub async fn gh_run_rerun(repo: &str, run_id: u64, failed_only: bool) -> Result<
 
 /// A build history entry with timestamps for duration/age calculation.
 #[derive(Debug)]
-#[allow(dead_code)]
 pub struct HistoryEntry {
+    #[allow(dead_code)] // populated from API but not yet displayed
     pub id: u64,
     pub conclusion: String,
     pub workflow: String,

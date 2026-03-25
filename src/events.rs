@@ -53,7 +53,6 @@ impl RunSnapshot {
 
 /// Events emitted by the watcher polling loop.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub enum WatchEvent {
     /// A new build was detected.
     RunStarted(RunSnapshot),
@@ -67,6 +66,7 @@ pub enum WatchEvent {
     },
 
     /// A build's status changed (e.g. queued -> `in_progress`).
+    #[allow(dead_code)] // fields carried for Debug logging
     StatusChanged {
         run: RunSnapshot,
         from: String,
@@ -106,6 +106,10 @@ pub async fn run_notification_handler(
     loop {
         match rx.recv().await {
             Ok(event) => {
+                // Check pause state before acquiring the config lock to
+                // avoid holding two locks simultaneously.
+                let paused = is_paused(&pause).await;
+
                 // Extract what we need from config and drop the lock before
                 // dispatching the notification (which performs async I/O).
                 let cfg_snapshot = {
@@ -113,7 +117,7 @@ pub async fn run_notification_handler(
                     let level = effective_level(&event, &cfg);
                     let suppressed = level == config::NotificationLevel::Off
                         || (level != config::NotificationLevel::Critical
-                            && (is_paused(&pause).await || cfg.is_in_quiet_hours()));
+                            && (paused || cfg.is_in_quiet_hours()));
                     if suppressed { None } else { Some(cfg.clone()) }
                 };
                 if let Some(cfg) = &cfg_snapshot {

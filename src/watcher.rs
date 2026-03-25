@@ -36,7 +36,7 @@ const RATE_LIMIT_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 /// Each active run adds 1 `gh run view` call per active cycle.
 /// This gives the rate limiter an accurate picture of actual API consumption.
 pub(crate) fn count_api_calls(watches: &HashMap<WatchKey, WatchEntry>) -> u64 {
-    let base_calls = watches.len().max(1) as u64; // 1 gh run list per watch
+    let base_calls = watches.len() as u64; // 1 gh run list per watch
     let active_run_calls: u64 = watches.values().map(|e| e.active_runs.len() as u64).sum();
     base_calls + active_run_calls
 }
@@ -775,7 +775,11 @@ async fn recover_existing_watches(
         });
     }
 
-    while let Some(Ok((key, result))) = set.join_next().await {
+    while let Some(join_result) = set.join_next().await {
+        let Ok((key, result)) = join_result else {
+            tracing::error!("Recovery task panicked");
+            continue;
+        };
         if let Ok(runs) = result {
             let (workflow_filter, ignored_workflows) = {
                 let cfg = config.lock().await;
@@ -1369,5 +1373,11 @@ mod tests {
 
         // 2 base calls (one per watch) + 3 active run calls = 5
         assert_eq!(count_api_calls(&watches), 5);
+    }
+
+    #[test]
+    fn count_api_calls_empty_watches() {
+        let watches = HashMap::new();
+        assert_eq!(count_api_calls(&watches), 0);
     }
 }

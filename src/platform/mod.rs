@@ -1,6 +1,7 @@
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::OnceLock;
+
+use tokio::sync::OnceCell;
 
 use crate::config::NotificationLevel;
 
@@ -35,22 +36,16 @@ pub trait Notifier: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
 }
 
-static INSTANCE: OnceLock<Box<dyn Notifier>> = OnceLock::new();
+static INSTANCE: OnceCell<Box<dyn Notifier>> = OnceCell::const_new();
 
-/// Override the notifier backend for testing. Must be called before any
-/// notification is sent. Subsequent calls are silently ignored (OnceLock semantics).
-#[cfg(test)]
-#[allow(dead_code)]
-pub fn init(notifier: Box<dyn Notifier>) {
-    INSTANCE.set(notifier).ok();
-}
-
-pub fn notifier() -> &'static dyn Notifier {
-    &**INSTANCE.get_or_init(|| {
-        let n = imp::detect();
-        tracing::info!("Using notification backend: {}", n.name());
-        n
-    })
+async fn notifier() -> &'static dyn Notifier {
+    &**INSTANCE
+        .get_or_init(|| async {
+            let n = imp::detect().await;
+            tracing::info!("Using notification backend: {}", n.name());
+            n
+        })
+        .await
 }
 
 pub async fn send_notification(
@@ -63,7 +58,7 @@ pub async fn send_notification(
     if level == NotificationLevel::Off {
         return;
     }
-    notifier().send(title, body, level, url, group).await;
+    notifier().await.send(title, body, level, url, group).await;
 }
 
 /// Default state directory when `STATE_DIRECTORY` is not set.
