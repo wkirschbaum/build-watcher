@@ -98,7 +98,6 @@ pub struct ActiveRun {
     pub started_at: Instant,
     pub workflow: String,
     pub title: String,
-    pub head_sha: String,
     pub event: String,
 }
 
@@ -109,13 +108,12 @@ impl ActiveRun {
             started_at: Instant::now(),
             workflow: run.workflow.clone(),
             title: run.title.clone(),
-            head_sha: run.head_sha.clone(),
             event: run.event.clone(),
         }
     }
 
     pub fn display_title(&self) -> String {
-        crate::github::display_title(&self.event, &self.title, &self.head_sha)
+        crate::github::display_title(&self.event, &self.title)
     }
 }
 
@@ -911,7 +909,6 @@ mod tests {
             started_at: Instant::now(),
             workflow: "CI".to_string(),
             title: "Test PR".to_string(),
-            head_sha: "abc1234".to_string(),
             event: "push".to_string(),
         }
     }

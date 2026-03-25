@@ -18,7 +18,6 @@ pub struct RunSnapshot {
     pub run_id: u64,
     pub workflow: String,
     pub title: String,
-    pub head_sha: String,
     pub event: String,
 }
 
@@ -30,7 +29,6 @@ impl RunSnapshot {
             run_id: run.id,
             workflow: run.workflow.clone(),
             title: run.title.clone(),
-            head_sha: run.head_sha.clone(),
             event: run.event.clone(),
         }
     }
@@ -43,7 +41,7 @@ impl RunSnapshot {
     }
 
     pub fn display_title(&self) -> String {
-        crate::github::display_title(&self.event, &self.title, &self.head_sha)
+        crate::github::display_title(&self.event, &self.title)
     }
 
     fn notification_group(&self) -> String {

@@ -675,9 +675,9 @@ impl BuildWatcher {
                 qh.start,
                 qh.end,
                 if config.is_in_quiet_hours() {
-                    "active"
+                    "quiet"
                 } else {
-                    "inactive"
+                    "allowing"
                 }
             )),
             None => lines.push("\nQuiet hours: not configured".to_string()),
@@ -773,7 +773,7 @@ impl BuildWatcher {
         lines.push(format!(
             "  Quiet hours : {} (currently: {})",
             quiet_hours_label,
-            if quiet_active { "active" } else { "inactive" },
+            if quiet_active { "quiet" } else { "allowing" },
         ));
 
         Ok(CallToolResult::success(vec![Content::text(

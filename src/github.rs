@@ -73,7 +73,7 @@ pub struct LastBuild {
 impl LastBuild {
     /// Human-friendly title: "PR: <title>" for `pull_request` events, else "<title> <sha>".
     pub fn display_title(&self) -> String {
-        display_title(&self.event, &self.title, &self.head_sha)
+        display_title(&self.event, &self.title)
     }
 }
 
@@ -139,7 +139,7 @@ impl RunInfo {
 
     /// Human-friendly title: "PR: <title>" for `pull_request` events, else "<title> <sha>".
     pub fn display_title(&self) -> String {
-        display_title(&self.event, &self.title, &self.head_sha)
+        display_title(&self.event, &self.title)
     }
 
     pub fn is_completed(&self) -> bool {
@@ -220,18 +220,13 @@ pub async fn gh_run_status(repo: &str, run_id: u64) -> Result<RunInfo, GhError> 
     })
 }
 
-/// Format a human-readable title. PR events (`pull_request`, `pull_request_target`)
-/// show "PR: <title>", push events show "<title> (<sha>)".
-pub(crate) fn display_title(event: &str, title: &str, head_sha: &str) -> String {
+/// Format a human-readable title. PR events get a "PR: " prefix;
+/// all other events use the title as-is.
+pub(crate) fn display_title(event: &str, title: &str) -> String {
     if event.starts_with("pull_request") {
         format!("PR: {title}")
     } else {
-        let sha = short_sha(head_sha);
-        if sha.is_empty() {
-            title.to_string()
-        } else {
-            format!("{title} ({sha})")
-        }
+        title.to_string()
     }
 }
 
@@ -315,7 +310,7 @@ pub struct HistoryEntry {
 
 impl HistoryEntry {
     pub fn display_title(&self) -> String {
-        display_title(&self.event, &self.title, "")
+        display_title(&self.event, &self.title)
     }
 
     /// Duration as `updated_at - created_at`, parsed from ISO 8601 timestamps.
@@ -675,7 +670,7 @@ mod tests {
     #[test]
     fn display_title_for_push_event() {
         let run = run_from_value(&sample_json()).unwrap();
-        assert_eq!(run.display_title(), "Fix login bug (abc1234)");
+        assert_eq!(run.display_title(), "Fix login bug");
     }
 
     #[test]
@@ -687,18 +682,10 @@ mod tests {
     }
 
     #[test]
-    fn display_title_for_empty_sha() {
-        let mut v = sample_json();
-        v["headSha"] = json!("");
-        let run = run_from_value(&v).unwrap();
-        assert_eq!(run.display_title(), "Fix login bug");
-    }
-
-    #[test]
     fn last_build_display_title() {
         let run = run_from_value(&sample_json()).unwrap();
         let lb = run.to_last_build();
-        assert_eq!(lb.display_title(), "Fix login bug (abc1234)");
+        assert_eq!(lb.display_title(), "Fix login bug");
     }
 
     #[test]
