@@ -484,7 +484,7 @@ impl Poller {
         let mut last_rate_limit_refresh: Option<Instant> = None;
 
         loop {
-            // Refresh rate limit state every 5 minutes. The `gh api rate_limit`
+            // Refresh rate limit state every minute. The `gh api rate_limit`
             // call is free and doesn't count against the budget.
             if last_rate_limit_refresh.is_none_or(|t| t.elapsed() >= RATE_LIMIT_REFRESH_INTERVAL) {
                 match gh_rate_limit().await {

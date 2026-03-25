@@ -45,6 +45,7 @@ fn build_router(
     handle: WatcherHandle,
     pause: PauseState,
     rate_limit: RateLimitState,
+    started_at: std::time::Instant,
     ct: &CancellationToken,
 ) -> axum::Router {
     let http_config = StreamableHttpServerConfig {
@@ -64,6 +65,7 @@ fn build_router(
                     handle.clone(),
                     pause.clone(),
                     rate_limit.clone(),
+                    started_at,
                 ))
             },
             Arc::default(),
@@ -85,6 +87,7 @@ pub async fn serve(
     rate_limit: RateLimitState,
     ct: CancellationToken,
 ) -> Result<()> {
+    let started_at = std::time::Instant::now();
     let port: u16 = std::env::var("BUILD_WATCHER_PORT")
         .ok()
         .and_then(|p| p.parse().ok())
@@ -96,6 +99,7 @@ pub async fn serve(
         handle.clone(),
         pause,
         rate_limit,
+        started_at,
         &ct,
     );
     let listener = bind_with_fallback(port).await?;
@@ -315,6 +319,7 @@ impl BuildWatcher {
         handle: WatcherHandle,
         pause: PauseState,
         rate_limit: RateLimitState,
+        started_at: std::time::Instant,
     ) -> Self {
         Self {
             tool_router: Self::tool_router(),
@@ -323,7 +328,7 @@ impl BuildWatcher {
             handle,
             pause,
             rate_limit,
-            started_at: std::time::Instant::now(),
+            started_at,
         }
     }
 
