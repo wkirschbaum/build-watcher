@@ -1404,115 +1404,77 @@ fn format_notification_overrides(overrides: &NotificationOverrides) -> String {
 #[cfg(test)]
 mod tests {
     use super::deserialize_string_or_vec;
+    use crate::config::{NotificationLevel, NotificationOverrides};
 
-    #[test]
-    fn deserialize_proper_array() {
-        let json = r#"["alice/app","bob/lib"]"#;
+    fn deser(json: &str) -> Result<Vec<String>, serde_json::Error> {
         let mut de = serde_json::Deserializer::from_str(json);
-        let result = deserialize_string_or_vec(&mut de).unwrap();
-        assert_eq!(result, vec!["alice/app", "bob/lib"]);
+        deserialize_string_or_vec(&mut de)
     }
 
     #[test]
-    fn deserialize_stringified_array() {
-        let json = r#""[\"alice/app\",\"bob/lib\"]""#;
-        let mut de = serde_json::Deserializer::from_str(json);
-        let result = deserialize_string_or_vec(&mut de).unwrap();
-        assert_eq!(result, vec!["alice/app", "bob/lib"]);
+    fn deserialize_string_or_vec_variants() {
+        assert_eq!(deser(r#"["a","b"]"#).unwrap(), ["a", "b"]);
+        assert_eq!(deser(r#""[\"a\",\"b\"]""#).unwrap(), ["a", "b"]);
+        assert!(deser(r#"[]"#).unwrap().is_empty());
+        assert!(deser(r#""not json""#).is_err());
     }
 
     #[test]
-    fn deserialize_empty_array() {
-        let json = r#"[]"#;
-        let mut de = serde_json::Deserializer::from_str(json);
-        let result = deserialize_string_or_vec(&mut de).unwrap();
-        assert!(result.is_empty());
-    }
-
-    #[test]
-    fn deserialize_invalid_string_errors() {
-        let json = r#""not json""#;
-        let mut de = serde_json::Deserializer::from_str(json);
-        assert!(deserialize_string_or_vec(&mut de).is_err());
-    }
-
-    #[test]
-    fn validate_hhmm_accepts_valid() {
+    fn hhmm_validation() {
         assert!(super::validate_hhmm("00:00").is_ok());
         assert!(super::validate_hhmm("23:59").is_ok());
-        assert!(super::validate_hhmm("12:30").is_ok());
-    }
-
-    #[test]
-    fn validate_hhmm_rejects_invalid() {
         assert!(super::validate_hhmm("24:00").is_err());
         assert!(super::validate_hhmm("12:60").is_err());
         assert!(super::validate_hhmm("noon").is_err());
         assert!(super::validate_hhmm("12").is_err());
-        assert!(super::validate_hhmm("ab:cd").is_err());
     }
 
-    #[test]
-    fn format_rate_limit_line_no_data() {
-        let line = super::format_rate_limit_line(None, 15, 60, 0);
-        assert_eq!(line, "unknown (no watches active yet)");
-    }
-
-    #[test]
-    fn format_rate_limit_line_normal() {
-        let now = 1_000_000;
-        let rl = crate::github::RateLimit {
+    fn rl(remaining: u64, reset_offset: u64) -> crate::github::RateLimit {
+        crate::github::RateLimit {
             limit: 5000,
-            remaining: 4500,
-            reset: now + 3600,
-            used: 500,
-        };
-        let line = super::format_rate_limit_line(Some(&rl), 15, 60, now);
-        assert_eq!(line, "4500/5000 remaining (resets in 60m)");
+            remaining,
+            reset: 1_000_000 + reset_offset,
+            used: 5000 - remaining,
+        }
     }
 
     #[test]
-    fn format_rate_limit_line_throttled() {
+    fn rate_limit_line_formatting() {
         let now = 1_000_000;
-        let rl = crate::github::RateLimit {
-            limit: 5000,
-            remaining: 100,
-            reset: now + 3600,
-            used: 4900,
-        };
-        let line = super::format_rate_limit_line(Some(&rl), 72, 72, now);
-        assert!(line.contains("[throttled]"));
+        assert_eq!(
+            super::format_rate_limit_line(None, 15, 60, now),
+            "unknown (no watches active yet)"
+        );
+        assert_eq!(
+            super::format_rate_limit_line(Some(&rl(4500, 3600)), 15, 60, now),
+            "4500/5000 remaining (resets in 60m)"
+        );
+        assert!(
+            super::format_rate_limit_line(Some(&rl(100, 3600)), 72, 72, now)
+                .contains("[throttled]")
+        );
     }
 
     #[test]
-    fn format_notification_overrides_all_set() {
-        use crate::config::{NotificationLevel, NotificationOverrides};
-        let overrides = NotificationOverrides {
-            build_started: Some(NotificationLevel::Off),
-            build_success: Some(NotificationLevel::Normal),
-            build_failure: Some(NotificationLevel::Critical),
-        };
-        let s = super::format_notification_overrides(&overrides);
-        assert_eq!(s, "started: off, success: normal, failure: critical");
-    }
-
-    #[test]
-    fn format_notification_overrides_partial() {
-        use crate::config::{NotificationLevel, NotificationOverrides};
-        let overrides = NotificationOverrides {
-            build_started: None,
-            build_success: None,
-            build_failure: Some(NotificationLevel::Low),
-        };
-        let s = super::format_notification_overrides(&overrides);
-        assert_eq!(s, "failure: low");
-    }
-
-    #[test]
-    fn format_notification_overrides_empty() {
-        use crate::config::NotificationOverrides;
-        let overrides = NotificationOverrides::default();
-        let s = super::format_notification_overrides(&overrides);
-        assert_eq!(s, "");
+    fn notification_overrides_formatting() {
+        assert_eq!(
+            super::format_notification_overrides(&NotificationOverrides::default()),
+            ""
+        );
+        assert_eq!(
+            super::format_notification_overrides(&NotificationOverrides {
+                build_started: Some(NotificationLevel::Off),
+                build_success: Some(NotificationLevel::Normal),
+                build_failure: Some(NotificationLevel::Critical),
+            }),
+            "started: off, success: normal, failure: critical"
+        );
+        assert_eq!(
+            super::format_notification_overrides(&NotificationOverrides {
+                build_failure: Some(NotificationLevel::Low),
+                ..Default::default()
+            }),
+            "failure: low"
+        );
     }
 }

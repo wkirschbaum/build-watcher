@@ -49,27 +49,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn duration_seconds_only() {
+    fn duration_formatting() {
+        assert_eq!(duration(Duration::ZERO), "0s");
         assert_eq!(duration(Duration::from_secs(42)), "42s");
-    }
-
-    #[test]
-    fn duration_minutes_and_seconds() {
+        assert_eq!(duration(Duration::from_secs(120)), "2m");
         assert_eq!(duration(Duration::from_secs(150)), "2m 30s");
     }
 
     #[test]
-    fn duration_exact_minutes() {
-        assert_eq!(duration(Duration::from_secs(120)), "2m");
-    }
-
-    #[test]
-    fn duration_zero() {
-        assert_eq!(duration(Duration::ZERO), "0s");
-    }
-
-    #[test]
-    fn seconds_formats_correctly() {
+    fn seconds_formatting() {
         assert_eq!(seconds(0), "0s");
         assert_eq!(seconds(59), "59s");
         assert_eq!(seconds(60), "1m");
@@ -77,7 +65,7 @@ mod tests {
     }
 
     #[test]
-    fn age_formats_correctly() {
+    fn age_formatting() {
         assert_eq!(age(30), "just now");
         assert_eq!(age(300), "5m ago");
         assert_eq!(age(7200), "2h ago");
@@ -85,12 +73,8 @@ mod tests {
     }
 
     #[test]
-    fn truncate_short_string_unchanged() {
+    fn truncate_behavior() {
         assert_eq!(truncate("hello", 10), "hello");
-    }
-
-    #[test]
-    fn truncate_long_string() {
         assert_eq!(truncate("hello world!", 8), "hello w…");
     }
 }

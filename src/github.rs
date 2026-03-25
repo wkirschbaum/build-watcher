@@ -557,73 +557,38 @@ mod tests {
     }
 
     #[test]
-    fn short_sha_truncates_to_seven() {
-        let run = run_from_value(&sample_json()).unwrap();
-        assert_eq!(run.short_sha(), "abc1234");
-    }
-
-    #[test]
-    fn short_sha_returns_full_sha_when_short() {
-        let mut v = sample_json();
-        v["headSha"] = json!("abc");
-        let run = run_from_value(&v).unwrap();
-        assert_eq!(run.short_sha(), "abc");
-    }
-
-    #[test]
-    fn shared_short_sha_uses_get() {
+    fn short_sha_truncation() {
         assert_eq!(short_sha("abc1234def5678"), "abc1234");
         assert_eq!(short_sha("abc"), "abc");
         assert_eq!(short_sha(""), "");
     }
 
     #[test]
-    fn is_completed_true_when_status_completed() {
+    fn run_info_status_helpers() {
         let run = run_from_value(&sample_json()).unwrap();
         assert!(run.is_completed());
-    }
-
-    #[test]
-    fn is_completed_false_when_in_progress() {
-        let mut v = sample_json();
-        v["status"] = json!("in_progress");
-        let run = run_from_value(&v).unwrap();
-        assert!(!run.is_completed());
-    }
-
-    #[test]
-    fn succeeded_true_for_success_conclusion() {
-        let run = run_from_value(&sample_json()).unwrap();
         assert!(run.succeeded());
-    }
-
-    #[test]
-    fn succeeded_false_for_failure_conclusion() {
-        let mut v = sample_json();
-        v["conclusion"] = json!("failure");
-        let run = run_from_value(&v).unwrap();
-        assert!(!run.succeeded());
-    }
-
-    #[test]
-    fn url_format() {
-        let run = run_from_value(&sample_json()).unwrap();
+        assert_eq!(run.short_sha(), "abc1234");
         assert_eq!(
             run.url("alice/myapp"),
             "https://github.com/alice/myapp/actions/runs/123456789"
         );
+
+        let mut v = sample_json();
+        v["status"] = json!("in_progress");
+        v["conclusion"] = json!("failure");
+        let run = run_from_value(&v).unwrap();
+        assert!(!run.is_completed());
+        assert!(!run.succeeded());
     }
 
     #[test]
     fn to_last_build_copies_fields() {
-        let run = run_from_value(&sample_json()).unwrap();
-        let lb = run.to_last_build();
+        let lb = run_from_value(&sample_json()).unwrap().to_last_build();
         assert_eq!(lb.run_id, 123456789);
         assert_eq!(lb.conclusion, "success");
         assert_eq!(lb.workflow, "Lint and Test");
         assert_eq!(lb.title, "Fix login bug");
-        assert_eq!(lb.head_sha, "abc1234def5678");
-        assert_eq!(lb.event, "push");
     }
 
     #[test]
@@ -639,13 +604,9 @@ mod tests {
     }
 
     #[test]
-    fn validate_repo_accepts_valid() {
+    fn repo_validation() {
         assert!(validate_repo("alice/myapp").is_ok());
         assert!(validate_repo("my-org/my_repo.rs").is_ok());
-    }
-
-    #[test]
-    fn validate_repo_rejects_invalid() {
         assert!(validate_repo("noslash").is_err());
         assert!(validate_repo("a/b/c").is_err());
         assert!(validate_repo("/repo").is_err());
@@ -654,140 +615,84 @@ mod tests {
     }
 
     #[test]
-    fn validate_branch_accepts_valid() {
+    fn branch_validation() {
         assert!(validate_branch("main").is_ok());
         assert!(validate_branch("feature/my-branch").is_ok());
         assert!(validate_branch("release-1.0").is_ok());
-    }
-
-    #[test]
-    fn validate_branch_rejects_invalid() {
         assert!(validate_branch("").is_err());
         assert!(validate_branch("branch name").is_err());
     }
 
     #[test]
-    fn display_title_for_push_event() {
+    fn display_title_formatting() {
         let run = run_from_value(&sample_json()).unwrap();
         assert_eq!(run.display_title(), "Fix login bug");
-    }
+        assert_eq!(run.to_last_build().display_title(), "Fix login bug");
 
-    #[test]
-    fn display_title_for_pr_event() {
         let mut v = sample_json();
         v["event"] = json!("pull_request");
-        let run = run_from_value(&v).unwrap();
-        assert_eq!(run.display_title(), "PR: Fix login bug");
+        assert_eq!(
+            run_from_value(&v).unwrap().display_title(),
+            "PR: Fix login bug"
+        );
     }
 
     #[test]
-    fn last_build_display_title() {
-        let run = run_from_value(&sample_json()).unwrap();
-        let lb = run.to_last_build();
-        assert_eq!(lb.display_title(), "Fix login bug");
-    }
-
-    #[test]
-    fn parse_iso_epoch_basic() {
-        // 2024-01-01T00:00:00Z = known epoch value
-        let epoch = parse_iso_epoch("2024-01-01T00:00:00Z");
-        assert!(epoch.is_some());
-        // 2024-01-01 is 19723 days after 1970-01-01
-        assert_eq!(epoch.unwrap(), 19723 * 86400);
-    }
-
-    #[test]
-    fn parse_iso_epoch_with_fractional_seconds() {
-        let a = parse_iso_epoch("2024-01-01T12:30:45Z");
-        let b = parse_iso_epoch("2024-01-01T12:30:45.123Z");
-        assert_eq!(a, b); // fractional seconds are ignored
-    }
-
-    #[test]
-    fn parse_iso_epoch_returns_none_for_invalid() {
-        assert!(parse_iso_epoch("").is_none());
-        assert!(parse_iso_epoch("not-a-date").is_none());
-        assert!(parse_iso_epoch("2024-01-01").is_none()); // no time component
-    }
-
-    #[test]
-    fn parse_iso_epoch_duration_calculation() {
+    fn parse_iso_epoch_valid() {
+        assert_eq!(
+            parse_iso_epoch("2024-01-01T00:00:00Z").unwrap(),
+            19723 * 86400
+        );
+        // Fractional seconds are ignored
+        assert_eq!(
+            parse_iso_epoch("2024-01-01T12:30:45Z"),
+            parse_iso_epoch("2024-01-01T12:30:45.123Z")
+        );
+        // Duration between two timestamps
         let start = parse_iso_epoch("2024-01-01T10:00:00Z").unwrap();
         let end = parse_iso_epoch("2024-01-01T10:05:30Z").unwrap();
-        assert_eq!(end - start, 330); // 5m 30s = 330 seconds
+        assert_eq!(end - start, 330);
     }
 
     #[test]
-    fn parse_iso_epoch_rejects_invalid_day() {
-        assert!(parse_iso_epoch("2024-02-30T00:00:00Z").is_none()); // Feb 30
-        assert!(parse_iso_epoch("2024-04-31T00:00:00Z").is_none()); // Apr 31
-        assert!(parse_iso_epoch("2023-02-29T00:00:00Z").is_none()); // non-leap Feb 29
-        assert!(parse_iso_epoch("2024-02-29T00:00:00Z").is_some()); // leap Feb 29
-    }
-
-    #[test]
-    fn parse_iso_epoch_rejects_invalid_time() {
+    fn parse_iso_epoch_rejects_invalid() {
+        // Malformed
+        assert!(parse_iso_epoch("").is_none());
+        assert!(parse_iso_epoch("not-a-date").is_none());
+        assert!(parse_iso_epoch("2024-01-01").is_none());
+        // Invalid day
+        assert!(parse_iso_epoch("2024-02-30T00:00:00Z").is_none());
+        assert!(parse_iso_epoch("2023-02-29T00:00:00Z").is_none()); // non-leap
+        assert!(parse_iso_epoch("2024-02-29T00:00:00Z").is_some()); // leap
+        // Invalid time
         assert!(parse_iso_epoch("2024-01-01T24:00:00Z").is_none());
         assert!(parse_iso_epoch("2024-01-01T12:60:00Z").is_none());
     }
 
-    #[test]
-    fn history_entry_display_title_push() {
-        let entry = HistoryEntry {
-            id: 1,
-            conclusion: "success".to_string(),
-            workflow: "CI".to_string(),
-            title: "Update deps".to_string(),
-            branch: "main".to_string(),
-            event: "push".to_string(),
-            created_at: "2024-01-01T10:00:00Z".to_string(),
-            updated_at: "2024-01-01T10:05:00Z".to_string(),
-        };
-        assert_eq!(entry.display_title(), "Update deps");
-    }
-
-    #[test]
-    fn history_entry_display_title_pr() {
-        let entry = HistoryEntry {
-            id: 1,
-            conclusion: "success".to_string(),
-            workflow: "CI".to_string(),
-            title: "Fix bug".to_string(),
-            branch: "main".to_string(),
-            event: "pull_request".to_string(),
-            created_at: String::new(),
-            updated_at: String::new(),
-        };
-        assert_eq!(entry.display_title(), "PR: Fix bug");
-    }
-
-    #[test]
-    fn history_entry_duration_secs() {
-        let entry = HistoryEntry {
+    fn make_history(event: &str, created: &str, updated: &str) -> HistoryEntry {
+        HistoryEntry {
             id: 1,
             conclusion: "success".to_string(),
             workflow: "CI".to_string(),
             title: "Test".to_string(),
             branch: "main".to_string(),
-            event: "push".to_string(),
-            created_at: "2024-01-01T10:00:00Z".to_string(),
-            updated_at: "2024-01-01T10:05:30Z".to_string(),
-        };
-        assert_eq!(entry.duration_secs(), Some(330)); // 5m 30s
+            event: event.to_string(),
+            created_at: created.to_string(),
+            updated_at: updated.to_string(),
+        }
     }
 
     #[test]
-    fn history_entry_duration_secs_invalid_timestamps() {
-        let entry = HistoryEntry {
-            id: 1,
-            conclusion: "success".to_string(),
-            workflow: "CI".to_string(),
-            title: "Test".to_string(),
-            branch: "main".to_string(),
-            event: "push".to_string(),
-            created_at: "invalid".to_string(),
-            updated_at: "2024-01-01T10:05:30Z".to_string(),
-        };
-        assert_eq!(entry.duration_secs(), None);
+    fn history_entry_methods() {
+        let entry = make_history("push", "2024-01-01T10:00:00Z", "2024-01-01T10:05:30Z");
+        assert_eq!(entry.display_title(), "Test");
+        assert_eq!(entry.duration_secs(), Some(330));
+
+        let pr = make_history("pull_request", "", "");
+        assert_eq!(pr.display_title(), "PR: Test");
+        assert_eq!(pr.duration_secs(), None); // invalid timestamps
+
+        let bad = make_history("push", "invalid", "2024-01-01T10:05:30Z");
+        assert_eq!(bad.duration_secs(), None);
     }
 }

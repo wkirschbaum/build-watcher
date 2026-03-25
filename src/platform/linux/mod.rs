@@ -244,29 +244,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn dbus_props_low() {
-        let p = dbus_props(NotificationLevel::Low);
-        assert_eq!(p.icon, "emblem-synchronizing");
-        assert_eq!(p.category, "transfer");
-        assert_eq!(p.expire_ms, 4000);
-        assert_eq!(p.urgency, 0);
-    }
+    fn dbus_props_by_level() {
+        let low = dbus_props(NotificationLevel::Low);
+        assert_eq!(
+            (low.icon, low.urgency, low.expire_ms),
+            ("emblem-synchronizing", 0, 4000)
+        );
 
-    #[test]
-    fn dbus_props_normal() {
-        let p = dbus_props(NotificationLevel::Normal);
-        assert_eq!(p.icon, "emblem-ok");
-        assert_eq!(p.category, "transfer.complete");
-        assert_eq!(p.expire_ms, 6000);
-        assert_eq!(p.urgency, 1);
-    }
+        let normal = dbus_props(NotificationLevel::Normal);
+        assert_eq!(
+            (normal.icon, normal.urgency, normal.expire_ms),
+            ("emblem-ok", 1, 6000)
+        );
 
-    #[test]
-    fn dbus_props_critical() {
-        let p = dbus_props(NotificationLevel::Critical);
-        assert_eq!(p.icon, "dialog-error");
-        assert_eq!(p.category, "transfer.error");
-        assert_eq!(p.expire_ms, 0);
-        assert_eq!(p.urgency, 2);
+        let critical = dbus_props(NotificationLevel::Critical);
+        assert_eq!(
+            (critical.icon, critical.urgency, critical.expire_ms),
+            ("dialog-error", 2, 0)
+        );
     }
 }

@@ -935,32 +935,19 @@ mod tests {
     // -- WatchKey tests --
 
     #[test]
-    fn watch_key_display() {
-        assert_eq!(
-            WatchKey::new("alice/myapp", "main").to_string(),
-            "alice/myapp#main"
-        );
-    }
-
-    #[test]
-    fn watch_key_parse_splits_correctly() {
-        let k = WatchKey::parse("alice/myapp#main");
-        assert_eq!(k.repo, "alice/myapp");
-        assert_eq!(k.branch, "main");
-    }
-
-    #[test]
-    fn watch_key_parse_falls_back_to_main() {
-        let k = WatchKey::parse("alice/myapp");
-        assert_eq!(k.repo, "alice/myapp");
-        assert_eq!(k.branch, "main");
-    }
-
-    #[test]
-    fn watch_key_matches_repo() {
+    fn watch_key_roundtrip_and_matching() {
         let k = WatchKey::new("alice/myapp", "main");
+        assert_eq!(k.to_string(), "alice/myapp#main");
         assert!(k.matches_repo("alice/myapp"));
         assert!(!k.matches_repo("bob/other"));
+
+        let parsed = WatchKey::parse("alice/myapp#main");
+        assert_eq!(parsed.repo, "alice/myapp");
+        assert_eq!(parsed.branch, "main");
+
+        // Falls back to "main" when no branch in persisted key
+        let legacy = WatchKey::parse("alice/myapp");
+        assert_eq!(legacy.branch, "main");
     }
 
     // -- WatchEntry state machine tests --
@@ -1300,26 +1287,14 @@ mod tests {
     }
 
     #[test]
-    fn compute_intervals_at_threshold_throttles() {
-        // Exactly 50%: remaining * 2 == limit, so NOT above threshold → throttle
-        // 2500 remaining, 1 api call, 3600s until reset
-        // rate_limited = (1 * 3600) / 2500 = 1s
-        // active = max(15, 1) = 15s, idle = max(60, 1) = 60s
-        let rl = make_rate_limit(2500, 5000, 3600);
-        let (active, idle) = compute_intervals(Some(&rl), 1, T);
-        assert_eq!(active, 15);
-        assert_eq!(idle, 60);
-    }
+    fn compute_intervals_below_threshold_throttles() {
+        // At 50%: floors dominate for 1 call
+        let rl50 = make_rate_limit(2500, 5000, 3600);
+        assert_eq!(compute_intervals(Some(&rl50), 1, T), (15, 60));
 
-    #[test]
-    fn compute_intervals_low_remaining_throttles() {
-        // 500/5000 = 10% remaining, 1 api call, 3600s until reset
-        // rate_limited = (1 * 3600) / 500 = 7s
-        // active = max(15, 7) = 15s, idle = max(60, 7) = 60s
-        let rl = make_rate_limit(500, 5000, 3600);
-        let (active, idle) = compute_intervals(Some(&rl), 1, T);
-        assert_eq!(active, 15);
-        assert_eq!(idle, 60);
+        // At 10%: still floors for 1 call (rate_limited = 3600/500 = 7s < floors)
+        let rl10 = make_rate_limit(500, 5000, 3600);
+        assert_eq!(compute_intervals(Some(&rl10), 1, T), (15, 60));
     }
 
     #[test]
