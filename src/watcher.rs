@@ -57,9 +57,9 @@ pub(crate) fn count_api_calls(watches: &HashMap<WatchKey, WatchEntry>) -> u64 {
 /// at full speed for the first half of the window, then gradually backs off
 /// so the remaining budget lasts exactly to the reset.
 ///
-/// Above 50%, floor intervals scale as `MIN_*_SECS × (ilog2(calls) + 1)`
-/// — logarithmic growth keeps single-repo latency low while gently slowing
-/// things down as the call count grows.
+/// Above 50%, floor intervals scale as `MIN_*_SECS × (isqrt(calls))`
+/// — square-root growth keeps latency low for typical setups (≤10 watches)
+/// while gently slowing things down as the call count grows.
 pub(crate) fn compute_intervals(
     rate_limit: Option<&RateLimit>,
     api_calls_per_cycle: u64,
@@ -69,10 +69,11 @@ pub(crate) fn compute_intervals(
         return (FALLBACK_ACTIVE_SECS, FALLBACK_IDLE_SECS);
     };
 
-    // Above 50%: scale floor intervals logarithmically with call count.
-    // Uses ilog2(n)+1 so 1 call → ×1, 2–3 → ×2, 4–7 → ×3, 8–15 → ×4, …
+    // Above 50%: scale floor intervals by sqrt(calls).
+    // 1 call → ×1, 2–3 → ×1, 4–8 → ×2, 9–15 → ×3, 16–24 → ×4, …
     if rl.remaining * 2 > rl.limit {
-        let scale = u64::from(calls.ilog2()) + 1;
+        let scale = (calls as f64).sqrt() as u64;
+        let scale = scale.max(1);
         return (MIN_ACTIVE_SECS * scale, MIN_IDLE_SECS * scale);
     }
 
@@ -1271,20 +1272,25 @@ mod tests {
     fn compute_intervals_above_threshold_scales_with_call_count() {
         let rl = make_rate_limit(3000, 5000, 3600); // 60% remaining — above 50%
 
-        // 1 api call: bare floor
+        // 1 api call: sqrt(1) = 1 → bare floor
         let (active, idle) = compute_intervals(Some(&rl), 1);
         assert_eq!(active, MIN_ACTIVE_SECS);
         assert_eq!(idle, MIN_IDLE_SECS);
 
-        // 3 api calls: ilog2(3)+1 = 2
+        // 3 api calls: sqrt(3) = 1 → ×1
         let (active, idle) = compute_intervals(Some(&rl), 3);
+        assert_eq!(active, MIN_ACTIVE_SECS);
+        assert_eq!(idle, MIN_IDLE_SECS);
+
+        // 6 api calls: sqrt(6) = 2 → ×2
+        let (active, idle) = compute_intervals(Some(&rl), 6);
         assert_eq!(active, MIN_ACTIVE_SECS * 2);
         assert_eq!(idle, MIN_IDLE_SECS * 2);
 
-        // 10 api calls: ilog2(10)+1 = 4
+        // 10 api calls: sqrt(10) = 3 → ×3
         let (active, idle) = compute_intervals(Some(&rl), 10);
-        assert_eq!(active, MIN_ACTIVE_SECS * 4);
-        assert_eq!(idle, MIN_IDLE_SECS * 4);
+        assert_eq!(active, MIN_ACTIVE_SECS * 3);
+        assert_eq!(idle, MIN_IDLE_SECS * 3);
     }
 
     #[test]
