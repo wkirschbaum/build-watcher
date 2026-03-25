@@ -325,6 +325,20 @@ impl Config {
         repos
     }
 
+    /// Returns just the repo name (e.g. `"bar"`) when it is unique among all watched
+    /// repos, or the full `"owner/repo"` string when another watched repo shares the
+    /// same name (e.g. both `"foo/bar"` and `"zoo/bar"` are watched).
+    pub fn short_repo<'a>(&self, repo: &'a str) -> &'a str {
+        let Some((_, name)) = repo.rsplit_once('/') else {
+            return repo;
+        };
+        let ambiguous = self
+            .repos
+            .keys()
+            .any(|r| r != repo && r.rsplit_once('/').map_or(r.as_str(), |(_, n)| n) == name);
+        if ambiguous { repo } else { name }
+    }
+
     pub fn add_repos(&mut self, repos: &[String]) {
         for repo in repos {
             self.repos.entry(repo.clone()).or_default();
