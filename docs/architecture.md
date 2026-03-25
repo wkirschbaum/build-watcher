@@ -56,7 +56,7 @@ src/
 | `WatchKey` | `watcher` | Type-safe `repo#branch` key, serializes as string |
 | `WatchEntry` | `watcher` | Per-branch state: active runs, failure counts, last build |
 | `Poller` | `watcher` | Per-repo/branch async polling task |
-| `Config` | `config` | Persisted configuration: repos, branches, notification levels, polling intervals |
+| `Config` | `config` | Persisted configuration: repos, branches, notification levels, polling intervals. `short_repo(&str)` returns an unambiguous display name |
 | `EventBus` | `events` | Broadcast channel for `WatchEvent`s |
 | `WatchEvent` | `events` | `RunStarted`, `RunCompleted`, `StatusChanged` |
 | `RunSnapshot` | `events` | Immutable snapshot of a run's identity, carried by events |
@@ -95,6 +95,8 @@ The `EventBus` (`events.rs`) is a `tokio::sync::broadcast` channel that decouple
 This separation means adding new consumers (logging, webhooks) doesn't require modifying the poller.
 
 ## Polling strategy
+
+Each `Poller` task refreshes the shared `RateLimitState` every 5 minutes via `gh api rate_limit`. `compute_intervals` uses the current quota to derive dynamic sleep durations: full speed (1s/10s) above 50% remaining, throttled proportionally below that, waiting out the reset window at zero. All pollers share the same `Arc<Mutex<Option<RateLimit>>>` so they coordinate rather than independently consuming quota.
 
 Two functions handle different concerns:
 
@@ -135,7 +137,7 @@ Notifications are grouped per `repo#branch#workflow` so each workflow slot repla
 
 ## MCP server
 
-The `BuildWatcher` struct implements 17 MCP tools via `rmcp`'s `#[tool]` / `#[tool_router]` macros. The server uses Streamable HTTP transport in stateless mode over axum. A `StreamableHttpService` wraps the handler with `LocalSessionManager`.
+The `BuildWatcher` struct implements 16 MCP tools via `rmcp`'s `#[tool]` / `#[tool_router]` macros. The server uses Streamable HTTP transport in stateless mode over axum. A `StreamableHttpService` wraps the handler with `LocalSessionManager`.
 
 Port binding tries the preferred port (default 8417), falling back to up to 9 consecutive ports. The bound port is written to `~/.local/state/build-watcher/port`.
 

@@ -6,7 +6,17 @@ Watches GitHub Actions workflow runs for configured repositories by polling the 
 
 ## Desktop Notifications
 
-Sends native desktop notifications when builds start and complete. Notifications include the workflow name, branch, commit title (with short SHA for push events, or "PR: title" for pull requests), build conclusion, elapsed time, and a clickable link to the GitHub Actions run. Notifications are grouped per repo/branch/workflow so each slot replaces the previous one rather than stacking.
+Sends native desktop notifications when builds start and complete. The notification title uses the format `status: project | workflow` — for example:
+
+```
+🔨 started: build-watcher | CI
+✅ succeeded: build-watcher | CI
+❌ failed: build-watcher | CI
+```
+
+The project name is shortened to just the repo name (e.g. `build-watcher`) when it is unambiguous across all watched repos. If two watched repos share the same name (e.g. `foo/bar` and `zoo/bar`), the full `owner/repo` is shown instead. The notification body contains the branch, commit title (short SHA for push events, or "PR: title" for pull requests), elapsed time, and failing step names for failures. Notifications include a clickable link to the GitHub Actions run.
+
+Notifications are grouped per `repo#branch#workflow` so each workflow slot replaces the previous notification rather than stacking.
 
 On Linux, the preferred backend is D-Bus via the `notify-rust` crate, with a fallback to the `notify-send` CLI. Both support notification replacement via stored IDs, urgency levels, icons, categories, expiry times, a `desktop-entry` hint for GNOME/KDE grouping, and an "Open" action button that launches `xdg-open` with the run URL.
 
@@ -44,6 +54,15 @@ Reruns a GitHub Actions workflow run directly from Claude Code. Specify a run ID
 ## Build History
 
 Displays a formatted table of recent builds for a repo, showing conclusion, workflow name, commit title, duration, and relative age. Optionally filter by branch. When multiple branches are present and no branch filter is applied, the branch column is shown. Durations and ages are computed from GitHub's `createdAt`/`updatedAt` timestamps using a built-in ISO 8601 parser (no datetime library dependency).
+
+## Dynamic Rate-Limit-Aware Polling
+
+Polling intervals adapt in real time to the GitHub API rate limit. After each rate-limit refresh (every 5 minutes), the daemon computes intervals based on remaining quota:
+
+- **Above 50% remaining** — poll at floor speed (1s active, 10s idle).
+- **Below 50% remaining** — throttle: spread the remaining budget evenly across the seconds until the reset window expires, floored at the minimum values. At zero remaining, wait out the full reset window.
+
+This keeps polling fast when quota is plentiful and backs off gracefully as it depletes, without ever hitting a hard API cap. The rate-limit state is shared across all pollers so they coordinate rather than each independently consuming quota.
 
 ## Branch Configuration
 

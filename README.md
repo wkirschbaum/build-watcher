@@ -5,6 +5,8 @@ A background daemon that monitors GitHub Actions builds and sends desktop notifi
 ## Features
 
 - Desktop notifications on build start, success, and failure — with a direct link to the run
+- Notification titles formatted as `status: project | workflow` (e.g. `✅ succeeded: build-watcher | CI`)
+- Short repo names in notifications — org prefix omitted when the name is unambiguous
 - Build duration shown in completion notifications
 - Failing job/step context included in failure notifications
 - PR titles displayed for pull request events
@@ -16,6 +18,7 @@ A background daemon that monitors GitHub Actions builds and sends desktop notifi
 - Persistent watches that survive restarts
 - Tracks multiple concurrent builds on the same branch
 - Configurable notification urgency per event, per repo, or per branch
+- Dynamic rate-limit-aware polling — speeds up when quota is plentiful, backs off as it depletes
 - Configurable polling intervals (default: 10s active, 60s idle)
 
 ## Requirements
