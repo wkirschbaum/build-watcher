@@ -17,6 +17,7 @@ use crate::config::{
     NotificationLevel, NotificationOverrides, PersistError, QuietHours, RepoConfig, config_dir,
     save_config, state_dir,
 };
+use crate::format;
 use crate::github::{gh_run_list_history, gh_run_rerun, validate_branch, validate_repo};
 use crate::watcher::{
     MIN_ACTIVE_SECS, MIN_IDLE_SECS, PauseState, RateLimitState, SharedConfig, WatchKey,
@@ -1355,10 +1356,13 @@ impl ServerHandler for BuildWatcher {
                  Use configure_notifications to control which events trigger notifications — \
                  set scope with repo and branch params (global if omitted, per-repo, or per-branch). \
                  Levels: off, low, normal, critical. \
+                 Use set_alias to give a repo a short display name in notification titles. \
                  Use pause_notifications/resume_notifications to temporarily suppress notifications. \
+                 Use configure_quiet_hours to suppress notifications between two HH:MM times (default 22:00–06:00). \
                  Use configure_sound to enable/disable audio alerts on failure. \
                  Use rerun_build to rerun a failed build (or the last failed build for a repo). \
                  Use build_history to see recent builds for a repo. \
+                 Use get_stats for a live snapshot of polling, rate limit, and notification state. \
                  Use get_config to see current settings.",
             )
     }
@@ -1371,8 +1375,6 @@ impl ServerHandler for BuildWatcher {
         Ok(self.get_info())
     }
 }
-
-use crate::format;
 
 /// Apply notification level params to a global `NotificationConfig` (sets values directly).
 fn apply_notification_levels(
