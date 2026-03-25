@@ -179,6 +179,47 @@ where
     deserializer.deserialize_any(StringOrVec)
 }
 
+/// Like `deserialize_string_or_vec` but wraps the result in `Some`, and returns `None` for null
+/// or absent fields (use with `#[serde(default)]`).
+fn deserialize_opt_string_or_vec<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de;
+
+    struct OptStringOrVec;
+
+    impl<'de> de::Visitor<'de> for OptStringOrVec {
+        type Value = Option<Vec<String>>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a string array, a JSON-encoded string array, or null")
+        }
+
+        fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+            serde_json::from_str(v).map(Some).map_err(de::Error::custom)
+        }
+
+        fn visit_seq<A: de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+            let mut vec = Vec::new();
+            while let Some(item) = seq.next_element()? {
+                vec.push(item);
+            }
+            Ok(Some(vec))
+        }
+    }
+
+    deserializer.deserialize_any(OptStringOrVec)
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 struct WatchBuildsParams {
     /// List of GitHub repos in "owner/repo" format
@@ -203,34 +244,45 @@ struct ConfigureBranchesParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-struct ConfigureNotificationsParams {
-    /// Optional: GitHub repo in "owner/repo" format. If omitted, sets global defaults.
+struct UpdateNotificationsParams {
+    // --- Notification levels ---
+    /// Scope: GitHub repo in "owner/repo" format. Omit for global defaults.
     repo: Option<String>,
-    /// Optional: branch name. Requires repo. If omitted with repo, sets repo-level defaults.
+    /// Scope: branch name. Requires repo.
     branch: Option<String>,
-    /// Notification level for build started events (off, low, normal, critical)
+    /// Level for build started events (off, low, normal, critical)
     build_started: Option<NotificationLevel>,
-    /// Notification level for build success events (off, low, normal, critical)
+    /// Level for build success events (off, low, normal, critical)
     build_success: Option<NotificationLevel>,
-    /// Notification level for build failure events (off, low, normal, critical)
+    /// Level for build failure events (off, low, normal, critical)
     build_failure: Option<NotificationLevel>,
+
+    // --- Quiet hours ---
+    /// Start of quiet window in HH:MM (24h) local time. Defaults to "22:00".
+    quiet_start: Option<String>,
+    /// End of quiet window in HH:MM (24h) local time. Defaults to "06:00".
+    quiet_end: Option<String>,
+    /// Set true to disable quiet hours entirely.
+    quiet_clear: Option<bool>,
+
+    // --- Pause control ---
+    /// true = pause, false = resume. Combine with pause_minutes for a timed pause.
+    pause: Option<bool>,
+    /// Minutes to pause (only used when pause=true). Omit for indefinite.
+    pause_minutes: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-struct SetAliasParams {
+struct ConfigureRepoParams {
     /// GitHub repo in "owner/repo" format
     repo: String,
-    /// Short display name shown in notification titles. Set to null or omit to clear the alias.
+    /// Workflow allow-list. Empty = all workflows. Omit to leave unchanged.
+    #[serde(default, deserialize_with = "deserialize_opt_string_or_vec")]
+    workflows: Option<Vec<String>>,
+    /// Display alias for notification titles. Omit to leave unchanged.
     alias: Option<String>,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-struct ConfigureWorkflowsParams {
-    /// GitHub repo in "owner/repo" format
-    repo: String,
-    /// Workflow names to watch (e.g. `["CI", "Deploy"]`). Empty list means all workflows.
-    #[serde(deserialize_with = "deserialize_string_or_vec")]
-    workflows: Vec<String>,
+    /// Set true to clear the alias entirely.
+    clear_alias: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -245,22 +297,6 @@ struct UnignoreWorkflowsParams {
     /// Workflow names to stop ignoring
     #[serde(deserialize_with = "deserialize_string_or_vec")]
     workflows: Vec<String>,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-struct PauseNotificationsParams {
-    /// Minutes to pause notifications. Omit or 0 to pause until restart.
-    minutes: Option<u64>,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-struct ConfigureQuietHoursParams {
-    /// Start of quiet period in HH:MM (24-hour) local time. Defaults to `"22:00"`.
-    start: Option<String>,
-    /// End of quiet period in HH:MM (24-hour) local time. Defaults to `"06:00"`.
-    end: Option<String>,
-    /// Set to true to disable quiet hours entirely.
-    clear: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -572,88 +608,6 @@ impl BuildWatcher {
     }
 
     #[tool(
-        description = "Show the current configuration: watched repos, branch and workflow filters, notification levels, quiet hours, and ignored workflows. For live runtime state (rate limit, polling intervals, pause), use get_stats."
-    )]
-    async fn get_config(&self) -> Result<CallToolResult, McpError> {
-        let config = self.config.lock().await;
-        let mut lines = Vec::new();
-
-        lines.push(format!("Default branches: {:?}", config.default_branches));
-        lines.push(format!(
-            "\nNotifications:\n  build_started: {}\n  build_success: {}\n  build_failure: {}",
-            config.notifications.build_started,
-            config.notifications.build_success,
-            config.notifications.build_failure,
-        ));
-
-        if !config.ignored_workflows.is_empty() {
-            lines.push(format!(
-                "\nIgnored workflows: {:?}",
-                config.ignored_workflows
-            ));
-        }
-
-        let watched = config.watched_repos();
-        if watched.is_empty() {
-            lines.push("\nNo watched repos.".to_string());
-        } else {
-            lines.push("\nRepos:".to_string());
-            for repo in watched {
-                let rc = &config.repos[repo];
-                let label = config.short_repo(repo);
-                if rc.branches.is_empty() {
-                    lines.push(format!("  {repo}: (default branches)"));
-                } else {
-                    lines.push(format!("  {repo}: {:?}", rc.branches));
-                }
-                if let Some(alias) = &rc.alias {
-                    lines.push(format!("    alias: \"{alias}\" (shown as \"{label}\")"));
-                }
-                if !rc.workflows.is_empty() {
-                    lines.push(format!("    workflows: {:?}", rc.workflows));
-                }
-                if !rc.notifications.is_empty() {
-                    lines.push(format!(
-                        "    notifications: {}",
-                        format_notification_overrides(&rc.notifications)
-                    ));
-                }
-                for (branch, bc) in &rc.branch_notifications {
-                    if !bc.notifications.is_empty() {
-                        lines.push(format!(
-                            "    [{branch}] notifications: {}",
-                            format_notification_overrides(&bc.notifications)
-                        ));
-                    }
-                }
-            }
-        }
-
-        match &config.quiet_hours {
-            Some(qh) => lines.push(format!(
-                "\nQuiet hours: {}–{} (currently: {})",
-                qh.start,
-                qh.end,
-                if config.is_in_quiet_hours() {
-                    "quiet"
-                } else {
-                    "allowing"
-                }
-            )),
-            None => lines.push("\nQuiet hours: not configured".to_string()),
-        }
-
-        lines.push(format!(
-            "\nConfig file: {}",
-            config_dir().join("config.json").display()
-        ));
-
-        Ok(CallToolResult::success(vec![Content::text(
-            lines.join("\n"),
-        )]))
-    }
-
-    #[tool(
         description = "Show a live stats snapshot: active builds, polling intervals, \
                        GitHub API rate limit, and notification state (paused / quiet hours)."
     )]
@@ -749,138 +703,60 @@ impl BuildWatcher {
     }
 
     #[tool(
-        description = "Set or clear a daily quiet hours window during which desktop notifications \
-                       are suppressed. Builds are still tracked; only the notification is skipped. \
-                       Defaults to 22:00–06:00 local time if no times are given. \
-                       Use clear=true to disable quiet hours."
+        description = "Configure per-repo settings: workflow allow-list and display alias. \
+                       workflows: names to watch (empty = all; omit = no change). \
+                       alias: display name in notifications (omit = no change; use clear_alias=true to remove). \
+                       Workflow matching is case-insensitive."
     )]
-    async fn configure_quiet_hours(
+    async fn configure_repo(
         &self,
-        Parameters(params): Parameters<ConfigureQuietHoursParams>,
+        Parameters(params): Parameters<ConfigureRepoParams>,
     ) -> Result<CallToolResult, McpError> {
-        if params.clear == Some(true) {
-            let snapshot = {
-                let mut config = self.config.lock().await;
-                config.quiet_hours = None;
-                config.clone()
+        if let Err(e) = validate_repo(&params.repo) {
+            return Ok(CallToolResult::error(vec![Content::text(e)]));
+        }
+        if params.workflows.is_none() && params.alias.is_none() && params.clear_alias != Some(true)
+        {
+            return Ok(CallToolResult::error(vec![Content::text(
+                "at least one of workflows, alias, or clear_alias must be set",
+            )]));
+        }
+
+        let (snapshot, mut msgs) = {
+            let mut config = self.config.lock().await;
+            let Some(rc) = config.repos.get_mut(&params.repo) else {
+                return Ok(CallToolResult::error(vec![Content::text(format!(
+                    "{} is not being watched — use watch_builds first",
+                    params.repo
+                ))]));
             };
-            let mut msg = "Quiet hours cleared".to_string();
-            if let Some(warning) = persist_config(snapshot).await {
-                msg.push_str(&warning);
+            let mut msgs = Vec::new();
+            if let Some(workflows) = &params.workflows {
+                rc.workflows.clone_from(workflows);
+                if workflows.is_empty() {
+                    msgs.push(format!("{}: watching all workflows", params.repo));
+                } else {
+                    msgs.push(format!(
+                        "{}: watching workflows {:?}",
+                        params.repo, workflows
+                    ));
+                }
             }
-            return Ok(CallToolResult::success(vec![Content::text(msg)]));
-        }
-
-        let start = params.start.unwrap_or_else(|| "22:00".to_string());
-        let end = params.end.unwrap_or_else(|| "06:00".to_string());
-
-        if let Err(e) = validate_hhmm(&start) {
-            return Ok(CallToolResult::error(vec![Content::text(e)]));
-        }
-        if let Err(e) = validate_hhmm(&end) {
-            return Ok(CallToolResult::error(vec![Content::text(e)]));
-        }
-
-        let snapshot = {
-            let mut config = self.config.lock().await;
-            config.quiet_hours = Some(QuietHours {
-                start: start.clone(),
-                end: end.clone(),
-            });
-            config.clone()
-        };
-        let mut msg = format!("Quiet hours set: {start}–{end} (local time)");
-        if let Some(warning) = persist_config(snapshot).await {
-            msg.push_str(&warning);
-        }
-        Ok(CallToolResult::success(vec![Content::text(msg)]))
-    }
-
-    #[tool(description = "Send a test desktop notification to verify notifications are working")]
-    async fn test_notification(&self) -> Result<CallToolResult, McpError> {
-        crate::platform::send(crate::platform::Notification {
-            title: "🔔 Build Watcher Test".to_string(),
-            body: "If you see this, notifications are working!".to_string(),
-            level: NotificationLevel::Normal,
-            url: None,
-            group: "build-watcher".to_string(),
-            app_name: "Build Watcher".to_string(),
-        })
-        .await;
-        Ok(CallToolResult::success(vec![Content::text(
-            "Test notification sent. You should see it on your desktop.",
-        )]))
-    }
-
-    #[tool(
-        description = "Set a display alias for a repo. The alias replaces the repo name in notification titles. Pass alias=null to clear and restore the default name."
-    )]
-    async fn set_alias(
-        &self,
-        Parameters(params): Parameters<SetAliasParams>,
-    ) -> Result<CallToolResult, McpError> {
-        if let Err(e) = validate_repo(&params.repo) {
-            return Ok(CallToolResult::error(vec![Content::text(e)]));
-        }
-
-        let (snapshot, mut msg) = {
-            let mut config = self.config.lock().await;
-            let Some(rc) = config.repos.get_mut(&params.repo) else {
-                return Ok(CallToolResult::error(vec![Content::text(format!(
-                    "{} is not being watched — use watch_builds first",
-                    params.repo
-                ))]));
-            };
-            let msg = if let Some(alias) = &params.alias {
-                rc.alias = Some(alias.clone());
-                format!("{}: alias set to \"{}\"", params.repo, alias)
-            } else {
+            if params.clear_alias == Some(true) {
                 rc.alias = None;
-                format!("{}: alias cleared", params.repo)
-            };
-            (config.clone(), msg)
+                msgs.push(format!("{}: alias cleared", params.repo));
+            } else if let Some(alias) = &params.alias {
+                rc.alias = Some(alias.clone());
+                msgs.push(format!("{}: alias set to \"{alias}\"", params.repo));
+            }
+            (config.clone(), msgs)
         };
         if let Some(warning) = persist_config(snapshot).await {
-            msg.push_str(&warning);
+            msgs.push(warning);
         }
-        Ok(CallToolResult::success(vec![Content::text(msg)]))
-    }
-
-    #[tool(
-        description = "Configure which workflows to watch for a repo. Only matching workflow names will trigger notifications. Empty list means all workflows (default). Matching is case-insensitive."
-    )]
-    async fn configure_workflows(
-        &self,
-        Parameters(params): Parameters<ConfigureWorkflowsParams>,
-    ) -> Result<CallToolResult, McpError> {
-        if let Err(e) = validate_repo(&params.repo) {
-            return Ok(CallToolResult::error(vec![Content::text(e)]));
-        }
-
-        let (snapshot, mut msg) = {
-            let mut config = self.config.lock().await;
-            let Some(rc) = config.repos.get_mut(&params.repo) else {
-                return Ok(CallToolResult::error(vec![Content::text(format!(
-                    "{} is not being watched — use watch_builds first",
-                    params.repo
-                ))]));
-            };
-            rc.workflows.clone_from(&params.workflows);
-            let msg = if params.workflows.is_empty() {
-                format!("{}: watching all workflows", params.repo)
-            } else {
-                format!(
-                    "{}: watching workflows {:?}\nApplies to new builds immediately.",
-                    params.repo, params.workflows
-                )
-            };
-            (config.clone(), msg)
-        };
-        if let Some(warning) = persist_config(snapshot).await {
-            msg.push_str(&warning);
-        }
-
-        Ok(CallToolResult::success(vec![Content::text(msg)]))
+        Ok(CallToolResult::success(vec![Content::text(
+            msgs.join("\n"),
+        )]))
     }
 
     #[tool(
@@ -968,42 +844,6 @@ impl BuildWatcher {
             msg.push_str(&warning);
         }
 
-        Ok(CallToolResult::success(vec![Content::text(msg)]))
-    }
-
-    #[tool(
-        description = "Temporarily pause all desktop notifications. Specify minutes to auto-resume, or omit for indefinite (until resume_notifications or restart). Builds are still tracked — only notifications are suppressed."
-    )]
-    async fn pause_notifications(
-        &self,
-        Parameters(params): Parameters<PauseNotificationsParams>,
-    ) -> Result<CallToolResult, McpError> {
-        let mut p = self.pause.lock().await;
-        let msg = match params.minutes {
-            Some(mins) if mins > 0 => {
-                *p = Some(tokio::time::Instant::now() + std::time::Duration::from_secs(mins * 60));
-                format!("Notifications paused for {mins} minutes")
-            }
-            _ => {
-                const INDEFINITE: u64 = u32::MAX as u64; // ~136 years
-                *p = Some(tokio::time::Instant::now() + std::time::Duration::from_secs(INDEFINITE));
-                "Notifications paused until resume or restart".to_string()
-            }
-        };
-
-        Ok(CallToolResult::success(vec![Content::text(msg)]))
-    }
-
-    #[tool(description = "Resume desktop notifications after a pause")]
-    async fn resume_notifications(&self) -> Result<CallToolResult, McpError> {
-        let mut p = self.pause.lock().await;
-        let was_paused = p.is_some_and(|deadline| tokio::time::Instant::now() < deadline);
-        *p = None;
-        let msg = if was_paused {
-            "Notifications resumed"
-        } else {
-            "Notifications were not paused"
-        };
         Ok(CallToolResult::success(vec![Content::text(msg)]))
     }
 
@@ -1170,27 +1010,21 @@ impl BuildWatcher {
     }
 
     #[tool(
-        description = "Configure notification levels. Scope depends on which params are set: global (no repo/branch), per-repo (repo only), or per-branch (repo + branch). Only the events you specify are changed; others keep their current value. Levels: off, low, normal, critical. Examples: 'only notify me on failure for build-watcher' or 'on the release branch, only notify on success'."
+        description = "Update notification settings in one call — any combination of params. \
+                       Levels: set build_started/success/failure with optional repo/branch scope (global if omitted). \
+                       Quiet hours: quiet_start + quiet_end in HH:MM local time (defaults 22:00–06:00), or quiet_clear=true to disable. \
+                       Pause: pause=true to pause (add pause_minutes for timed), pause=false to resume. \
+                       Levels: off, low, normal, critical."
     )]
-    async fn configure_notifications(
+    async fn update_notifications(
         &self,
-        Parameters(params): Parameters<ConfigureNotificationsParams>,
+        Parameters(params): Parameters<UpdateNotificationsParams>,
     ) -> Result<CallToolResult, McpError> {
         if params.branch.is_some() && params.repo.is_none() {
             return Ok(CallToolResult::error(vec![Content::text(
                 "branch requires repo to be set",
             )]));
         }
-
-        if params.build_started.is_none()
-            && params.build_success.is_none()
-            && params.build_failure.is_none()
-        {
-            return Ok(CallToolResult::error(vec![Content::text(
-                "at least one of build_started, build_success, or build_failure must be set",
-            )]));
-        }
-
         if let Some(repo) = &params.repo
             && let Err(e) = validate_repo(repo)
         {
@@ -1201,63 +1035,144 @@ impl BuildWatcher {
         {
             return Ok(CallToolResult::error(vec![Content::text(e)]));
         }
-
-        let (snapshot, scope, effective) = {
-            let mut config = self.config.lock().await;
-
-            let scope = match (&params.repo, &params.branch) {
-                (None, _) => {
-                    apply_notification_levels(&mut config.notifications, &params);
-                    "global".to_string()
-                }
-                (Some(repo), None) => {
-                    let Some(rc) = config.repos.get_mut(repo) else {
-                        return Ok(CallToolResult::error(vec![Content::text(format!(
-                            "{repo} is not being watched — use watch_builds first"
-                        ))]));
-                    };
-                    apply_notification_overrides(&mut rc.notifications, &params);
-                    repo.clone()
-                }
-                (Some(repo), Some(branch)) => {
-                    let Some(rc) = config.repos.get_mut(repo) else {
-                        return Ok(CallToolResult::error(vec![Content::text(format!(
-                            "{repo} is not being watched — use watch_builds first"
-                        ))]));
-                    };
-                    let bc = rc.branch_notifications.entry(branch.clone()).or_default();
-                    apply_notification_overrides(&mut bc.notifications, &params);
-                    format!("{repo} [{branch}]")
-                }
-            };
-
-            // Show effective config for the scope
-            let effective = match (&params.repo, &params.branch) {
-                (Some(repo), Some(branch)) => config.notifications_for(repo, branch),
-                (Some(repo), None) => config.notifications_for(
-                    repo,
-                    config
-                        .default_branches
-                        .first()
-                        .map_or("main", |s| s.as_str()),
-                ),
-                _ => config.notifications.clone(),
-            };
-
-            (config.clone(), scope, effective)
-        };
-
-        let save_warning = persist_config(snapshot).await;
-
-        let mut msg = format!(
-            "Updated notifications for {scope}:\n  build_started: {}\n  build_success: {}\n  build_failure: {}",
-            effective.build_started, effective.build_success, effective.build_failure,
-        );
-        if let Some(warning) = save_warning {
-            msg.push_str(&warning);
+        if let Some(s) = &params.quiet_start
+            && let Err(e) = validate_hhmm(s)
+        {
+            return Ok(CallToolResult::error(vec![Content::text(e)]));
+        }
+        if let Some(s) = &params.quiet_end
+            && let Err(e) = validate_hhmm(s)
+        {
+            return Ok(CallToolResult::error(vec![Content::text(e)]));
         }
 
-        Ok(CallToolResult::success(vec![Content::text(msg)]))
+        let has_levels = params.build_started.is_some()
+            || params.build_success.is_some()
+            || params.build_failure.is_some();
+        let has_quiet = params.quiet_start.is_some()
+            || params.quiet_end.is_some()
+            || params.quiet_clear == Some(true);
+
+        if !has_levels && !has_quiet && params.pause.is_none() {
+            return Ok(CallToolResult::error(vec![Content::text(
+                "at least one parameter must be set",
+            )]));
+        }
+
+        let mut msgs = Vec::new();
+
+        // Pause / resume
+        if let Some(pause) = params.pause {
+            let mut p = self.pause.lock().await;
+            if pause {
+                let msg = match params.pause_minutes {
+                    Some(mins) if mins > 0 => {
+                        *p = Some(
+                            tokio::time::Instant::now() + std::time::Duration::from_secs(mins * 60),
+                        );
+                        format!("Notifications paused for {mins} minutes")
+                    }
+                    _ => {
+                        const INDEFINITE: u64 = u32::MAX as u64; // ~136 years
+                        *p = Some(
+                            tokio::time::Instant::now()
+                                + std::time::Duration::from_secs(INDEFINITE),
+                        );
+                        "Notifications paused indefinitely".to_string()
+                    }
+                };
+                msgs.push(msg);
+            } else {
+                let was_paused = p.is_some_and(|d| tokio::time::Instant::now() < d);
+                *p = None;
+                msgs.push(if was_paused {
+                    "Notifications resumed".to_string()
+                } else {
+                    "Notifications were not paused".to_string()
+                });
+            }
+        }
+
+        // Quiet hours + notification levels (both touch config)
+        if has_levels || has_quiet {
+            let (snapshot, scope, effective) = {
+                let mut config = self.config.lock().await;
+
+                // Quiet hours
+                if params.quiet_clear == Some(true) {
+                    config.quiet_hours = None;
+                    msgs.push("Quiet hours cleared".to_string());
+                } else if has_quiet {
+                    let start = params.quiet_start.as_deref().unwrap_or("22:00").to_string();
+                    let end = params.quiet_end.as_deref().unwrap_or("06:00").to_string();
+                    config.quiet_hours = Some(QuietHours {
+                        start: start.clone(),
+                        end: end.clone(),
+                    });
+                    msgs.push(format!("Quiet hours set: {start}–{end} (local time)"));
+                }
+
+                // Notification levels
+                let (scope, effective) = if has_levels {
+                    let scope = match (&params.repo, &params.branch) {
+                        (None, _) => {
+                            apply_notification_levels(&mut config.notifications, &params);
+                            "global".to_string()
+                        }
+                        (Some(repo), None) => {
+                            let Some(rc) = config.repos.get_mut(repo) else {
+                                return Ok(CallToolResult::error(vec![Content::text(format!(
+                                    "{repo} is not being watched — use watch_builds first"
+                                ))]));
+                            };
+                            apply_notification_overrides(&mut rc.notifications, &params);
+                            repo.clone()
+                        }
+                        (Some(repo), Some(branch)) => {
+                            let Some(rc) = config.repos.get_mut(repo) else {
+                                return Ok(CallToolResult::error(vec![Content::text(format!(
+                                    "{repo} is not being watched — use watch_builds first"
+                                ))]));
+                            };
+                            let bc = rc.branch_notifications.entry(branch.clone()).or_default();
+                            apply_notification_overrides(&mut bc.notifications, &params);
+                            format!("{repo} [{branch}]")
+                        }
+                    };
+                    let effective = match (&params.repo, &params.branch) {
+                        (Some(repo), Some(branch)) => config.notifications_for(repo, branch),
+                        (Some(repo), None) => config.notifications_for(
+                            repo,
+                            config
+                                .default_branches
+                                .first()
+                                .map_or("main", |s| s.as_str()),
+                        ),
+                        _ => config.notifications.clone(),
+                    };
+                    (scope, Some(effective))
+                } else {
+                    (String::new(), None)
+                };
+
+                (config.clone(), scope, effective)
+            };
+
+            if let Some(eff) = effective {
+                msgs.push(format!(
+                    "Updated notifications for {scope}:\n  build_started: {}\n  build_success: {}\n  build_failure: {}",
+                    eff.build_started, eff.build_success, eff.build_failure,
+                ));
+            }
+
+            if let Some(warning) = persist_config(snapshot).await {
+                msgs.push(warning);
+            }
+        }
+
+        Ok(CallToolResult::success(vec![Content::text(
+            msgs.join("\n"),
+        )]))
     }
 }
 
@@ -1270,18 +1185,14 @@ impl ServerHandler for BuildWatcher {
                 "Monitors GitHub Actions builds and sends desktop notifications on completion. \
                  Use watch_builds with one or more repos in 'owner/repo' format to start watching. \
                  Use configure_branches to set which branches to watch — omit repo to set global defaults, or pass repo to override for a specific repo. \
-                 Use configure_workflows to filter which workflows to watch per repo. \
+                 Use configure_repo to set per-repo workflow allow-list and/or display alias. \
                  Use ignore_workflows/unignore_workflows to globally ignore workflows like Semgrep or Dependabot. \
-                 Use configure_notifications to control which events trigger notifications — \
-                 set scope with repo and branch params (global if omitted, per-repo, or per-branch). \
-                 Levels: off, low, normal, critical. \
-                 Use set_alias to give a repo a short display name in notification titles. \
-                 Use pause_notifications/resume_notifications to temporarily suppress notifications. \
-                 Use configure_quiet_hours to suppress notifications between two HH:MM times (default 22:00–06:00). \
+                 Use update_notifications to set notification levels (off/low/normal/critical, per event and scope), \
+                 configure quiet hours (quiet_start/quiet_end in HH:MM, or quiet_clear=true), \
+                 or pause/resume (pause=true/false, with optional pause_minutes). \
                  Use rerun_build to rerun a failed build (or the last failed build for a repo). \
                  Use build_history to see recent builds for a repo. \
-                 Use get_stats for a live snapshot of polling, rate limit, notification state, and config file path. \
-                 Use get_config to see current settings (repos, branches, workflows, notification levels).",
+                 Use get_stats for a live snapshot of polling, rate limit, notification state, and config file path.",
             )
     }
 
@@ -1297,7 +1208,7 @@ impl ServerHandler for BuildWatcher {
 /// Apply notification level params to a global `NotificationConfig` (sets values directly).
 fn apply_notification_levels(
     notif: &mut crate::config::NotificationConfig,
-    params: &ConfigureNotificationsParams,
+    params: &UpdateNotificationsParams,
 ) {
     if let Some(l) = params.build_started {
         notif.build_started = l;
@@ -1313,7 +1224,7 @@ fn apply_notification_levels(
 /// Apply notification level params to an override struct (sets Option values).
 fn apply_notification_overrides(
     overrides: &mut NotificationOverrides,
-    params: &ConfigureNotificationsParams,
+    params: &UpdateNotificationsParams,
 ) {
     if let Some(l) = params.build_started {
         overrides.build_started = Some(l);
@@ -1406,16 +1317,33 @@ mod tests {
         );
     }
 
+    fn notif_params(
+        started: Option<NotificationLevel>,
+        success: Option<NotificationLevel>,
+        failure: Option<NotificationLevel>,
+    ) -> super::UpdateNotificationsParams {
+        super::UpdateNotificationsParams {
+            repo: None,
+            branch: None,
+            build_started: started,
+            build_success: success,
+            build_failure: failure,
+            quiet_start: None,
+            quiet_end: None,
+            quiet_clear: None,
+            pause: None,
+            pause_minutes: None,
+        }
+    }
+
     #[test]
     fn apply_notification_levels_selective() {
         let mut notif = crate::config::NotificationConfig::default();
-        let params = super::ConfigureNotificationsParams {
-            repo: None,
-            branch: None,
-            build_started: Some(NotificationLevel::Off),
-            build_success: None, // unchanged
-            build_failure: Some(NotificationLevel::Low),
-        };
+        let params = notif_params(
+            Some(NotificationLevel::Off),
+            None,
+            Some(NotificationLevel::Low),
+        );
         super::apply_notification_levels(&mut notif, &params);
         assert_eq!(notif.build_started, NotificationLevel::Off);
         assert_eq!(notif.build_success, NotificationLevel::Normal); // unchanged
@@ -1425,13 +1353,7 @@ mod tests {
     #[test]
     fn apply_notification_overrides_selective() {
         let mut overrides = NotificationOverrides::default();
-        let params = super::ConfigureNotificationsParams {
-            repo: None,
-            branch: None,
-            build_started: None,
-            build_success: Some(NotificationLevel::Critical),
-            build_failure: None,
-        };
+        let params = notif_params(None, Some(NotificationLevel::Critical), None);
         super::apply_notification_overrides(&mut overrides, &params);
         assert_eq!(overrides.build_started, None); // unchanged
         assert_eq!(overrides.build_success, Some(NotificationLevel::Critical));

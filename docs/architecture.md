@@ -135,7 +135,7 @@ Notifications are grouped per `repo#branch#workflow` so each workflow slot repla
 
 ## MCP server
 
-The `BuildWatcher` struct implements 17 MCP tools via `rmcp`'s `#[tool]` / `#[tool_router]` macros. The server uses Streamable HTTP transport in stateless mode over axum. A `StreamableHttpService` wraps the handler with `LocalSessionManager`.
+The `BuildWatcher` struct implements 11 MCP tools via `rmcp`'s `#[tool]` / `#[tool_router]` macros. The server uses Streamable HTTP transport in stateless mode over axum. A `StreamableHttpService` wraps the handler with `LocalSessionManager`.
 
 Port binding tries the preferred port (default 8417), falling back to up to 9 consecutive ports. The bound port is written to `~/.local/state/build-watcher/port`.
 

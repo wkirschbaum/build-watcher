@@ -64,19 +64,13 @@ Or call the MCP tools directly:
 | `stop_watches` | Remove repos and stop watching |
 | `list_watches` | Show all watched repos and their status |
 | `configure_branches` | Set branches for a repo, or omit repo to set global defaults |
-| `configure_workflows` | Filter which workflows to watch per repo |
+| `configure_repo` | Set per-repo workflow allow-list and/or display alias |
 | `ignore_workflows` | Globally ignore workflows (e.g. Semgrep, Dependabot) |
 | `unignore_workflows` | Stop ignoring workflows |
-| `configure_notifications` | Set notification levels (global, per-repo, or per-branch) |
-| `configure_quiet_hours` | Set daily quiet hours (no notifications during a time window) |
-| `pause_notifications` | Temporarily suppress notifications (minutes or indefinite) |
-| `resume_notifications` | Resume notifications after a pause |
-| `set_alias` | Set a display alias for a repo |
+| `update_notifications` | Set levels, quiet hours, and pause/resume in one call |
 | `rerun_build` | Rerun a failed build (specific ID or last failed) |
 | `build_history` | Show recent builds for a repo with duration and age |
-| `get_config` | Show current settings (repos, branches, workflows, notification levels) |
-| `get_stats` | Show live stats (uptime, rate limit, polling intervals, pause state, config path) |
-| `test_notification` | Send a test notification to verify setup |
+| `get_stats` | Show live stats (uptime, rate limit, polling, pause state, config path) |
 
 ## Configuration
 

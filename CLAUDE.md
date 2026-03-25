@@ -41,7 +41,7 @@ cargo clippy                # Lint
 
 ### How it works
 
-The `BuildWatcher` struct implements 17 MCP tools. When a repo is watched, it spawns an async tokio task per repo/branch that polls GitHub via the `gh` CLI. Events are emitted onto a broadcast `EventBus`; a notification handler subscribes and dispatches desktop notifications based on config and pause/quiet-hours state.
+The `BuildWatcher` struct implements 11 MCP tools. When a repo is watched, it spawns an async tokio task per repo/branch that polls GitHub via the `gh` CLI. Events are emitted onto a broadcast `EventBus`; a notification handler subscribes and dispatches desktop notifications based on config and pause/quiet-hours state.
 
 **Polling intervals:** Minimum 15s when builds are active, 60s when idle. Intervals scale dynamically based on the GitHub API rate limit. The `gh` CLI must be authenticated (`gh auth login`).
 
