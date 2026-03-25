@@ -36,7 +36,7 @@ cargo clippy                # Lint
 - `src/config.rs` — Config structs, crash-safe JSON persistence helpers
 - `src/github.rs` — `gh` CLI wrappers, `RunInfo`/`HistoryEntry` types, input validation
 - `src/format.rs` — Duration, age, and truncation formatting
-- `src/platform/` — `Notifier` trait + backends (Linux: `notify-send` CLI; macOS: `terminal-notifier` → `osascript` fallback)
+- `src/platform/` — `Notifier` trait + backends (Linux: D-Bus via `zbus`; macOS: `terminal-notifier` → `osascript` fallback)
 
 ### How it works
 
@@ -66,4 +66,8 @@ It also registers the MCP server in `~/.claude.json`.
 - `rmcp` — MCP server framework with HTTP transport
 - `tokio` + `axum` — async runtime and HTTP
 - `schemars` — JSON Schema generation for tool parameters
-- `serde_json` — config and state serialization
+- `serde` + `serde_json` — serialization and config/state persistence
+- `thiserror` — error type derivation
+- `chrono` — local time for quiet hours
+- `zbus` (Linux) — D-Bus notifications via `org.freedesktop.Notifications`
+- `tracing` + `tracing-subscriber` — structured logging

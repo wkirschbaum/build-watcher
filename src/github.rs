@@ -3,8 +3,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 const GH_TIMEOUT: Duration = Duration::from_secs(30);
-const GH_JSON_FIELDS: &str =
-    "databaseId,status,conclusion,displayTitle,workflowName,headSha,headBranch,event";
+const GH_JSON_FIELDS: &str = "databaseId,status,conclusion,displayTitle,workflowName,headSha,event";
 
 /// Truncates a hex SHA to 7 characters. Returns the full string if shorter.
 pub fn short_sha(sha: &str) -> &str {

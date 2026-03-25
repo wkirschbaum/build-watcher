@@ -37,9 +37,8 @@ src/
     ├── mod.rs       — Notifier trait, global singleton, platform dispatch
     ├── universal/   — NullNotifier (used in tests)
     ├── linux/
-    │   ├── mod.rs           — detection (D-Bus → notify-send), shared helpers
-    │   ├── dbus.rs          — D-Bus backend via notify-rust (preferred)
-    │   └── notify_send.rs   — notify-send CLI backend with --replace-id grouping
+    │   ├── mod.rs   — detection, shared helpers (notification props, app name)
+    │   └── dbus.rs  — D-Bus backend via zbus (org.freedesktop.Notifications)
     └── macos/
         ├── mod.rs                — detection (terminal-notifier → osascript), sound mapping
         ├── terminal_notifier.rs  — terminal-notifier backend (preferred)
@@ -122,7 +121,7 @@ A crash at any point leaves either the previous file or the backup intact. On lo
 
 `startup_watches` (called at daemon start) does two things:
 
-1. **Recover existing watches**: For each key in `watches.json`, fetches recent runs concurrently via `join_all`, adds any in-progress ones back to `active_runs`, and advances `last_seen_run_id` to the latest run seen. Without this, `check_for_new_runs` would treat runs from during downtime as new and fire spurious notifications.
+1. **Recover existing watches**: For each key in `watches.json`, fetches recent runs concurrently via a `JoinSet`, adds any in-progress ones back to `active_runs`, and advances `last_seen_run_id` to the latest run seen. Without this, `check_for_new_runs` would treat runs from during downtime as new and fire spurious notifications.
 
 2. **Start new config watches**: For each repo in `config.json` that has no entry in `watches.json`, calls `start_watch` to begin fresh.
 
@@ -130,7 +129,7 @@ A crash at any point leaves either the previous file or the backup intact. On lo
 
 The `Notifier` trait (`platform/mod.rs`) abstracts the backend. A global `OnceLock` singleton is initialized on first use. The active backend is chosen at startup via platform-specific detection:
 
-- **Linux** — `notify-send` CLI with `--print-id` / `--replace-id` for notification replacement, urgency levels, icons, categories, expiry times, and a `desktop-entry` hint for GNOME/KDE grouping. The GitHub Actions run URL is included in the notification body.
+- **Linux** — D-Bus via `zbus` (`org.freedesktop.Notifications` interface). Uses `replaces_id` for notification stacking per group, urgency hints, icons, categories, expiry times, and a `desktop-entry` hint for GNOME/KDE grouping. Clicking a notification opens the GitHub Actions run URL via `xdg-open` (using the D-Bus `ActionInvoked` signal with a 10-minute listener timeout).
 - **macOS** — `terminal-notifier` if available (supports URL open, grouping, and sound), otherwise `osascript` (AppleScript `display notification` with sound). Both macOS backends reap child processes with a 10-second timeout to prevent zombies.
 
 Notifications are grouped per `repo#branch#workflow` so each workflow slot replaces rather than stacks.
@@ -155,5 +154,4 @@ On SIGINT (ctrl-c):
 
 - Each watched branch has exactly one `Poller` task. The `Watches` mutex is held only for brief in-memory reads/writes — never across `await` points or GitHub API calls.
 - `start_watch` performs a double-checked lock: checks for a duplicate before the `gh` call, makes the network call, then re-checks before inserting. This prevents duplicate pollers if concurrent `watch_builds` calls race for the same key.
-- The D-Bus notification backend runs `notify-rust`'s blocking `show()` call on `spawn_blocking` to avoid blocking the async executor. Action click handling also runs on a blocking thread.
-- The `notify-send` backend reads the notification ID from stdout before returning, ensuring `--replace-id` is available for the next notification even when multiple fire in rapid succession.
+- The D-Bus notification backend (`zbus`) is fully async. The `replaces_id` for notification grouping is tracked in an `Arc<Mutex<HashMap>>` keyed by group. Action click handling (for opening URLs) spawns a background task per notification with a 10-minute timeout.

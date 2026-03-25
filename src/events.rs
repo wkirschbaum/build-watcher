@@ -118,10 +118,14 @@ pub async fn run_notification_handler(
                     let suppressed = level == config::NotificationLevel::Off
                         || (level != config::NotificationLevel::Critical
                             && (paused || cfg.is_in_quiet_hours()));
-                    if suppressed { None } else { Some(cfg.clone()) }
+                    if suppressed {
+                        None
+                    } else {
+                        Some((cfg.clone(), level))
+                    }
                 };
-                if let Some(cfg) = &cfg_snapshot {
-                    handle_notification(event, cfg).await;
+                if let Some((cfg, level)) = &cfg_snapshot {
+                    handle_notification(event, cfg, *level).await;
                 }
             }
             Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -158,10 +162,13 @@ async fn is_paused(pause: &Arc<Mutex<Option<Instant>>>) -> bool {
     p.is_some_and(|deadline| Instant::now() < deadline)
 }
 
-async fn handle_notification(event: WatchEvent, cfg: &config::Config) {
+async fn handle_notification(
+    event: WatchEvent,
+    cfg: &config::Config,
+    level: config::NotificationLevel,
+) {
     match event {
         WatchEvent::RunStarted(run) => {
-            let level = cfg.notifications_for(&run.repo, &run.branch).build_started;
             let repo_label = cfg.short_repo(&run.repo);
             let group = run.notification_group();
             platform::send_notification(
@@ -180,12 +187,6 @@ async fn handle_notification(event: WatchEvent, cfg: &config::Config) {
             failing_steps,
         } => {
             let succeeded = conclusion == "success";
-            let notif = cfg.notifications_for(&run.repo, &run.branch);
-            let level = if succeeded {
-                notif.build_success
-            } else {
-                notif.build_failure
-            };
             let repo_label = cfg.short_repo(&run.repo);
 
             let (emoji, status) = if succeeded {

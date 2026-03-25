@@ -18,7 +18,7 @@ The project name is shortened to just the repo name (e.g. `build-watcher`) when 
 
 Notifications are grouped per `repo#branch#workflow` so each workflow slot replaces the previous notification rather than stacking.
 
-On Linux, notifications are sent via the `notify-send` CLI with `--print-id` / `--replace-id` for notification replacement, urgency levels, icons, categories, expiry times, and a `desktop-entry` hint for GNOME/KDE grouping.
+On Linux, notifications are sent via D-Bus (`org.freedesktop.Notifications` interface, using the `zbus` crate). Uses `replaces_id` for notification replacement, urgency hints, icons, categories, expiry times, and a `desktop-entry` hint for GNOME/KDE grouping. Clicking a notification opens the GitHub Actions run URL via `xdg-open`.
 
 On macOS, the preferred backend is `terminal-notifier` (supports URL open and notification grouping), with a fallback to `osascript` (AppleScript `display notification`). Child processes are reaped with a 10-second timeout to prevent zombies.
 
@@ -49,7 +49,7 @@ Reruns a GitHub Actions workflow run directly from Claude Code. Specify a run ID
 
 ## Build History
 
-Displays a formatted table of recent builds for a repo, showing conclusion, workflow name, commit title, duration, and relative age. Optionally filter by branch. When multiple branches are present and no branch filter is applied, the branch column is shown. Durations and ages are computed from GitHub's `createdAt`/`updatedAt` timestamps using a built-in ISO 8601 parser (no datetime library dependency).
+Displays a formatted table of recent builds for a repo, showing conclusion, workflow name, commit title, duration, and relative age. Optionally filter by branch. When multiple branches are present and no branch filter is applied, the branch column is shown. Durations and ages are computed from GitHub's `createdAt`/`updatedAt` timestamps using a built-in ISO 8601 parser (avoiding the overhead of a full datetime library for this specific use case).
 
 ## Dynamic Rate-Limit-Aware Polling
 
