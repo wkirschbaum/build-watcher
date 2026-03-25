@@ -284,4 +284,53 @@ mod tests {
         };
         assert_eq!(effective_level(&status, &cfg), Off);
     }
+
+    #[test]
+    fn from_run_info_copies_fields() {
+        let run = crate::github::RunInfo {
+            id: 99,
+            status: "in_progress".to_string(),
+            conclusion: String::new(),
+            title: "Update deps".to_string(),
+            workflow: "Deploy".to_string(),
+            head_sha: "abc1234".to_string(),
+            event: "pull_request".to_string(),
+        };
+        let s = RunSnapshot::from_run_info(&run, "alice/app", "release");
+        assert_eq!(s.repo, "alice/app");
+        assert_eq!(s.branch, "release");
+        assert_eq!(s.run_id, 99);
+        assert_eq!(s.workflow, "Deploy");
+        assert_eq!(s.title, "Update deps");
+        assert_eq!(s.event, "pull_request");
+    }
+
+    #[test]
+    fn serialize_elapsed_formats() {
+        // Some(duration) → float seconds
+        let json = serde_json::to_value(completed("success")).unwrap();
+        assert_eq!(json["RunCompleted"]["elapsed"], serde_json::Value::Null);
+
+        let event = WatchEvent::RunCompleted {
+            run: snap(),
+            conclusion: "success".to_string(),
+            elapsed: Some(Duration::from_secs_f64(134.5)),
+            failing_steps: None,
+        };
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["RunCompleted"]["elapsed"], 134.5);
+    }
+
+    #[test]
+    fn event_bus_emit_and_subscribe() {
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+
+        bus.emit(WatchEvent::RunStarted(snap()));
+
+        match rx.try_recv() {
+            Ok(WatchEvent::RunStarted(s)) => assert_eq!(s.repo, "alice/app"),
+            other => panic!("expected RunStarted, got {other:?}"),
+        }
+    }
 }

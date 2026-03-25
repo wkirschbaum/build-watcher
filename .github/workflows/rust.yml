@@ -45,5 +45,9 @@ jobs:
       uses: taiki-e/install-action@v2
       with:
         tool: cargo-llvm-cov
-    - name: Generate coverage report
-      run: cargo llvm-cov --summary-only 2>&1 | tail -15
+    - name: Generate coverage
+      run: cargo llvm-cov --lcov --output-path lcov.info
+    - name: Upload to Codecov
+      uses: codecov/codecov-action@v5
+      with:
+        files: lcov.info

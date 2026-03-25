@@ -1477,4 +1477,36 @@ mod tests {
             "failure: low"
         );
     }
+
+    #[test]
+    fn apply_notification_levels_selective() {
+        let mut notif = crate::config::NotificationConfig::default();
+        let params = super::ConfigureNotificationsParams {
+            repo: None,
+            branch: None,
+            build_started: Some(NotificationLevel::Off),
+            build_success: None, // unchanged
+            build_failure: Some(NotificationLevel::Low),
+        };
+        super::apply_notification_levels(&mut notif, &params);
+        assert_eq!(notif.build_started, NotificationLevel::Off);
+        assert_eq!(notif.build_success, NotificationLevel::Normal); // unchanged
+        assert_eq!(notif.build_failure, NotificationLevel::Low);
+    }
+
+    #[test]
+    fn apply_notification_overrides_selective() {
+        let mut overrides = NotificationOverrides::default();
+        let params = super::ConfigureNotificationsParams {
+            repo: None,
+            branch: None,
+            build_started: None,
+            build_success: Some(NotificationLevel::Critical),
+            build_failure: None,
+        };
+        super::apply_notification_overrides(&mut overrides, &params);
+        assert_eq!(overrides.build_started, None); // unchanged
+        assert_eq!(overrides.build_success, Some(NotificationLevel::Critical));
+        assert_eq!(overrides.build_failure, None); // unchanged
+    }
 }

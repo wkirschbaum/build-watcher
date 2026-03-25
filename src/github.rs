@@ -233,24 +233,6 @@ pub(crate) fn display_title(event: &str, title: &str) -> String {
 /// Fetch the failing job and step names for a completed run.
 /// Returns a human-readable string like "Build / Run tests", or None on error.
 pub async fn gh_failing_steps(repo: &str, run_id: u64) -> Option<String> {
-    #[derive(Debug, Deserialize)]
-    struct GhStep {
-        name: String,
-        conclusion: String,
-    }
-
-    #[derive(Debug, Deserialize)]
-    struct GhJob {
-        name: String,
-        conclusion: String,
-        steps: Vec<GhStep>,
-    }
-
-    #[derive(Debug, Deserialize)]
-    struct GhJobsResponse {
-        jobs: Vec<GhJob>,
-    }
-
     let id_str = run_id.to_string();
     let stdout = gh_exec(
         repo,
@@ -260,21 +242,42 @@ pub async fn gh_failing_steps(repo: &str, run_id: u64) -> Option<String> {
     .ok()?;
 
     let resp: GhJobsResponse = serde_json::from_slice(&stdout).ok()?;
-    let mut failures: Vec<String> = Vec::new();
+    extract_failing_steps(&resp.jobs)
+}
 
-    for job in &resp.jobs {
-        if job.conclusion == "failure" {
-            let step = job
-                .steps
+#[derive(Debug, Deserialize)]
+struct GhStep {
+    name: String,
+    conclusion: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GhJob {
+    name: String,
+    conclusion: String,
+    steps: Vec<GhStep>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GhJobsResponse {
+    jobs: Vec<GhJob>,
+}
+
+/// Pure extraction of failing job/step names from parsed GitHub API response.
+fn extract_failing_steps(jobs: &[GhJob]) -> Option<String> {
+    let failures: Vec<String> = jobs
+        .iter()
+        .filter(|job| job.conclusion == "failure")
+        .map(|job| {
+            job.steps
                 .iter()
                 .find(|s| s.conclusion == "failure")
                 .map_or_else(
                     || job.name.clone(),
                     |s| format!("{} / {}", job.name, s.name),
-                );
-            failures.push(step);
-        }
-    }
+                )
+        })
+        .collect();
 
     if failures.is_empty() {
         None
@@ -694,5 +697,68 @@ mod tests {
 
         let bad = make_history("push", "invalid", "2024-01-01T10:05:30Z");
         assert_eq!(bad.duration_secs(), None);
+    }
+
+    fn job(name: &str, conclusion: &str, steps: Vec<(&str, &str)>) -> GhJob {
+        GhJob {
+            name: name.to_string(),
+            conclusion: conclusion.to_string(),
+            steps: steps
+                .into_iter()
+                .map(|(n, c)| GhStep {
+                    name: n.to_string(),
+                    conclusion: c.to_string(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn extract_failing_steps_finds_failed_job_and_step() {
+        let jobs = vec![
+            job(
+                "Build",
+                "success",
+                vec![("Checkout", "success"), ("Compile", "success")],
+            ),
+            job(
+                "Test",
+                "failure",
+                vec![("Checkout", "success"), ("Run tests", "failure")],
+            ),
+        ];
+        assert_eq!(
+            extract_failing_steps(&jobs),
+            Some("Test / Run tests".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_failing_steps_job_failed_no_step() {
+        let jobs = vec![job("Deploy", "failure", vec![("Setup", "success")])];
+        assert_eq!(extract_failing_steps(&jobs), Some("Deploy".to_string()));
+    }
+
+    #[test]
+    fn extract_failing_steps_multiple_failures() {
+        let jobs = vec![
+            job("Lint", "failure", vec![("Check", "failure")]),
+            job("Test", "failure", vec![("Run", "failure")]),
+        ];
+        assert_eq!(
+            extract_failing_steps(&jobs),
+            Some("Lint / Check, Test / Run".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_failing_steps_none_when_all_pass() {
+        let jobs = vec![job("Build", "success", vec![("Compile", "success")])];
+        assert_eq!(extract_failing_steps(&jobs), None);
+    }
+
+    #[test]
+    fn extract_failing_steps_empty_jobs() {
+        assert_eq!(extract_failing_steps(&[]), None);
     }
 }
