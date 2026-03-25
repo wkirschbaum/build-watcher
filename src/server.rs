@@ -14,8 +14,8 @@ use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{
-    NotificationLevel, NotificationOverrides, PersistError, RepoConfig, config_dir, save_config,
-    state_dir,
+    NotificationLevel, NotificationOverrides, PersistError, QuietHours, RepoConfig, config_dir,
+    save_config, state_dir,
 };
 use crate::github::{gh_run_list_history, gh_run_rerun, validate_branch, validate_repo};
 use crate::watcher::{
@@ -254,6 +254,16 @@ struct ConfigureSoundParams {
     sound_file: Option<String>,
     /// Optional repo to override sound setting per-repo
     repo: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct ConfigureQuietHoursParams {
+    /// Start of quiet period in HH:MM (24-hour) local time. Defaults to `"22:00"`.
+    start: Option<String>,
+    /// End of quiet period in HH:MM (24-hour) local time. Defaults to `"06:00"`.
+    end: Option<String>,
+    /// Set to true to disable quiet hours entirely.
+    clear: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -648,6 +658,16 @@ impl BuildWatcher {
             }
         }
 
+        match &config.quiet_hours {
+            Some(qh) => lines.push(format!(
+                "\nQuiet hours: {}–{} (currently: {})",
+                qh.start,
+                qh.end,
+                if config.is_in_quiet_hours() { "active" } else { "inactive" }
+            )),
+            None => lines.push("\nQuiet hours: not configured".to_string()),
+        }
+
         lines.push(format!(
             "\nConfig file: {}",
             config_dir().join("config.json").display()
@@ -656,6 +676,118 @@ impl BuildWatcher {
         Ok(CallToolResult::success(vec![Content::text(
             lines.join("\n"),
         )]))
+    }
+
+    #[tool(
+        description = "Show a live stats snapshot: active builds, polling intervals, \
+                       GitHub API rate limit, and notification state (paused / quiet hours)."
+    )]
+    async fn get_stats(&self) -> Result<CallToolResult, McpError> {
+        // Lock order: rate_limit → watches → pause → config (matches poller order).
+        let rl = self.rate_limit.lock().await;
+        let watches_snap: Vec<(String, usize)> = {
+            let w = self.watches.lock().await;
+            w.iter()
+                .map(|(k, e)| (k.to_string(), e.active_runs.len()))
+                .collect()
+        };
+        let (active_secs, idle_secs) = compute_intervals(rl.as_ref(), watches_snap.len());
+        let throttled = active_secs > MIN_ACTIVE_SECS || idle_secs > MIN_IDLE_SECS;
+
+        let paused = {
+            let p = self.pause.lock().await;
+            p.is_some_and(|d| tokio::time::Instant::now() < d)
+        };
+        let (quiet_hours_label, quiet_active) = {
+            let cfg = self.config.lock().await;
+            let label = cfg
+                .quiet_hours
+                .as_ref()
+                .map_or_else(|| "off".to_string(), |qh| format!("{}–{}", qh.start, qh.end));
+            let active = cfg.is_in_quiet_hours();
+            (label, active)
+        };
+
+        let mut lines = Vec::new();
+
+        // Watches
+        let total_active_builds: usize = watches_snap.iter().map(|(_, n)| n).sum();
+        lines.push(format!(
+            "Watches   : {} repo/branch pairs, {} build(s) in progress",
+            watches_snap.len(),
+            total_active_builds,
+        ));
+
+        // Polling
+        let throttle_note = if throttled { " [throttled]" } else { "" };
+        lines.push(format!(
+            "Polling   : {active_secs}s active / {idle_secs}s idle{throttle_note}",
+        ));
+
+        // Rate limit
+        lines.push(String::new());
+        lines.push("GitHub API rate limit".to_string());
+        match rl.as_ref() {
+            None => lines.push("  (no data yet — first refresh happens after the first poll)".to_string()),
+            Some(rl) => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let mins_left = rl.reset.saturating_sub(now) / 60;
+                let pct = rl.remaining * 100 / rl.limit.max(1);
+                lines.push(format!("  Remaining : {} / {} ({}%)", rl.remaining, rl.limit, pct));
+                lines.push(format!("  Used      : {}", rl.used));
+                lines.push(format!("  Resets in : {mins_left}m"));
+            }
+        }
+
+        // Notification state
+        lines.push(String::new());
+        lines.push("Notifications".to_string());
+        lines.push(format!("  Paused      : {}", if paused { "yes" } else { "no" }));
+        lines.push(format!(
+            "  Quiet hours : {} (currently: {})",
+            quiet_hours_label,
+            if quiet_active { "active" } else { "inactive" },
+        ));
+
+        Ok(CallToolResult::success(vec![Content::text(lines.join("\n"))]))
+    }
+
+    #[tool(
+        description = "Set or clear a daily quiet hours window during which desktop notifications \
+                       are suppressed. Builds are still tracked; only the notification is skipped. \
+                       Defaults to 22:00–06:00 local time if no times are given. \
+                       Use clear=true to disable quiet hours."
+    )]
+    async fn configure_quiet_hours(
+        &self,
+        Parameters(params): Parameters<ConfigureQuietHoursParams>,
+    ) -> Result<CallToolResult, McpError> {
+        if params.clear == Some(true) {
+            let mut config = self.config.lock().await;
+            config.quiet_hours = None;
+            let msg = persist_warning(save_config(&config))
+                .unwrap_or_else(|| "Quiet hours cleared".to_string());
+            return Ok(CallToolResult::success(vec![Content::text(msg)]));
+        }
+
+        let start = params.start.unwrap_or_else(|| "22:00".to_string());
+        let end = params.end.unwrap_or_else(|| "06:00".to_string());
+
+        if let Err(e) = validate_hhmm(&start) {
+            return Ok(CallToolResult::error(vec![Content::text(e)]));
+        }
+        if let Err(e) = validate_hhmm(&end) {
+            return Ok(CallToolResult::error(vec![Content::text(e)]));
+        }
+
+        let mut config = self.config.lock().await;
+        config.quiet_hours = Some(QuietHours { start: start.clone(), end: end.clone() });
+        let msg = persist_warning(save_config(&config))
+            .unwrap_or_else(|| format!("Quiet hours set: {start}–{end} (local time)"));
+        Ok(CallToolResult::success(vec![Content::text(msg)]))
     }
 
     #[tool(description = "Send a test desktop notification to verify notifications are working")]
@@ -1213,6 +1345,19 @@ fn apply_notification_overrides(
     if let Some(l) = params.build_failure {
         overrides.build_failure = Some(l);
     }
+}
+
+/// Validate a time string in HH:MM (24-hour) format.
+fn validate_hhmm(s: &str) -> Result<(), String> {
+    let Some((h, m)) = s.split_once(':') else {
+        return Err(format!("{s:?} is not HH:MM format (e.g. \"22:00\")"));
+    };
+    let h: u32 = h.parse().map_err(|_| format!("{s:?}: hours must be a number"))?;
+    let m: u32 = m.parse().map_err(|_| format!("{s:?}: minutes must be a number"))?;
+    if h > 23 || m > 59 {
+        return Err(format!("{s:?}: hours must be 0–23, minutes 0–59"));
+    }
+    Ok(())
 }
 
 /// Format the rate-limit status line for `get_config`.

@@ -106,7 +106,9 @@ pub async fn run_notification_handler(
     loop {
         match rx.recv().await {
             Ok(event) => {
-                if !is_paused(&pause).await {
+                let suppressed = is_paused(&pause).await
+                    || config.lock().await.is_in_quiet_hours();
+                if !suppressed {
                     handle_notification(event, &config).await;
                 }
             }

@@ -3,6 +3,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
+use chrono::Timelike as _;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -217,6 +218,17 @@ pub struct SoundConfig {
     pub sound_file: Option<String>,
 }
 
+/// Daily time window during which desktop notifications are suppressed.
+/// Times are in 24-hour HH:MM format using local system time.
+/// Overnight ranges are supported (e.g. `start = "22:00"`, `end = "08:00"`).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct QuietHours {
+    /// Start of quiet period, e.g. `"22:00"`
+    pub start: String,
+    /// End of quiet period, e.g. `"08:00"`
+    pub end: String,
+}
+
 /// Per-branch notification overrides.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BranchConfig {
@@ -249,6 +261,8 @@ pub struct Config {
     pub notifications: NotificationConfig,
     #[serde(default)]
     pub sound_on_failure: SoundConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quiet_hours: Option<QuietHours>,
     #[serde(default)]
     pub repos: HashMap<String, RepoConfig>,
 }
@@ -264,6 +278,7 @@ impl Default for Config {
             ignored_workflows: Vec::new(),
             notifications: NotificationConfig::default(),
             sound_on_failure: SoundConfig::default(),
+            quiet_hours: None,
             repos: HashMap::new(),
         }
     }
@@ -339,10 +354,43 @@ impl Config {
         if ambiguous { repo } else { name }
     }
 
+    /// Returns `true` if the current local time falls within the configured quiet hours.
+    pub fn is_in_quiet_hours(&self) -> bool {
+        let Some(qh) = &self.quiet_hours else {
+            return false;
+        };
+        let now = chrono::Local::now();
+        let cur_mins = now.hour() * 60 + now.minute();
+        is_in_quiet_hours_at(qh, cur_mins)
+    }
+
     pub fn add_repos(&mut self, repos: &[String]) {
         for repo in repos {
             self.repos.entry(repo.clone()).or_default();
         }
+    }
+}
+
+/// Pure helper for testability — takes the current time as `cur_mins` (minutes since midnight).
+fn is_in_quiet_hours_at(qh: &QuietHours, cur_mins: u32) -> bool {
+    let parse = |s: &str| -> Option<u32> {
+        let (h, m) = s.split_once(':')?;
+        let h: u32 = h.parse().ok()?;
+        let m: u32 = m.parse().ok()?;
+        if h > 23 || m > 59 {
+            return None;
+        }
+        Some(h * 60 + m)
+    };
+    let (Some(start), Some(end)) = (parse(&qh.start), parse(&qh.end)) else {
+        return false; // invalid config — never suppress
+    };
+    if start <= end {
+        // Same-day range e.g. 09:00–17:00
+        cur_mins >= start && cur_mins < end
+    } else {
+        // Overnight range e.g. 22:00–08:00
+        cur_mins >= start || cur_mins < end
     }
 }
 
@@ -381,6 +429,45 @@ pub fn save_config(config: &Config) -> Result<(), PersistError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn qh(start: &str, end: &str) -> QuietHours {
+        QuietHours { start: start.to_string(), end: end.to_string() }
+    }
+
+    #[test]
+    fn quiet_hours_same_day_inside() {
+        assert!(is_in_quiet_hours_at(&qh("09:00", "17:00"), 9 * 60));
+        assert!(is_in_quiet_hours_at(&qh("09:00", "17:00"), 12 * 60));
+        assert!(is_in_quiet_hours_at(&qh("09:00", "17:00"), 17 * 60 - 1));
+    }
+
+    #[test]
+    fn quiet_hours_same_day_outside() {
+        assert!(!is_in_quiet_hours_at(&qh("09:00", "17:00"), 8 * 60 + 59));
+        assert!(!is_in_quiet_hours_at(&qh("09:00", "17:00"), 17 * 60));
+        assert!(!is_in_quiet_hours_at(&qh("09:00", "17:00"), 23 * 60));
+    }
+
+    #[test]
+    fn quiet_hours_overnight_inside() {
+        assert!(is_in_quiet_hours_at(&qh("22:00", "08:00"), 22 * 60));
+        assert!(is_in_quiet_hours_at(&qh("22:00", "08:00"), 23 * 60 + 59));
+        assert!(is_in_quiet_hours_at(&qh("22:00", "08:00"), 0));
+        assert!(is_in_quiet_hours_at(&qh("22:00", "08:00"), 7 * 60 + 59));
+    }
+
+    #[test]
+    fn quiet_hours_overnight_outside() {
+        assert!(!is_in_quiet_hours_at(&qh("22:00", "08:00"), 8 * 60));
+        assert!(!is_in_quiet_hours_at(&qh("22:00", "08:00"), 21 * 60 + 59));
+        assert!(!is_in_quiet_hours_at(&qh("22:00", "08:00"), 12 * 60));
+    }
+
+    #[test]
+    fn quiet_hours_invalid_config_never_suppresses() {
+        assert!(!is_in_quiet_hours_at(&qh("bad", "08:00"), 12 * 60));
+        assert!(!is_in_quiet_hours_at(&qh("22:00", "99:00"), 23 * 60));
+    }
 
     #[test]
     fn notifications_for_global_defaults() {
