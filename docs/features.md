@@ -14,11 +14,11 @@ Sends native desktop notifications when builds start and complete. The notificat
 ❌ failed: build-watcher | CI
 ```
 
-The project name is shortened to just the repo name (e.g. `build-watcher`) when it is unambiguous across all watched repos. If two watched repos share the same name (e.g. `foo/bar` and `zoo/bar`), the full `owner/repo` is shown instead. The notification body contains the branch, commit title (short SHA for push events, or "PR: title" for pull requests), elapsed time, and failing step names for failures. Notifications include a clickable link to the GitHub Actions run.
+The project name is shortened to just the repo name (e.g. `build-watcher`) when it is unambiguous across all watched repos. If two watched repos share the same name (e.g. `foo/bar` and `zoo/bar`), the full `owner/repo` is shown instead. The notification body contains the branch, commit title (short SHA for push events, or "PR: title" for pull requests), elapsed time, failing step names for failures, and a link to the GitHub Actions run.
 
 Notifications are grouped per `repo#branch#workflow` so each workflow slot replaces the previous notification rather than stacking.
 
-On Linux, the preferred backend is D-Bus via the `notify-rust` crate, with a fallback to the `notify-send` CLI. Both support notification replacement via stored IDs, urgency levels, icons, categories, expiry times, a `desktop-entry` hint for GNOME/KDE grouping, and an "Open" action button that launches `xdg-open` with the run URL.
+On Linux, notifications are sent via the `notify-send` CLI with `--print-id` / `--replace-id` for notification replacement, urgency levels, icons, categories, expiry times, and a `desktop-entry` hint for GNOME/KDE grouping.
 
 On macOS, the preferred backend is `terminal-notifier` (supports URL open and notification grouping), with a fallback to `osascript` (AppleScript `display notification`). Child processes are reaped with a 10-second timeout to prevent zombies.
 

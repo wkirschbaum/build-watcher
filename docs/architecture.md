@@ -130,7 +130,7 @@ A crash at any point leaves either the previous file or the backup intact. On lo
 
 The `Notifier` trait (`platform/mod.rs`) abstracts the backend. A global `OnceLock` singleton is initialized on first use. The active backend is chosen at startup via platform-specific detection:
 
-- **Linux** — D-Bus via `notify-rust` (preferred): type-safe hints, proper `desktop-entry` support, notification replacement via stored IDs. Fallback: `notify-send` CLI with `--print-id` / `--replace-id`. Both support urgency levels, icons, categories, expiry times, and an "Open" action button that launches `xdg-open`.
+- **Linux** — `notify-send` CLI with `--print-id` / `--replace-id` for notification replacement, urgency levels, icons, categories, expiry times, and a `desktop-entry` hint for GNOME/KDE grouping. The GitHub Actions run URL is included in the notification body.
 - **macOS** — `terminal-notifier` if available (supports URL open, grouping, and sound), otherwise `osascript` (AppleScript `display notification` with sound). Both macOS backends reap child processes with a 10-second timeout to prevent zombies.
 
 Notifications are grouped per `repo#branch#workflow` so each workflow slot replaces rather than stacks.

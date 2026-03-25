@@ -36,7 +36,7 @@ cargo clippy                # Lint
 - `src/config.rs` — Config structs, crash-safe JSON persistence helpers
 - `src/github.rs` — `gh` CLI wrappers, `RunInfo`/`HistoryEntry` types, input validation
 - `src/format.rs` — Duration, age, and truncation formatting
-- `src/platform/` — `Notifier` trait + backends (Linux: D-Bus via `notify-rust` → `notify-send` fallback; macOS: `terminal-notifier` → `osascript` fallback)
+- `src/platform/` — `Notifier` trait + backends (Linux: `notify-send` CLI; macOS: `terminal-notifier` → `osascript` fallback)
 
 ### How it works
 

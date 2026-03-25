@@ -7,9 +7,6 @@ Personal desktop tool — all features should improve the local daily experience
 ### Auto-watch from git remote
 Detect `origin` remote of the current working directory and auto-suggest watching it via MCP. Saves the manual `owner/repo` lookup.
 
-### Notification action buttons
-Add a "Rerun" button directly on D-Bus desktop notifications using notify-rust's action support. The infrastructure is already in place with the D-Bus notifier.
-
 ### Per-repo/branch snooze
 Snooze a specific repo or branch for N minutes without silencing all notifications globally. Finer control than the current global pause.
 
