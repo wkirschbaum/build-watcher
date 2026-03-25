@@ -24,7 +24,7 @@ use crate::watcher::{
     start_watch,
 };
 
-const DEFAULT_PORT: u16 = 8417;
+pub const DEFAULT_PORT: u16 = 8417;
 
 /// Bind to the preferred port, trying up to 9 consecutive ports on conflict.
 async fn bind_with_fallback(preferred: u16) -> Result<tokio::net::TcpListener> {

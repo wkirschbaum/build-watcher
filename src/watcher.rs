@@ -362,7 +362,11 @@ pub async fn start_watch(
         ));
     }
 
-    let max_id = runs.iter().map(|r| r.id).max().expect("runs is non-empty");
+    let Some(max_id) = runs.iter().map(|r| r.id).max() else {
+        return Err(format!(
+            "{repo} [{branch}]: filtered runs unexpectedly empty"
+        ));
+    };
     let active: HashMap<u64, ActiveRun> = runs
         .iter()
         .filter(|r| !r.is_completed())
@@ -761,19 +765,17 @@ async fn recover_existing_watches(
     rate_limit: &RateLimitState,
     snapshot: &[WatchKey],
 ) {
-    let futures: Vec<_> = snapshot
-        .iter()
-        .map(|key| {
-            tracing::info!(key = %key, "Resuming watch");
-            let key = key.clone();
-            async move {
-                let result = gh_recent_runs(&key.repo, &key.branch).await;
-                (key, result)
-            }
-        })
-        .collect();
+    let mut set = tokio::task::JoinSet::new();
+    for key in snapshot {
+        tracing::info!(key = %key, "Resuming watch");
+        let key = key.clone();
+        set.spawn(async move {
+            let result = gh_recent_runs(&key.repo, &key.branch).await;
+            (key, result)
+        });
+    }
 
-    for (key, result) in futures::future::join_all(futures).await {
+    while let Some(Ok((key, result))) = set.join_next().await {
         if let Ok(runs) = result {
             let (workflow_filter, ignored_workflows) = {
                 let cfg = config.lock().await;
@@ -833,36 +835,34 @@ async fn start_new_config_watches(
             .collect()
     };
 
-    let futures: Vec<_> = new_keys
-        .into_iter()
-        .map(|key| {
-            tracing::info!(
-                repo = key.repo,
-                branch = key.branch,
-                "Starting new watch from config"
-            );
-            let watches = watches.clone();
-            let config = config.clone();
-            let handle = handle.clone();
-            let rate_limit = rate_limit.clone();
-            async move {
-                match start_watch(
-                    &watches,
-                    &config,
-                    &handle,
-                    &rate_limit,
-                    &key.repo,
-                    &key.branch,
-                )
-                .await
-                {
-                    Ok(msg) | Err(msg) => tracing::info!("{msg}"),
-                }
+    let mut set = tokio::task::JoinSet::new();
+    for key in new_keys {
+        tracing::info!(
+            repo = key.repo,
+            branch = key.branch,
+            "Starting new watch from config"
+        );
+        let watches = watches.clone();
+        let config = config.clone();
+        let handle = handle.clone();
+        let rate_limit = rate_limit.clone();
+        set.spawn(async move {
+            match start_watch(
+                &watches,
+                &config,
+                &handle,
+                &rate_limit,
+                &key.repo,
+                &key.branch,
+            )
+            .await
+            {
+                Ok(msg) | Err(msg) => tracing::info!("{msg}"),
             }
-        })
-        .collect();
+        });
+    }
 
-    futures::future::join_all(futures).await;
+    while set.join_next().await.is_some() {}
 }
 
 /// Find the most recent failed build across all branches of a repo.

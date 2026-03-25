@@ -6,6 +6,8 @@ use std::sync::OnceLock;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use chrono::Timelike;
+
 use crate::platform;
 
 /// Current Unix epoch in seconds.
@@ -102,9 +104,15 @@ pub async fn save_json_async<T: Serialize + Send + 'static>(
     path: PathBuf,
     value: T,
 ) -> Result<(), PersistError> {
-    tokio::task::spawn_blocking(move || save_json(path, &value))
-        .await
-        .expect("save_json_async: blocking task panicked")
+    match tokio::task::spawn_blocking(move || save_json(path, &value)).await {
+        Ok(result) => result,
+        Err(e) => {
+            tracing::error!("save_json_async: blocking task panicked: {e}");
+            Err(PersistError::Serialize(serde_json::Error::io(
+                std::io::Error::other("blocking task panicked"),
+            )))
+        }
+    }
 }
 
 pub fn save_json<T: Serialize>(path: PathBuf, value: &T) -> Result<(), PersistError> {
@@ -140,7 +148,12 @@ pub fn save_json<T: Serialize>(path: PathBuf, value: &T) -> Result<(), PersistEr
 
     // Backup current file, then promote draft
     let bak = path.with_extension("json.bak");
-    let _ = std::fs::rename(&path, &bak);
+    if let Err(e) = std::fs::rename(&path, &bak) {
+        // Not fatal — the file may not exist yet (first save)
+        if path.exists() {
+            tracing::warn!("Failed to create backup {}: {e}", bak.display());
+        }
+    }
     if let Err(e) = std::fs::rename(&draft, &path) {
         // Try to restore backup
         let _ = std::fs::rename(&bak, &path);
@@ -371,10 +384,8 @@ impl Config {
 
 /// Returns the current local time as minutes since midnight.
 fn local_time_minutes() -> u32 {
-    let epoch = unix_now() as libc::time_t;
-    let mut tm = unsafe { std::mem::zeroed::<libc::tm>() };
-    unsafe { libc::localtime_r(&epoch, &mut tm) };
-    (tm.tm_hour as u32) * 60 + (tm.tm_min as u32)
+    let now = chrono::Local::now();
+    now.hour() * 60 + now.minute()
 }
 
 /// Pure helper for testability — takes the current time as `cur_mins` (minutes since midnight).

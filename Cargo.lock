@@ -261,8 +261,7 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "axum",
- "futures",
- "libc",
+ "chrono",
  "notify-rust",
  "rmcp",
  "schemars",

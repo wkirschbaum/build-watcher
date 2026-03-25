@@ -3,6 +3,7 @@ mod events;
 mod format;
 mod github;
 mod platform;
+mod register;
 mod server;
 mod watcher;
 
@@ -15,6 +16,18 @@ use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+
+    if args.iter().any(|a| a == "--register") {
+        let port = args
+            .iter()
+            .position(|a| a == "--port")
+            .and_then(|i| args.get(i + 1))
+            .and_then(|p| p.parse::<u16>().ok())
+            .unwrap_or(server::DEFAULT_PORT);
+        return register::register(port);
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env().add_directive("build_watcher=info".parse()?))
         .init();

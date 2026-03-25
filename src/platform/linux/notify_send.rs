@@ -104,7 +104,11 @@ impl Notifier for NotifySend {
                 }
             };
 
-            let mut lines = BufReader::new(child.stdout.take().expect("stdout is piped")).lines();
+            let Some(stdout) = child.stdout.take() else {
+                tracing::warn!("notify-send stdout was not piped");
+                return;
+            };
+            let mut lines = BufReader::new(stdout).lines();
 
             // Read the notification ID before returning — this ensures --replace-id is
             // available for the next call, even when multiple notifications fire in rapid

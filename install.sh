@@ -10,6 +10,9 @@ CLAUDE_CONFIG="$HOME/.claude.json"
 PORT=8417
 OS="$(uname -s)"
 
+# -- Pre-flight checks --
+command -v gh >/dev/null 2>&1 || { echo "Error: gh (GitHub CLI) is required but not found. Install it from https://cli.github.com"; exit 1; }
+
 echo "==> Building release binary..."
 cargo build --release --manifest-path "$SCRIPT_DIR/Cargo.toml"
 
@@ -96,59 +99,7 @@ fi
 # -- Claude Code MCP config --
 
 echo "==> Configuring Claude Code MCP server..."
-if [ ! -f "$CLAUDE_CONFIG" ]; then
-  echo '{}' > "$CLAUDE_CONFIG"
-fi
-
-python3 - "$CLAUDE_CONFIG" "$PORT" <<'PYEOF'
-import json
-import sys
-
-config_path = sys.argv[1]
-port = sys.argv[2]
-
-with open(config_path) as f:
-    config = json.load(f)
-
-if "mcpServers" not in config:
-    config["mcpServers"] = {}
-
-config["mcpServers"]["build-watcher"] = {
-    "type": "http",
-    "url": f"http://127.0.0.1:{port}/mcp"
-}
-
-with open(config_path, "w") as f:
-    json.dump(config, f, indent=2)
-    f.write("\n")
-PYEOF
-
-echo "==> Adding permissions to Claude Code settings..."
-CLAUDE_SETTINGS="$HOME/.claude/settings.json"
-if [ -f "$CLAUDE_SETTINGS" ]; then
-  python3 - "$CLAUDE_SETTINGS" <<'PYEOF'
-import json
-import sys
-
-settings_path = sys.argv[1]
-
-with open(settings_path) as f:
-    settings = json.load(f)
-
-perms = settings.get("permissions", {})
-allow = perms.get("allow", [])
-
-entry = "mcp__build-watcher__*"
-if entry not in allow:
-    allow.append(entry)
-    perms["allow"] = allow
-    settings["permissions"] = perms
-
-    with open(settings_path, "w") as f:
-        json.dump(settings, f, indent=2)
-        f.write("\n")
-PYEOF
-fi
+"$BINARY_PATH" --register --port "$PORT"
 
 echo ""
 echo "Done! build-watcher is installed and running."

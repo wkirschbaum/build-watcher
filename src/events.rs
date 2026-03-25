@@ -106,9 +106,13 @@ pub async fn run_notification_handler(
     loop {
         match rx.recv().await {
             Ok(event) => {
-                let suppressed = is_paused(&pause).await || config.lock().await.is_in_quiet_hours();
+                let cfg = config.lock().await;
+                let level = effective_level(&event, &cfg);
+                let suppressed = level == config::NotificationLevel::Off
+                    || (level != config::NotificationLevel::Critical
+                        && (is_paused(&pause).await || cfg.is_in_quiet_hours()));
                 if !suppressed {
-                    handle_notification(event, &config).await;
+                    handle_notification(event, &cfg).await;
                 }
             }
             Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -122,20 +126,34 @@ pub async fn run_notification_handler(
     }
 }
 
+/// Determine the effective notification level for an event without sending it.
+fn effective_level(event: &WatchEvent, cfg: &config::Config) -> config::NotificationLevel {
+    match event {
+        WatchEvent::RunStarted(run) => cfg.notifications_for(&run.repo, &run.branch).build_started,
+        WatchEvent::RunCompleted {
+            run, conclusion, ..
+        } => {
+            let notif = cfg.notifications_for(&run.repo, &run.branch);
+            if conclusion == "success" {
+                notif.build_success
+            } else {
+                notif.build_failure
+            }
+        }
+        WatchEvent::StatusChanged { .. } => config::NotificationLevel::Off,
+    }
+}
+
 async fn is_paused(pause: &Arc<Mutex<Option<Instant>>>) -> bool {
     let p = pause.lock().await;
     p.is_some_and(|deadline| Instant::now() < deadline)
 }
 
-async fn handle_notification(event: WatchEvent, config: &Arc<Mutex<config::Config>>) {
+async fn handle_notification(event: WatchEvent, cfg: &config::Config) {
     match event {
         WatchEvent::RunStarted(run) => {
-            let (level, repo_label) = {
-                let cfg = config.lock().await;
-                let level = cfg.notifications_for(&run.repo, &run.branch).build_started;
-                let label = cfg.short_repo(&run.repo).to_string();
-                (level, label)
-            };
+            let level = cfg.notifications_for(&run.repo, &run.branch).build_started;
+            let repo_label = cfg.short_repo(&run.repo);
             let group = run.notification_group();
             platform::send_notification(
                 &format!("🔨 started: {} | {}", repo_label, run.workflow),
@@ -153,16 +171,13 @@ async fn handle_notification(event: WatchEvent, config: &Arc<Mutex<config::Confi
             failing_steps,
         } => {
             let succeeded = conclusion == "success";
-            let (level, repo_label) = {
-                let cfg = config.lock().await;
-                let notif = cfg.notifications_for(&run.repo, &run.branch);
-                let level = if succeeded {
-                    notif.build_success
-                } else {
-                    notif.build_failure
-                };
-                (level, cfg.short_repo(&run.repo).to_string())
+            let notif = cfg.notifications_for(&run.repo, &run.branch);
+            let level = if succeeded {
+                notif.build_success
+            } else {
+                notif.build_failure
             };
+            let repo_label = cfg.short_repo(&run.repo);
 
             let (emoji, status) = if succeeded {
                 ("✅", "succeeded")
