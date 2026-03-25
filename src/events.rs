@@ -126,16 +126,32 @@ async fn is_paused(pause: &Arc<Mutex<Option<Instant>>>) -> bool {
     p.is_some_and(|deadline| Instant::now() < deadline)
 }
 
+/// Returns just the repo name (e.g. `"bar"`) when it is unique among all watched
+/// repos, or the full `"owner/repo"` string when another watched repo shares the
+/// same name (e.g. both `"foo/bar"` and `"zoo/bar"` are watched).
+fn short_repo<'a>(repo: &'a str, cfg: &config::Config) -> &'a str {
+    let Some((_, name)) = repo.rsplit_once('/') else {
+        return repo;
+    };
+    let ambiguous = cfg
+        .repos
+        .keys()
+        .any(|r| r != repo && r.rsplit_once('/').map_or(r.as_str(), |(_, n)| n) == name);
+    if ambiguous { repo } else { name }
+}
+
 async fn handle_notification(event: WatchEvent, config: &Arc<Mutex<config::Config>>) {
     match event {
         WatchEvent::RunStarted(run) => {
-            let level = {
+            let (level, repo_label) = {
                 let cfg = config.lock().await;
-                cfg.notifications_for(&run.repo, &run.branch).build_started
+                let level = cfg.notifications_for(&run.repo, &run.branch).build_started;
+                let label = short_repo(&run.repo, &cfg).to_string();
+                (level, label)
             };
             let group = run.notification_group();
             platform::send_notification(
-                &format!("🔨 {} / {} - started", run.repo, run.workflow),
+                &format!("🔨 {} / {} - started", repo_label, run.workflow),
                 &format!("[{}] {}", run.branch, run.display_title()),
                 level,
                 Some(&run.url()),
@@ -150,7 +166,7 @@ async fn handle_notification(event: WatchEvent, config: &Arc<Mutex<config::Confi
             failing_steps,
         } => {
             let succeeded = conclusion == "success";
-            let (level, sound_on_failure, sound_file) = {
+            let (level, sound_on_failure, sound_file, repo_label) = {
                 let cfg = config.lock().await;
                 let notif = cfg.notifications_for(&run.repo, &run.branch);
                 let level = if succeeded {
@@ -162,6 +178,7 @@ async fn handle_notification(event: WatchEvent, config: &Arc<Mutex<config::Confi
                     level,
                     cfg.sound_on_failure_for(&run.repo),
                     cfg.sound_on_failure.sound_file.clone(),
+                    short_repo(&run.repo, &cfg).to_string(),
                 )
             };
 
@@ -176,7 +193,7 @@ async fn handle_notification(event: WatchEvent, config: &Arc<Mutex<config::Confi
 
             let group = run.notification_group();
             platform::send_notification(
-                &format!("{emoji} {} / {} - {conclusion}", run.repo, run.workflow),
+                &format!("{emoji} {} / {} - {conclusion}", repo_label, run.workflow),
                 &body,
                 level,
                 Some(&run.url()),
