@@ -16,8 +16,8 @@ use crate::config::{
 };
 use crate::github::{gh_run_list_history, gh_run_rerun, validate_branch, validate_repo};
 use crate::watcher::{
-    PauseState, SharedConfig, WatchKey, WatcherHandle, Watches, last_failed_build, save_watches,
-    start_watch,
+    MIN_ACTIVE_SECS, MIN_IDLE_SECS, PauseState, RateLimitState, SharedConfig, WatchKey,
+    WatcherHandle, Watches, compute_intervals, last_failed_build, save_watches, start_watch,
 };
 
 const DEFAULT_PORT: u16 = 8417;
@@ -40,6 +40,7 @@ fn build_router(
     config: SharedConfig,
     handle: WatcherHandle,
     pause: PauseState,
+    rate_limit: RateLimitState,
     ct: &CancellationToken,
 ) -> axum::Router {
     let http_config = StreamableHttpServerConfig {
@@ -58,6 +59,7 @@ fn build_router(
                     config.clone(),
                     handle.clone(),
                     pause.clone(),
+                    rate_limit.clone(),
                 ))
             },
             Default::default(),
@@ -76,6 +78,7 @@ pub async fn serve(
     config: SharedConfig,
     handle: WatcherHandle,
     pause: PauseState,
+    rate_limit: RateLimitState,
     ct: CancellationToken,
 ) -> Result<()> {
     let port: u16 = std::env::var("BUILD_WATCHER_PORT")
@@ -83,7 +86,14 @@ pub async fn serve(
         .and_then(|p| p.parse().ok())
         .unwrap_or(DEFAULT_PORT);
 
-    let router = build_router(watches.clone(), config, handle.clone(), pause, &ct);
+    let router = build_router(
+        watches.clone(),
+        config,
+        handle.clone(),
+        pause,
+        rate_limit,
+        &ct,
+    );
     let listener = bind_with_fallback(port).await?;
     let bound_port = listener.local_addr()?.port();
 
@@ -271,6 +281,7 @@ pub struct BuildWatcher {
     config: SharedConfig,
     handle: WatcherHandle,
     pause: PauseState,
+    rate_limit: RateLimitState,
 }
 
 #[tool_router]
@@ -280,6 +291,7 @@ impl BuildWatcher {
         config: SharedConfig,
         handle: WatcherHandle,
         pause: PauseState,
+        rate_limit: RateLimitState,
     ) -> Self {
         Self {
             tool_router: Self::tool_router(),
@@ -287,6 +299,7 @@ impl BuildWatcher {
             config,
             handle,
             pause,
+            rate_limit,
         }
     }
 
@@ -322,7 +335,16 @@ impl BuildWatcher {
         for (repo, branches) in &repo_branches {
             let mut any_started = false;
             for branch in branches {
-                match start_watch(&self.watches, &self.config, &self.handle, repo, branch).await {
+                match start_watch(
+                    &self.watches,
+                    &self.config,
+                    &self.handle,
+                    &self.rate_limit,
+                    repo,
+                    branch,
+                )
+                .await
+                {
                     Ok(msg) => {
                         any_started = true;
                         results.push(msg);
@@ -499,10 +521,7 @@ impl BuildWatcher {
             params.repo.clone(),
             RepoConfig {
                 branches: params.branches.clone(),
-                workflows: existing.workflows,
-                sound_on_failure: existing.sound_on_failure,
-                notifications: existing.notifications,
-                branch_notifications: existing.branch_notifications,
+                ..existing
             },
         );
         let mut msg = format!(
@@ -541,23 +560,30 @@ impl BuildWatcher {
         description = "Show the current configuration including watched repos, default branches, and per-repo overrides."
     )]
     async fn get_config(&self) -> Result<CallToolResult, McpError> {
-        let config = self.config.lock().await;
-        let mut lines = Vec::new();
+        // Acquire rate_limit and watches before config to maintain consistent lock order
+        // (pollers lock in the same order: rate_limit → watches → config).
+        let (active_secs, idle_secs, rate_limit_line) = {
+            let rl = self.rate_limit.lock().await;
+            let num_watches = self.watches.lock().await.len();
+            let (active, idle) = compute_intervals(rl.as_ref(), num_watches);
+            let line = format_rate_limit_line(rl.as_ref(), active, idle);
+            (active, idle, line)
+        };
 
-        // Pause status
         let paused = {
             let p = self.pause.lock().await;
             p.is_some_and(|deadline| tokio::time::Instant::now() < deadline)
         };
+
+        let config = self.config.lock().await;
+        let mut lines = Vec::new();
+
         if paused {
             lines.push("⏸ Notifications: PAUSED".to_string());
         }
-
         lines.push(format!("Default branches: {:?}", config.default_branches));
-        lines.push(format!(
-            "\nPolling:\n  active builds: every {}s\n  idle repos: every {}s",
-            config.active_poll_seconds, config.idle_poll_seconds,
-        ));
+        lines.push(format!("\nRate limit: {rate_limit_line}"));
+        lines.push(format!("Polling: active={active_secs}s idle={idle_secs}s"));
         lines.push(format!(
             "\nNotifications:\n  build_started: {}\n  build_success: {}\n  build_failure: {}",
             config.notifications.build_started,
@@ -1185,6 +1211,28 @@ fn apply_notification_overrides(
     if let Some(l) = params.build_failure {
         overrides.build_failure = Some(l);
     }
+}
+
+/// Format the rate-limit status line for `get_config`.
+fn format_rate_limit_line(
+    rl: Option<&crate::github::RateLimit>,
+    active_secs: u64,
+    idle_secs: u64,
+) -> String {
+    let Some(rl) = rl else {
+        return "unknown (no watches active yet)".to_string();
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mins_left = rl.reset.saturating_sub(now) / 60;
+    let throttled = active_secs > MIN_ACTIVE_SECS || idle_secs > MIN_IDLE_SECS;
+    let throttle_note = if throttled { " [throttled]" } else { "" };
+    format!(
+        "{}/{} remaining (resets in {}m){}",
+        rl.remaining, rl.limit, mins_left, throttle_note
+    )
 }
 
 fn format_notification_overrides(overrides: &NotificationOverrides) -> String {

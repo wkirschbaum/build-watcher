@@ -10,11 +10,63 @@ use tokio_util::task::TaskTracker;
 
 use crate::config::{Config, load_json, save_json, state_dir};
 use crate::events::{EventBus, RunSnapshot, WatchEvent};
-use crate::github::{GhError, LastBuild, RunInfo, gh_failing_steps, gh_recent_runs, gh_run_status};
+use crate::github::{
+    GhError, LastBuild, RateLimit, RunInfo, gh_failing_steps, gh_rate_limit, gh_recent_runs,
+    gh_run_status,
+};
 
 pub type SharedConfig = Arc<Mutex<Config>>;
 pub type Watches = Arc<Mutex<HashMap<WatchKey, WatchEntry>>>;
 pub type PauseState = Arc<Mutex<Option<Instant>>>;
+pub type RateLimitState = Arc<Mutex<Option<RateLimit>>>;
+
+/// Fastest permitted polling interval when active runs exist.
+pub(crate) const MIN_ACTIVE_SECS: u64 = 1;
+/// Fastest permitted polling interval when no active runs exist.
+pub(crate) const MIN_IDLE_SECS: u64 = 10;
+/// Fallback intervals used before the first rate-limit fetch succeeds.
+pub(crate) const FALLBACK_ACTIVE_SECS: u64 = 10;
+pub(crate) const FALLBACK_IDLE_SECS: u64 = 60;
+/// Conservative estimate of GitHub API calls per poll cycle per watcher.
+const CALLS_PER_CYCLE: u64 = 2;
+/// How often each poller refreshes the shared rate limit state.
+const RATE_LIMIT_REFRESH_INTERVAL: Duration = Duration::from_secs(300);
+
+/// Compute dynamic polling intervals based on the current GitHub rate limit.
+///
+/// Strategy:
+/// - No data yet → conservative fallback (10s / 60s).
+/// - More than 50% of the limit remains → run at floor speed (1s / 10s).
+/// - Below 50% → throttle: spread the remaining budget evenly across the
+///   seconds until the window resets, then floor at MIN values.
+pub(crate) fn compute_intervals(rate_limit: Option<&RateLimit>, num_watches: usize) -> (u64, u64) {
+    let Some(rl) = rate_limit else {
+        return (FALLBACK_ACTIVE_SECS, FALLBACK_IDLE_SECS);
+    };
+
+    // Above 50%: no throttling needed.
+    if rl.remaining * 2 > rl.limit {
+        return (MIN_ACTIVE_SECS, MIN_IDLE_SECS);
+    }
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let seconds_until_reset = rl.reset.saturating_sub(now).max(1);
+    let total_calls_per_cycle = num_watches.max(1) as u64 * CALLS_PER_CYCLE;
+
+    // Spread remaining budget evenly: min_interval = total_calls * secs / remaining.
+    // checked_div handles remaining == 0 by waiting out the full reset window.
+    let rate_limited_secs = (total_calls_per_cycle * seconds_until_reset)
+        .checked_div(rl.remaining)
+        .unwrap_or(seconds_until_reset);
+
+    (
+        MIN_ACTIVE_SECS.max(rate_limited_secs),
+        MIN_IDLE_SECS.max(rate_limited_secs),
+    )
+}
 
 /// Runtime state for an in-progress run, including when we first saw it.
 #[derive(Debug, Clone)]
@@ -247,11 +299,12 @@ impl WatcherHandle {
 
 // -- Starting watches --
 
-#[tracing::instrument(skip(watches, config, handle), fields(%repo, %branch))]
+#[tracing::instrument(skip(watches, config, handle, rate_limit), fields(%repo, %branch))]
 pub async fn start_watch(
     watches: &Watches,
     config: &SharedConfig,
     handle: &WatcherHandle,
+    rate_limit: &RateLimitState,
     repo: &str,
     branch: &str,
 ) -> std::result::Result<String, String> {
@@ -325,15 +378,22 @@ pub async fn start_watch(
     }
     save_watches(watches).await;
 
-    spawn_poller(watches, config, handle, key);
+    spawn_poller(watches, config, handle, rate_limit, key);
     Ok(msg)
 }
 
-fn spawn_poller(watches: &Watches, config: &SharedConfig, handle: &WatcherHandle, key: WatchKey) {
+fn spawn_poller(
+    watches: &Watches,
+    config: &SharedConfig,
+    handle: &WatcherHandle,
+    rate_limit: &RateLimitState,
+    key: WatchKey,
+) {
     let poller = Poller {
         key,
         watches: watches.clone(),
         config: config.clone(),
+        rate_limit: rate_limit.clone(),
         token: handle.cancel.child_token(),
         events: handle.events.clone(),
     };
@@ -363,6 +423,7 @@ struct Poller {
     key: WatchKey,
     watches: Watches,
     config: SharedConfig,
+    rate_limit: RateLimitState,
     token: CancellationToken,
     events: EventBus,
 }
@@ -407,8 +468,28 @@ impl Poller {
         let repo = self.key.repo.clone();
         let branch = self.key.branch.clone();
         let mut last_new_run_check: Option<Instant> = None;
+        let mut last_rate_limit_refresh: Option<Instant> = None;
 
         loop {
+            // Refresh rate limit state every 5 minutes. The `gh api rate_limit`
+            // call is free and doesn't count against the budget.
+            if last_rate_limit_refresh.is_none_or(|t| t.elapsed() >= RATE_LIMIT_REFRESH_INTERVAL) {
+                match gh_rate_limit().await {
+                    Ok(rl) => {
+                        tracing::debug!(
+                            remaining = rl.remaining,
+                            limit = rl.limit,
+                            "Rate limit refreshed"
+                        );
+                        *self.rate_limit.lock().await = Some(rl);
+                    }
+                    Err(e) => {
+                        tracing::warn!(key = %self.key, error = %e, "Failed to fetch rate limit");
+                    }
+                }
+                last_rate_limit_refresh = Some(Instant::now());
+            }
+
             let has_active = match self.read_active_state().await {
                 Some(active) => active,
                 None => return,
@@ -453,10 +534,13 @@ impl Poller {
     }
 
     async fn read_config(&self, repo: &str) -> PollConfig {
+        let rate_limit = self.rate_limit.lock().await.clone();
+        let num_watches = self.watches.lock().await.len();
+        let (active_secs, idle_secs) = compute_intervals(rate_limit.as_ref(), num_watches);
         let cfg = self.config.lock().await;
         PollConfig {
-            active_secs: cfg.active_poll_seconds,
-            idle_secs: cfg.idle_poll_seconds,
+            active_secs,
+            idle_secs,
             workflows: cfg.workflows_for(repo).to_vec(),
             ignored: cfg.ignored_workflows.clone(),
         }
@@ -628,14 +712,19 @@ impl Poller {
 
 // -- Startup --
 
-pub async fn startup_watches(watches: &Watches, config: &SharedConfig, handle: &WatcherHandle) {
+pub async fn startup_watches(
+    watches: &Watches,
+    config: &SharedConfig,
+    handle: &WatcherHandle,
+    rate_limit: &RateLimitState,
+) {
     let snapshot: Vec<WatchKey> = {
         let w = watches.lock().await;
         w.keys().cloned().collect()
     };
 
-    recover_existing_watches(watches, config, handle, &snapshot).await;
-    start_new_config_watches(watches, config, handle, &snapshot).await;
+    recover_existing_watches(watches, config, handle, rate_limit, &snapshot).await;
+    start_new_config_watches(watches, config, handle, rate_limit, &snapshot).await;
 }
 
 /// Resume persisted watches and recover any in-progress runs from GitHub.
@@ -643,6 +732,7 @@ async fn recover_existing_watches(
     watches: &Watches,
     config: &SharedConfig,
     handle: &WatcherHandle,
+    rate_limit: &RateLimitState,
     snapshot: &[WatchKey],
 ) {
     let futures: Vec<_> = snapshot
@@ -679,7 +769,7 @@ async fn recover_existing_watches(
             tracing::warn!(key = %key, error = %e, "Could not recover runs");
         }
 
-        spawn_poller(watches, config, handle, key);
+        spawn_poller(watches, config, handle, rate_limit, key);
     }
 }
 
@@ -688,6 +778,7 @@ async fn start_new_config_watches(
     watches: &Watches,
     config: &SharedConfig,
     handle: &WatcherHandle,
+    rate_limit: &RateLimitState,
     snapshot: &[WatchKey],
 ) {
     let new_keys: Vec<WatchKey> = {
@@ -717,8 +808,18 @@ async fn start_new_config_watches(
             let watches = watches.clone();
             let config = config.clone();
             let handle = handle.clone();
+            let rate_limit = rate_limit.clone();
             async move {
-                match start_watch(&watches, &config, &handle, &key.repo, &key.branch).await {
+                match start_watch(
+                    &watches,
+                    &config,
+                    &handle,
+                    &rate_limit,
+                    &key.repo,
+                    &key.branch,
+                )
+                .await
+                {
                     Ok(msg) | Err(msg) => tracing::info!("{msg}"),
                 }
             }
@@ -1107,5 +1208,87 @@ mod tests {
         watches.insert(WatchKey::new("bob/other", "main"), entry);
 
         assert!(last_failed_build(&watches, "alice/app").is_none());
+    }
+
+    // -- compute_intervals --
+
+    fn make_rate_limit(remaining: u64, limit: u64, secs_until_reset: u64) -> RateLimit {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        RateLimit {
+            limit,
+            remaining,
+            reset: now + secs_until_reset,
+            used: limit.saturating_sub(remaining),
+        }
+    }
+
+    #[test]
+    fn compute_intervals_no_data_returns_fallback() {
+        let (active, idle) = compute_intervals(None, 1);
+        assert_eq!(active, FALLBACK_ACTIVE_SECS);
+        assert_eq!(idle, FALLBACK_IDLE_SECS);
+    }
+
+    #[test]
+    fn compute_intervals_above_threshold_returns_floors() {
+        // 3000/5000 remaining = 60% — above 50%, no throttling
+        let rl = make_rate_limit(3000, 5000, 3600);
+        let (active, idle) = compute_intervals(Some(&rl), 1);
+        assert_eq!(active, MIN_ACTIVE_SECS);
+        assert_eq!(idle, MIN_IDLE_SECS);
+    }
+
+    #[test]
+    fn compute_intervals_at_threshold_throttles() {
+        // Exactly 50%: remaining * 2 == limit, so NOT above threshold → throttle
+        // 2500 remaining, 1 watch, 3600s until reset
+        // rate_limited = (1 * 2 * 3600) / 2500 = 7200 / 2500 = 2s
+        // active = max(1, 2) = 2s, idle = max(10, 2) = 10s
+        let rl = make_rate_limit(2500, 5000, 3600);
+        let (active, idle) = compute_intervals(Some(&rl), 1);
+        assert_eq!(active, 2);
+        assert_eq!(idle, 10);
+    }
+
+    #[test]
+    fn compute_intervals_low_remaining_throttles() {
+        // 500/5000 = 10% remaining, 1 watch, 3600s until reset
+        // rate_limited = (2 * 3600) / 500 = 7200 / 500 = 14s
+        // active = max(1, 14) = 14s, idle = max(10, 14) = 14s
+        let rl = make_rate_limit(500, 5000, 3600);
+        let (active, idle) = compute_intervals(Some(&rl), 1);
+        assert_eq!(active, 14);
+        assert_eq!(idle, 14);
+    }
+
+    #[test]
+    fn compute_intervals_scales_with_watch_count() {
+        // 500/5000 remaining, 5 watches, 3600s until reset
+        // rate_limited = (5 * 2 * 3600) / 500 = 36000 / 500 = 72s
+        let rl = make_rate_limit(500, 5000, 3600);
+        let (active, idle) = compute_intervals(Some(&rl), 5);
+        assert_eq!(active, 72);
+        assert_eq!(idle, 72);
+    }
+
+    #[test]
+    fn compute_intervals_zero_remaining_waits_for_reset() {
+        let rl = make_rate_limit(0, 5000, 3600);
+        let (active, idle) = compute_intervals(Some(&rl), 1);
+        // Both should be approximately seconds_until_reset (±1s for timing)
+        assert!(active >= 3599 && active <= 3601, "active={active}");
+        assert_eq!(active, idle);
+    }
+
+    #[test]
+    fn compute_intervals_zero_watches_treated_as_one() {
+        let rl = make_rate_limit(500, 5000, 3600);
+        let (a0, i0) = compute_intervals(Some(&rl), 0);
+        let (a1, i1) = compute_intervals(Some(&rl), 1);
+        assert_eq!(a0, a1);
+        assert_eq!(i0, i1);
     }
 }

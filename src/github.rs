@@ -467,6 +467,29 @@ pub async fn gh_run_list_history(
         .collect())
 }
 
+/// GitHub API rate limit info for the `core` resource.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RateLimit {
+    pub limit: u64,
+    pub remaining: u64,
+    pub reset: u64, // unix timestamp
+    pub used: u64,
+}
+
+/// Fetch current rate limit for the `core` resource. This call is free and
+/// does not count against the rate limit itself.
+pub async fn gh_rate_limit() -> Result<RateLimit, GhError> {
+    let stdout = gh_exec(
+        "rate_limit",
+        &["api", "rate_limit", "--jq", ".resources.core"],
+    )
+    .await?;
+    serde_json::from_slice(&stdout).map_err(|e| GhError::Parse {
+        repo: "rate_limit".into(),
+        source: e,
+    })
+}
+
 /// Validates that a branch name contains only safe characters.
 /// Notably rejects `#` which is used as the key delimiter in watch keys (`repo#branch`).
 pub fn validate_branch(branch: &str) -> Result<(), String> {

@@ -134,7 +134,7 @@ async fn handle_notification(event: WatchEvent, config: &Arc<Mutex<config::Confi
             };
             let group = run.notification_group();
             platform::send_notification(
-                &format!("\u{1f528} {} - started", run.workflow),
+                &format!("🔨 {} - started", run.workflow),
                 &format!("[{}] {}", run.branch, run.display_title()),
                 level,
                 Some(&run.url()),
@@ -164,7 +164,7 @@ async fn handle_notification(event: WatchEvent, config: &Arc<Mutex<config::Confi
                 )
             };
 
-            let emoji = if succeeded { "\u{2705}" } else { "\u{274c}" };
+            let emoji = if succeeded { "✅" } else { "❌" };
             let mut body = format!("[{}] {}", run.branch, run.display_title());
             if let Some(d) = elapsed {
                 body.push_str(&format!(" in {}", format::duration(d)));

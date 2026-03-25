@@ -247,20 +247,8 @@ pub struct Config {
     pub notifications: NotificationConfig,
     #[serde(default)]
     pub sound_on_failure: SoundConfig,
-    #[serde(default = "default_active_poll_seconds")]
-    pub active_poll_seconds: u64,
-    #[serde(default = "default_idle_poll_seconds")]
-    pub idle_poll_seconds: u64,
     #[serde(default)]
     pub repos: HashMap<String, RepoConfig>,
-}
-
-fn default_active_poll_seconds() -> u64 {
-    10
-}
-
-fn default_idle_poll_seconds() -> u64 {
-    60
 }
 
 fn default_branches() -> Vec<String> {
@@ -274,8 +262,6 @@ impl Default for Config {
             ignored_workflows: Vec::new(),
             notifications: NotificationConfig::default(),
             sound_on_failure: SoundConfig::default(),
-            active_poll_seconds: default_active_poll_seconds(),
-            idle_poll_seconds: default_idle_poll_seconds(),
             repos: HashMap::new(),
         }
     }

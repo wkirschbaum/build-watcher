@@ -28,6 +28,14 @@ fi
 echo "==> Removing binary..."
 rm -f "$INSTALL_DIR/$BINARY_NAME"
 
+echo "==> Removing desktop entry..."
+DESKTOP_FILE="$HOME/.local/share/applications/$BINARY_NAME.desktop"
+if [ -f "$DESKTOP_FILE" ]; then
+  rm -f "$DESKTOP_FILE"
+  command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database "$HOME/.local/share/applications" 2>/dev/null || true
+  echo "  Removed $DESKTOP_FILE"
+fi
+
 echo "==> Removing MCP server from Claude Code config..."
 if [ -f "$CLAUDE_CONFIG" ]; then
   python3 - "$CLAUDE_CONFIG" <<'PYEOF'

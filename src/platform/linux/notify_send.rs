@@ -9,6 +9,8 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use crate::config::NotificationLevel;
 use crate::platform::Notifier;
 
+use super::{app_name_from_group, format_body, notification_props, play_sound_impl};
+
 /// Linux desktop notifications via `notify-send`.
 ///
 /// Uses `--print-id` / `--replace-id` to stack notifications per group (`owner/repo#branch`),
@@ -29,32 +31,13 @@ impl NotifySend {
     }
 }
 
-const DEFAULT_ERROR_SOUND: &str = "/usr/share/sounds/freedesktop/stereo/dialog-error.oga";
-
 impl Notifier for NotifySend {
     fn name(&self) -> &'static str {
         "notify-send"
     }
 
     fn play_sound(&self, path: Option<&str>) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
-        let path = path.unwrap_or(DEFAULT_ERROR_SOUND).to_string();
-        Box::pin(async move {
-            // Try paplay (PulseAudio/PipeWire) first, fall back to aplay (ALSA)
-            let result = tokio::process::Command::new("paplay")
-                .arg(&path)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .await;
-            if result.is_err() || !result.unwrap().success() {
-                let _ = tokio::process::Command::new("aplay")
-                    .arg(&path)
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status()
-                    .await;
-            }
-        })
+        play_sound_impl(path)
     }
 
     fn send(
@@ -65,33 +48,24 @@ impl Notifier for NotifySend {
         url: Option<&str>,
         group: Option<&str>,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
-        let (icon, category, expire_ms) = match level {
-            NotificationLevel::Low => ("emblem-synchronizing", "transfer", "4000"),
-            NotificationLevel::Normal => ("emblem-ok", "transfer.complete", "6000"),
-            NotificationLevel::Critical => ("dialog-error", "transfer.error", "0"),
-            NotificationLevel::Off => unreachable!("Off is filtered before send()"),
-        };
-        let urgency = match level {
-            NotificationLevel::Low => "low",
-            NotificationLevel::Normal => "normal",
-            NotificationLevel::Critical => "critical",
-            NotificationLevel::Off => unreachable!("Off is filtered before send()"),
-        };
+        let props = notification_props(level);
 
         let key = group.unwrap_or("build-watcher").to_string();
-        let app_name = format!("Github Actions [{}]", repo_name_from_group(&key));
+        let app_name = app_name_from_group(group).to_string();
 
         let mut args = vec![
             "--app-name".to_string(),
             app_name,
             "--urgency".to_string(),
-            urgency.to_string(),
+            props.urgency.to_string(),
             "--icon".to_string(),
-            icon.to_string(),
+            props.icon.to_string(),
             "--category".to_string(),
-            category.to_string(),
+            props.category.to_string(),
             "--expire-time".to_string(),
-            expire_ms.to_string(),
+            props.expire_ms.to_string(),
+            "--hint".to_string(),
+            "string:desktop-entry:build-watcher".to_string(),
             "--print-id".to_string(),
         ];
 
@@ -112,12 +86,7 @@ impl Notifier for NotifySend {
 
         args.push(title.to_string());
 
-        // Append the plain URL on a second line — most notification daemons auto-link it.
-        let display_body = match url {
-            Some(u) => format!("{body}\n{u}"),
-            None => body.to_string(),
-        };
-        args.push(display_body);
+        args.push(format_body(body));
 
         let url_owned = url.map(str::to_string);
         let ids = Arc::clone(&self.ids);
@@ -184,34 +153,5 @@ impl Notifier for NotifySend {
                 });
             }
         })
-    }
-}
-
-/// Extracts the repo name from a group key of the form `owner/repo#branch`.
-/// Falls back to the full key if the expected format isn't present.
-fn repo_name_from_group(group: &str) -> &str {
-    group
-        .split_once('/')
-        .map(|(_, rest)| rest.split_once('#').map_or(rest, |(repo, _)| repo))
-        .unwrap_or(group)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn repo_name_from_full_group_key() {
-        assert_eq!(repo_name_from_group("alice/myapp#main"), "myapp");
-    }
-
-    #[test]
-    fn repo_name_without_branch() {
-        assert_eq!(repo_name_from_group("alice/myapp"), "myapp");
-    }
-
-    #[test]
-    fn repo_name_fallback_no_slash() {
-        assert_eq!(repo_name_from_group("build-watcher"), "build-watcher");
     }
 }
