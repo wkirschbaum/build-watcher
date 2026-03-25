@@ -9,7 +9,7 @@ use notify_rust::{Hint, Notification, Urgency};
 use crate::config::NotificationLevel;
 use crate::platform::Notifier;
 
-use super::{app_name_from_group, format_body, notification_props, play_sound_impl};
+use super::{app_name_from_group, notification_props};
 
 /// Linux desktop notifications via D-Bus using `notify-rust`.
 ///
@@ -38,10 +38,6 @@ impl Notifier for DbusNotifier {
         "dbus"
     }
 
-    fn play_sound(&self, path: Option<&str>) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
-        play_sound_impl(path)
-    }
-
     fn send(
         &self,
         title: &str,
@@ -60,7 +56,7 @@ impl Notifier for DbusNotifier {
 
         let key = group.unwrap_or("build-watcher").to_string();
         let app_name = app_name_from_group(group).to_string();
-        let display_body = format_body(body);
+        let display_body = body.to_string();
 
         let replace_id = {
             let ids = self

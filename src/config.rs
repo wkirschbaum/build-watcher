@@ -3,11 +3,18 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-use chrono::Timelike as _;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::platform;
+
+/// Current Unix epoch in seconds.
+pub fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
 
 // -- Directories (computed once) --
 
@@ -88,6 +95,16 @@ pub enum PersistError {
         to: PathBuf,
         source: std::io::Error,
     },
+}
+
+/// Async wrapper around `save_json` that runs the blocking I/O on a dedicated thread.
+pub async fn save_json_async<T: Serialize + Send + 'static>(
+    path: PathBuf,
+    value: T,
+) -> Result<(), PersistError> {
+    tokio::task::spawn_blocking(move || save_json(path, &value))
+        .await
+        .expect("save_json_async: blocking task panicked")
 }
 
 pub fn save_json<T: Serialize>(path: PathBuf, value: &T) -> Result<(), PersistError> {
@@ -208,16 +225,6 @@ impl Default for NotificationConfig {
     }
 }
 
-/// Sound-on-failure configuration.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct SoundConfig {
-    #[serde(default)]
-    pub enabled: bool,
-    /// Path to a .wav/.ogg file. None means use system default.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sound_file: Option<String>,
-}
-
 /// Daily time window during which desktop notifications are suppressed.
 /// Times are in 24-hour HH:MM format using local system time.
 /// Overnight ranges are supported (e.g. `start = "22:00"`, `end = "08:00"`).
@@ -245,8 +252,6 @@ pub struct RepoConfig {
     pub branches: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub workflows: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sound_on_failure: Option<bool>,
     #[serde(default, skip_serializing_if = "NotificationOverrides::is_empty")]
     pub notifications: NotificationOverrides,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
@@ -261,8 +266,6 @@ pub struct Config {
     pub ignored_workflows: Vec<String>,
     #[serde(default)]
     pub notifications: NotificationConfig,
-    #[serde(default)]
-    pub sound_on_failure: SoundConfig,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quiet_hours: Option<QuietHours>,
     #[serde(default)]
@@ -279,7 +282,6 @@ impl Default for Config {
             default_branches: default_branches(),
             ignored_workflows: Vec::new(),
             notifications: NotificationConfig::default(),
-            sound_on_failure: SoundConfig::default(),
             quiet_hours: None,
             repos: HashMap::new(),
         }
@@ -311,14 +313,6 @@ impl Config {
             build_success: resolve(|o| o.build_success, global.build_success),
             build_failure: resolve(|o| o.build_failure, global.build_failure),
         }
-    }
-
-    /// Whether sound on failure is enabled for a repo (repo override > global).
-    pub fn sound_on_failure_for(&self, repo: &str) -> bool {
-        self.repos
-            .get(repo)
-            .and_then(|r| r.sound_on_failure)
-            .unwrap_or(self.sound_on_failure.enabled)
     }
 
     /// Workflow filter for a repo. Empty slice means all workflows.
@@ -364,8 +358,7 @@ impl Config {
         let Some(qh) = &self.quiet_hours else {
             return false;
         };
-        let now = chrono::Local::now();
-        let cur_mins = now.hour() * 60 + now.minute();
+        let cur_mins = local_time_minutes();
         is_in_quiet_hours_at(qh, cur_mins)
     }
 
@@ -374,6 +367,14 @@ impl Config {
             self.repos.entry(repo.clone()).or_default();
         }
     }
+}
+
+/// Returns the current local time as minutes since midnight.
+fn local_time_minutes() -> u32 {
+    let epoch = unix_now() as libc::time_t;
+    let mut tm = unsafe { std::mem::zeroed::<libc::tm>() };
+    unsafe { libc::localtime_r(&epoch, &mut tm) };
+    (tm.tm_hour as u32) * 60 + (tm.tm_min as u32)
 }
 
 /// Pure helper for testability — takes the current time as `cur_mins` (minutes since midnight).
@@ -429,6 +430,10 @@ pub fn load_and_normalize() -> Config {
 
 pub fn save_config(config: &Config) -> Result<(), PersistError> {
     save_json(config_dir().join("config.json"), config)
+}
+
+pub async fn save_config_async(config: &Config) -> Result<(), PersistError> {
+    save_json_async(config_dir().join("config.json"), config.clone()).await
 }
 
 #[cfg(test)]

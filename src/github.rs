@@ -329,10 +329,7 @@ impl HistoryEntry {
     /// Seconds since `created_at`.
     pub fn age_secs(&self) -> Option<u64> {
         let start = parse_iso_epoch(&self.created_at)?;
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .ok()?
-            .as_secs();
+        let now = crate::config::unix_now();
         Some(now.saturating_sub(start))
     }
 }
@@ -349,9 +346,6 @@ fn parse_iso_epoch(s: &str) -> Option<u64> {
     let year: u64 = parts[0].parse().ok()?;
     let month: u64 = parts[1].parse().ok()?;
     let day: u64 = parts[2].parse().ok()?;
-    if !(1..=12).contains(&month) || day == 0 {
-        return None;
-    }
 
     let time_parts: Vec<&str> = time.split(':').collect();
     if time_parts.len() < 2 {
@@ -365,17 +359,12 @@ fn parse_iso_epoch(s: &str) -> Option<u64> {
         .and_then(|s| s.split('.').next()?.parse().ok())
         .unwrap_or(0);
 
-    // Days from epoch using a simplified calculation
-    let mut days: u64 = 0;
-    for y in 1970..year {
-        days += if y.is_multiple_of(4) && (!y.is_multiple_of(100) || y.is_multiple_of(400)) {
-            366
-        } else {
-            365
-        };
+    if !(1..=12).contains(&month) || day == 0 || hour > 23 || min > 59 || sec > 59 {
+        return None;
     }
+
     let is_leap = year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
-    let month_days = [
+    let month_days: [u64; 12] = [
         31,
         if is_leap { 29 } else { 28 },
         31,
@@ -391,6 +380,15 @@ fn parse_iso_epoch(s: &str) -> Option<u64> {
     ];
     #[allow(clippy::cast_possible_truncation)]
     // month is validated 1-12, value fits usize on all targets
+    if day > month_days[(month - 1) as usize] {
+        return None;
+    }
+
+    // Days from epoch (constant-time calculation)
+    let leap_days = |y: u64| -> u64 { y / 4 - y / 100 + y / 400 };
+    let y0 = year - 1;
+    let days_to_year = year * 365 + leap_days(y0) - (1970 * 365 + leap_days(1969));
+    let mut days: u64 = days_to_year;
     for md in &month_days[..((month - 1) as usize)] {
         days += md;
     }
@@ -732,5 +730,19 @@ mod tests {
         let start = parse_iso_epoch("2024-01-01T10:00:00Z").unwrap();
         let end = parse_iso_epoch("2024-01-01T10:05:30Z").unwrap();
         assert_eq!(end - start, 330); // 5m 30s = 330 seconds
+    }
+
+    #[test]
+    fn parse_iso_epoch_rejects_invalid_day() {
+        assert!(parse_iso_epoch("2024-02-30T00:00:00Z").is_none()); // Feb 30
+        assert!(parse_iso_epoch("2024-04-31T00:00:00Z").is_none()); // Apr 31
+        assert!(parse_iso_epoch("2023-02-29T00:00:00Z").is_none()); // non-leap Feb 29
+        assert!(parse_iso_epoch("2024-02-29T00:00:00Z").is_some()); // leap Feb 29
+    }
+
+    #[test]
+    fn parse_iso_epoch_rejects_invalid_time() {
+        assert!(parse_iso_epoch("2024-01-01T24:00:00Z").is_none());
+        assert!(parse_iso_epoch("2024-01-01T12:60:00Z").is_none());
     }
 }

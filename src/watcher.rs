@@ -8,7 +8,7 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
-use crate::config::{Config, load_json, save_json, state_dir};
+use crate::config::{Config, load_json, save_json_async, state_dir};
 use crate::events::{EventBus, RunSnapshot, WatchEvent};
 use crate::github::{
     GhError, LastBuild, RateLimit, RunInfo, gh_failing_steps, gh_rate_limit, gh_recent_runs,
@@ -76,11 +76,7 @@ pub(crate) fn compute_intervals(
         return (MIN_ACTIVE_SECS * scale, MIN_IDLE_SECS * scale);
     }
 
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let seconds_until_reset = rl.reset.saturating_sub(now).max(1);
+    let seconds_until_reset = rl.reset.saturating_sub(crate::config::unix_now()).max(1);
 
     // Spread remaining budget evenly: min_interval = calls * secs / remaining.
     // checked_div handles remaining == 0 by waiting out the full reset window.
@@ -124,7 +120,9 @@ impl ActiveRun {
 
 // -- Watch key --
 
-const DEFAULT_BRANCH: &str = "main";
+/// Fallback branch for legacy persisted keys that lack `#branch`.
+/// All current keys include it; this only guards against hand-edited JSON.
+const FALLBACK_BRANCH: &str = "main";
 
 /// Type-safe watch key combining repo and branch.
 /// Serializes as `"owner/repo#branch"` for persistence compatibility.
@@ -146,7 +144,7 @@ impl WatchKey {
     fn parse(s: &str) -> Self {
         match s.rsplit_once('#') {
             Some((repo, branch)) => Self::new(repo, branch),
-            None => Self::new(s, DEFAULT_BRANCH),
+            None => Self::new(s, FALLBACK_BRANCH),
         }
     }
 
@@ -201,7 +199,7 @@ pub async fn save_watches(watches: &Watches) {
             .map(|(k, v)| (k.clone(), v.to_persisted()))
             .collect()
     };
-    if let Err(e) = save_json(state_dir().join("watches.json"), &persisted) {
+    if let Err(e) = save_json_async(state_dir().join("watches.json"), persisted).await {
         tracing::error!("Failed to save watches: {e}");
     }
 }
@@ -535,7 +533,7 @@ impl Poller {
             }
 
             if has_active {
-                self.poll_active_runs(&repo, &branch, &pcfg).await;
+                self.poll_active_runs(&repo, &branch).await;
             }
 
             let due = last_new_run_check
@@ -576,7 +574,7 @@ impl Poller {
     /// Poll all in-progress runs, emit events on completion/status change, handle failures.
     /// The watch lock is released during each GitHub API call (high latency)
     /// and re-acquired for each state update to avoid holding it across awaits.
-    async fn poll_active_runs(&self, repo: &str, branch: &str, _pcfg: &PollConfig) {
+    async fn poll_active_runs(&self, repo: &str, branch: &str) {
         let run_ids: Vec<u64> = {
             let w = self.watches.lock().await;
             match w.get(&self.key) {
@@ -776,9 +774,18 @@ async fn recover_existing_watches(
 
     for (key, result) in futures::future::join_all(futures).await {
         if let Ok(runs) = result {
+            let (workflow_filter, ignored_workflows) = {
+                let cfg = config.lock().await;
+                (
+                    cfg.workflows_for(&key.repo).to_vec(),
+                    cfg.ignored_workflows.clone(),
+                )
+            };
+            let filtered = filter_runs(&runs, &workflow_filter, &ignored_workflows);
+
             let mut w = watches.lock().await;
             if let Some(entry) = w.get_mut(&key) {
-                for run in &runs {
+                for run in &filtered {
                     if !run.is_completed() && !entry.active_runs.contains_key(&run.id) {
                         tracing::info!(key = %key, run_id = run.id, "Recovering in-progress run");
                         // Note: started_at is approximate — the actual GitHub start
@@ -787,7 +794,8 @@ async fn recover_existing_watches(
                         entry.active_runs.insert(run.id, ActiveRun::from_run(run));
                     }
                 }
-                // Bump high-water mark so check_for_new_runs doesn't re-notify.
+                // Bump high-water mark from all runs (not just filtered) so
+                // check_for_new_runs doesn't re-notify for ignored workflows.
                 if let Some(max_id) = runs.iter().map(|r| r.id).max() {
                     entry.last_seen_run_id = entry.last_seen_run_id.max(max_id);
                 }

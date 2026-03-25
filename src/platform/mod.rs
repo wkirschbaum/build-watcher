@@ -33,11 +33,6 @@ pub trait Notifier: Send + Sync {
         url: Option<&str>,
         group: Option<&str>,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
-
-    /// Play a sound file. `path` is an optional custom path; None means use system default.
-    fn play_sound(&self, _path: Option<&str>) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
-        Box::pin(async {})
-    }
 }
 
 static INSTANCE: OnceLock<Box<dyn Notifier>> = OnceLock::new();
@@ -69,10 +64,6 @@ pub async fn send_notification(
         return;
     }
     notifier().send(title, body, level, url, group).await;
-}
-
-pub async fn play_sound(path: Option<&str>) {
-    notifier().play_sound(path).await;
 }
 
 /// Default state directory when `STATE_DIRECTORY` is not set.

@@ -9,7 +9,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use crate::config::NotificationLevel;
 use crate::platform::Notifier;
 
-use super::{app_name_from_group, format_body, notification_props, play_sound_impl};
+use super::{app_name_from_group, notification_props};
 
 /// Linux desktop notifications via `notify-send`.
 ///
@@ -34,10 +34,6 @@ impl NotifySend {
 impl Notifier for NotifySend {
     fn name(&self) -> &'static str {
         "notify-send"
-    }
-
-    fn play_sound(&self, path: Option<&str>) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
-        play_sound_impl(path)
     }
 
     fn send(
@@ -89,7 +85,7 @@ impl Notifier for NotifySend {
 
         args.push(title.to_string());
 
-        args.push(format_body(body));
+        args.push(body.to_string());
 
         let url_owned = url.map(str::to_string);
         let ids = Arc::clone(&self.ids);

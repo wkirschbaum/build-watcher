@@ -1,15 +1,8 @@
-use std::future::Future;
-use std::pin::Pin;
-use std::process::Stdio;
-
 use crate::config::NotificationLevel;
 use crate::platform::Notifier;
 
 mod dbus;
 mod notify_send;
-
-pub(super) const DEFAULT_ERROR_SOUND: &str =
-    "/usr/share/sounds/freedesktop/stereo/dialog-error.oga";
 
 /// Shared notification properties derived from a `NotificationLevel`.
 #[derive(Debug, PartialEq)]
@@ -44,40 +37,12 @@ pub(super) fn notification_props(level: NotificationLevel) -> NotificationProps 
     }
 }
 
-/// Format body text. The URL is surfaced via the action button, not the body.
-pub(super) fn format_body(body: &str) -> String {
-    body.to_string()
-}
-
 /// Extract the repo name from a notification group key (`owner/repo#branch#workflow`).
 /// Falls back to "Build Watcher" when no group is provided.
 pub(super) fn app_name_from_group(group: Option<&str>) -> &str {
     group
         .and_then(|g| g.split('#').next())
         .unwrap_or("Build Watcher")
-}
-
-/// Play a sound file via PulseAudio/PipeWire (`paplay`), falling back to ALSA (`aplay`).
-pub(super) fn play_sound_impl(
-    path: Option<&str>,
-) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
-    let path = path.unwrap_or(DEFAULT_ERROR_SOUND).to_string();
-    Box::pin(async move {
-        let result = tokio::process::Command::new("paplay")
-            .arg(&path)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .await;
-        if result.is_err() || !result.unwrap().success() {
-            let _ = tokio::process::Command::new("aplay")
-                .arg(&path)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .await;
-        }
-    })
 }
 
 pub fn default_state_dir() -> String {
@@ -129,11 +94,6 @@ mod tests {
         assert_eq!(props.category, "transfer.error");
         assert_eq!(props.expire_ms, 0);
         assert_eq!(props.urgency, "critical");
-    }
-
-    #[test]
-    fn format_body_returns_body_unchanged() {
-        assert_eq!(format_body("build passed"), "build passed");
     }
 
     #[test]

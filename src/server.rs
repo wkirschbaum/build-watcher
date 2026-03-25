@@ -1,4 +1,3 @@
-use std::fmt::Write as _;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -14,8 +13,8 @@ use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{
-    NotificationLevel, NotificationOverrides, PersistError, QuietHours, RepoConfig, config_dir,
-    save_config, state_dir,
+    NotificationLevel, NotificationOverrides, QuietHours, RepoConfig, config_dir,
+    save_config_async, state_dir,
 };
 use crate::format;
 use crate::github::{gh_run_list_history, gh_run_rerun, validate_branch, validate_repo};
@@ -29,14 +28,15 @@ const DEFAULT_PORT: u16 = 8417;
 
 /// Bind to the preferred port, trying up to 9 consecutive ports on conflict.
 async fn bind_with_fallback(preferred: u16) -> Result<tokio::net::TcpListener> {
-    for port in preferred..=preferred.saturating_add(9) {
+    let last = preferred.saturating_add(9);
+    for port in preferred..=last {
         match tokio::net::TcpListener::bind(format!("127.0.0.1:{port}")).await {
             Ok(l) => return Ok(l),
-            Err(_) if port < preferred.saturating_add(9) => {}
-            Err(e) => return Err(e.into()),
+            Err(e) if port == last => return Err(e.into()),
+            Err(_) => {}
         }
     }
-    unreachable!()
+    unreachable!("preferred..=last is never empty")
 }
 
 /// Build the axum router with the MCP `StreamableHttpService`.
@@ -133,8 +133,8 @@ pub async fn serve(
     Ok(())
 }
 
-fn persist_warning(result: Result<(), PersistError>) -> Option<String> {
-    match result {
+async fn persist_config(config: crate::config::Config) -> Option<String> {
+    match save_config_async(&config).await {
         Ok(()) => None,
         Err(e) => {
             tracing::error!("Failed to save config: {e}");
@@ -261,16 +261,6 @@ struct PauseNotificationsParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-struct ConfigureSoundParams {
-    /// Enable or disable failure sound globally
-    enabled: Option<bool>,
-    /// Custom sound file path (absolute). Omit to use system default.
-    sound_file: Option<String>,
-    /// Optional repo to override sound setting per-repo
-    repo: Option<String>,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
 struct ConfigureQuietHoursParams {
     /// Start of quiet period in HH:MM (24-hour) local time. Defaults to `"22:00"`.
     start: Option<String>,
@@ -390,9 +380,12 @@ impl BuildWatcher {
         // Persist only the repos that actually got a poller running. Repos whose
         // every branch failed (e.g. no runs, bad name) are not saved.
         if !started_repos.is_empty() {
-            let mut config = self.config.lock().await;
-            config.add_repos(&started_repos);
-            if let Some(warning) = persist_warning(save_config(&config)) {
+            let snapshot = {
+                let mut config = self.config.lock().await;
+                config.add_repos(&started_repos);
+                config.clone()
+            };
+            if let Some(warning) = persist_config(snapshot).await {
                 results.push(warning);
             }
         }
@@ -435,19 +428,22 @@ impl BuildWatcher {
         // Phase 2: remove from config. We check both sources of truth here so the
         // response message is accurate — a repo can be in config but have no active
         // poller if a previous watch_builds call failed partway through.
-        let mut config = self.config.lock().await;
-        let mut results = Vec::new();
-        for (repo, branch_count) in removed_counts {
-            let was_in_config = config.repos.contains_key(&repo);
-            config.repos.remove(&repo);
-            let msg = match (branch_count, was_in_config) {
-                (n, _) if n > 0 => format!("Stopped watching {repo} ({n} branches)"),
-                (_, true) => format!("{repo}: removed from config (was not actively polling)"),
-                _ => format!("{repo}: not found"),
-            };
-            results.push(msg);
-        }
-        if let Some(warning) = persist_warning(save_config(&config)) {
+        let (snapshot, mut results) = {
+            let mut config = self.config.lock().await;
+            let mut results = Vec::new();
+            for (repo, branch_count) in removed_counts {
+                let was_in_config = config.repos.contains_key(&repo);
+                config.repos.remove(&repo);
+                let msg = match (branch_count, was_in_config) {
+                    (n, _) if n > 0 => format!("Stopped watching {repo} ({n} branches)"),
+                    (_, true) => format!("{repo}: removed from config (was not actively polling)"),
+                    _ => format!("{repo}: not found"),
+                };
+                results.push(msg);
+            }
+            (config.clone(), results)
+        };
+        if let Some(warning) = persist_config(snapshot).await {
             results.push(warning);
         }
 
@@ -540,25 +536,28 @@ impl BuildWatcher {
             }
         }
 
-        let mut config = self.config.lock().await;
-        let Some(existing) = config.repos.get(&params.repo).cloned() else {
-            return Ok(CallToolResult::error(vec![Content::text(format!(
-                "{} is not being watched — use watch_builds first",
-                params.repo
-            ))]));
+        let snapshot = {
+            let mut config = self.config.lock().await;
+            let Some(existing) = config.repos.get(&params.repo).cloned() else {
+                return Ok(CallToolResult::error(vec![Content::text(format!(
+                    "{} is not being watched — use watch_builds first",
+                    params.repo
+                ))]));
+            };
+            config.repos.insert(
+                params.repo.clone(),
+                RepoConfig {
+                    branches: params.branches.clone(),
+                    ..existing
+                },
+            );
+            config.clone()
         };
-        config.repos.insert(
-            params.repo.clone(),
-            RepoConfig {
-                branches: params.branches.clone(),
-                ..existing
-            },
-        );
         let mut msg = format!(
             "Set {}: watching branches {:?}\nRestart watches with watch_builds to apply.",
             params.repo, params.branches,
         );
-        if let Some(warning) = persist_warning(save_config(&config)) {
+        if let Some(warning) = persist_config(snapshot).await {
             msg.push_str(&warning);
         }
 
@@ -576,10 +575,13 @@ impl BuildWatcher {
             }
         }
 
-        let mut config = self.config.lock().await;
-        config.default_branches = params.branches;
-        let mut msg = format!("Default branches set to {:?}", config.default_branches);
-        if let Some(warning) = persist_warning(save_config(&config)) {
+        let (snapshot, mut msg) = {
+            let mut config = self.config.lock().await;
+            config.default_branches = params.branches;
+            let msg = format!("Default branches set to {:?}", config.default_branches);
+            (config.clone(), msg)
+        };
+        if let Some(warning) = persist_config(snapshot).await {
             msg.push_str(&warning);
         }
 
@@ -590,8 +592,9 @@ impl BuildWatcher {
         description = "Show the current configuration including watched repos, default branches, and per-repo overrides."
     )]
     async fn get_config(&self) -> Result<CallToolResult, McpError> {
-        // Acquire rate_limit and watches before config to maintain consistent lock order
-        // (pollers lock in the same order: rate_limit → watches → config).
+        // Acquire rate_limit and watches before config. Pollers never hold all
+        // three simultaneously, but we keep the same outer ordering
+        // (rate_limit → watches → config) to avoid potential deadlocks.
         let (active_secs, idle_secs, rate_limit_line) = {
             let rl = self.rate_limit.lock().await;
             let w = self.watches.lock().await;
@@ -621,21 +624,6 @@ impl BuildWatcher {
             config.notifications.build_started,
             config.notifications.build_success,
             config.notifications.build_failure,
-        ));
-
-        lines.push(format!(
-            "\nSound on failure: {}{}",
-            if config.sound_on_failure.enabled {
-                "enabled"
-            } else {
-                "disabled"
-            },
-            config
-                .sound_on_failure
-                .sound_file
-                .as_ref()
-                .map(|p| format!(" ({p})"))
-                .unwrap_or_default()
         ));
 
         if !config.ignored_workflows.is_empty() {
@@ -764,11 +752,7 @@ impl BuildWatcher {
             None => lines
                 .push("  (no data yet — first refresh happens after the first poll)".to_string()),
             Some(rl) => {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
-                let mins_left = rl.reset.saturating_sub(now) / 60;
+                let mins_left = rl.reset.saturating_sub(crate::config::unix_now()) / 60;
                 let pct = rl.remaining * 100 / rl.limit.max(1);
                 lines.push(format!(
                     "  Remaining : {} / {} ({}%)",
@@ -808,10 +792,15 @@ impl BuildWatcher {
         Parameters(params): Parameters<ConfigureQuietHoursParams>,
     ) -> Result<CallToolResult, McpError> {
         if params.clear == Some(true) {
-            let mut config = self.config.lock().await;
-            config.quiet_hours = None;
-            let msg = persist_warning(save_config(&config))
-                .unwrap_or_else(|| "Quiet hours cleared".to_string());
+            let snapshot = {
+                let mut config = self.config.lock().await;
+                config.quiet_hours = None;
+                config.clone()
+            };
+            let mut msg = "Quiet hours cleared".to_string();
+            if let Some(warning) = persist_config(snapshot).await {
+                msg.push_str(&warning);
+            }
             return Ok(CallToolResult::success(vec![Content::text(msg)]));
         }
 
@@ -825,12 +814,16 @@ impl BuildWatcher {
             return Ok(CallToolResult::error(vec![Content::text(e)]));
         }
 
-        let mut config = self.config.lock().await;
-        config.quiet_hours = Some(QuietHours {
-            start: start.clone(),
-            end: end.clone(),
-        });
-        let msg = persist_warning(save_config(&config))
+        let snapshot = {
+            let mut config = self.config.lock().await;
+            config.quiet_hours = Some(QuietHours {
+                start: start.clone(),
+                end: end.clone(),
+            });
+            config.clone()
+        };
+        let msg = persist_config(snapshot)
+            .await
             .unwrap_or_else(|| format!("Quiet hours set: {start}–{end} (local time)"));
         Ok(CallToolResult::success(vec![Content::text(msg)]))
     }
@@ -861,21 +854,24 @@ impl BuildWatcher {
             return Ok(CallToolResult::error(vec![Content::text(e)]));
         }
 
-        let mut config = self.config.lock().await;
-        let Some(rc) = config.repos.get_mut(&params.repo) else {
-            return Ok(CallToolResult::error(vec![Content::text(format!(
-                "{} is not being watched — use watch_builds first",
-                params.repo
-            ))]));
+        let (snapshot, mut msg) = {
+            let mut config = self.config.lock().await;
+            let Some(rc) = config.repos.get_mut(&params.repo) else {
+                return Ok(CallToolResult::error(vec![Content::text(format!(
+                    "{} is not being watched — use watch_builds first",
+                    params.repo
+                ))]));
+            };
+            let msg = if let Some(alias) = &params.alias {
+                rc.alias = Some(alias.clone());
+                format!("{}: alias set to \"{}\"", params.repo, alias)
+            } else {
+                rc.alias = None;
+                format!("{}: alias cleared", params.repo)
+            };
+            (config.clone(), msg)
         };
-        let mut msg = if let Some(alias) = &params.alias {
-            rc.alias = Some(alias.clone());
-            format!("{}: alias set to \"{}\"", params.repo, alias)
-        } else {
-            rc.alias = None;
-            format!("{}: alias cleared", params.repo)
-        };
-        if let Some(warning) = persist_warning(save_config(&config)) {
+        if let Some(warning) = persist_config(snapshot).await {
             msg.push_str(&warning);
         }
         Ok(CallToolResult::success(vec![Content::text(msg)]))
@@ -892,23 +888,26 @@ impl BuildWatcher {
             return Ok(CallToolResult::error(vec![Content::text(e)]));
         }
 
-        let mut config = self.config.lock().await;
-        let Some(rc) = config.repos.get_mut(&params.repo) else {
-            return Ok(CallToolResult::error(vec![Content::text(format!(
-                "{} is not being watched — use watch_builds first",
-                params.repo
-            ))]));
+        let (snapshot, mut msg) = {
+            let mut config = self.config.lock().await;
+            let Some(rc) = config.repos.get_mut(&params.repo) else {
+                return Ok(CallToolResult::error(vec![Content::text(format!(
+                    "{} is not being watched — use watch_builds first",
+                    params.repo
+                ))]));
+            };
+            rc.workflows.clone_from(&params.workflows);
+            let msg = if params.workflows.is_empty() {
+                format!("{}: watching all workflows", params.repo)
+            } else {
+                format!(
+                    "{}: watching workflows {:?}\nApplies to new builds immediately.",
+                    params.repo, params.workflows
+                )
+            };
+            (config.clone(), msg)
         };
-        rc.workflows.clone_from(&params.workflows);
-        let mut msg = if params.workflows.is_empty() {
-            format!("{}: watching all workflows", params.repo)
-        } else {
-            format!(
-                "{}: watching workflows {:?}\nApplies to new builds immediately.",
-                params.repo, params.workflows
-            )
-        };
-        if let Some(warning) = persist_warning(save_config(&config)) {
+        if let Some(warning) = persist_config(snapshot).await {
             msg.push_str(&warning);
         }
 
@@ -928,28 +927,31 @@ impl BuildWatcher {
             )]));
         }
 
-        let mut config = self.config.lock().await;
-        let mut added = Vec::new();
-        for w in &params.workflows {
-            if !config
-                .ignored_workflows
-                .iter()
-                .any(|existing| existing.eq_ignore_ascii_case(w))
-            {
-                config.ignored_workflows.push(w.clone());
-                added.push(w.as_str());
+        let (snapshot, mut msg) = {
+            let mut config = self.config.lock().await;
+            let mut added = Vec::new();
+            for w in &params.workflows {
+                if !config
+                    .ignored_workflows
+                    .iter()
+                    .any(|existing| existing.eq_ignore_ascii_case(w))
+                {
+                    config.ignored_workflows.push(w.clone());
+                    added.push(w.as_str());
+                }
             }
-        }
-        let mut msg = if added.is_empty() {
-            "All specified workflows are already ignored".to_string()
-        } else {
-            format!(
-                "Now ignoring: {}\nIgnored workflows: {:?}",
-                added.join(", "),
-                config.ignored_workflows
-            )
+            let msg = if added.is_empty() {
+                "All specified workflows are already ignored".to_string()
+            } else {
+                format!(
+                    "Now ignoring: {}\nIgnored workflows: {:?}",
+                    added.join(", "),
+                    config.ignored_workflows
+                )
+            };
+            (config.clone(), msg)
         };
-        if let Some(warning) = persist_warning(save_config(&config)) {
+        if let Some(warning) = persist_config(snapshot).await {
             msg.push_str(&warning);
         }
 
@@ -969,26 +971,31 @@ impl BuildWatcher {
             )]));
         }
 
-        let mut config = self.config.lock().await;
-        let before = config.ignored_workflows.len();
-        config.ignored_workflows.retain(|existing| {
-            !params
-                .workflows
-                .iter()
-                .any(|w| w.eq_ignore_ascii_case(existing))
-        });
-        let removed = before - config.ignored_workflows.len();
-        let mut msg = if removed == 0 {
-            "None of the specified workflows were in the ignore list".to_string()
-        } else if config.ignored_workflows.is_empty() {
-            format!("Removed {removed} workflow(s) from ignore list. No workflows are ignored now.")
-        } else {
-            format!(
-                "Removed {removed} workflow(s). Still ignoring: {:?}",
-                config.ignored_workflows
-            )
+        let (snapshot, mut msg) = {
+            let mut config = self.config.lock().await;
+            let before = config.ignored_workflows.len();
+            config.ignored_workflows.retain(|existing| {
+                !params
+                    .workflows
+                    .iter()
+                    .any(|w| w.eq_ignore_ascii_case(existing))
+            });
+            let removed = before - config.ignored_workflows.len();
+            let msg = if removed == 0 {
+                "None of the specified workflows were in the ignore list".to_string()
+            } else if config.ignored_workflows.is_empty() {
+                format!(
+                    "Removed {removed} workflow(s) from ignore list. No workflows are ignored now."
+                )
+            } else {
+                format!(
+                    "Removed {removed} workflow(s). Still ignoring: {:?}",
+                    config.ignored_workflows
+                )
+            };
+            (config.clone(), msg)
         };
-        if let Some(warning) = persist_warning(save_config(&config)) {
+        if let Some(warning) = persist_config(snapshot).await {
             msg.push_str(&warning);
         }
 
@@ -1028,92 +1035,6 @@ impl BuildWatcher {
         } else {
             "Notifications were not paused"
         };
-        Ok(CallToolResult::success(vec![Content::text(msg)]))
-    }
-
-    #[tool(
-        description = "Configure the sound-on-failure feature. Disabled by default. When enabled, plays an audio alert when builds fail. Set globally or per-repo."
-    )]
-    async fn configure_sound(
-        &self,
-        Parameters(params): Parameters<ConfigureSoundParams>,
-    ) -> Result<CallToolResult, McpError> {
-        if let Some(repo) = &params.repo
-            && let Err(e) = validate_repo(repo)
-        {
-            return Ok(CallToolResult::error(vec![Content::text(e)]));
-        }
-
-        if params.repo.is_some() && params.sound_file.is_some() {
-            return Ok(CallToolResult::error(vec![Content::text(
-                "sound_file can only be set globally, not per-repo",
-            )]));
-        }
-
-        let mut config = self.config.lock().await;
-        let mut msg = String::new();
-
-        if let Some(repo) = &params.repo {
-            let Some(rc) = config.repos.get_mut(repo) else {
-                return Ok(CallToolResult::error(vec![Content::text(format!(
-                    "{repo} is not being watched — use watch_builds first"
-                ))]));
-            };
-            if let Some(enabled) = params.enabled {
-                rc.sound_on_failure = Some(enabled);
-                msg = format!(
-                    "{repo}: sound on failure {}",
-                    if enabled { "enabled" } else { "disabled" }
-                );
-            }
-        } else {
-            if let Some(enabled) = params.enabled {
-                config.sound_on_failure.enabled = enabled;
-                msg = format!(
-                    "Sound on failure globally {}",
-                    if enabled { "enabled" } else { "disabled" }
-                );
-            }
-            if let Some(path) = &params.sound_file {
-                config.sound_on_failure.sound_file = if path.is_empty() {
-                    None
-                } else {
-                    Some(path.clone())
-                };
-                if !msg.is_empty() {
-                    msg.push('\n');
-                }
-                let _ = write!(
-                    msg,
-                    "Sound file: {}",
-                    config
-                        .sound_on_failure
-                        .sound_file
-                        .as_deref()
-                        .unwrap_or("(system default)")
-                );
-            }
-        }
-
-        if msg.is_empty() {
-            msg = format!(
-                "Sound on failure: {}\nSound file: {}",
-                if config.sound_on_failure.enabled {
-                    "enabled"
-                } else {
-                    "disabled"
-                },
-                config
-                    .sound_on_failure
-                    .sound_file
-                    .as_deref()
-                    .unwrap_or("(system default)")
-            );
-        }
-        if let Some(warning) = persist_warning(save_config(&config)) {
-            msg.push_str(&warning);
-        }
-
         Ok(CallToolResult::success(vec![Content::text(msg)]))
     }
 
@@ -1302,48 +1223,52 @@ impl BuildWatcher {
             return Ok(CallToolResult::error(vec![Content::text(e)]));
         }
 
-        let mut config = self.config.lock().await;
+        let (snapshot, scope, effective) = {
+            let mut config = self.config.lock().await;
 
-        let scope = match (&params.repo, &params.branch) {
-            (None, _) => {
-                apply_notification_levels(&mut config.notifications, &params);
-                "global".to_string()
-            }
-            (Some(repo), None) => {
-                let Some(rc) = config.repos.get_mut(repo) else {
-                    return Ok(CallToolResult::error(vec![Content::text(format!(
-                        "{repo} is not being watched — use watch_builds first"
-                    ))]));
-                };
-                apply_notification_overrides(&mut rc.notifications, &params);
-                repo.clone()
-            }
-            (Some(repo), Some(branch)) => {
-                let Some(rc) = config.repos.get_mut(repo) else {
-                    return Ok(CallToolResult::error(vec![Content::text(format!(
-                        "{repo} is not being watched — use watch_builds first"
-                    ))]));
-                };
-                let bc = rc.branch_notifications.entry(branch.clone()).or_default();
-                apply_notification_overrides(&mut bc.notifications, &params);
-                format!("{repo} [{branch}]")
-            }
+            let scope = match (&params.repo, &params.branch) {
+                (None, _) => {
+                    apply_notification_levels(&mut config.notifications, &params);
+                    "global".to_string()
+                }
+                (Some(repo), None) => {
+                    let Some(rc) = config.repos.get_mut(repo) else {
+                        return Ok(CallToolResult::error(vec![Content::text(format!(
+                            "{repo} is not being watched — use watch_builds first"
+                        ))]));
+                    };
+                    apply_notification_overrides(&mut rc.notifications, &params);
+                    repo.clone()
+                }
+                (Some(repo), Some(branch)) => {
+                    let Some(rc) = config.repos.get_mut(repo) else {
+                        return Ok(CallToolResult::error(vec![Content::text(format!(
+                            "{repo} is not being watched — use watch_builds first"
+                        ))]));
+                    };
+                    let bc = rc.branch_notifications.entry(branch.clone()).or_default();
+                    apply_notification_overrides(&mut bc.notifications, &params);
+                    format!("{repo} [{branch}]")
+                }
+            };
+
+            // Show effective config for the scope
+            let effective = match (&params.repo, &params.branch) {
+                (Some(repo), Some(branch)) => config.notifications_for(repo, branch),
+                (Some(repo), None) => config.notifications_for(
+                    repo,
+                    config
+                        .default_branches
+                        .first()
+                        .map_or("main", |s| s.as_str()),
+                ),
+                _ => config.notifications.clone(),
+            };
+
+            (config.clone(), scope, effective)
         };
 
-        let save_warning = persist_warning(save_config(&config));
-
-        // Show effective config for the scope
-        let effective = match (&params.repo, &params.branch) {
-            (Some(repo), Some(branch)) => config.notifications_for(repo, branch),
-            (Some(repo), None) => config.notifications_for(
-                repo,
-                config
-                    .default_branches
-                    .first()
-                    .map_or("main", |s| s.as_str()),
-            ),
-            _ => config.notifications.clone(),
-        };
+        let save_warning = persist_config(snapshot).await;
 
         let mut msg = format!(
             "Updated notifications for {scope}:\n  build_started: {}\n  build_success: {}\n  build_failure: {}",
@@ -1375,7 +1300,6 @@ impl ServerHandler for BuildWatcher {
                  Use set_alias to give a repo a short display name in notification titles. \
                  Use pause_notifications/resume_notifications to temporarily suppress notifications. \
                  Use configure_quiet_hours to suppress notifications between two HH:MM times (default 22:00–06:00). \
-                 Use configure_sound to enable/disable audio alerts on failure. \
                  Use rerun_build to rerun a failed build (or the last failed build for a repo). \
                  Use build_history to see recent builds for a repo. \
                  Use get_stats for a live snapshot of polling, rate limit, and notification state. \
@@ -1450,11 +1374,7 @@ fn format_rate_limit_line(
     let Some(rl) = rl else {
         return "unknown (no watches active yet)".to_string();
     };
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let mins_left = rl.reset.saturating_sub(now) / 60;
+    let mins_left = rl.reset.saturating_sub(crate::config::unix_now()) / 60;
     let throttled = active_secs > MIN_ACTIVE_SECS || idle_secs > MIN_IDLE_SECS;
     let throttle_note = if throttled { " [throttled]" } else { "" };
     format!(

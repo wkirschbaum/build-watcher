@@ -97,7 +97,7 @@ impl EventBus {
 
 // -- Notification handler --
 
-/// Listens for watch events and dispatches desktop notifications + sound.
+/// Listens for watch events and dispatches desktop notifications.
 pub async fn run_notification_handler(
     mut rx: broadcast::Receiver<WatchEvent>,
     config: Arc<Mutex<config::Config>>,
@@ -153,7 +153,7 @@ async fn handle_notification(event: WatchEvent, config: &Arc<Mutex<config::Confi
             failing_steps,
         } => {
             let succeeded = conclusion == "success";
-            let (level, sound_on_failure, sound_file, repo_label) = {
+            let (level, repo_label) = {
                 let cfg = config.lock().await;
                 let notif = cfg.notifications_for(&run.repo, &run.branch);
                 let level = if succeeded {
@@ -161,12 +161,7 @@ async fn handle_notification(event: WatchEvent, config: &Arc<Mutex<config::Confi
                 } else {
                     notif.build_failure
                 };
-                (
-                    level,
-                    cfg.sound_on_failure_for(&run.repo),
-                    cfg.sound_on_failure.sound_file.clone(),
-                    cfg.short_repo(&run.repo).to_string(),
-                )
+                (level, cfg.short_repo(&run.repo).to_string())
             };
 
             let (emoji, status) = if succeeded {
@@ -191,10 +186,6 @@ async fn handle_notification(event: WatchEvent, config: &Arc<Mutex<config::Confi
                 Some(&group),
             )
             .await;
-
-            if !succeeded && sound_on_failure {
-                platform::play_sound(sound_file.as_deref()).await;
-            }
         }
         WatchEvent::StatusChanged { .. } => {
             // No desktop notification for status changes
