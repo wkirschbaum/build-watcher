@@ -151,7 +151,7 @@ async fn handle_notification(event: WatchEvent, config: &Arc<Mutex<config::Confi
             };
             let group = run.notification_group();
             platform::send_notification(
-                &format!("🔨 {} / {} - started", repo_label, run.workflow),
+                &format!("🔨 started: {} | {}", repo_label, run.workflow),
                 &format!("[{}] {}", run.branch, run.display_title()),
                 level,
                 Some(&run.url()),
@@ -182,7 +182,11 @@ async fn handle_notification(event: WatchEvent, config: &Arc<Mutex<config::Confi
                 )
             };
 
-            let emoji = if succeeded { "✅" } else { "❌" };
+            let (emoji, status) = if succeeded {
+                ("✅", "succeeded")
+            } else {
+                ("❌", "failed")
+            };
             let mut body = format!("[{}] {}", run.branch, run.display_title());
             if let Some(d) = elapsed {
                 let _ = write!(body, " in {}", format::duration(d));
@@ -193,7 +197,7 @@ async fn handle_notification(event: WatchEvent, config: &Arc<Mutex<config::Confi
 
             let group = run.notification_group();
             platform::send_notification(
-                &format!("{emoji} {} / {} - {conclusion}", repo_label, run.workflow),
+                &format!("{emoji} {status}: {} | {}", repo_label, run.workflow),
                 &body,
                 level,
                 Some(&run.url()),
