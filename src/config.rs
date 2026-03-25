@@ -431,7 +431,10 @@ mod tests {
     use super::*;
 
     fn qh(start: &str, end: &str) -> QuietHours {
-        QuietHours { start: start.to_string(), end: end.to_string() }
+        QuietHours {
+            start: start.to_string(),
+            end: end.to_string(),
+        }
     }
 
     #[test]

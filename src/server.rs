@@ -663,7 +663,11 @@ impl BuildWatcher {
                 "\nQuiet hours: {}–{} (currently: {})",
                 qh.start,
                 qh.end,
-                if config.is_in_quiet_hours() { "active" } else { "inactive" }
+                if config.is_in_quiet_hours() {
+                    "active"
+                } else {
+                    "inactive"
+                }
             )),
             None => lines.push("\nQuiet hours: not configured".to_string()),
         }
@@ -700,10 +704,10 @@ impl BuildWatcher {
         };
         let (quiet_hours_label, quiet_active) = {
             let cfg = self.config.lock().await;
-            let label = cfg
-                .quiet_hours
-                .as_ref()
-                .map_or_else(|| "off".to_string(), |qh| format!("{}–{}", qh.start, qh.end));
+            let label = cfg.quiet_hours.as_ref().map_or_else(
+                || "off".to_string(),
+                |qh| format!("{}–{}", qh.start, qh.end),
+            );
             let active = cfg.is_in_quiet_hours();
             (label, active)
         };
@@ -728,7 +732,8 @@ impl BuildWatcher {
         lines.push(String::new());
         lines.push("GitHub API rate limit".to_string());
         match rl.as_ref() {
-            None => lines.push("  (no data yet — first refresh happens after the first poll)".to_string()),
+            None => lines
+                .push("  (no data yet — first refresh happens after the first poll)".to_string()),
             Some(rl) => {
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -736,7 +741,10 @@ impl BuildWatcher {
                     .unwrap_or(0);
                 let mins_left = rl.reset.saturating_sub(now) / 60;
                 let pct = rl.remaining * 100 / rl.limit.max(1);
-                lines.push(format!("  Remaining : {} / {} ({}%)", rl.remaining, rl.limit, pct));
+                lines.push(format!(
+                    "  Remaining : {} / {} ({}%)",
+                    rl.remaining, rl.limit, pct
+                ));
                 lines.push(format!("  Used      : {}", rl.used));
                 lines.push(format!("  Resets in : {mins_left}m"));
             }
@@ -745,14 +753,19 @@ impl BuildWatcher {
         // Notification state
         lines.push(String::new());
         lines.push("Notifications".to_string());
-        lines.push(format!("  Paused      : {}", if paused { "yes" } else { "no" }));
+        lines.push(format!(
+            "  Paused      : {}",
+            if paused { "yes" } else { "no" }
+        ));
         lines.push(format!(
             "  Quiet hours : {} (currently: {})",
             quiet_hours_label,
             if quiet_active { "active" } else { "inactive" },
         ));
 
-        Ok(CallToolResult::success(vec![Content::text(lines.join("\n"))]))
+        Ok(CallToolResult::success(vec![Content::text(
+            lines.join("\n"),
+        )]))
     }
 
     #[tool(
@@ -784,7 +797,10 @@ impl BuildWatcher {
         }
 
         let mut config = self.config.lock().await;
-        config.quiet_hours = Some(QuietHours { start: start.clone(), end: end.clone() });
+        config.quiet_hours = Some(QuietHours {
+            start: start.clone(),
+            end: end.clone(),
+        });
         let msg = persist_warning(save_config(&config))
             .unwrap_or_else(|| format!("Quiet hours set: {start}–{end} (local time)"));
         Ok(CallToolResult::success(vec![Content::text(msg)]))
@@ -1352,8 +1368,12 @@ fn validate_hhmm(s: &str) -> Result<(), String> {
     let Some((h, m)) = s.split_once(':') else {
         return Err(format!("{s:?} is not HH:MM format (e.g. \"22:00\")"));
     };
-    let h: u32 = h.parse().map_err(|_| format!("{s:?}: hours must be a number"))?;
-    let m: u32 = m.parse().map_err(|_| format!("{s:?}: minutes must be a number"))?;
+    let h: u32 = h
+        .parse()
+        .map_err(|_| format!("{s:?}: hours must be a number"))?;
+    let m: u32 = m
+        .parse()
+        .map_err(|_| format!("{s:?}: minutes must be a number"))?;
     if h > 23 || m > 59 {
         return Err(format!("{s:?}: hours must be 0–23, minutes 0–59"));
     }
