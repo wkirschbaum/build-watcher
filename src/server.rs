@@ -304,6 +304,7 @@ pub struct BuildWatcher {
     handle: WatcherHandle,
     pause: PauseState,
     rate_limit: RateLimitState,
+    started_at: std::time::Instant,
 }
 
 #[tool_router]
@@ -322,6 +323,7 @@ impl BuildWatcher {
             handle,
             pause,
             rate_limit,
+            started_at: std::time::Instant::now(),
         }
     }
 
@@ -725,7 +727,10 @@ impl BuildWatcher {
             (label, active)
         };
 
+        let uptime = format::seconds(self.started_at.elapsed().as_secs());
         let mut lines = Vec::new();
+
+        lines.push(format!("Uptime    : {uptime}"));
 
         // Watches
         let total_active_builds: usize = watches_snap.iter().map(|(_, n)| n).sum();

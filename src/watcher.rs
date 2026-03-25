@@ -30,7 +30,7 @@ pub(crate) const FALLBACK_IDLE_SECS: u64 = 60;
 /// Conservative estimate of GitHub API calls per poll cycle per watcher.
 const CALLS_PER_CYCLE: u64 = 2;
 /// How often each poller refreshes the shared rate limit state.
-const RATE_LIMIT_REFRESH_INTERVAL: Duration = Duration::from_secs(300);
+const RATE_LIMIT_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Compute dynamic polling intervals based on the current GitHub rate limit.
 ///
