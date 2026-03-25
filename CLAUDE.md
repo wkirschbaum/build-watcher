@@ -29,18 +29,23 @@ cargo clippy                # Lint
 
 ### Key files
 
-- `src/main.rs` — MCP server setup, tool handlers, GitHub polling logic (~1000 lines)
-- `src/config.rs` — Config struct, JSON persistence with safe draft/backup pattern
-- `src/platform/` — Trait-based desktop notification abstraction (Linux: `notify-send`, macOS: `terminal-notifier` → `osascript` fallback)
+- `src/main.rs` — Entry point, wires up config, watches, event bus, and server
+- `src/server.rs` — MCP tool handlers (`BuildWatcher` struct), axum router
+- `src/watcher.rs` — Watch lifecycle, `Poller` task, state persistence, rate limiting
+- `src/events.rs` — `EventBus` (broadcast channel), `WatchEvent` types, notification handler
+- `src/config.rs` — Config structs, crash-safe JSON persistence helpers
+- `src/github.rs` — `gh` CLI wrappers, `RunInfo`/`HistoryEntry` types, input validation
+- `src/format.rs` — Duration, age, and truncation formatting
+- `src/platform/` — `Notifier` trait + backends (Linux: D-Bus via `notify-rust` → `notify-send` fallback; macOS: `terminal-notifier` → `osascript` fallback)
 
 ### How it works
 
-The `BuildWatcher` struct implements 8 MCP tools (`watch_builds`, `stop_watches`, `list_watches`, `configure_branches`, `set_default_branches`, `configure_notifications`, `get_config`, `test_notification`). When a repo is watched, it spawns an async tokio task per repo that polls GitHub via the `gh` CLI.
+The `BuildWatcher` struct implements 18 MCP tools. When a repo is watched, it spawns an async tokio task per repo/branch that polls GitHub via the `gh` CLI. Events are emitted onto a broadcast `EventBus`; a notification handler subscribes and dispatches desktop notifications based on config and pause/quiet-hours state.
 
-**Polling intervals:** 10 seconds when builds are active, 60 seconds when idle. The `gh` CLI must be authenticated (`gh auth login`).
+**Polling intervals:** Minimum 15s when builds are active, 60s when idle. Intervals scale dynamically based on the GitHub API rate limit. The `gh` CLI must be authenticated (`gh auth login`).
 
 **State persistence:**
-- Config: `~/.config/build-watcher/config.json` — hierarchical notification settings (global → per-repo → per-branch)
+- Config: `~/.config/build-watcher/config.json` — repos, branches, notification levels (global → per-repo → per-branch), quiet hours, ignored workflows, aliases
 - Watch state: `~/.local/state/build-watcher/watches.json` — last seen run IDs and completed builds
 - Actual port: `~/.local/state/build-watcher/port`
 

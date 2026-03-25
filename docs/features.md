@@ -2,7 +2,7 @@
 
 ## GitHub Actions Build Monitoring
 
-Watches GitHub Actions workflow runs for configured repositories by polling the `gh` CLI. Each repo/branch combination gets its own async polling task. The poller uses two speeds: fast polling (default 10s) when builds are actively running, and slow polling (default 60s) when idle. New workflow runs are detected by tracking a high-water mark of the most recent run ID seen per repo/branch. On startup, persisted watches are recovered from disk and in-progress runs are re-discovered from GitHub so no build completions are missed across daemon restarts.
+Watches GitHub Actions workflow runs for configured repositories by polling the `gh` CLI. Each repo/branch combination gets its own async polling task. The poller uses two speeds: fast polling (minimum 15s) when builds are actively running, and slow polling (minimum 60s) when idle. Fallback intervals before the first rate-limit fetch are 30s active / 120s idle. New workflow runs are detected by tracking a high-water mark of the most recent run ID seen per repo/branch. On startup, persisted watches are recovered from disk and in-progress runs are re-discovered from GitHub so no build completions are missed across daemon restarts.
 
 ## Desktop Notifications
 
@@ -30,10 +30,6 @@ Notification levels (`off`, `low`, `normal`, `critical`) are configurable per ev
 
 Notifications can be temporarily paused for a specified number of minutes or indefinitely until manually resumed or the daemon restarts. While paused, builds continue to be tracked and state is updated — only the desktop notification dispatch is suppressed. The pause state is visible in `list_watches` and `get_config` output.
 
-## Sound on Failure
-
-An optional audio alert plays when a build fails. Disabled by default. Configurable globally (enable/disable + custom sound file path) and per-repo (enable/disable override). On Linux, plays via `paplay` (PulseAudio/PipeWire) with a fallback to `aplay` (ALSA), defaulting to `/usr/share/sounds/freedesktop/stereo/dialog-error.oga`.
-
 ## Workflow Filtering
 
 Two complementary filters control which workflows trigger notifications:
@@ -57,9 +53,9 @@ Displays a formatted table of recent builds for a repo, showing conclusion, work
 
 ## Dynamic Rate-Limit-Aware Polling
 
-Polling intervals adapt in real time to the GitHub API rate limit. After each rate-limit refresh (every 5 minutes), the daemon computes intervals based on remaining quota:
+Polling intervals adapt in real time to the GitHub API rate limit. Each poller refreshes the shared rate-limit state every 60 seconds via `gh api rate_limit` (a free call). The daemon computes intervals based on remaining quota:
 
-- **Above 50% remaining** — poll at floor speed (1s active, 10s idle).
+- **Above 50% remaining** — poll at floor speed, scaled by the square root of total API calls per cycle (15s active / 60s idle for 1 call, scaling gently with more watches).
 - **Below 50% remaining** — throttle: spread the remaining budget evenly across the seconds until the reset window expires, floored at the minimum values. At zero remaining, wait out the full reset window.
 
 This keeps polling fast when quota is plentiful and backs off gracefully as it depletes, without ever hitting a hard API cap. The rate-limit state is shared across all pollers so they coordinate rather than each independently consuming quota.
@@ -82,7 +78,7 @@ An internal broadcast channel decouples the polling loop from notification dispa
 
 ## MCP Server (Model Context Protocol)
 
-Runs as an HTTP server exposing tools via the MCP protocol, allowing Claude Code to manage watches interactively. The server uses `rmcp` with Streamable HTTP transport over `axum`. Tools exposed: `watch_builds`, `stop_watches`, `list_watches`, `configure_branches`, `set_default_branches`, `configure_notifications`, `configure_workflows`, `ignore_workflows`, `unignore_workflows`, `pause_notifications`, `resume_notifications`, `configure_sound`, `rerun_build`, `build_history`, `get_config`, `test_notification`. All tool parameters support double-encoded JSON arrays (a workaround for MCP clients that stringify array parameters).
+Runs as an HTTP server exposing tools via the MCP protocol, allowing Claude Code to manage watches interactively. The server uses `rmcp` with Streamable HTTP transport over `axum`. Tools exposed: `watch_builds`, `stop_watches`, `list_watches`, `configure_branches`, `set_default_branches`, `configure_notifications`, `configure_workflows`, `ignore_workflows`, `unignore_workflows`, `pause_notifications`, `resume_notifications`, `configure_quiet_hours`, `rerun_build`, `build_history`, `set_alias`, `get_config`, `get_stats`, `test_notification` (18 tools). All tool parameters support double-encoded JSON arrays (a workaround for MCP clients that stringify array parameters).
 
 ## Port Binding with Fallback
 
