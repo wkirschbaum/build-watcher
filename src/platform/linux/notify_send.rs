@@ -16,9 +16,7 @@ use super::{app_name_from_group, notification_props};
 /// Uses `--print-id` / `--replace-id` to stack notifications per group (`owner/repo#branch`),
 /// so each branch has its own notification slot. Requires notify-send ≥ 0.8 (libnotify).
 ///
-/// When a URL is provided, adds an `--action open=Open` button and embeds a clickable
-/// link in the body. The notification ID is read from stdout and stored before returning,
-/// ensuring the replace-id is available for the next notification.
+/// When a URL is provided, it is appended to the notification body.
 pub struct NotifySend {
     ids: Arc<Mutex<HashMap<String, u32>>>,
 }
@@ -76,22 +74,18 @@ impl Notifier for NotifySend {
             }
         }
 
-        let has_url = url.is_some();
-        if has_url {
-            args.push("--wait".to_string());
-            args.push("--action".to_string());
-            args.push("open=Open".to_string());
-        }
-
         args.push(title.to_string());
 
-        args.push(body.to_string());
+        let full_body = match url {
+            Some(url) => format!("{body}\n{url}"),
+            None => body.to_string(),
+        };
+        args.push(full_body);
 
-        let url_owned = url.map(str::to_string);
         let ids = Arc::clone(&self.ids);
 
         Box::pin(async move {
-            let mut child = match tokio::process::Command::new("notify-send")
+            let child = match tokio::process::Command::new("notify-send")
                 .args(&args)
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
@@ -104,7 +98,7 @@ impl Notifier for NotifySend {
                 }
             };
 
-            let Some(stdout) = child.stdout.take() else {
+            let Some(stdout) = child.stdout else {
                 tracing::warn!("notify-send stdout was not piped");
                 return;
             };
@@ -125,35 +119,6 @@ impl Notifier for NotifySend {
                 }
                 Ok(None) => {}
                 Err(e) => tracing::warn!("Failed to read notify-send output: {e}"),
-            }
-
-            // The --wait / action handling runs in the background so we don't block the caller.
-            if has_url {
-                tokio::spawn(async move {
-                    // Second line: action name, only written when the user clicks a button.
-                    match lines.next_line().await {
-                        Ok(Some(action)) => {
-                            if action.trim() == "open"
-                                && let Some(url) = url_owned
-                            {
-                                match tokio::process::Command::new("xdg-open").arg(&url).spawn() {
-                                    Ok(mut child) => {
-                                        if let Err(e) = child.wait().await {
-                                            tracing::warn!("xdg-open failed: {e}");
-                                        }
-                                    }
-                                    Err(e) => tracing::warn!("Failed to spawn xdg-open: {e}"),
-                                }
-                            }
-                        }
-                        Ok(None) => {}
-                        Err(e) => tracing::warn!("Failed to read notify-send action: {e}"),
-                    }
-
-                    if let Err(e) = child.wait().await {
-                        tracing::warn!("notify-send exited with error: {e}");
-                    }
-                });
             }
         })
     }
