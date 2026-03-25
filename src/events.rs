@@ -5,13 +5,15 @@ use std::time::Duration;
 use tokio::sync::{Mutex, broadcast};
 use tokio::time::Instant;
 
+use serde::Serialize;
+
 use crate::github::RunInfo;
 use crate::{config, format, platform};
 
 const CHANNEL_CAPACITY: usize = 256;
 
 /// Snapshot of a run's identity, carried by events.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct RunSnapshot {
     pub repo: String,
     pub branch: String,
@@ -50,7 +52,7 @@ impl RunSnapshot {
 }
 
 /// Events emitted by the watcher polling loop.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub enum WatchEvent {
     /// A new build was detected.
     RunStarted(RunSnapshot),
@@ -59,6 +61,7 @@ pub enum WatchEvent {
     RunCompleted {
         run: RunSnapshot,
         conclusion: String,
+        #[serde(serialize_with = "serialize_elapsed")]
         elapsed: Option<Duration>,
         failing_steps: Option<String>,
     },
@@ -70,6 +73,16 @@ pub enum WatchEvent {
         from: String,
         to: String,
     },
+}
+
+fn serialize_elapsed<S: serde::Serializer>(
+    elapsed: &Option<Duration>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    match elapsed {
+        Some(d) => serializer.serialize_some(&d.as_secs_f64()),
+        None => serializer.serialize_none(),
+    }
 }
 
 /// Broadcast bus for watch events. Cloning shares the same underlying channel.
