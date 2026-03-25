@@ -17,7 +17,7 @@ use crate::config::{
     save_config_async, state_dir,
 };
 use crate::format;
-use crate::github::{gh_run_list_history, gh_run_rerun, validate_branch, validate_repo};
+use crate::github::{validate_branch, validate_repo};
 use crate::watcher::{
     MIN_ACTIVE_SECS, MIN_IDLE_SECS, PauseState, RateLimitState, SharedConfig, WatchKey,
     WatcherHandle, Watches, compute_intervals, count_api_calls, last_failed_build, save_watches,
@@ -1076,7 +1076,12 @@ impl BuildWatcher {
             }
         };
 
-        match gh_run_rerun(&params.repo, run_id, params.failed_only).await {
+        match self
+            .handle
+            .github
+            .run_rerun(&params.repo, run_id, params.failed_only)
+            .await
+        {
             Ok(_) => {
                 let url = format!("https://github.com/{}/actions/runs/{run_id}", params.repo);
                 let kind = if params.failed_only {
@@ -1109,7 +1114,11 @@ impl BuildWatcher {
         }
 
         let limit = params.limit.unwrap_or(10).min(50);
-        let entries = match gh_run_list_history(&params.repo, params.branch.as_deref(), limit).await
+        let entries = match self
+            .handle
+            .github
+            .run_list_history(&params.repo, params.branch.as_deref(), limit)
+            .await
         {
             Ok(e) => e,
             Err(e) => return Ok(CallToolResult::error(vec![Content::text(e.to_string())])),

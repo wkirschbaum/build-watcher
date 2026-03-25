@@ -45,7 +45,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ));
 
     let ct = CancellationToken::new();
-    let handle = watcher::WatcherHandle::new(ct.clone(), events);
+    let gh: Arc<dyn github::GitHubClient> = Arc::new(github::GhCliClient);
+    let handle = watcher::WatcherHandle::new(ct.clone(), events, gh);
     watcher::startup_watches(&watches, &config, &handle, &rate_limit).await;
 
     server::serve(watches, config, handle, pause, rate_limit, ct).await

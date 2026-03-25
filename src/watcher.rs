@@ -10,10 +10,7 @@ use tokio_util::task::TaskTracker;
 
 use crate::config::{Config, load_json, save_json_async, state_dir};
 use crate::events::{EventBus, RunSnapshot, WatchEvent};
-use crate::github::{
-    GhError, LastBuild, RateLimit, RunInfo, gh_failing_steps, gh_rate_limit, gh_recent_runs,
-    gh_run_status,
-};
+use crate::github::{GhError, GitHubClient, LastBuild, RateLimit, RunInfo};
 
 pub type SharedConfig = Arc<Mutex<Config>>;
 pub type Watches = Arc<Mutex<HashMap<WatchKey, WatchEntry>>>;
@@ -305,14 +302,16 @@ pub struct WatcherHandle {
     pub tracker: TaskTracker,
     pub cancel: CancellationToken,
     pub events: EventBus,
+    pub github: Arc<dyn GitHubClient>,
 }
 
 impl WatcherHandle {
-    pub fn new(cancel: CancellationToken, events: EventBus) -> Self {
+    pub fn new(cancel: CancellationToken, events: EventBus, github: Arc<dyn GitHubClient>) -> Self {
         Self {
             tracker: TaskTracker::new(),
             cancel,
             events,
+            github,
         }
     }
 
@@ -341,7 +340,9 @@ pub async fn start_watch(
         }
     }
 
-    let all_runs = gh_recent_runs(repo, branch)
+    let all_runs = handle
+        .github
+        .recent_runs(repo, branch)
         .await
         .map_err(|e| e.to_string())?;
     if all_runs.is_empty() {
@@ -426,6 +427,7 @@ fn spawn_poller(
         rate_limit: rate_limit.clone(),
         token: handle.cancel.child_token(),
         events: handle.events.clone(),
+        github: handle.github.clone(),
     };
     handle.tracker.spawn(poller.run());
 }
@@ -456,6 +458,7 @@ struct Poller {
     rate_limit: RateLimitState,
     token: CancellationToken,
     events: EventBus,
+    github: Arc<dyn GitHubClient>,
 }
 
 /// Snapshot of config values needed for a poll cycle.
@@ -504,7 +507,7 @@ impl Poller {
             // Refresh rate limit state every minute. The `gh api rate_limit`
             // call is free and doesn't count against the budget.
             if last_rate_limit_refresh.is_none_or(|t| t.elapsed() >= RATE_LIMIT_REFRESH_INTERVAL) {
-                match gh_rate_limit().await {
+                match self.github.rate_limit().await {
                     Ok(rl) => {
                         tracing::debug!(
                             remaining = rl.remaining,
@@ -597,7 +600,7 @@ impl Poller {
                 return;
             }
 
-            let run = match gh_run_status(repo, run_id).await {
+            let run = match self.github.run_status(repo, run_id).await {
                 Ok(run) => {
                     let mut w = self.watches.lock().await;
                     if let Some(entry) = w.get_mut(&self.key) {
@@ -625,7 +628,7 @@ impl Poller {
                 let failing_steps = if run.succeeded() {
                     None
                 } else {
-                    gh_failing_steps(repo, run.id).await
+                    self.github.failing_steps(repo, run.id).await
                 };
 
                 if self.is_active().await {
@@ -677,7 +680,7 @@ impl Poller {
             }
         };
 
-        let runs = match gh_recent_runs(repo, branch).await {
+        let runs = match self.github.recent_runs(repo, branch).await {
             Ok(r) => r,
             Err(e) => {
                 tracing::error!(key = %self.key, error = %e, "Failed to check for new runs");
@@ -711,7 +714,7 @@ impl Poller {
                 let failing_steps = if run.succeeded() {
                     None
                 } else {
-                    gh_failing_steps(repo, run.id).await
+                    self.github.failing_steps(repo, run.id).await
                 };
                 self.events.emit(WatchEvent::RunCompleted {
                     run: snapshot,
@@ -771,8 +774,9 @@ async fn recover_existing_watches(
     for key in snapshot {
         tracing::info!(key = %key, "Resuming watch");
         let key = key.clone();
+        let gh = handle.github.clone();
         set.spawn(async move {
-            let result = gh_recent_runs(&key.repo, &key.branch).await;
+            let result = gh.recent_runs(&key.repo, &key.branch).await;
             (key, result)
         });
     }
@@ -1355,5 +1359,123 @@ mod tests {
     fn count_api_calls_empty_watches() {
         let watches = HashMap::new();
         assert_eq!(count_api_calls(&watches), 0);
+    }
+
+    // -- Mock GitHub client for integration tests --
+
+    struct MockGitHub {
+        runs: Vec<RunInfo>,
+    }
+
+    impl MockGitHub {
+        fn with_runs(runs: Vec<RunInfo>) -> Arc<dyn crate::github::GitHubClient> {
+            Arc::new(Self { runs })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::github::GitHubClient for MockGitHub {
+        async fn recent_runs(&self, _: &str, _: &str) -> Result<Vec<RunInfo>, GhError> {
+            Ok(self.runs.clone())
+        }
+        async fn run_status(&self, _: &str, run_id: u64) -> Result<RunInfo, GhError> {
+            self.runs
+                .iter()
+                .find(|r| r.id == run_id)
+                .cloned()
+                .ok_or(GhError::MissingFields {
+                    repo: "mock".into(),
+                })
+        }
+        async fn failing_steps(&self, _: &str, _: u64) -> Option<String> {
+            None
+        }
+        async fn run_rerun(&self, _: &str, _: u64, _: bool) -> Result<String, GhError> {
+            Ok(String::new())
+        }
+        async fn run_list_history(
+            &self,
+            _: &str,
+            _: Option<&str>,
+            _: u32,
+        ) -> Result<Vec<crate::github::HistoryEntry>, GhError> {
+            Ok(vec![])
+        }
+        async fn rate_limit(&self) -> Result<RateLimit, GhError> {
+            Ok(RateLimit {
+                limit: 5000,
+                remaining: 5000,
+                reset: crate::config::unix_now() + 3600,
+                used: 0,
+            })
+        }
+    }
+
+    fn mock_handle(github: Arc<dyn crate::github::GitHubClient>) -> WatcherHandle {
+        use tokio_util::sync::CancellationToken;
+        WatcherHandle::new(
+            CancellationToken::new(),
+            crate::events::EventBus::new(),
+            github,
+        )
+    }
+
+    #[tokio::test]
+    async fn start_watch_with_mock_github() {
+        let runs = vec![
+            make_run(100, "completed", "success"),
+            make_run(101, "in_progress", ""),
+        ];
+        let gh = MockGitHub::with_runs(runs);
+        let watches: Watches = Arc::new(Mutex::new(HashMap::new()));
+        let config: SharedConfig = Arc::new(Mutex::new(Config::default()));
+        let rate_limit: RateLimitState = Arc::new(Mutex::new(None));
+        let handle = mock_handle(gh);
+
+        let result =
+            start_watch(&watches, &config, &handle, &rate_limit, "alice/app", "main").await;
+        assert!(result.is_ok());
+
+        let w = watches.lock().await;
+        let key = WatchKey::new("alice/app", "main");
+        assert!(w.contains_key(&key));
+        let entry = &w[&key];
+        assert_eq!(entry.last_seen_run_id, 101);
+        assert!(entry.active_runs.contains_key(&101));
+        assert!(!entry.active_runs.contains_key(&100)); // completed, not tracked
+
+        handle.cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn start_watch_rejects_empty_runs() {
+        let gh = MockGitHub::with_runs(vec![]);
+        let watches: Watches = Arc::new(Mutex::new(HashMap::new()));
+        let config: SharedConfig = Arc::new(Mutex::new(Config::default()));
+        let rate_limit: RateLimitState = Arc::new(Mutex::new(None));
+        let handle = mock_handle(gh);
+
+        let result =
+            start_watch(&watches, &config, &handle, &rate_limit, "alice/app", "main").await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("no workflow runs found"));
+    }
+
+    #[tokio::test]
+    async fn start_watch_deduplicates() {
+        let runs = vec![make_run(100, "completed", "success")];
+        let gh = MockGitHub::with_runs(runs);
+        let watches: Watches = Arc::new(Mutex::new(HashMap::new()));
+        let config: SharedConfig = Arc::new(Mutex::new(Config::default()));
+        let rate_limit: RateLimitState = Arc::new(Mutex::new(None));
+        let handle = mock_handle(gh);
+
+        let r1 = start_watch(&watches, &config, &handle, &rate_limit, "alice/app", "main").await;
+        assert!(r1.is_ok());
+
+        let r2 = start_watch(&watches, &config, &handle, &rate_limit, "alice/app", "main").await;
+        assert!(r2.unwrap().contains("already being watched"));
+
+        handle.cancel.cancel();
     }
 }

@@ -97,7 +97,7 @@ struct GhRunJson {
 }
 
 /// A GitHub Actions run parsed for internal use.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct RunInfo {
     pub id: u64,
     pub status: String,
@@ -166,58 +166,135 @@ impl RunInfo {
     }
 }
 
-#[tracing::instrument(skip_all, fields(%repo, %branch))]
-pub async fn gh_recent_runs(repo: &str, branch: &str) -> Result<Vec<RunInfo>, GhError> {
-    let stdout = gh_exec(
-        repo,
-        &[
-            "run",
-            "list",
-            "--repo",
-            repo,
-            "--branch",
-            branch,
-            "--limit",
-            "10",
-            "--json",
-            GH_JSON_FIELDS,
-        ],
-    )
-    .await?;
-
-    let raw: Vec<GhRunJson> = serde_json::from_slice(&stdout).map_err(|e| GhError::Parse {
-        repo: repo.to_string(),
-        source: e,
-    })?;
-
-    Ok(raw.into_iter().filter_map(RunInfo::from_gh_json).collect())
+/// Abstraction over the GitHub API. The real implementation (`GhCliClient`) calls
+/// the `gh` CLI; tests can inject a mock.
+#[async_trait::async_trait]
+pub trait GitHubClient: Send + Sync + 'static {
+    async fn recent_runs(&self, repo: &str, branch: &str) -> Result<Vec<RunInfo>, GhError>;
+    async fn run_status(&self, repo: &str, run_id: u64) -> Result<RunInfo, GhError>;
+    async fn failing_steps(&self, repo: &str, run_id: u64) -> Option<String>;
+    async fn run_rerun(
+        &self,
+        repo: &str,
+        run_id: u64,
+        failed_only: bool,
+    ) -> Result<String, GhError>;
+    async fn run_list_history(
+        &self,
+        repo: &str,
+        branch: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<HistoryEntry>, GhError>;
+    async fn rate_limit(&self) -> Result<RateLimit, GhError>;
 }
 
-#[tracing::instrument(skip_all, fields(%repo, %run_id))]
-pub async fn gh_run_status(repo: &str, run_id: u64) -> Result<RunInfo, GhError> {
-    let id_str = run_id.to_string();
-    let stdout = gh_exec(
-        repo,
-        &[
-            "run",
-            "view",
-            &id_str,
-            "--repo",
+/// Real GitHub client that shells out to the `gh` CLI.
+pub struct GhCliClient;
+
+#[async_trait::async_trait]
+impl GitHubClient for GhCliClient {
+    #[tracing::instrument(skip_all, fields(%repo, %branch))]
+    async fn recent_runs(&self, repo: &str, branch: &str) -> Result<Vec<RunInfo>, GhError> {
+        let stdout = gh_exec(
             repo,
-            "--json",
-            GH_JSON_FIELDS,
-        ],
-    )
-    .await?;
+            &[
+                "run",
+                "list",
+                "--repo",
+                repo,
+                "--branch",
+                branch,
+                "--limit",
+                "10",
+                "--json",
+                GH_JSON_FIELDS,
+            ],
+        )
+        .await?;
 
-    let raw: GhRunJson = serde_json::from_slice(&stdout).map_err(|e| GhError::Parse {
-        repo: repo.to_string(),
-        source: e,
-    })?;
+        let raw: Vec<GhRunJson> = serde_json::from_slice(&stdout).map_err(|e| GhError::Parse {
+            repo: repo.to_string(),
+            source: e,
+        })?;
 
-    RunInfo::from_gh_json(raw).ok_or_else(|| GhError::MissingFields {
-        repo: repo.to_string(),
-    })
+        Ok(raw.into_iter().filter_map(RunInfo::from_gh_json).collect())
+    }
+
+    #[tracing::instrument(skip_all, fields(%repo, %run_id))]
+    async fn run_status(&self, repo: &str, run_id: u64) -> Result<RunInfo, GhError> {
+        let id_str = run_id.to_string();
+        let stdout = gh_exec(
+            repo,
+            &[
+                "run",
+                "view",
+                &id_str,
+                "--repo",
+                repo,
+                "--json",
+                GH_JSON_FIELDS,
+            ],
+        )
+        .await?;
+
+        let raw: GhRunJson = serde_json::from_slice(&stdout).map_err(|e| GhError::Parse {
+            repo: repo.to_string(),
+            source: e,
+        })?;
+
+        RunInfo::from_gh_json(raw).ok_or_else(|| GhError::MissingFields {
+            repo: repo.to_string(),
+        })
+    }
+
+    async fn failing_steps(&self, repo: &str, run_id: u64) -> Option<String> {
+        let id_str = run_id.to_string();
+        let stdout = gh_exec(
+            repo,
+            &["run", "view", &id_str, "--repo", repo, "--json", "jobs"],
+        )
+        .await
+        .ok()?;
+
+        let resp: GhJobsResponse = serde_json::from_slice(&stdout).ok()?;
+        extract_failing_steps(&resp.jobs)
+    }
+
+    async fn run_rerun(
+        &self,
+        repo: &str,
+        run_id: u64,
+        failed_only: bool,
+    ) -> Result<String, GhError> {
+        let id_str = run_id.to_string();
+        let mut args = vec!["run", "rerun", &id_str, "--repo", repo];
+        if failed_only {
+            args.push("--failed");
+        }
+        let stdout = gh_exec(repo, &args).await?;
+        Ok(String::from_utf8_lossy(&stdout).to_string())
+    }
+
+    async fn run_list_history(
+        &self,
+        repo: &str,
+        branch: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<HistoryEntry>, GhError> {
+        gh_run_list_history_impl(repo, branch, limit).await
+    }
+
+    async fn rate_limit(&self) -> Result<RateLimit, GhError> {
+        let stdout = gh_exec(
+            "rate_limit",
+            &["api", "rate_limit", "--jq", ".resources.core"],
+        )
+        .await?;
+        serde_json::from_slice(&stdout).map_err(|e| GhError::Parse {
+            repo: "rate_limit".into(),
+            source: e,
+        })
+    }
 }
 
 /// Format a human-readable title. PR events get a "PR: " prefix;
@@ -228,21 +305,6 @@ pub(crate) fn display_title(event: &str, title: &str) -> String {
     } else {
         title.to_string()
     }
-}
-
-/// Fetch the failing job and step names for a completed run.
-/// Returns a human-readable string like "Build / Run tests", or None on error.
-pub async fn gh_failing_steps(repo: &str, run_id: u64) -> Option<String> {
-    let id_str = run_id.to_string();
-    let stdout = gh_exec(
-        repo,
-        &["run", "view", &id_str, "--repo", repo, "--json", "jobs"],
-    )
-    .await
-    .ok()?;
-
-    let resp: GhJobsResponse = serde_json::from_slice(&stdout).ok()?;
-    extract_failing_steps(&resp.jobs)
 }
 
 #[derive(Debug, Deserialize)]
@@ -284,17 +346,6 @@ fn extract_failing_steps(jobs: &[GhJob]) -> Option<String> {
     } else {
         Some(failures.join(", "))
     }
-}
-
-/// Rerun a GitHub Actions run. If `failed_only` is true, only reruns failed jobs.
-pub async fn gh_run_rerun(repo: &str, run_id: u64, failed_only: bool) -> Result<String, GhError> {
-    let id_str = run_id.to_string();
-    let mut args = vec!["run", "rerun", &id_str, "--repo", repo];
-    if failed_only {
-        args.push("--failed");
-    }
-    let stdout = gh_exec(repo, &args).await?;
-    Ok(String::from_utf8_lossy(&stdout).to_string())
 }
 
 /// A build history entry with timestamps for duration/age calculation.
@@ -397,7 +448,7 @@ const GH_HISTORY_FIELDS: &str =
     "databaseId,conclusion,displayTitle,workflowName,headBranch,event,createdAt,updatedAt";
 
 /// Fetch recent build history for a repo, optionally filtered by branch.
-pub async fn gh_run_list_history(
+async fn gh_run_list_history_impl(
     repo: &str,
     branch: Option<&str>,
     limit: u32,
@@ -472,20 +523,6 @@ pub struct RateLimit {
     pub remaining: u64,
     pub reset: u64, // unix timestamp
     pub used: u64,
-}
-
-/// Fetch current rate limit for the `core` resource. This call is free and
-/// does not count against the rate limit itself.
-pub async fn gh_rate_limit() -> Result<RateLimit, GhError> {
-    let stdout = gh_exec(
-        "rate_limit",
-        &["api", "rate_limit", "--jq", ".resources.core"],
-    )
-    .await?;
-    serde_json::from_slice(&stdout).map_err(|e| GhError::Parse {
-        repo: "rate_limit".into(),
-        source: e,
-    })
 }
 
 /// Validates that a branch name contains only safe characters.
