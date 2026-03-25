@@ -286,17 +286,13 @@ struct ConfigureRepoParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-struct IgnoreWorkflowsParams {
-    /// Workflow names to ignore globally (e.g. `["Semgrep", "Dependabot"]`)
-    #[serde(deserialize_with = "deserialize_string_or_vec")]
-    workflows: Vec<String>,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-struct UnignoreWorkflowsParams {
-    /// Workflow names to stop ignoring
-    #[serde(deserialize_with = "deserialize_string_or_vec")]
-    workflows: Vec<String>,
+struct ConfigureIgnoredWorkflowsParams {
+    /// Workflow names to add to the global ignore list (case-insensitive)
+    #[serde(default, deserialize_with = "deserialize_string_or_vec")]
+    add: Vec<String>,
+    /// Workflow names to remove from the global ignore list (case-insensitive)
+    #[serde(default, deserialize_with = "deserialize_string_or_vec")]
+    remove: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -760,22 +756,25 @@ impl BuildWatcher {
     }
 
     #[tool(
-        description = "Globally ignore workflows by name across all repos. Ignored workflows are never tracked or notified. Case-insensitive. Example: ignore Semgrep, Dependabot."
+        description = "Add to or remove from the global workflow ignore list. Ignored workflows are \
+                       never tracked or notified across all repos. Case-insensitive. \
+                       Pass add and/or remove — at least one must be non-empty."
     )]
-    async fn ignore_workflows(
+    async fn configure_ignored_workflows(
         &self,
-        Parameters(params): Parameters<IgnoreWorkflowsParams>,
+        Parameters(params): Parameters<ConfigureIgnoredWorkflowsParams>,
     ) -> Result<CallToolResult, McpError> {
-        if params.workflows.is_empty() {
+        if params.add.is_empty() && params.remove.is_empty() {
             return Ok(CallToolResult::error(vec![Content::text(
-                "At least one workflow name is required",
+                "at least one of add or remove must be non-empty",
             )]));
         }
 
-        let (snapshot, mut msg) = {
+        let (snapshot, mut msgs) = {
             let mut config = self.config.lock().await;
+
             let mut added = Vec::new();
-            for w in &params.workflows {
+            for w in &params.add {
                 if !config
                     .ignored_workflows
                     .iter()
@@ -785,66 +784,42 @@ impl BuildWatcher {
                     added.push(w.as_str());
                 }
             }
-            let msg = if added.is_empty() {
-                "All specified workflows are already ignored".to_string()
-            } else {
-                format!(
-                    "Now ignoring: {}\nIgnored workflows: {:?}",
-                    added.join(", "),
-                    config.ignored_workflows
-                )
-            };
-            (config.clone(), msg)
-        };
-        if let Some(warning) = persist_config(snapshot).await {
-            msg.push_str(&warning);
-        }
 
-        Ok(CallToolResult::success(vec![Content::text(msg)]))
-    }
-
-    #[tool(
-        description = "Stop ignoring workflows. Removes them from the global ignore list so they are tracked and notified again."
-    )]
-    async fn unignore_workflows(
-        &self,
-        Parameters(params): Parameters<UnignoreWorkflowsParams>,
-    ) -> Result<CallToolResult, McpError> {
-        if params.workflows.is_empty() {
-            return Ok(CallToolResult::error(vec![Content::text(
-                "At least one workflow name is required",
-            )]));
-        }
-
-        let (snapshot, mut msg) = {
-            let mut config = self.config.lock().await;
             let before = config.ignored_workflows.len();
             config.ignored_workflows.retain(|existing| {
                 !params
-                    .workflows
+                    .remove
                     .iter()
                     .any(|w| w.eq_ignore_ascii_case(existing))
             });
             let removed = before - config.ignored_workflows.len();
-            let msg = if removed == 0 {
-                "None of the specified workflows were in the ignore list".to_string()
-            } else if config.ignored_workflows.is_empty() {
-                format!(
-                    "Removed {removed} workflow(s) from ignore list. No workflows are ignored now."
-                )
+
+            let mut msgs = Vec::new();
+            if !added.is_empty() {
+                msgs.push(format!("Added to ignore list: {}", added.join(", ")));
+            } else if !params.add.is_empty() {
+                msgs.push("All specified workflows were already ignored".to_string());
+            }
+            if removed > 0 {
+                msgs.push(format!("Removed from ignore list: {removed} workflow(s)"));
+            } else if !params.remove.is_empty() {
+                msgs.push("None of the specified workflows were in the ignore list".to_string());
+            }
+            if config.ignored_workflows.is_empty() {
+                msgs.push("No workflows are globally ignored now.".to_string());
             } else {
-                format!(
-                    "Removed {removed} workflow(s). Still ignoring: {:?}",
-                    config.ignored_workflows
-                )
-            };
-            (config.clone(), msg)
+                msgs.push(format!("Ignored: {:?}", config.ignored_workflows));
+            }
+
+            (config.clone(), msgs)
         };
         if let Some(warning) = persist_config(snapshot).await {
-            msg.push_str(&warning);
+            msgs.push(warning);
         }
 
-        Ok(CallToolResult::success(vec![Content::text(msg)]))
+        Ok(CallToolResult::success(vec![Content::text(
+            msgs.join("\n"),
+        )]))
     }
 
     #[tool(
@@ -1186,7 +1161,7 @@ impl ServerHandler for BuildWatcher {
                  Use watch_builds with one or more repos in 'owner/repo' format to start watching. \
                  Use configure_branches to set which branches to watch — omit repo to set global defaults, or pass repo to override for a specific repo. \
                  Use configure_repo to set per-repo workflow allow-list and/or display alias. \
-                 Use ignore_workflows/unignore_workflows to globally ignore workflows like Semgrep or Dependabot. \
+                 Use configure_ignored_workflows(add/remove) to manage the global workflow ignore list (e.g. Semgrep, Dependabot). \
                  Use update_notifications to set notification levels (off/low/normal/critical, per event and scope), \
                  configure quiet hours (quiet_start/quiet_end in HH:MM, or quiet_clear=true), \
                  or pause/resume (pause=true/false, with optional pause_minutes). \

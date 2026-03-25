@@ -65,8 +65,7 @@ Or call the MCP tools directly:
 | `list_watches` | Show all watched repos and their status |
 | `configure_branches` | Set branches for a repo, or omit repo to set global defaults |
 | `configure_repo` | Set per-repo workflow allow-list and/or display alias |
-| `ignore_workflows` | Globally ignore workflows (e.g. Semgrep, Dependabot) |
-| `unignore_workflows` | Stop ignoring workflows |
+| `configure_ignored_workflows` | Add/remove from the global workflow ignore list |
 | `update_notifications` | Set levels, quiet hours, and pause/resume in one call |
 | `rerun_build` | Rerun a failed build (specific ID or last failed) |
 | `build_history` | Show recent builds for a repo with duration and age |
