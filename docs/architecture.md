@@ -33,16 +33,15 @@ src/
 ├── config.rs        — Config structs, crash-safe JSON persistence helpers
 ├── format.rs        — duration, age, and truncation formatting
 ├── github.rs        — gh CLI wrappers, RunInfo/HistoryEntry types, input validation
+├── register.rs      — MCP server registration in ~/.claude.json (--register flag)
 └── platform/
     ├── mod.rs       — Notifier trait, global singleton, platform dispatch
-    ├── universal/   — NullNotifier (used in tests)
+    ├── universal/
+    │   └── mod.rs   — NullNotifier (used in tests)
     ├── linux/
-    │   ├── mod.rs   — detection, shared helpers (notification props, app name)
-    │   └── dbus.rs  — D-Bus backend via zbus (org.freedesktop.Notifications)
+    │   └── mod.rs   — D-Bus backend via zbus (org.freedesktop.Notifications), notification props, action listener
     └── macos/
-        ├── mod.rs                — detection (terminal-notifier → osascript), sound mapping
-        ├── terminal_notifier.rs  — terminal-notifier backend (preferred)
-        └── apple_script.rs       — osascript fallback
+        └── mod.rs   — detection (terminal-notifier → osascript), both backends, sound mapping
 ```
 
 ## Key types

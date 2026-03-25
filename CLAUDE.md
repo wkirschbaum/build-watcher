@@ -36,6 +36,7 @@ cargo clippy                # Lint
 - `src/config.rs` — Config structs, crash-safe JSON persistence helpers
 - `src/github.rs` — `gh` CLI wrappers, `RunInfo`/`HistoryEntry` types, input validation
 - `src/format.rs` — Duration, age, and truncation formatting
+- `src/register.rs` — MCP server registration in `~/.claude.json` (invoked via `--register` flag)
 - `src/platform/` — `Notifier` trait + backends (Linux: D-Bus via `zbus`; macOS: `terminal-notifier` → `osascript` fallback)
 
 ### How it works
