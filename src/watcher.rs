@@ -1363,13 +1363,29 @@ mod tests {
 
     // -- Mock GitHub client for integration tests --
 
+    // -- Mock GitHub client --
+
     struct MockGitHub {
         runs: Vec<RunInfo>,
+        failure_msg: Option<String>,
     }
 
     impl MockGitHub {
         fn with_runs(runs: Vec<RunInfo>) -> Arc<dyn crate::github::GitHubClient> {
-            Arc::new(Self { runs })
+            Arc::new(Self {
+                runs,
+                failure_msg: None,
+            })
+        }
+
+        fn with_runs_and_failures(
+            runs: Vec<RunInfo>,
+            failure_msg: &str,
+        ) -> Arc<dyn crate::github::GitHubClient> {
+            Arc::new(Self {
+                runs,
+                failure_msg: Some(failure_msg.to_string()),
+            })
         }
     }
 
@@ -1388,7 +1404,7 @@ mod tests {
                 })
         }
         async fn failing_steps(&self, _: &str, _: u64) -> Option<String> {
-            None
+            self.failure_msg.clone()
         }
         async fn run_rerun(&self, _: &str, _: u64, _: bool) -> Result<String, GhError> {
             Ok(String::new())
@@ -1412,12 +1428,29 @@ mod tests {
     }
 
     fn mock_handle(github: Arc<dyn crate::github::GitHubClient>) -> WatcherHandle {
-        use tokio_util::sync::CancellationToken;
         WatcherHandle::new(
             CancellationToken::new(),
             crate::events::EventBus::new(),
             github,
         )
+    }
+
+    fn make_poller(
+        key: &WatchKey,
+        watches: &Watches,
+        config: &SharedConfig,
+        rate_limit: &RateLimitState,
+        handle: &WatcherHandle,
+    ) -> Poller {
+        Poller {
+            key: key.clone(),
+            watches: watches.clone(),
+            config: config.clone(),
+            rate_limit: rate_limit.clone(),
+            token: handle.cancel.child_token(),
+            events: handle.events.clone(),
+            github: handle.github.clone(),
+        }
     }
 
     #[tokio::test]
@@ -1475,6 +1508,301 @@ mod tests {
 
         let r2 = start_watch(&watches, &config, &handle, &rate_limit, "alice/app", "main").await;
         assert!(r2.unwrap().contains("already being watched"));
+
+        handle.cancel.cancel();
+    }
+
+    // -- Poller: check_for_new_runs --
+
+    #[tokio::test]
+    async fn check_for_new_runs_detects_new_builds() {
+        let key = WatchKey::new("alice/app", "main");
+        // Mock returns runs 99-102; watch has seen up to 100
+        let runs = vec![
+            make_run(99, "completed", "success"),
+            make_run(100, "completed", "success"),
+            make_run(101, "in_progress", ""),
+            make_run(102, "completed", "failure"),
+        ];
+        let gh = MockGitHub::with_runs_and_failures(runs, "Build / Run tests");
+        let watches: Watches = Arc::new(Mutex::new(HashMap::new()));
+        let config: SharedConfig = Arc::new(Mutex::new(Config::default()));
+        let rate_limit: RateLimitState = Arc::new(Mutex::new(None));
+        let handle = mock_handle(gh);
+
+        // Seed a watch entry with last_seen=100
+        {
+            let mut w = watches.lock().await;
+            w.insert(
+                key.clone(),
+                WatchEntry {
+                    last_seen_run_id: 100,
+                    active_runs: HashMap::new(),
+                    failure_counts: HashMap::new(),
+                    last_build: None,
+                },
+            );
+        }
+
+        let mut rx = handle.events.subscribe();
+        let poller = make_poller(&key, &watches, &config, &rate_limit, &handle);
+        let pcfg = PollConfig {
+            active_secs: 15,
+            idle_secs: 60,
+            workflows: vec![],
+            ignored: vec![],
+        };
+
+        poller.check_for_new_runs("alice/app", "main", &pcfg).await;
+
+        // Verify high-water mark advanced
+        let w = watches.lock().await;
+        let entry = &w[&key];
+        assert_eq!(entry.last_seen_run_id, 102);
+        // 101 is in_progress → tracked as active
+        assert!(entry.active_runs.contains_key(&101));
+        // 102 is completed → last_build
+        assert_eq!(entry.last_build.as_ref().unwrap().run_id, 102);
+        drop(w);
+
+        // Verify events: RunStarted for 101 and 102, RunCompleted for 102
+        let mut events = vec![];
+        while let Ok(e) = rx.try_recv() {
+            events.push(e);
+        }
+        assert!(
+            events.len() >= 3,
+            "expected ≥3 events, got {}",
+            events.len()
+        );
+
+        handle.cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn check_for_new_runs_applies_workflow_filter() {
+        let key = WatchKey::new("alice/app", "main");
+        let mut ci = make_run(101, "in_progress", "");
+        ci.workflow = "CI".to_string();
+        let mut semgrep = make_run(102, "in_progress", "");
+        semgrep.workflow = "Semgrep".to_string();
+
+        let gh = MockGitHub::with_runs(vec![ci, semgrep]);
+        let watches: Watches = Arc::new(Mutex::new(HashMap::new()));
+        let config: SharedConfig = Arc::new(Mutex::new(Config::default()));
+        let rate_limit: RateLimitState = Arc::new(Mutex::new(None));
+        let handle = mock_handle(gh);
+
+        {
+            let mut w = watches.lock().await;
+            w.insert(
+                key.clone(),
+                WatchEntry {
+                    last_seen_run_id: 100,
+                    active_runs: HashMap::new(),
+                    failure_counts: HashMap::new(),
+                    last_build: None,
+                },
+            );
+        }
+
+        let poller = make_poller(&key, &watches, &config, &rate_limit, &handle);
+        let pcfg = PollConfig {
+            active_secs: 15,
+            idle_secs: 60,
+            workflows: vec![],
+            ignored: vec!["Semgrep".to_string()],
+        };
+
+        poller.check_for_new_runs("alice/app", "main", &pcfg).await;
+
+        let w = watches.lock().await;
+        let entry = &w[&key];
+        // CI tracked, Semgrep filtered out
+        assert!(entry.active_runs.contains_key(&101));
+        assert!(!entry.active_runs.contains_key(&102));
+        // High-water mark includes filtered runs
+        assert_eq!(entry.last_seen_run_id, 102);
+
+        handle.cancel.cancel();
+    }
+
+    // -- Poller: poll_active_runs --
+
+    #[tokio::test]
+    async fn poll_active_runs_detects_completion() {
+        let key = WatchKey::new("alice/app", "main");
+        // Mock: run 101 now completed
+        let runs = vec![make_run(101, "completed", "success")];
+        let gh = MockGitHub::with_runs(runs);
+        let watches: Watches = Arc::new(Mutex::new(HashMap::new()));
+        let config: SharedConfig = Arc::new(Mutex::new(Config::default()));
+        let rate_limit: RateLimitState = Arc::new(Mutex::new(None));
+        let handle = mock_handle(gh);
+
+        // Seed watch with run 101 as active
+        {
+            let mut w = watches.lock().await;
+            let mut entry = WatchEntry {
+                last_seen_run_id: 101,
+                active_runs: HashMap::new(),
+                failure_counts: HashMap::new(),
+                last_build: None,
+            };
+            entry.active_runs.insert(101, make_active("in_progress"));
+            w.insert(key.clone(), entry);
+        }
+
+        let mut rx = handle.events.subscribe();
+        let poller = make_poller(&key, &watches, &config, &rate_limit, &handle);
+
+        poller.poll_active_runs("alice/app", "main").await;
+
+        let w = watches.lock().await;
+        let entry = &w[&key];
+        // Run removed from active, recorded as last_build
+        assert!(!entry.active_runs.contains_key(&101));
+        assert_eq!(entry.last_build.as_ref().unwrap().run_id, 101);
+        assert_eq!(entry.last_build.as_ref().unwrap().conclusion, "success");
+        drop(w);
+
+        // RunCompleted event emitted
+        match rx.try_recv() {
+            Ok(WatchEvent::RunCompleted { conclusion, .. }) => {
+                assert_eq!(conclusion, "success");
+            }
+            other => panic!("expected RunCompleted, got {other:?}"),
+        }
+
+        handle.cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn poll_active_runs_emits_status_change() {
+        let key = WatchKey::new("alice/app", "main");
+        // Mock: run 101 changed from queued to in_progress
+        let runs = vec![make_run(101, "in_progress", "")];
+        let gh = MockGitHub::with_runs(runs);
+        let watches: Watches = Arc::new(Mutex::new(HashMap::new()));
+        let config: SharedConfig = Arc::new(Mutex::new(Config::default()));
+        let rate_limit: RateLimitState = Arc::new(Mutex::new(None));
+        let handle = mock_handle(gh);
+
+        {
+            let mut w = watches.lock().await;
+            let mut entry = WatchEntry {
+                last_seen_run_id: 101,
+                active_runs: HashMap::new(),
+                failure_counts: HashMap::new(),
+                last_build: None,
+            };
+            entry.active_runs.insert(101, make_active("queued"));
+            w.insert(key.clone(), entry);
+        }
+
+        let mut rx = handle.events.subscribe();
+        let poller = make_poller(&key, &watches, &config, &rate_limit, &handle);
+
+        poller.poll_active_runs("alice/app", "main").await;
+
+        // Still active, status updated
+        let w = watches.lock().await;
+        assert_eq!(w[&key].active_runs[&101].status, "in_progress");
+        drop(w);
+
+        // StatusChanged event
+        match rx.try_recv() {
+            Ok(WatchEvent::StatusChanged { from, to, .. }) => {
+                assert_eq!(from, "queued");
+                assert_eq!(to, "in_progress");
+            }
+            other => panic!("expected StatusChanged, got {other:?}"),
+        }
+
+        handle.cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn poll_active_runs_fetches_failing_steps() {
+        let key = WatchKey::new("alice/app", "main");
+        let runs = vec![make_run(101, "completed", "failure")];
+        let gh = MockGitHub::with_runs_and_failures(runs, "Build / Run tests");
+        let watches: Watches = Arc::new(Mutex::new(HashMap::new()));
+        let config: SharedConfig = Arc::new(Mutex::new(Config::default()));
+        let rate_limit: RateLimitState = Arc::new(Mutex::new(None));
+        let handle = mock_handle(gh);
+
+        {
+            let mut w = watches.lock().await;
+            let mut entry = WatchEntry {
+                last_seen_run_id: 101,
+                active_runs: HashMap::new(),
+                failure_counts: HashMap::new(),
+                last_build: None,
+            };
+            entry.active_runs.insert(101, make_active("in_progress"));
+            w.insert(key.clone(), entry);
+        }
+
+        let mut rx = handle.events.subscribe();
+        let poller = make_poller(&key, &watches, &config, &rate_limit, &handle);
+
+        poller.poll_active_runs("alice/app", "main").await;
+
+        match rx.try_recv() {
+            Ok(WatchEvent::RunCompleted {
+                failing_steps,
+                conclusion,
+                ..
+            }) => {
+                assert_eq!(conclusion, "failure");
+                assert_eq!(failing_steps.as_deref(), Some("Build / Run tests"));
+            }
+            other => panic!("expected RunCompleted, got {other:?}"),
+        }
+
+        handle.cancel.cancel();
+    }
+
+    // -- Startup recovery --
+
+    #[tokio::test]
+    async fn recover_existing_watches_recovers_active_runs() {
+        let key = WatchKey::new("alice/app", "main");
+        // Mock returns a mix: 100 completed, 101 in_progress
+        let runs = vec![
+            make_run(100, "completed", "success"),
+            make_run(101, "in_progress", ""),
+        ];
+        let gh = MockGitHub::with_runs(runs);
+        let watches: Watches = Arc::new(Mutex::new(HashMap::new()));
+        let config: SharedConfig = Arc::new(Mutex::new(Config::default()));
+        let rate_limit: RateLimitState = Arc::new(Mutex::new(None));
+        let handle = mock_handle(gh);
+
+        // Seed: persisted watch with last_seen=99, no active runs
+        {
+            let mut w = watches.lock().await;
+            w.insert(
+                key.clone(),
+                WatchEntry {
+                    last_seen_run_id: 99,
+                    active_runs: HashMap::new(),
+                    failure_counts: HashMap::new(),
+                    last_build: None,
+                },
+            );
+        }
+
+        let snapshot = vec![key.clone()];
+        recover_existing_watches(&watches, &config, &handle, &rate_limit, &snapshot).await;
+
+        let w = watches.lock().await;
+        let entry = &w[&key];
+        // In-progress run recovered
+        assert!(entry.active_runs.contains_key(&101));
+        // High-water mark bumped
+        assert_eq!(entry.last_seen_run_id, 101);
 
         handle.cancel.cancel();
     }
