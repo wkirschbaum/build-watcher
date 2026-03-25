@@ -831,13 +831,14 @@ impl BuildWatcher {
 
     #[tool(description = "Send a test desktop notification to verify notifications are working")]
     async fn test_notification(&self) -> Result<CallToolResult, McpError> {
-        crate::platform::send_notification(
-            "🔔 Build Watcher Test",
-            "If you see this, notifications are working!",
-            NotificationLevel::Normal,
-            None,
-            None,
-        )
+        crate::platform::send(crate::platform::Notification {
+            title: "🔔 Build Watcher Test".to_string(),
+            body: "If you see this, notifications are working!".to_string(),
+            level: NotificationLevel::Normal,
+            url: None,
+            group: "build-watcher".to_string(),
+            app_name: "Build Watcher".to_string(),
+        })
         .await;
         Ok(CallToolResult::success(vec![Content::text(
             "Test notification sent. You should see it on your desktop.",

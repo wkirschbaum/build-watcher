@@ -170,14 +170,14 @@ async fn handle_notification(
     match event {
         WatchEvent::RunStarted(run) => {
             let repo_label = cfg.short_repo(&run.repo);
-            let group = run.notification_group();
-            platform::send_notification(
-                &format!("🔨 started: {} | {}", repo_label, run.workflow),
-                &format!("[{}] {}", run.branch, run.display_title()),
+            platform::send(platform::Notification {
+                title: format!("🔨 started: {} | {}", repo_label, run.workflow),
+                body: format!("[{}] {}", run.branch, run.display_title()),
                 level,
-                Some(&run.url()),
-                Some(&group),
-            )
+                url: Some(run.url()),
+                group: run.notification_group(),
+                app_name: run.repo,
+            })
             .await;
         }
         WatchEvent::RunCompleted {
@@ -202,14 +202,14 @@ async fn handle_notification(
                 let _ = write!(body, "\nFailed: {steps}");
             }
 
-            let group = run.notification_group();
-            platform::send_notification(
-                &format!("{emoji} {status}: {} | {}", repo_label, run.workflow),
-                &body,
+            platform::send(platform::Notification {
+                title: format!("{emoji} {status}: {} | {}", repo_label, run.workflow),
+                body,
                 level,
-                Some(&run.url()),
-                Some(&group),
-            )
+                url: Some(run.url()),
+                group: run.notification_group(),
+                app_name: run.repo,
+            })
             .await;
         }
         WatchEvent::StatusChanged { .. } => {

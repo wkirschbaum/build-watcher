@@ -24,16 +24,22 @@ mod universal;
 #[allow(unused_imports)]
 pub use universal::NullNotifier;
 
+/// Pre-computed notification data. All formatting happens before this is
+/// passed to the platform backend — the backend only does the OS dispatch.
+pub struct Notification {
+    pub title: String,
+    pub body: String,
+    pub level: NotificationLevel,
+    pub url: Option<String>,
+    /// Grouping key — notifications with the same group replace each other.
+    pub group: String,
+    /// Human-readable source identifier shown in the OS notification chrome.
+    pub app_name: String,
+}
+
 pub trait Notifier: Send + Sync {
     fn name(&self) -> &'static str;
-    fn send(
-        &self,
-        title: &str,
-        body: &str,
-        level: NotificationLevel,
-        url: Option<&str>,
-        group: Option<&str>,
-    ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
+    fn send(&self, n: &Notification) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
 }
 
 static INSTANCE: OnceCell<Box<dyn Notifier>> = OnceCell::const_new();
@@ -48,17 +54,11 @@ async fn notifier() -> &'static dyn Notifier {
         .await
 }
 
-pub async fn send_notification(
-    title: &str,
-    body: &str,
-    level: NotificationLevel,
-    url: Option<&str>,
-    group: Option<&str>,
-) {
-    if level == NotificationLevel::Off {
+pub async fn send(n: Notification) {
+    if n.level == NotificationLevel::Off {
         return;
     }
-    notifier().await.send(title, body, level, url, group).await;
+    notifier().await.send(&n).await;
 }
 
 /// Default state directory when `STATE_DIRECTORY` is not set.

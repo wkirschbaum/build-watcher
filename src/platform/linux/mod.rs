@@ -1,49 +1,224 @@
+// D-Bus Notify method has 8 params per spec; the zbus #[proxy] macro generates
+// a wrapper with one extra (&self), triggering too_many_arguments on the expansion.
+#![allow(clippy::too_many_arguments)]
+
+use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+
+use futures_lite::StreamExt;
+use zbus::Connection;
+use zbus::proxy;
+
 use crate::config::NotificationLevel;
-use crate::platform::Notifier;
+use crate::platform::{Notification, Notifier};
 
-#[allow(clippy::too_many_arguments)] // D-Bus Notify method has 8 params per spec
-mod dbus;
+// -- D-Bus interface proxy --
 
-/// Shared notification properties derived from a `NotificationLevel`.
-#[derive(Debug, PartialEq)]
-pub(super) struct NotificationProps {
-    pub icon: &'static str,
-    pub category: &'static str,
-    pub expire_ms: i32,
-    pub urgency: &'static str,
+#[proxy(
+    interface = "org.freedesktop.Notifications",
+    default_service = "org.freedesktop.Notifications",
+    default_path = "/org/freedesktop/Notifications"
+)]
+trait Notifications {
+    fn notify(
+        &self,
+        app_name: &str,
+        replaces_id: u32,
+        app_icon: &str,
+        summary: &str,
+        body: &str,
+        actions: Vec<&str>,
+        hints: HashMap<&str, zbus::zvariant::Value<'_>>,
+        expire_timeout: i32,
+    ) -> zbus::Result<u32>;
+
+    #[zbus(signal)]
+    fn action_invoked(&self, id: u32, action_key: &str) -> zbus::Result<()>;
 }
 
-pub(super) fn notification_props(level: NotificationLevel) -> NotificationProps {
+// -- Level → D-Bus property mapping --
+
+struct DbusProps {
+    icon: &'static str,
+    category: &'static str,
+    expire_ms: i32,
+    /// D-Bus urgency hint: 0 = low, 1 = normal, 2 = critical.
+    urgency: u8,
+}
+
+fn dbus_props(level: NotificationLevel) -> DbusProps {
     match level {
-        NotificationLevel::Low => NotificationProps {
+        NotificationLevel::Low => DbusProps {
             icon: "emblem-synchronizing",
             category: "transfer",
             expire_ms: 4000,
-            urgency: "low",
+            urgency: 0,
         },
-        NotificationLevel::Normal => NotificationProps {
+        NotificationLevel::Normal => DbusProps {
             icon: "emblem-ok",
             category: "transfer.complete",
             expire_ms: 6000,
-            urgency: "normal",
+            urgency: 1,
         },
-        NotificationLevel::Critical => NotificationProps {
+        NotificationLevel::Critical => DbusProps {
             icon: "dialog-error",
             category: "transfer.error",
             expire_ms: 0,
-            urgency: "critical",
+            urgency: 2,
         },
         NotificationLevel::Off => unreachable!("Off is filtered before send()"),
     }
 }
 
-/// Extract the repo name from a notification group key (`owner/repo#branch#workflow`).
-/// Falls back to "Build Watcher" when no group is provided.
-pub(super) fn app_name_from_group(group: Option<&str>) -> &str {
-    group
-        .and_then(|g| g.split('#').next())
-        .unwrap_or("Build Watcher")
+// -- D-Bus notifier --
+
+/// Linux desktop notifications via D-Bus (`org.freedesktop.Notifications`).
+///
+/// Uses `replaces_id` to stack notifications per group, so each
+/// repo/branch/workflow has its own notification slot.
+///
+/// When a URL is provided, clicking the notification opens it via `xdg-open`.
+struct DbusNotifier {
+    connection: Connection,
+    ids: Arc<Mutex<HashMap<String, u32>>>,
 }
+
+impl DbusNotifier {
+    async fn new() -> zbus::Result<Self> {
+        let connection = Connection::session().await?;
+        Ok(Self {
+            connection,
+            ids: Arc::new(Mutex::new(HashMap::new())),
+        })
+    }
+}
+
+impl Notifier for DbusNotifier {
+    fn name(&self) -> &'static str {
+        "dbus"
+    }
+
+    fn send(&self, n: &Notification) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        let props = dbus_props(n.level);
+
+        let replaces_id = self
+            .ids
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&n.group)
+            .copied()
+            .unwrap_or(0);
+
+        let title = n.title.clone();
+        let body = n.body.clone();
+        let url = n.url.clone();
+        let group = n.group.clone();
+        let app_name = n.app_name.clone();
+        let ids = Arc::clone(&self.ids);
+        let icon = props.icon;
+        let category = props.category;
+        let expire_ms = props.expire_ms;
+        let urgency = props.urgency;
+        let level = n.level;
+
+        Box::pin(async move {
+            let proxy = match NotificationsProxy::new(&self.connection).await {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!("Failed to create D-Bus notification proxy: {e}");
+                    return;
+                }
+            };
+
+            let mut hints = HashMap::new();
+            hints.insert("urgency", zbus::zvariant::Value::from(urgency));
+            hints.insert("category", zbus::zvariant::Value::from(category));
+            hints.insert(
+                "desktop-entry",
+                zbus::zvariant::Value::from("build-watcher"),
+            );
+            if level == NotificationLevel::Critical {
+                hints.insert("resident", zbus::zvariant::Value::from(true));
+            }
+
+            let actions = if url.is_some() {
+                vec!["default", "Open"]
+            } else {
+                vec![]
+            };
+
+            match proxy
+                .notify(
+                    &app_name,
+                    replaces_id,
+                    icon,
+                    &title,
+                    &body,
+                    actions,
+                    hints,
+                    expire_ms,
+                )
+                .await
+            {
+                Ok(id) => {
+                    ids.lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .insert(group, id);
+
+                    if let Some(url) = url {
+                        spawn_action_listener(proxy, id, url);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("D-Bus notification failed: {e}");
+                }
+            }
+        })
+    }
+}
+
+/// Spawn a background task that waits for the user to click the notification,
+/// then opens the URL via `xdg-open`. Times out after 10 minutes.
+fn spawn_action_listener(proxy: NotificationsProxy<'static>, notification_id: u32, url: String) {
+    tokio::spawn(async move {
+        let mut stream = match proxy.receive_action_invoked().await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::debug!("Failed to subscribe to ActionInvoked signal: {e}");
+                return;
+            }
+        };
+
+        let timeout = tokio::time::sleep(std::time::Duration::from_secs(600));
+        tokio::pin!(timeout);
+
+        loop {
+            tokio::select! {
+                signal = stream.next() => {
+                    let Some(signal) = signal else { break };
+                    let Ok(args) = signal.args() else { continue };
+                    if args.id == notification_id && args.action_key == "default" {
+                        if let Err(e) = tokio::process::Command::new("xdg-open")
+                            .arg(&url)
+                            .stdin(std::process::Stdio::null())
+                            .stdout(std::process::Stdio::null())
+                            .stderr(std::process::Stdio::null())
+                            .spawn()
+                        {
+                            tracing::warn!("Failed to open URL: {e}");
+                        }
+                        break;
+                    }
+                }
+                () = &mut timeout => break,
+            }
+        }
+    });
+}
+
+// -- Platform API --
 
 pub fn default_state_dir() -> String {
     let home = super::home_dir();
@@ -56,7 +231,7 @@ pub fn default_config_dir() -> String {
 }
 
 pub async fn detect() -> Box<dyn Notifier> {
-    match dbus::DbusNotifier::new().await {
+    match DbusNotifier::new().await {
         Ok(n) => Box::new(n),
         Err(e) => {
             panic!("D-Bus session bus unavailable: {e}");
@@ -69,44 +244,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn notification_props_low() {
-        let props = notification_props(NotificationLevel::Low);
-        assert_eq!(props.icon, "emblem-synchronizing");
-        assert_eq!(props.category, "transfer");
-        assert_eq!(props.expire_ms, 4000);
-        assert_eq!(props.urgency, "low");
+    fn dbus_props_low() {
+        let p = dbus_props(NotificationLevel::Low);
+        assert_eq!(p.icon, "emblem-synchronizing");
+        assert_eq!(p.category, "transfer");
+        assert_eq!(p.expire_ms, 4000);
+        assert_eq!(p.urgency, 0);
     }
 
     #[test]
-    fn notification_props_normal() {
-        let props = notification_props(NotificationLevel::Normal);
-        assert_eq!(props.icon, "emblem-ok");
-        assert_eq!(props.category, "transfer.complete");
-        assert_eq!(props.expire_ms, 6000);
-        assert_eq!(props.urgency, "normal");
+    fn dbus_props_normal() {
+        let p = dbus_props(NotificationLevel::Normal);
+        assert_eq!(p.icon, "emblem-ok");
+        assert_eq!(p.category, "transfer.complete");
+        assert_eq!(p.expire_ms, 6000);
+        assert_eq!(p.urgency, 1);
     }
 
     #[test]
-    fn notification_props_critical() {
-        let props = notification_props(NotificationLevel::Critical);
-        assert_eq!(props.icon, "dialog-error");
-        assert_eq!(props.category, "transfer.error");
-        assert_eq!(props.expire_ms, 0);
-        assert_eq!(props.urgency, "critical");
-    }
-
-    #[test]
-    fn app_name_from_group_extracts_repo() {
-        assert_eq!(app_name_from_group(Some("alice/app#main#CI")), "alice/app");
-    }
-
-    #[test]
-    fn app_name_from_group_none_falls_back() {
-        assert_eq!(app_name_from_group(None), "Build Watcher");
-    }
-
-    #[test]
-    fn app_name_from_group_no_hash_returns_whole_string() {
-        assert_eq!(app_name_from_group(Some("build-watcher")), "build-watcher");
+    fn dbus_props_critical() {
+        let p = dbus_props(NotificationLevel::Critical);
+        assert_eq!(p.icon, "dialog-error");
+        assert_eq!(p.category, "transfer.error");
+        assert_eq!(p.expire_ms, 0);
+        assert_eq!(p.urgency, 2);
     }
 }
