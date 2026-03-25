@@ -351,7 +351,6 @@ fn extract_failing_steps(jobs: &[GhJob]) -> Option<String> {
 /// A build history entry with timestamps for duration/age calculation.
 #[derive(Debug)]
 pub struct HistoryEntry {
-    #[allow(dead_code)] // populated from API but not yet displayed
     pub id: u64,
     pub conclusion: String,
     pub workflow: String,

@@ -627,14 +627,17 @@ impl BuildWatcher {
             let p = self.pause.lock().await;
             p.is_some_and(|d| tokio::time::Instant::now() < d)
         };
-        let (quiet_hours_label, quiet_active) = {
+        let (quiet_hours_label, quiet_active, notif_levels, ignored_workflows, repo_count) = {
             let cfg = self.config.lock().await;
             let label = cfg.quiet_hours.as_ref().map_or_else(
                 || "off".to_string(),
                 |qh| format!("{}–{}", qh.start, qh.end),
             );
             let active = cfg.is_in_quiet_hours();
-            (label, active)
+            let levels = cfg.notifications.clone();
+            let ignored = cfg.ignored_workflows.clone();
+            let repos = cfg.repos.len();
+            (label, active, levels, ignored, repos)
         };
 
         let uptime = format::seconds(self.started_at.elapsed().as_secs());
@@ -686,6 +689,23 @@ impl BuildWatcher {
             quiet_hours_label,
             if quiet_active { "quiet" } else { "allowing" },
         ));
+        lines.push(format!(
+            "  Levels      : started={} success={} failure={}",
+            notif_levels.build_started, notif_levels.build_success, notif_levels.build_failure
+        ));
+
+        // Settings
+        lines.push(String::new());
+        lines.push("Settings".to_string());
+        lines.push(format!("  Watched repos  : {repo_count}"));
+        if ignored_workflows.is_empty() {
+            lines.push("  Ignored workflows: (none)".to_string());
+        } else {
+            lines.push(format!(
+                "  Ignored workflows: {}",
+                ignored_workflows.join(", ")
+            ));
+        }
 
         lines.push(String::new());
         lines.push(format!(
@@ -836,22 +856,54 @@ impl BuildWatcher {
         let run_id = if let Some(id) = params.run_id {
             id
         } else {
-            let watches = self.watches.lock().await;
-            match last_failed_build(&watches, &params.repo) {
-                Some((key, build)) => {
+            let in_memory = {
+                let watches = self.watches.lock().await;
+                last_failed_build(&watches, &params.repo).map(|(key, build)| {
                     tracing::info!(
                         repo = params.repo,
                         branch = key.branch,
                         run_id = build.run_id,
-                        "Rerunning last failed build"
+                        "Rerunning last failed build (from memory)"
                     );
                     build.run_id
-                }
-                None => {
-                    return Ok(CallToolResult::error(vec![Content::text(format!(
-                        "No recent failed build found for {}",
-                        params.repo
-                    ))]));
+                })
+            };
+
+            if let Some(id) = in_memory {
+                id
+            } else {
+                // Fall back to GitHub API history
+                tracing::debug!(
+                    repo = params.repo,
+                    "No in-memory failed build; querying GitHub history"
+                );
+                match self
+                    .handle
+                    .github
+                    .run_list_history(&params.repo, None, 20)
+                    .await
+                {
+                    Ok(entries) => match entries.into_iter().find(|e| e.conclusion == "failure") {
+                        Some(entry) => {
+                            tracing::info!(
+                                repo = params.repo,
+                                run_id = entry.id,
+                                "Rerunning last failed build (from GitHub history)"
+                            );
+                            entry.id
+                        }
+                        None => {
+                            return Ok(CallToolResult::error(vec![Content::text(format!(
+                                "No recent failed build found for {}",
+                                params.repo
+                            ))]));
+                        }
+                    },
+                    Err(e) => {
+                        return Ok(CallToolResult::error(vec![Content::text(format!(
+                            "No in-memory failed build and GitHub history lookup failed: {e}"
+                        ))]));
+                    }
                 }
             }
         };
@@ -1229,6 +1281,7 @@ fn validate_hhmm(s: &str) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(test)]
 fn format_notification_overrides(overrides: &NotificationOverrides) -> String {
     [
         overrides.build_started.map(|l| format!("started: {l}")),

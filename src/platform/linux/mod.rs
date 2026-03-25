@@ -59,7 +59,7 @@ fn dbus_props(level: NotificationLevel) -> DbusProps {
         NotificationLevel::Normal => DbusProps {
             icon: "emblem-ok",
             category: "transfer.complete",
-            expire_ms: 6000,
+            expire_ms: 8000,
             urgency: 1,
         },
         NotificationLevel::Critical => DbusProps {
@@ -116,6 +116,7 @@ impl Notifier for DbusNotifier {
         let url = n.url.clone();
         let group = n.group.clone();
         let app_name = n.app_name.clone();
+        let rerun_run_id = n.rerun_run_id;
         let ids = Arc::clone(&self.ids);
         let icon = props.icon;
         let category = props.category;
@@ -143,10 +144,10 @@ impl Notifier for DbusNotifier {
                 hints.insert("resident", zbus::zvariant::Value::from(true));
             }
 
-            let actions = if url.is_some() {
-                vec!["default", "Open"]
-            } else {
-                vec![]
+            let actions = match (&url, rerun_run_id) {
+                (Some(_), Some(_)) => vec!["default", "Open", "rerun", "Rerun"],
+                (Some(_), None) => vec!["default", "Open"],
+                _ => vec![],
             };
 
             match proxy
@@ -167,8 +168,8 @@ impl Notifier for DbusNotifier {
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .insert(group, id);
 
-                    if let Some(url) = url {
-                        spawn_action_listener(proxy, id, url);
+                    if url.is_some() || rerun_run_id.is_some() {
+                        spawn_action_listener(proxy, id, url, rerun_run_id);
                     }
                 }
                 Err(e) => {
@@ -180,8 +181,13 @@ impl Notifier for DbusNotifier {
 }
 
 /// Spawn a background task that waits for the user to click the notification,
-/// then opens the URL via `xdg-open`. Times out after 10 minutes.
-fn spawn_action_listener(proxy: NotificationsProxy<'static>, notification_id: u32, url: String) {
+/// then opens the URL via `xdg-open` or reruns a failed build. Times out after 10 minutes.
+fn spawn_action_listener(
+    proxy: NotificationsProxy<'static>,
+    notification_id: u32,
+    url: Option<String>,
+    rerun_run_id: Option<u64>,
+) {
     tokio::spawn(async move {
         let mut stream = match proxy.receive_action_invoked().await {
             Ok(s) => s,
@@ -199,17 +205,40 @@ fn spawn_action_listener(proxy: NotificationsProxy<'static>, notification_id: u3
                 signal = stream.next() => {
                     let Some(signal) = signal else { break };
                     let Ok(args) = signal.args() else { continue };
-                    if args.id == notification_id && args.action_key == "default" {
-                        if let Err(e) = tokio::process::Command::new("xdg-open")
-                            .arg(&url)
-                            .stdin(std::process::Stdio::null())
-                            .stdout(std::process::Stdio::null())
-                            .stderr(std::process::Stdio::null())
-                            .spawn()
-                        {
-                            tracing::warn!("Failed to open URL: {e}");
+                    if args.id != notification_id {
+                        continue;
+                    }
+                    match args.action_key {
+                        "default" => {
+                            if let Some(ref u) = url
+                                && let Err(e) = tokio::process::Command::new("xdg-open")
+                                    .arg(u)
+                                    .stdin(std::process::Stdio::null())
+                                    .stdout(std::process::Stdio::null())
+                                    .stderr(std::process::Stdio::null())
+                                    .spawn()
+                            {
+                                tracing::warn!("Failed to open URL: {e}");
+                            }
+                            break;
                         }
-                        break;
+                        "rerun" => {
+                            if let Some(id) = rerun_run_id {
+                                if let Err(e) = tokio::process::Command::new("gh")
+                                    .args(["run", "rerun", "--failed", &id.to_string()])
+                                    .stdin(std::process::Stdio::null())
+                                    .stdout(std::process::Stdio::null())
+                                    .stderr(std::process::Stdio::null())
+                                    .spawn()
+                                {
+                                    tracing::warn!("Failed to rerun build {id}: {e}");
+                                } else {
+                                    tracing::info!("Rerunning failed jobs for run {id}");
+                                }
+                            }
+                            break;
+                        }
+                        _ => {}
                     }
                 }
                 () = &mut timeout => break,
@@ -254,7 +283,7 @@ mod tests {
         let normal = dbus_props(NotificationLevel::Normal);
         assert_eq!(
             (normal.icon, normal.urgency, normal.expire_ms),
-            ("emblem-ok", 1, 6000)
+            ("emblem-ok", 1, 8000)
         );
 
         let critical = dbus_props(NotificationLevel::Critical);

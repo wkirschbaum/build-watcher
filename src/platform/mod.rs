@@ -35,6 +35,8 @@ pub struct Notification {
     pub group: String,
     /// Human-readable source identifier shown in the OS notification chrome.
     pub app_name: String,
+    /// Run ID to offer a "Rerun" action on failure notifications (Linux D-Bus).
+    pub rerun_run_id: Option<u64>,
 }
 
 pub trait Notifier: Send + Sync {
