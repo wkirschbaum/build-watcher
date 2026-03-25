@@ -195,16 +195,9 @@ struct StopWatchesParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct ConfigureBranchesParams {
-    /// GitHub repo in "owner/repo" format
-    repo: String,
-    /// Branches to watch for this repo (e.g. `["main", "develop"]`)
-    #[serde(deserialize_with = "deserialize_string_or_vec")]
-    branches: Vec<String>,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-struct SetDefaultBranchesParams {
-    /// Default branches to watch when no per-repo config exists (e.g. `["main"]`)
+    /// GitHub repo in "owner/repo" format. Omit to set the global default branches.
+    repo: Option<String>,
+    /// Branches to watch (e.g. `["main", "develop"]`)
     #[serde(deserialize_with = "deserialize_string_or_vec")]
     branches: Vec<String>,
 }
@@ -521,105 +514,71 @@ impl BuildWatcher {
     }
 
     #[tool(
-        description = "Configure which branches to watch for a specific repo. Overrides the default branches for this repo."
+        description = "Configure which branches to watch. If repo is given, overrides branches for that repo only. If repo is omitted, sets the global default branches used for repos without per-repo config."
     )]
     async fn configure_branches(
         &self,
         Parameters(params): Parameters<ConfigureBranchesParams>,
     ) -> Result<CallToolResult, McpError> {
-        if let Err(e) = validate_repo(&params.repo) {
-            return Ok(CallToolResult::error(vec![Content::text(e)]));
-        }
         for branch in &params.branches {
             if let Err(e) = validate_branch(branch) {
                 return Ok(CallToolResult::error(vec![Content::text(e)]));
             }
         }
 
-        let snapshot = {
-            let mut config = self.config.lock().await;
-            let Some(existing) = config.repos.get(&params.repo).cloned() else {
-                return Ok(CallToolResult::error(vec![Content::text(format!(
-                    "{} is not being watched — use watch_builds first",
-                    params.repo
-                ))]));
-            };
-            config.repos.insert(
-                params.repo.clone(),
-                RepoConfig {
-                    branches: params.branches.clone(),
-                    ..existing
-                },
-            );
-            config.clone()
-        };
-        let mut msg = format!(
-            "Set {}: watching branches {:?}\nRestart watches with watch_builds to apply.",
-            params.repo, params.branches,
-        );
-        if let Some(warning) = persist_config(snapshot).await {
-            msg.push_str(&warning);
-        }
-
-        Ok(CallToolResult::success(vec![Content::text(msg)]))
-    }
-
-    #[tool(description = "Set the default branches to watch for repos without per-repo config.")]
-    async fn set_default_branches(
-        &self,
-        Parameters(params): Parameters<SetDefaultBranchesParams>,
-    ) -> Result<CallToolResult, McpError> {
-        for branch in &params.branches {
-            if let Err(e) = validate_branch(branch) {
-                return Ok(CallToolResult::error(vec![Content::text(e)]));
+        match params.repo {
+            None => {
+                let (snapshot, mut msg) = {
+                    let mut config = self.config.lock().await;
+                    config.default_branches = params.branches;
+                    let msg = format!("Default branches set to {:?}", config.default_branches);
+                    (config.clone(), msg)
+                };
+                if let Some(warning) = persist_config(snapshot).await {
+                    msg.push_str(&warning);
+                }
+                Ok(CallToolResult::success(vec![Content::text(msg)]))
+            }
+            Some(repo) => {
+                if let Err(e) = validate_repo(&repo) {
+                    return Ok(CallToolResult::error(vec![Content::text(e)]));
+                }
+                let snapshot = {
+                    let mut config = self.config.lock().await;
+                    let Some(existing) = config.repos.get(&repo).cloned() else {
+                        return Ok(CallToolResult::error(vec![Content::text(format!(
+                            "{repo} is not being watched — use watch_builds first"
+                        ))]));
+                    };
+                    config.repos.insert(
+                        repo.clone(),
+                        RepoConfig {
+                            branches: params.branches.clone(),
+                            ..existing
+                        },
+                    );
+                    config.clone()
+                };
+                let mut msg = format!(
+                    "Set {repo}: watching branches {:?}\nRestart watches with watch_builds to apply.",
+                    params.branches,
+                );
+                if let Some(warning) = persist_config(snapshot).await {
+                    msg.push_str(&warning);
+                }
+                Ok(CallToolResult::success(vec![Content::text(msg)]))
             }
         }
-
-        let (snapshot, mut msg) = {
-            let mut config = self.config.lock().await;
-            config.default_branches = params.branches;
-            let msg = format!("Default branches set to {:?}", config.default_branches);
-            (config.clone(), msg)
-        };
-        if let Some(warning) = persist_config(snapshot).await {
-            msg.push_str(&warning);
-        }
-
-        Ok(CallToolResult::success(vec![Content::text(msg)]))
     }
 
     #[tool(
-        description = "Show the current configuration including watched repos, default branches, and per-repo overrides."
+        description = "Show the current configuration: watched repos, branch and workflow filters, notification levels, quiet hours, and ignored workflows. For live runtime state (rate limit, polling intervals, pause), use get_stats."
     )]
     async fn get_config(&self) -> Result<CallToolResult, McpError> {
-        // Acquire rate_limit and watches before config. Pollers never hold all
-        // three simultaneously, but we keep the same outer ordering
-        // (rate_limit → watches → config) to avoid potential deadlocks.
-        let now = crate::config::unix_now();
-        let (active_secs, idle_secs, rate_limit_line) = {
-            let rl = self.rate_limit.lock().await;
-            let w = self.watches.lock().await;
-            let api_calls = count_api_calls(&w);
-            drop(w);
-            let (active, idle) = compute_intervals(rl.as_ref(), api_calls, now);
-            let line = format_rate_limit_line(rl.as_ref(), active, idle, now);
-            (active, idle, line)
-        };
-
-        let paused = {
-            let p = self.pause.lock().await;
-            p.is_some_and(|deadline| tokio::time::Instant::now() < deadline)
-        };
-
         let config = self.config.lock().await;
         let mut lines = Vec::new();
 
-        if paused {
-            lines.push("⏸ Notifications: PAUSED".to_string());
-        }
         lines.push(format!("Default branches: {:?}", config.default_branches));
-        lines.push(format!("\nRate limit: {rate_limit_line}"));
-        lines.push(format!("Polling: active={active_secs}s idle={idle_secs}s"));
         lines.push(format!(
             "\nNotifications:\n  build_started: {}\n  build_success: {}\n  build_failure: {}",
             config.notifications.build_started,
@@ -776,6 +735,12 @@ impl BuildWatcher {
             "  Quiet hours : {} (currently: {})",
             quiet_hours_label,
             if quiet_active { "quiet" } else { "allowing" },
+        ));
+
+        lines.push(String::new());
+        lines.push(format!(
+            "Config file : {}",
+            config_dir().join("config.json").display()
         ));
 
         Ok(CallToolResult::success(vec![Content::text(
@@ -1304,8 +1269,7 @@ impl ServerHandler for BuildWatcher {
             .with_instructions(
                 "Monitors GitHub Actions builds and sends desktop notifications on completion. \
                  Use watch_builds with one or more repos in 'owner/repo' format to start watching. \
-                 Use configure_branches to set which branches to watch per repo, or \
-                 set_default_branches to change the default (main). \
+                 Use configure_branches to set which branches to watch — omit repo to set global defaults, or pass repo to override for a specific repo. \
                  Use configure_workflows to filter which workflows to watch per repo. \
                  Use ignore_workflows/unignore_workflows to globally ignore workflows like Semgrep or Dependabot. \
                  Use configure_notifications to control which events trigger notifications — \
@@ -1316,8 +1280,8 @@ impl ServerHandler for BuildWatcher {
                  Use configure_quiet_hours to suppress notifications between two HH:MM times (default 22:00–06:00). \
                  Use rerun_build to rerun a failed build (or the last failed build for a repo). \
                  Use build_history to see recent builds for a repo. \
-                 Use get_stats for a live snapshot of polling, rate limit, and notification state. \
-                 Use get_config to see current settings.",
+                 Use get_stats for a live snapshot of polling, rate limit, notification state, and config file path. \
+                 Use get_config to see current settings (repos, branches, workflows, notification levels).",
             )
     }
 
@@ -1379,25 +1343,6 @@ fn validate_hhmm(s: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Format the rate-limit status line for `get_config`.
-fn format_rate_limit_line(
-    rl: Option<&crate::github::RateLimit>,
-    active_secs: u64,
-    idle_secs: u64,
-    now: u64,
-) -> String {
-    let Some(rl) = rl else {
-        return "unknown (no watches active yet)".to_string();
-    };
-    let mins_left = rl.reset.saturating_sub(now) / 60;
-    let throttled = active_secs > MIN_ACTIVE_SECS || idle_secs > MIN_IDLE_SECS;
-    let throttle_note = if throttled { " [throttled]" } else { "" };
-    format!(
-        "{}/{} remaining (resets in {}m){}",
-        rl.remaining, rl.limit, mins_left, throttle_note
-    )
-}
-
 fn format_notification_overrides(overrides: &NotificationOverrides) -> String {
     [
         overrides.build_started.map(|l| format!("started: {l}")),
@@ -1436,32 +1381,6 @@ mod tests {
         assert!(super::validate_hhmm("12:60").is_err());
         assert!(super::validate_hhmm("noon").is_err());
         assert!(super::validate_hhmm("12").is_err());
-    }
-
-    fn rl(remaining: u64, reset_offset: u64) -> crate::github::RateLimit {
-        crate::github::RateLimit {
-            limit: 5000,
-            remaining,
-            reset: 1_000_000 + reset_offset,
-            used: 5000 - remaining,
-        }
-    }
-
-    #[test]
-    fn rate_limit_line_formatting() {
-        let now = 1_000_000;
-        assert_eq!(
-            super::format_rate_limit_line(None, 15, 60, now),
-            "unknown (no watches active yet)"
-        );
-        assert_eq!(
-            super::format_rate_limit_line(Some(&rl(4500, 3600)), 15, 60, now),
-            "4500/5000 remaining (resets in 60m)"
-        );
-        assert!(
-            super::format_rate_limit_line(Some(&rl(100, 3600)), 72, 72, now)
-                .contains("[throttled]")
-        );
     }
 
     #[test]

@@ -62,7 +62,7 @@ This keeps polling fast when quota is plentiful and backs off gracefully as it d
 
 ## Branch Configuration
 
-Per-repo branch lists override the global default branches (default: `["main"]`). The default branches can be changed globally via `set_default_branches`. Per-repo branches are set via `configure_branches`. Changes to branch configuration require restarting watches to take effect.
+Per-repo branch lists override the global default branches (default: `["main"]`). `configure_branches` handles both: omit `repo` to set the global defaults, or pass `repo` to override for a specific repo. Changes to branch configuration require restarting watches to take effect.
 
 ## Persistent Configuration
 
@@ -78,7 +78,7 @@ An internal broadcast channel decouples the polling loop from notification dispa
 
 ## MCP Server (Model Context Protocol)
 
-Runs as an HTTP server exposing tools via the MCP protocol, allowing Claude Code to manage watches interactively. The server uses `rmcp` with Streamable HTTP transport over `axum`. Tools exposed: `watch_builds`, `stop_watches`, `list_watches`, `configure_branches`, `set_default_branches`, `configure_notifications`, `configure_workflows`, `ignore_workflows`, `unignore_workflows`, `pause_notifications`, `resume_notifications`, `configure_quiet_hours`, `rerun_build`, `build_history`, `set_alias`, `get_config`, `get_stats`, `test_notification` (18 tools). All tool parameters support double-encoded JSON arrays (a workaround for MCP clients that stringify array parameters).
+Runs as an HTTP server exposing tools via the MCP protocol, allowing Claude Code to manage watches interactively. The server uses `rmcp` with Streamable HTTP transport over `axum`. Tools exposed: `watch_builds`, `stop_watches`, `list_watches`, `configure_branches`, `configure_notifications`, `configure_workflows`, `ignore_workflows`, `unignore_workflows`, `pause_notifications`, `resume_notifications`, `configure_quiet_hours`, `rerun_build`, `build_history`, `set_alias`, `get_config`, `get_stats`, `test_notification` (17 tools). All tool parameters support double-encoded JSON arrays (a workaround for MCP clients that stringify array parameters).
 
 ## Port Binding with Fallback
 

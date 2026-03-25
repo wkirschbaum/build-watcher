@@ -63,8 +63,7 @@ Or call the MCP tools directly:
 | `watch_builds` | Add repos to watch (`owner/repo` format) |
 | `stop_watches` | Remove repos and stop watching |
 | `list_watches` | Show all watched repos and their status |
-| `configure_branches` | Set custom branches for a repo |
-| `set_default_branches` | Change the default branches for all repos |
+| `configure_branches` | Set branches for a repo, or omit repo to set global defaults |
 | `configure_workflows` | Filter which workflows to watch per repo |
 | `ignore_workflows` | Globally ignore workflows (e.g. Semgrep, Dependabot) |
 | `unignore_workflows` | Stop ignoring workflows |
@@ -75,8 +74,8 @@ Or call the MCP tools directly:
 | `set_alias` | Set a display alias for a repo |
 | `rerun_build` | Rerun a failed build (specific ID or last failed) |
 | `build_history` | Show recent builds for a repo with duration and age |
-| `get_config` | Show current configuration |
-| `get_stats` | Show live stats (uptime, rate limit, active watches, pause state) |
+| `get_config` | Show current settings (repos, branches, workflows, notification levels) |
+| `get_stats` | Show live stats (uptime, rate limit, polling intervals, pause state, config path) |
 | `test_notification` | Send a test notification to verify setup |
 
 ## Configuration
