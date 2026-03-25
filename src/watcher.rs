@@ -39,6 +39,11 @@ const RATE_LIMIT_REFRESH_INTERVAL: Duration = Duration::from_secs(300);
 /// - More than 50% of the limit remains → run at floor speed (1s / 10s).
 /// - Below 50% → throttle: spread the remaining budget evenly across the
 ///   seconds until the window resets, then floor at MIN values.
+///
+/// The 50% threshold gives a comfortable safety margin: it lets polling run
+/// at full speed for the first half of the window, then gradually backs off
+/// so the remaining budget lasts exactly to the reset. This avoids both
+/// over-throttling early and hitting the hard cap near the end of a window.
 pub(crate) fn compute_intervals(rate_limit: Option<&RateLimit>, num_watches: usize) -> (u64, u64) {
     let Some(rl) = rate_limit else {
         return (FALLBACK_ACTIVE_SECS, FALLBACK_IDLE_SECS);
@@ -161,7 +166,7 @@ type PersistedWatches = HashMap<WatchKey, PersistedWatch>;
 
 pub fn load_watches() -> HashMap<WatchKey, WatchEntry> {
     let persisted: PersistedWatches =
-        load_json(state_dir().join("watches.json")).unwrap_or_default();
+        load_json(&state_dir().join("watches.json")).unwrap_or_default();
     persisted
         .into_iter()
         .map(|(k, v)| (k, WatchEntry::from_persisted(v)))
@@ -490,9 +495,8 @@ impl Poller {
                 last_rate_limit_refresh = Some(Instant::now());
             }
 
-            let has_active = match self.read_active_state().await {
-                Some(active) => active,
-                None => return,
+            let Some(has_active) = self.read_active_state().await else {
+                return;
             };
 
             let pcfg = self.read_config(&repo).await;
@@ -524,12 +528,11 @@ impl Poller {
 
     async fn read_active_state(&self) -> Option<bool> {
         let w = self.watches.lock().await;
-        match w.get(&self.key) {
-            Some(entry) => Some(entry.has_active_runs()),
-            None => {
-                tracing::info!(key = %self.key, "Watch cancelled");
-                None
-            }
+        if let Some(entry) = w.get(&self.key) {
+            Some(entry.has_active_runs())
+        } else {
+            tracing::info!(key = %self.key, "Watch cancelled");
+            None
         }
     }
 
@@ -553,7 +556,7 @@ impl Poller {
         let run_ids: Vec<u64> = {
             let w = self.watches.lock().await;
             match w.get(&self.key) {
-                Some(entry) => entry.active_runs.keys().cloned().collect(),
+                Some(entry) => entry.active_runs.keys().copied().collect(),
                 None => return,
             }
         };
@@ -590,10 +593,10 @@ impl Poller {
                         .map(|a| a.started_at.elapsed())
                 };
 
-                let failing_steps = if !run.succeeded() {
-                    gh_failing_steps(repo, run.id).await
-                } else {
+                let failing_steps = if run.succeeded() {
                     None
+                } else {
+                    gh_failing_steps(repo, run.id).await
                 };
 
                 if self.is_active().await {
@@ -676,10 +679,10 @@ impl Poller {
             self.events.emit(WatchEvent::RunStarted(snapshot.clone()));
 
             if run.is_completed() {
-                let failing_steps = if !run.succeeded() {
-                    gh_failing_steps(repo, run.id).await
-                } else {
+                let failing_steps = if run.succeeded() {
                     None
+                } else {
+                    gh_failing_steps(repo, run.id).await
                 };
                 self.events.emit(WatchEvent::RunCompleted {
                     run: snapshot,
@@ -1279,7 +1282,7 @@ mod tests {
         let rl = make_rate_limit(0, 5000, 3600);
         let (active, idle) = compute_intervals(Some(&rl), 1);
         // Both should be approximately seconds_until_reset (±1s for timing)
-        assert!(active >= 3599 && active <= 3601, "active={active}");
+        assert!((3599..=3601).contains(&active), "active={active}");
         assert_eq!(active, idle);
     }
 

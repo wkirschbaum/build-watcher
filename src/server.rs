@@ -1,3 +1,6 @@
+use std::fmt::Write as _;
+use std::sync::Arc;
+
 use anyhow::Result;
 use rmcp::handler::server::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -27,14 +30,14 @@ async fn bind_with_fallback(preferred: u16) -> Result<tokio::net::TcpListener> {
     for port in preferred..=preferred.saturating_add(9) {
         match tokio::net::TcpListener::bind(format!("127.0.0.1:{port}")).await {
             Ok(l) => return Ok(l),
-            Err(_) if port < preferred.saturating_add(9) => continue,
+            Err(_) if port < preferred.saturating_add(9) => {}
             Err(e) => return Err(e.into()),
         }
     }
     unreachable!()
 }
 
-/// Build the axum router with the MCP StreamableHttpService.
+/// Build the axum router with the MCP `StreamableHttpService`.
 fn build_router(
     watches: Watches,
     config: SharedConfig,
@@ -62,7 +65,7 @@ fn build_router(
                     rate_limit.clone(),
                 ))
             },
-            Default::default(),
+            Arc::default(),
             http_config,
         );
 
@@ -188,14 +191,14 @@ struct StopWatchesParams {
 struct ConfigureBranchesParams {
     /// GitHub repo in "owner/repo" format
     repo: String,
-    /// Branches to watch for this repo (e.g. ["main", "develop"])
+    /// Branches to watch for this repo (e.g. `["main", "develop"]`)
     #[serde(deserialize_with = "deserialize_string_or_vec")]
     branches: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct SetDefaultBranchesParams {
-    /// Default branches to watch when no per-repo config exists (e.g. ["main"])
+    /// Default branches to watch when no per-repo config exists (e.g. `["main"]`)
     #[serde(deserialize_with = "deserialize_string_or_vec")]
     branches: Vec<String>,
 }
@@ -218,14 +221,14 @@ struct ConfigureNotificationsParams {
 struct ConfigureWorkflowsParams {
     /// GitHub repo in "owner/repo" format
     repo: String,
-    /// Workflow names to watch (e.g. ["CI", "Deploy"]). Empty list means all workflows.
+    /// Workflow names to watch (e.g. `["CI", "Deploy"]`). Empty list means all workflows.
     #[serde(deserialize_with = "deserialize_string_or_vec")]
     workflows: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct IgnoreWorkflowsParams {
-    /// Workflow names to ignore globally (e.g. ["Semgrep", "Dependabot"])
+    /// Workflow names to ignore globally (e.g. `["Semgrep", "Dependabot"]`)
     #[serde(deserialize_with = "deserialize_string_or_vec")]
     workflows: Vec<String>,
 }
@@ -688,7 +691,7 @@ impl BuildWatcher {
                 params.repo
             ))]));
         };
-        rc.workflows = params.workflows.clone();
+        rc.workflows.clone_from(&params.workflows);
         let mut msg = if params.workflows.is_empty() {
             format!("{}: watching all workflows", params.repo)
         } else {
@@ -872,14 +875,15 @@ impl BuildWatcher {
                 if !msg.is_empty() {
                     msg.push('\n');
                 }
-                msg.push_str(&format!(
+                let _ = write!(
+                    msg,
                     "Sound file: {}",
                     config
                         .sound_on_failure
                         .sound_file
                         .as_deref()
                         .unwrap_or("(system default)")
-                ));
+                );
             }
         }
 
@@ -1024,12 +1028,10 @@ impl BuildWatcher {
         for entry in &entries {
             let duration = entry
                 .duration_secs()
-                .map(format::seconds)
-                .unwrap_or_else(|| "—".to_string());
+                .map_or_else(|| "—".to_string(), format::seconds);
             let age = entry
                 .age_secs()
-                .map(format::age)
-                .unwrap_or_else(|| "—".to_string());
+                .map_or_else(|| "—".to_string(), format::age);
             let title = entry.display_title();
 
             if show_branch {
@@ -1181,7 +1183,7 @@ impl ServerHandler for BuildWatcher {
 
 use crate::format;
 
-/// Apply notification level params to a global NotificationConfig (sets values directly).
+/// Apply notification level params to a global `NotificationConfig` (sets values directly).
 fn apply_notification_levels(
     notif: &mut crate::config::NotificationConfig,
     params: &ConfigureNotificationsParams,

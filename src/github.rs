@@ -72,7 +72,7 @@ pub struct LastBuild {
 }
 
 impl LastBuild {
-    /// Human-friendly title: "PR: <title>" for pull_request events, else "<title> <sha>".
+    /// Human-friendly title: "PR: <title>" for `pull_request` events, else "<title> <sha>".
     pub fn display_title(&self) -> String {
         display_title(&self.event, &self.title, &self.head_sha)
     }
@@ -138,7 +138,7 @@ impl RunInfo {
         short_sha(&self.head_sha)
     }
 
-    /// Human-friendly title: "PR: <title>" for pull_request events, else "<title> <sha>".
+    /// Human-friendly title: "PR: <title>" for `pull_request` events, else "<title> <sha>".
     pub fn display_title(&self) -> String {
         display_title(&self.event, &self.title, &self.head_sha)
     }
@@ -221,7 +221,7 @@ pub async fn gh_run_status(repo: &str, run_id: u64) -> Result<RunInfo, GhError> 
     })
 }
 
-/// Format a human-readable title. PR events (pull_request, pull_request_target)
+/// Format a human-readable title. PR events (`pull_request`, `pull_request_target`)
 /// show "PR: <title>", push events show "<title> (<sha>)".
 pub(crate) fn display_title(event: &str, title: &str, head_sha: &str) -> String {
     if event.starts_with("pull_request") {
@@ -274,8 +274,10 @@ pub async fn gh_failing_steps(repo: &str, run_id: u64) -> Option<String> {
                 .steps
                 .iter()
                 .find(|s| s.conclusion == "failure")
-                .map(|s| format!("{} / {}", job.name, s.name))
-                .unwrap_or_else(|| job.name.clone());
+                .map_or_else(
+                    || job.name.clone(),
+                    |s| format!("{} / {}", job.name, s.name),
+                );
             failures.push(step);
         }
     }
@@ -387,6 +389,8 @@ fn parse_iso_epoch(s: &str) -> Option<u64> {
         30,
         31,
     ];
+    #[allow(clippy::cast_possible_truncation)]
+    // month is validated 1-12, value fits usize on all targets
     for md in &month_days[..((month - 1) as usize)] {
         days += md;
     }

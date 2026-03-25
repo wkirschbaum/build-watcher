@@ -75,12 +75,12 @@ pub async fn play_sound(path: Option<&str>) {
     notifier().play_sound(path).await;
 }
 
-/// Default state directory when STATE_DIRECTORY is not set.
+/// Default state directory when `STATE_DIRECTORY` is not set.
 pub fn default_state_dir() -> String {
     imp::default_state_dir()
 }
 
-/// Default config directory when CONFIGURATION_DIRECTORY is not set.
+/// Default config directory when `CONFIGURATION_DIRECTORY` is not set.
 pub fn default_config_dir() -> String {
     imp::default_config_dir()
 }

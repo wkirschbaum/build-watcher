@@ -70,7 +70,10 @@ impl Notifier for NotifySend {
         ];
 
         {
-            let ids = self.ids.lock().unwrap_or_else(|e| e.into_inner());
+            let ids = self
+                .ids
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(&id) = ids.get(&key) {
                 args.push("--replace-id".to_string());
                 args.push(id.to_string());
@@ -114,7 +117,7 @@ impl Notifier for NotifySend {
                 Ok(Some(line)) => {
                     if let Ok(id) = line.trim().parse::<u32>() {
                         ids.lock()
-                            .unwrap_or_else(|e| e.into_inner())
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
                             .insert(key, id);
                     } else {
                         tracing::debug!("notify-send returned non-numeric ID: {line:?}");

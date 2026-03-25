@@ -50,15 +50,15 @@ pub fn config_dir() -> &'static Path {
 //
 // On load, we transparently fall back to .bak if the primary is missing or corrupt.
 
-pub fn load_json<T: serde::de::DeserializeOwned>(path: PathBuf) -> Option<T> {
-    if let Some(val) = try_parse_file::<T>(&path) {
+pub fn load_json<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
+    if let Some(val) = try_parse_file::<T>(path) {
         return Some(val);
     }
 
     let bak = path.with_extension("json.bak");
     if let Some(val) = try_parse_file::<T>(&bak) {
         tracing::warn!("Primary {} corrupt, recovered from backup", path.display());
-        let _ = std::fs::copy(&bak, &path);
+        let _ = std::fs::copy(&bak, path);
         return Some(val);
     }
 
@@ -161,6 +161,7 @@ impl std::fmt::Display for NotificationLevel {
 
 /// Per-event notification levels.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(clippy::struct_field_names)] // `build_` prefix is intentional domain naming
 pub struct NotificationConfig {
     #[serde(default = "default_normal")]
     pub build_started: NotificationLevel,
@@ -172,6 +173,7 @@ pub struct NotificationConfig {
 
 /// Optional per-event notification overrides. `None` means inherit from parent.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[allow(clippy::struct_field_names)] // `build_` prefix is intentional domain naming
 pub struct NotificationOverrides {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build_started: Option<NotificationLevel>,
@@ -307,16 +309,14 @@ impl Config {
         self.repos
             .get(repo)
             .filter(|r| !r.workflows.is_empty())
-            .map(|r| r.workflows.as_slice())
-            .unwrap_or(&[])
+            .map_or(&[], |r| r.workflows.as_slice())
     }
 
     pub fn branches_for(&self, repo: &str) -> &[String] {
         self.repos
             .get(repo)
             .filter(|r| !r.branches.is_empty())
-            .map(|r| r.branches.as_slice())
-            .unwrap_or(&self.default_branches)
+            .map_or(&self.default_branches, |r| r.branches.as_slice())
     }
 
     pub fn watched_repos(&self) -> Vec<&String> {
@@ -444,7 +444,7 @@ mod tests {
         );
 
         save_json(path.clone(), &config).unwrap();
-        let loaded: Config = load_json(path.clone()).unwrap();
+        let loaded: Config = load_json(&path).unwrap();
         assert_eq!(loaded.repos.len(), 1);
         assert_eq!(
             loaded.repos["alice/app"].branches,
@@ -467,7 +467,7 @@ mod tests {
         // Write corrupt primary
         std::fs::write(&path, "not json").unwrap();
 
-        let loaded: Config = load_json(path).unwrap();
+        let loaded: Config = load_json(&path).unwrap();
         assert_eq!(loaded.default_branches, vec!["main".to_string()]);
 
         std::fs::remove_dir_all(&dir).ok();

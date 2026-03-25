@@ -1,3 +1,4 @@
+use std::fmt::Write as _;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -65,7 +66,7 @@ pub enum WatchEvent {
         failing_steps: Option<String>,
     },
 
-    /// A build's status changed (e.g. queued -> in_progress).
+    /// A build's status changed (e.g. queued -> `in_progress`).
     StatusChanged {
         run: RunSnapshot,
         from: String,
@@ -134,7 +135,7 @@ async fn handle_notification(event: WatchEvent, config: &Arc<Mutex<config::Confi
             };
             let group = run.notification_group();
             platform::send_notification(
-                &format!("🔨 {} - started", run.workflow),
+                &format!("🔨 {} / {} - started", run.repo, run.workflow),
                 &format!("[{}] {}", run.branch, run.display_title()),
                 level,
                 Some(&run.url()),
@@ -167,15 +168,15 @@ async fn handle_notification(event: WatchEvent, config: &Arc<Mutex<config::Confi
             let emoji = if succeeded { "✅" } else { "❌" };
             let mut body = format!("[{}] {}", run.branch, run.display_title());
             if let Some(d) = elapsed {
-                body.push_str(&format!(" in {}", format::duration(d)));
+                let _ = write!(body, " in {}", format::duration(d));
             }
             if let Some(steps) = &failing_steps {
-                body.push_str(&format!("\nFailed: {steps}"));
+                let _ = write!(body, "\nFailed: {steps}");
             }
 
             let group = run.notification_group();
             platform::send_notification(
-                &format!("{emoji} {} - {conclusion}", run.workflow),
+                &format!("{emoji} {} / {} - {conclusion}", run.repo, run.workflow),
                 &body,
                 level,
                 Some(&run.url()),

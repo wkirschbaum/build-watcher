@@ -63,7 +63,10 @@ impl Notifier for DbusNotifier {
         let display_body = format_body(body);
 
         let replace_id = {
-            let ids = self.ids.lock().unwrap_or_else(|e| e.into_inner());
+            let ids = self
+                .ids
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             ids.get(&key).copied()
         };
 
@@ -105,7 +108,7 @@ impl Notifier for DbusNotifier {
                 Ok(Ok(handle)) => {
                     let new_id = handle.id();
                     ids.lock()
-                        .unwrap_or_else(|e| e.into_inner())
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .insert(key, new_id);
 
                     // Handle action clicks in background
