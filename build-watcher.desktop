@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Build Watcher
+Comment=GitHub Actions build monitor with desktop notifications
+Icon=emblem-synchronizing
+Exec=build-watcher
+NoDisplay=true
+Categories=Development;

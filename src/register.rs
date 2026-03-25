@@ -1,13 +1,13 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 /// Register build-watcher as an MCP server in Claude Code config files.
 ///
 /// - Adds the MCP server entry to `~/.claude.json`
 /// - Adds `mcp__build-watcher__*` to the allow list in `~/.claude/settings.json`
 pub fn register(port: u16) -> Result<()> {
-    let home = std::env::var("HOME").context("HOME not set")?;
+    let home = std::env::var("HOME")?;
 
     register_mcp_server(&home, port)?;
     register_permissions(&home)?;
@@ -21,8 +21,8 @@ fn register_mcp_server(home: &str, port: u16) -> Result<()> {
 
     let mut config: serde_json::Map<String, serde_json::Value> = if path.exists() {
         let data = std::fs::read_to_string(&path)
-            .with_context(|| format!("reading {}", path.display()))?;
-        serde_json::from_str(&data).with_context(|| format!("parsing {}", path.display()))?
+            .map_err(|e| format!("reading {}: {e}", path.display()))?;
+        serde_json::from_str(&data).map_err(|e| format!("parsing {}: {e}", path.display()))?
     } else {
         serde_json::Map::new()
     };
@@ -51,9 +51,9 @@ fn register_permissions(home: &str) -> Result<()> {
     }
 
     let data =
-        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+        std::fs::read_to_string(&path).map_err(|e| format!("reading {}: {e}", path.display()))?;
     let mut settings: serde_json::Map<String, serde_json::Value> =
-        serde_json::from_str(&data).with_context(|| format!("parsing {}", path.display()))?;
+        serde_json::from_str(&data).map_err(|e| format!("parsing {}: {e}", path.display()))?;
 
     let perms = settings
         .entry("permissions")
@@ -78,7 +78,7 @@ fn register_permissions(home: &str) -> Result<()> {
     Ok(())
 }
 
-fn write_json<T: serde::Serialize>(path: &PathBuf, value: &T) -> Result<()> {
+fn write_json<T: serde::Serialize>(path: &Path, value: &T) -> Result<()> {
     let data = serde_json::to_string_pretty(value)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;

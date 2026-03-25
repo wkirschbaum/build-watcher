@@ -106,13 +106,18 @@ pub async fn run_notification_handler(
     loop {
         match rx.recv().await {
             Ok(event) => {
-                let cfg = config.lock().await;
-                let level = effective_level(&event, &cfg);
-                let suppressed = level == config::NotificationLevel::Off
-                    || (level != config::NotificationLevel::Critical
-                        && (is_paused(&pause).await || cfg.is_in_quiet_hours()));
-                if !suppressed {
-                    handle_notification(event, &cfg).await;
+                // Extract what we need from config and drop the lock before
+                // dispatching the notification (which performs async I/O).
+                let cfg_snapshot = {
+                    let cfg = config.lock().await;
+                    let level = effective_level(&event, &cfg);
+                    let suppressed = level == config::NotificationLevel::Off
+                        || (level != config::NotificationLevel::Critical
+                            && (is_paused(&pause).await || cfg.is_in_quiet_hours()));
+                    if suppressed { None } else { Some(cfg.clone()) }
+                };
+                if let Some(cfg) = &cfg_snapshot {
+                    handle_notification(event, cfg).await;
                 }
             }
             Err(broadcast::error::RecvError::Lagged(n)) => {

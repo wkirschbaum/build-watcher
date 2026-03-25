@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use anyhow::Result;
+type AnyResult<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 use rmcp::handler::server::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, Content, Implementation, ServerCapabilities, ServerInfo};
@@ -27,7 +27,7 @@ use crate::watcher::{
 pub const DEFAULT_PORT: u16 = 8417;
 
 /// Bind to the preferred port, trying up to 9 consecutive ports on conflict.
-async fn bind_with_fallback(preferred: u16) -> Result<tokio::net::TcpListener> {
+async fn bind_with_fallback(preferred: u16) -> AnyResult<tokio::net::TcpListener> {
     let last = preferred.saturating_add(9);
     for port in preferred..=last {
         match tokio::net::TcpListener::bind(format!("127.0.0.1:{port}")).await {
@@ -87,7 +87,7 @@ pub async fn serve(
     pause: PauseState,
     rate_limit: RateLimitState,
     ct: CancellationToken,
-) -> Result<()> {
+) -> AnyResult<()> {
     let started_at = std::time::Instant::now();
     let port: u16 = std::env::var("BUILD_WATCHER_PORT")
         .ok()
@@ -822,9 +822,10 @@ impl BuildWatcher {
             });
             config.clone()
         };
-        let msg = persist_config(snapshot)
-            .await
-            .unwrap_or_else(|| format!("Quiet hours set: {start}–{end} (local time)"));
+        let mut msg = format!("Quiet hours set: {start}–{end} (local time)");
+        if let Some(warning) = persist_config(snapshot).await {
+            msg.push_str(&warning);
+        }
         Ok(CallToolResult::success(vec![Content::text(msg)]))
     }
 

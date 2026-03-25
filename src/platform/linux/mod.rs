@@ -1,7 +1,6 @@
 use crate::config::NotificationLevel;
 use crate::platform::Notifier;
 
-mod dbus;
 mod notify_send;
 
 /// Shared notification properties derived from a `NotificationLevel`.
@@ -56,13 +55,7 @@ pub fn default_config_dir() -> String {
 }
 
 pub fn detect() -> Box<dyn Notifier> {
-    match dbus::DbusNotifier::new() {
-        Ok(n) => Box::new(n),
-        Err(e) => {
-            tracing::warn!("D-Bus notifications unavailable ({e}), falling back to notify-send");
-            Box::new(notify_send::NotifySend::new())
-        }
-    }
+    Box::new(notify_send::NotifySend::new())
 }
 
 #[cfg(test)]
@@ -113,8 +106,7 @@ mod tests {
 
     #[test]
     fn detect_returns_a_notifier() {
-        // On CI without D-Bus this falls back to notify-send; either way we get a valid backend.
         let notifier = detect();
-        assert!(notifier.name() == "dbus" || notifier.name() == "notify-send");
+        assert_eq!(notifier.name(), "notify-send");
     }
 }
