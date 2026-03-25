@@ -23,10 +23,10 @@ pub type RateLimitState = Arc<Mutex<Option<RateLimit>>>;
 /// Fastest permitted polling interval when active runs exist.
 pub(crate) const MIN_ACTIVE_SECS: u64 = 1;
 /// Fastest permitted polling interval when no active runs exist.
-pub(crate) const MIN_IDLE_SECS: u64 = 10;
+pub(crate) const MIN_IDLE_SECS: u64 = 11;
 /// Fallback intervals used before the first rate-limit fetch succeeds.
-pub(crate) const FALLBACK_ACTIVE_SECS: u64 = 10;
-pub(crate) const FALLBACK_IDLE_SECS: u64 = 60;
+pub(crate) const FALLBACK_ACTIVE_SECS: u64 = 11;
+pub(crate) const FALLBACK_IDLE_SECS: u64 = 66;
 /// Conservative estimate of GitHub API calls per poll cycle per watcher.
 const CALLS_PER_CYCLE: u64 = 2;
 /// How often each poller refreshes the shared rate limit state.
@@ -36,7 +36,7 @@ const RATE_LIMIT_REFRESH_INTERVAL: Duration = Duration::from_secs(300);
 ///
 /// Strategy:
 /// - No data yet → conservative fallback (10s / 60s).
-/// - More than 50% of the limit remains → run at floor speed (1s / 10s).
+/// - More than 50% of the limit remains → floor speed scaled by watch count.
 /// - Below 50% → throttle: spread the remaining budget evenly across the
 ///   seconds until the window resets, then floor at MIN values.
 ///
@@ -44,14 +44,21 @@ const RATE_LIMIT_REFRESH_INTERVAL: Duration = Duration::from_secs(300);
 /// at full speed for the first half of the window, then gradually backs off
 /// so the remaining budget lasts exactly to the reset. This avoids both
 /// over-throttling early and hitting the hard cap near the end of a window.
+///
+/// Above 50%, each poller sleeps `MIN_*_SECS × num_watches` so the aggregate
+/// API call rate stays constant regardless of how many repos are watched.
 pub(crate) fn compute_intervals(rate_limit: Option<&RateLimit>, num_watches: usize) -> (u64, u64) {
     let Some(rl) = rate_limit else {
         return (FALLBACK_ACTIVE_SECS, FALLBACK_IDLE_SECS);
     };
 
-    // Above 50%: no throttling needed.
+    // Above 50%: scale floor intervals by watch count so the aggregate API call
+    // rate stays constant (≈ 1/MIN_ACTIVE_SECS calls/sec total) regardless of
+    // how many repos are watched. With N watchers each sleeping N× longer, the
+    // per-second total stays the same whether there are 1 or 20 repos.
     if rl.remaining * 2 > rl.limit {
-        return (MIN_ACTIVE_SECS, MIN_IDLE_SECS);
+        let n = num_watches.max(1) as u64;
+        return (MIN_ACTIVE_SECS * n, MIN_IDLE_SECS * n);
     }
 
     let now = std::time::SystemTime::now()
@@ -1236,12 +1243,23 @@ mod tests {
     }
 
     #[test]
-    fn compute_intervals_above_threshold_returns_floors() {
-        // 3000/5000 remaining = 60% — above 50%, no throttling
-        let rl = make_rate_limit(3000, 5000, 3600);
+    fn compute_intervals_above_threshold_scales_with_watch_count() {
+        let rl = make_rate_limit(3000, 5000, 3600); // 60% remaining — above 50%
+
+        // 1 watch: bare floor
         let (active, idle) = compute_intervals(Some(&rl), 1);
         assert_eq!(active, MIN_ACTIVE_SECS);
         assert_eq!(idle, MIN_IDLE_SECS);
+
+        // 3 watches: each poller sleeps 3× longer so aggregate rate stays constant
+        let (active, idle) = compute_intervals(Some(&rl), 3);
+        assert_eq!(active, MIN_ACTIVE_SECS * 3);
+        assert_eq!(idle, MIN_IDLE_SECS * 3);
+
+        // 10 watches
+        let (active, idle) = compute_intervals(Some(&rl), 10);
+        assert_eq!(active, MIN_ACTIVE_SECS * 10);
+        assert_eq!(idle, MIN_IDLE_SECS * 10);
     }
 
     #[test]
@@ -1249,11 +1267,11 @@ mod tests {
         // Exactly 50%: remaining * 2 == limit, so NOT above threshold → throttle
         // 2500 remaining, 1 watch, 3600s until reset
         // rate_limited = (1 * 2 * 3600) / 2500 = 7200 / 2500 = 2s
-        // active = max(1, 2) = 2s, idle = max(10, 2) = 10s
+        // active = max(1, 2) = 2s, idle = max(11, 2) = 11s
         let rl = make_rate_limit(2500, 5000, 3600);
         let (active, idle) = compute_intervals(Some(&rl), 1);
         assert_eq!(active, 2);
-        assert_eq!(idle, 10);
+        assert_eq!(idle, 11);
     }
 
     #[test]
