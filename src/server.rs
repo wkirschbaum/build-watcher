@@ -21,7 +21,8 @@ use crate::format;
 use crate::github::{gh_run_list_history, gh_run_rerun, validate_branch, validate_repo};
 use crate::watcher::{
     MIN_ACTIVE_SECS, MIN_IDLE_SECS, PauseState, RateLimitState, SharedConfig, WatchKey,
-    WatcherHandle, Watches, compute_intervals, last_failed_build, save_watches, start_watch,
+    WatcherHandle, Watches, compute_intervals, count_api_calls, last_failed_build, save_watches,
+    start_watch,
 };
 
 const DEFAULT_PORT: u16 = 8417;
@@ -593,8 +594,10 @@ impl BuildWatcher {
         // (pollers lock in the same order: rate_limit → watches → config).
         let (active_secs, idle_secs, rate_limit_line) = {
             let rl = self.rate_limit.lock().await;
-            let num_watches = self.watches.lock().await.len();
-            let (active, idle) = compute_intervals(rl.as_ref(), num_watches);
+            let w = self.watches.lock().await;
+            let api_calls = count_api_calls(&w);
+            drop(w);
+            let (active, idle) = compute_intervals(rl.as_ref(), api_calls);
             let line = format_rate_limit_line(rl.as_ref(), active, idle);
             (active, idle, line)
         };
@@ -709,13 +712,16 @@ impl BuildWatcher {
     async fn get_stats(&self) -> Result<CallToolResult, McpError> {
         // Lock order: rate_limit → watches → pause → config (matches poller order).
         let rl = self.rate_limit.lock().await;
-        let watches_snap: Vec<(String, usize)> = {
+        let (watches_snap, api_calls) = {
             let w = self.watches.lock().await;
-            w.iter()
+            let snap: Vec<(String, usize)> = w
+                .iter()
                 .map(|(k, e)| (k.to_string(), e.active_runs.len()))
-                .collect()
+                .collect();
+            let calls = count_api_calls(&w);
+            (snap, calls)
         };
-        let (active_secs, idle_secs) = compute_intervals(rl.as_ref(), watches_snap.len());
+        let (active_secs, idle_secs) = compute_intervals(rl.as_ref(), api_calls);
         let throttled = active_secs > MIN_ACTIVE_SECS || idle_secs > MIN_IDLE_SECS;
 
         let paused = {

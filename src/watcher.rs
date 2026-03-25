@@ -21,44 +21,58 @@ pub type PauseState = Arc<Mutex<Option<Instant>>>;
 pub type RateLimitState = Arc<Mutex<Option<RateLimit>>>;
 
 /// Fastest permitted polling interval when active runs exist.
-pub(crate) const MIN_ACTIVE_SECS: u64 = 1;
+pub(crate) const MIN_ACTIVE_SECS: u64 = 15;
 /// Fastest permitted polling interval when no active runs exist.
-pub(crate) const MIN_IDLE_SECS: u64 = 10;
+pub(crate) const MIN_IDLE_SECS: u64 = 60;
 /// Fallback intervals used before the first rate-limit fetch succeeds.
-pub(crate) const FALLBACK_ACTIVE_SECS: u64 = 10;
-pub(crate) const FALLBACK_IDLE_SECS: u64 = 60;
-/// Conservative estimate of GitHub API calls per poll cycle per watcher.
-const CALLS_PER_CYCLE: u64 = 2;
+pub(crate) const FALLBACK_ACTIVE_SECS: u64 = 30;
+pub(crate) const FALLBACK_IDLE_SECS: u64 = 120;
 /// How often each poller refreshes the shared rate limit state.
 const RATE_LIMIT_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
+/// Count the expected API calls per poll cycle across all watches.
+///
+/// Each watch makes 1 `gh run list` call per idle cycle to check for new runs.
+/// Each active run adds 1 `gh run view` call per active cycle.
+/// This gives the rate limiter an accurate picture of actual API consumption.
+pub(crate) fn count_api_calls(watches: &HashMap<WatchKey, WatchEntry>) -> u64 {
+    let base_calls = watches.len().max(1) as u64; // 1 gh run list per watch
+    let active_run_calls: u64 = watches.values().map(|e| e.active_runs.len() as u64).sum();
+    base_calls + active_run_calls
+}
+
 /// Compute dynamic polling intervals based on the current GitHub rate limit.
 ///
+/// `api_calls_per_cycle` is the total expected GitHub API calls per poll cycle
+/// across all watches (from `count_api_calls`). This accounts for both the
+/// base `gh run list` call per watch and the `gh run view` call per active run.
+///
 /// Strategy:
-/// - No data yet → conservative fallback (10s / 60s).
-/// - More than 50% of the limit remains → floor speed scaled by watch count.
+/// - No data yet → conservative fallback.
+/// - More than 50% of the limit remains → floor speed scaled by call count.
 /// - Below 50% → throttle: spread the remaining budget evenly across the
 ///   seconds until the window resets, then floor at MIN values.
 ///
 /// The 50% threshold gives a comfortable safety margin: it lets polling run
 /// at full speed for the first half of the window, then gradually backs off
-/// so the remaining budget lasts exactly to the reset. This avoids both
-/// over-throttling early and hitting the hard cap near the end of a window.
+/// so the remaining budget lasts exactly to the reset.
 ///
-/// Above 50%, floor intervals scale as `MIN_*_SECS × (ilog2(num_watches) + 1)`
+/// Above 50%, floor intervals scale as `MIN_*_SECS × (ilog2(calls) + 1)`
 /// — logarithmic growth keeps single-repo latency low while gently slowing
-/// things down as the watch count grows.
-pub(crate) fn compute_intervals(rate_limit: Option<&RateLimit>, num_watches: usize) -> (u64, u64) {
+/// things down as the call count grows.
+pub(crate) fn compute_intervals(
+    rate_limit: Option<&RateLimit>,
+    api_calls_per_cycle: u64,
+) -> (u64, u64) {
+    let calls = api_calls_per_cycle.max(1);
     let Some(rl) = rate_limit else {
         return (FALLBACK_ACTIVE_SECS, FALLBACK_IDLE_SECS);
     };
 
-    // Above 50%: scale floor intervals logarithmically with watch count.
-    // Uses ilog2(n)+1 so 1 watch → ×1, 2–3 → ×2, 4–7 → ×3, 8–15 → ×4, …
-    // Growth is gentle enough to stay fast for typical repo counts while
-    // still preventing unbounded API usage with many repos.
+    // Above 50%: scale floor intervals logarithmically with call count.
+    // Uses ilog2(n)+1 so 1 call → ×1, 2–3 → ×2, 4–7 → ×3, 8–15 → ×4, …
     if rl.remaining * 2 > rl.limit {
-        let scale = u64::from((num_watches.max(1) as u64).ilog2()) + 1;
+        let scale = u64::from(calls.ilog2()) + 1;
         return (MIN_ACTIVE_SECS * scale, MIN_IDLE_SECS * scale);
     }
 
@@ -67,11 +81,10 @@ pub(crate) fn compute_intervals(rate_limit: Option<&RateLimit>, num_watches: usi
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let seconds_until_reset = rl.reset.saturating_sub(now).max(1);
-    let total_calls_per_cycle = num_watches.max(1) as u64 * CALLS_PER_CYCLE;
 
-    // Spread remaining budget evenly: min_interval = total_calls * secs / remaining.
+    // Spread remaining budget evenly: min_interval = calls * secs / remaining.
     // checked_div handles remaining == 0 by waiting out the full reset window.
-    let rate_limited_secs = (total_calls_per_cycle * seconds_until_reset)
+    let rate_limited_secs = (calls * seconds_until_reset)
         .checked_div(rl.remaining)
         .unwrap_or(seconds_until_reset);
 
@@ -546,8 +559,11 @@ impl Poller {
 
     async fn read_config(&self, repo: &str) -> PollConfig {
         let rate_limit = self.rate_limit.lock().await.clone();
-        let num_watches = self.watches.lock().await.len();
-        let (active_secs, idle_secs) = compute_intervals(rate_limit.as_ref(), num_watches);
+        let api_calls = {
+            let w = self.watches.lock().await;
+            count_api_calls(&w)
+        };
+        let (active_secs, idle_secs) = compute_intervals(rate_limit.as_ref(), api_calls);
         let cfg = self.config.lock().await;
         PollConfig {
             active_secs,
@@ -1244,20 +1260,20 @@ mod tests {
     }
 
     #[test]
-    fn compute_intervals_above_threshold_scales_with_watch_count() {
+    fn compute_intervals_above_threshold_scales_with_call_count() {
         let rl = make_rate_limit(3000, 5000, 3600); // 60% remaining — above 50%
 
-        // 1 watch: bare floor
+        // 1 api call: bare floor
         let (active, idle) = compute_intervals(Some(&rl), 1);
         assert_eq!(active, MIN_ACTIVE_SECS);
         assert_eq!(idle, MIN_IDLE_SECS);
 
-        // 3 watches: ilog2(3)+1 = 2
+        // 3 api calls: ilog2(3)+1 = 2
         let (active, idle) = compute_intervals(Some(&rl), 3);
         assert_eq!(active, MIN_ACTIVE_SECS * 2);
         assert_eq!(idle, MIN_IDLE_SECS * 2);
 
-        // 10 watches: ilog2(10)+1 = 4
+        // 10 api calls: ilog2(10)+1 = 4
         let (active, idle) = compute_intervals(Some(&rl), 10);
         assert_eq!(active, MIN_ACTIVE_SECS * 4);
         assert_eq!(idle, MIN_IDLE_SECS * 4);
@@ -1266,32 +1282,32 @@ mod tests {
     #[test]
     fn compute_intervals_at_threshold_throttles() {
         // Exactly 50%: remaining * 2 == limit, so NOT above threshold → throttle
-        // 2500 remaining, 1 watch, 3600s until reset
-        // rate_limited = (1 * 2 * 3600) / 2500 = 7200 / 2500 = 2s
-        // active = max(1, 2) = 2s, idle = max(10, 2) = 10s
+        // 2500 remaining, 1 api call, 3600s until reset
+        // rate_limited = (1 * 3600) / 2500 = 1s
+        // active = max(15, 1) = 15s, idle = max(60, 1) = 60s
         let rl = make_rate_limit(2500, 5000, 3600);
         let (active, idle) = compute_intervals(Some(&rl), 1);
-        assert_eq!(active, 2);
-        assert_eq!(idle, 10);
+        assert_eq!(active, 15);
+        assert_eq!(idle, 60);
     }
 
     #[test]
     fn compute_intervals_low_remaining_throttles() {
-        // 500/5000 = 10% remaining, 1 watch, 3600s until reset
-        // rate_limited = (2 * 3600) / 500 = 7200 / 500 = 14s
-        // active = max(1, 14) = 14s, idle = max(10, 14) = 14s
+        // 500/5000 = 10% remaining, 1 api call, 3600s until reset
+        // rate_limited = (1 * 3600) / 500 = 7s
+        // active = max(15, 7) = 15s, idle = max(60, 7) = 60s
         let rl = make_rate_limit(500, 5000, 3600);
         let (active, idle) = compute_intervals(Some(&rl), 1);
-        assert_eq!(active, 14);
-        assert_eq!(idle, 14);
+        assert_eq!(active, 15);
+        assert_eq!(idle, 60);
     }
 
     #[test]
-    fn compute_intervals_scales_with_watch_count() {
-        // 500/5000 remaining, 5 watches, 3600s until reset
-        // rate_limited = (5 * 2 * 3600) / 500 = 36000 / 500 = 72s
+    fn compute_intervals_scales_with_call_count() {
+        // 500/5000 remaining, 10 api calls (e.g. 5 watches + 5 active runs), 3600s
+        // rate_limited = (10 * 3600) / 500 = 72s
         let rl = make_rate_limit(500, 5000, 3600);
-        let (active, idle) = compute_intervals(Some(&rl), 5);
+        let (active, idle) = compute_intervals(Some(&rl), 10);
         assert_eq!(active, 72);
         assert_eq!(idle, 72);
     }
@@ -1306,11 +1322,38 @@ mod tests {
     }
 
     #[test]
-    fn compute_intervals_zero_watches_treated_as_one() {
+    fn compute_intervals_zero_calls_treated_as_one() {
         let rl = make_rate_limit(500, 5000, 3600);
         let (a0, i0) = compute_intervals(Some(&rl), 0);
         let (a1, i1) = compute_intervals(Some(&rl), 1);
         assert_eq!(a0, a1);
         assert_eq!(i0, i1);
+    }
+
+    #[test]
+    fn count_api_calls_reflects_active_runs() {
+        let mut watches = HashMap::new();
+        // 2 watches, one with 3 active runs, one idle
+        let mut active_runs = HashMap::new();
+        for id in 1..=3 {
+            active_runs.insert(id, make_active("in_progress"));
+        }
+        let entry1 = WatchEntry {
+            last_seen_run_id: 100,
+            active_runs,
+            failure_counts: HashMap::new(),
+            last_build: None,
+        };
+        let entry2 = WatchEntry {
+            last_seen_run_id: 100,
+            active_runs: HashMap::new(),
+            failure_counts: HashMap::new(),
+            last_build: None,
+        };
+        watches.insert(WatchKey::new("owner/repo1", "main"), entry1);
+        watches.insert(WatchKey::new("owner/repo2", "main"), entry2);
+
+        // 2 base calls (one per watch) + 3 active run calls = 5
+        assert_eq!(count_api_calls(&watches), 5);
     }
 }
