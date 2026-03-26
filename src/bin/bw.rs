@@ -577,8 +577,7 @@ async fn stream_sse(
         };
         buf.push_str(&String::from_utf8_lossy(&bytes));
 
-        loop {
-            let Some(pos) = buf.find('\n') else { break };
+        while let Some(pos) = buf.find('\n') {
             let line = buf[..pos].trim_end_matches('\r').to_string();
             buf.drain(..=pos);
 
