@@ -19,6 +19,7 @@ A background daemon that monitors GitHub Actions builds and sends desktop notifi
 - Tracks multiple concurrent builds on the same branch
 - Configurable notification urgency per event, per repo, or per branch
 - Dynamic rate-limit-aware polling — speeds up when quota is plentiful, backs off as it depletes (minimum 15s active, 60s idle)
+- **Live TUI dashboard** (`bw`) — top-like terminal UI with real-time SSE updates, row selection, rerun/open/pause actions
 
 ## Requirements
 
@@ -70,6 +71,28 @@ Or call the MCP tools directly:
 | `rerun_build` | Rerun a failed build (specific ID or last failed) |
 | `build_history` | Show recent builds for a repo with duration and age |
 | `get_stats` | Show live stats (uptime, rate limit, polling, pause state, config path) |
+
+## TUI Dashboard
+
+Run `bw` for a live terminal dashboard:
+
+```sh
+bw
+```
+
+```
+build-watcher — up 2h 15m                    poll 15s/60s  API 4521/5000 (90%)  reset 42m
+7 repos, 3 active
+────────────────────────────────────────────────────────────────────────────────
+REPO                BRANCH    STATUS          WORKFLOW       TITLE              ELAPSED / AGE
+floatpays/benefits  main      ⏳ in_progress  CI             Fix login bug      1m 12s
+floatpays/moneyclub main      ❌ failure      CI             Update deps        3m ago
+wkirschbaum/build…  main      ✅ success      CI             Add TUI            2h ago
+────────────────────────────────────────────────────────────────────────────────
+[↑↓] select  [r] rerun  [o] open  [p] pause notifs  [q] quit
+```
+
+Keybindings: `↑`/`↓`/`j`/`k` navigate, `r` rerun, `o` open in browser, `p` toggle notification pause, `q`/`Ctrl-C` quit.
 
 ## Configuration
 

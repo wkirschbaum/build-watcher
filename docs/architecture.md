@@ -18,8 +18,16 @@ Claude Code ──HTTP/MCP──► server.rs (axum + rmcp)
                                ▼
                           events.rs (broadcast EventBus)
                                │
-                               ▼
-                          platform/ (desktop notifications + sound)
+                      ┌────────┴────────┐
+                      ▼                 ▼
+                 platform/         GET /events (SSE)
+            (desktop notifs)            │
+                                        ▼
+                                   bw TUI (bin/bw.rs)
+                                   ├── GET /status
+                                   ├── GET /stats
+                                   ├── POST /pause
+                                   └── POST /rerun
 ```
 
 ## Source layout
@@ -27,13 +35,17 @@ Claude Code ──HTTP/MCP──► server.rs (axum + rmcp)
 ```
 src/
 ├── main.rs          — entry point, wires up config, watches, event bus, server
-├── server.rs        — MCP tool handlers, BuildWatcher struct, axum router
+├── server.rs        — MCP tool handlers, BuildWatcher struct, axum router, REST endpoints
 ├── watcher.rs       — watch lifecycle, Poller task, state persistence
-├── events.rs        — EventBus (broadcast channel), WatchEvent types, notification handler
+├── events.rs        — EventBus (broadcast channel), WatchEvent types
 ├── config.rs        — Config structs, crash-safe JSON persistence helpers
+├── status.rs        — shared HTTP response types (StatusResponse, StatsResponse)
 ├── format.rs        — duration, age, and truncation formatting
 ├── github.rs        — gh CLI wrappers, RunInfo/HistoryEntry types, input validation
+├── notification.rs  — notification handler, subscribes to EventBus, dispatches to platform
 ├── register.rs      — MCP server registration in ~/.claude.json (--register flag)
+├── bin/
+│   └── bw.rs        — TUI dashboard binary (ratatui + SSE + REST actions)
 └── platform/
     ├── mod.rs       — Notifier trait, global singleton, platform dispatch
     ├── universal/
@@ -60,6 +72,8 @@ src/
 | `RunSnapshot` | `events` | Immutable snapshot of a run's identity, carried by events |
 | `RunInfo` | `github` | A GitHub Actions run parsed from `gh` CLI output |
 | `HistoryEntry` | `github` | A build history entry with timestamps for duration/age |
+| `StatusResponse` | `status` | JSON snapshot of all watches, used by `GET /status` and the TUI |
+| `StatsResponse` | `status` | Daemon stats (uptime, poll intervals, rate limit), used by `GET /stats` |
 | `Notifier` | `platform` | Trait for desktop notification backends |
 
 ## Startup sequence
@@ -140,6 +154,31 @@ The `BuildWatcher` struct implements 10 MCP tools via `rmcp`'s `#[tool]` / `#[to
 Port binding tries the preferred port (default 8417), falling back to up to 9 consecutive ports. The bound port is written to `~/.local/state/build-watcher/port`.
 
 Tool parameters use a custom `deserialize_string_or_vec` deserializer to handle MCP clients that double-encode JSON arrays as strings.
+
+## REST API
+
+Alongside the MCP endpoint, the daemon exposes REST endpoints on the same port for the TUI and other consumers:
+
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `/status` | GET | JSON snapshot of all watches, active runs, and last builds |
+| `/stats` | GET | Daemon stats: uptime, polling intervals, API rate limit |
+| `/events` | GET | SSE stream of `WatchEvent`s (RunStarted, RunCompleted, StatusChanged) |
+| `/pause` | POST | Toggle notification pause (`{"pause": true/false}`) |
+| `/rerun` | POST | Rerun a build (`{"repo": "owner/repo", "run_id": 123}`) |
+
+## TUI dashboard (`bw`)
+
+The `bw` binary (`src/bin/bw.rs`) is a ratatui-based live terminal dashboard. It connects to the daemon's REST API:
+
+- **Real-time updates** via SSE (`GET /events`), with `apply_event` updating local state in-place
+- **Periodic resync** via `GET /status` + `GET /stats` every 30 seconds and on SSE reconnect
+- **Local ticking** of elapsed times and build ages every second between resyncs
+- **Row selection** (`↑`/`↓`/`j`/`k`) with actions: rerun (`r`), open in browser (`o`), pause notifications (`p`)
+- **Responsive layout** with column widths scaling to terminal width
+- **Reconnection** with exponential backoff (1s → 30s), resetting on successful connection
+
+The TUI shares types from the `build_watcher` library crate (`status.rs`, `events.rs`, `format.rs`) but has no dependency on daemon-only code.
 
 ## Graceful shutdown
 

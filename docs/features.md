@@ -97,6 +97,28 @@ Both platforms get the MCP server registered in `~/.claude.json` and permissions
 
 Repo names are validated to match the `owner/repo` format with safe characters (alphanumeric, hyphen, underscore, dot). Branch names are validated similarly. The `#` character is explicitly rejected since it serves as the internal delimiter in watch keys (`repo#branch`). Validation runs before any state mutation or GitHub API call.
 
+## TUI Dashboard (`bw`)
+
+A top-like live terminal dashboard for monitoring all watched builds. Run with `cargo run --bin bw` (or the installed `bw` binary). The TUI connects to the daemon's REST API and SSE stream for real-time updates.
+
+Features:
+- **Live build status table** with colour-coded status, failing steps sub-rows, and elapsed/age columns
+- **Top-like header** showing daemon uptime, polling intervals, and GitHub API rate limit
+- **Row selection** (`↑`/`↓`/`j`/`k`) with actions: rerun build (`r`), open in browser (`o`), toggle notification pause (`p`)
+- **SSE real-time updates** — builds appear and complete instantly without waiting for poll cycles
+- **Responsive columns** that scale to terminal width
+- **Reconnection** with exponential backoff when the daemon connection drops
+
+## REST API
+
+The daemon exposes REST endpoints alongside the MCP server for the TUI and other consumers:
+
+- `GET /status` — JSON snapshot of all watches, active runs, and last builds
+- `GET /stats` — daemon stats (uptime, polling intervals, API rate limit)
+- `GET /events` — SSE stream of typed watch events
+- `POST /pause` — toggle notification pause
+- `POST /rerun` — rerun a build by repo and run ID
+
 ## Graceful Shutdown
 
 On SIGINT (ctrl-c), the server cancels all poller tasks via a `CancellationToken`, waits for in-flight operations to complete via a `TaskTracker`, persists final watch state to disk, removes the port file, and exits cleanly.

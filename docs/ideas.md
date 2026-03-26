@@ -13,16 +13,10 @@ Snooze a specific repo or branch for N minutes without silencing all notificatio
 ### Workflow filtering by event type
 Ignore runs triggered by specific GitHub events (e.g. `schedule`, `dependabot`) globally or per-repo. Reduces noise from automated runs that don't need human attention.
 
-### `bw status` CLI command
-One-shot terminal snapshot of all watched repos and their current build status, without launching the full TUI. Useful for a quick check from any terminal.
-
 ### Author in notifications
 Show the commit author or triggering user in the notification body (e.g. last line: "by Kynan Ware"). **Limitation:** `gh run list --json` does not expose author or actor fields. The data is available via `gh api repos/{owner}/{repo}/actions/runs/{id}` (`head_commit.author.name` and `triggering_actor.login`), but that requires one extra API call per newly detected run — too expensive given rate-limit constraints. Feasible once we track per-run state and can batch the lookup.
 
 ## Medium Effort
-
-### TUI dashboard
-Real-time terminal dashboard (`bw` binary) showing all watched repos, active builds, and last results. Already designed in [docs/tui.md](tui.md).
 
 ### Failure streak alert
 Detect when a branch has failed N times in a row and send a distinct sticky notification (e.g., "main has failed 5 times in a row"). Helps catch broken branches that need attention.
@@ -38,9 +32,6 @@ Single command to watch a curated set of repos (e.g. all repos in a GitHub team)
 
 ### Multi-account support
 Support separate GitHub accounts (personal + work) by routing `gh` CLI calls through per-account configurations. Currently assumes a single authenticated account.
-
-### Health check endpoint
-Expose a `/health` HTTP endpoint returning daemon uptime, watch count, and rate-limit status. Useful for scripting or monitoring the daemon from outside Claude Code.
 
 ## Ambitious
 
