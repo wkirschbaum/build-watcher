@@ -22,6 +22,7 @@ use tokio_stream::StreamExt as _;
 use build_watcher::config::state_dir;
 use build_watcher::events::WatchEvent;
 use build_watcher::format;
+use build_watcher::github::validate_repo;
 use build_watcher::status::{
     ActiveRunView, LastBuildView, StatsResponse, StatusResponse, WatchStatus,
 };
@@ -188,12 +189,16 @@ impl App {
                 let repo = buffer.trim().to_string();
                 self.input_mode = InputMode::Normal;
                 if !repo.is_empty() {
-                    match daemon.watch(&repo).await {
-                        Ok(()) => {
-                            self.set_flash(format!("Watching {repo}"));
-                            self.resync(daemon).await;
+                    if let Err(e) = validate_repo(&repo) {
+                        self.set_flash(e);
+                    } else {
+                        match daemon.watch(&repo).await {
+                            Ok(()) => {
+                                self.set_flash(format!("Watching {repo}"));
+                                self.resync(daemon).await;
+                            }
+                            Err(e) => self.set_flash(e),
                         }
-                        Err(e) => self.set_flash(e),
                     }
                 }
             }

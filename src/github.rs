@@ -57,6 +57,18 @@ pub enum GhError {
     MissingFields { repo: String },
 }
 
+impl GhError {
+    /// Returns `true` if the error indicates the repository does not exist or
+    /// is inaccessible (e.g. deleted, renamed, or private without access).
+    pub fn is_repo_not_found(&self) -> bool {
+        if let GhError::CliError { stderr, .. } = self {
+            stderr.contains("Could not resolve to a Repository") || stderr.contains("Not Found")
+        } else {
+            false
+        }
+    }
+}
+
 /// Summary of the last completed build, persisted across restarts.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LastBuild {
@@ -598,6 +610,34 @@ mod tests {
         assert!(validate_repo("/repo").is_err());
         assert!(validate_repo("owner/").is_err());
         assert!(validate_repo("owner/repo name").is_err());
+    }
+
+    #[test]
+    fn is_repo_not_found_detects_gh_errors() {
+        let not_found = GhError::CliError {
+            repo: "alice/gone".to_string(),
+            stderr: "GraphQL: Could not resolve to a Repository with the name 'alice/gone'."
+                .to_string(),
+        };
+        assert!(not_found.is_repo_not_found());
+
+        let http_404 = GhError::CliError {
+            repo: "alice/gone".to_string(),
+            stderr: "HTTP 404: Not Found".to_string(),
+        };
+        assert!(http_404.is_repo_not_found());
+
+        let transient = GhError::CliError {
+            repo: "alice/app".to_string(),
+            stderr: "HTTP 502: Bad Gateway".to_string(),
+        };
+        assert!(!transient.is_repo_not_found());
+
+        let timeout = GhError::Timeout {
+            repo: "alice/app".to_string(),
+            timeout_secs: 30,
+        };
+        assert!(!timeout.is_repo_not_found());
     }
 
     #[test]

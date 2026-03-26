@@ -606,6 +606,29 @@ impl Poller {
         }
     }
 
+    /// Remove this watch and its config entry when the repo no longer exists.
+    async fn remove_dead_watch(&self, repo: &str) {
+        {
+            let mut w = self.watches.lock().await;
+            let keys: Vec<WatchKey> = w.keys().filter(|k| k.matches_repo(repo)).cloned().collect();
+            for key in &keys {
+                w.remove(key);
+            }
+        }
+        self.persistence
+            .save_watches(&collect_persisted(&self.watches).await)
+            .await;
+
+        let snapshot = {
+            let mut cfg = self.config.lock().await;
+            cfg.repos.remove(repo);
+            cfg.clone()
+        };
+        if let Err(e) = self.persistence.save_config(&snapshot).await {
+            tracing::error!(error = %e, "Failed to save config after removing dead repo");
+        }
+    }
+
     /// Poll all in-progress runs, emit events on completion/status change, handle failures.
     /// The watch lock is released during each GitHub API call (high latency)
     /// and re-acquired for each state update to avoid holding it across awaits.
@@ -708,6 +731,11 @@ impl Poller {
 
         let runs = match self.github.recent_runs(repo, branch).await {
             Ok(r) => r,
+            Err(e) if e.is_repo_not_found() => {
+                tracing::warn!(key = %self.key, error = %e, "Repo not found, removing watch");
+                self.remove_dead_watch(repo).await;
+                return;
+            }
             Err(e) => {
                 tracing::error!(key = %self.key, error = %e, "Failed to check for new runs");
                 return;
