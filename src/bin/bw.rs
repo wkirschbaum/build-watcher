@@ -137,7 +137,7 @@ enum InputMode {
 }
 
 /// Column used for sorting the watch list.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SortColumn {
     Repo,
     Branch,
@@ -226,7 +226,6 @@ impl App {
     /// Spawn a background HTTP action that reports its result via the channel.
     fn spawn_action(
         &mut self,
-        _daemon: &DaemonClient,
         flash: impl Into<String>,
         resync: bool,
         action: impl Future<Output = Result<String, String>> + Send + 'static,
@@ -281,7 +280,7 @@ impl App {
                 }
                 let d = daemon.clone();
                 let repo = input.clone();
-                self.spawn_action(daemon, format!("Adding {input}…"), true, async move {
+                self.spawn_action(format!("Adding {input}…"), true, async move {
                     d.watch(&repo).await.map(|()| format!("Watching {repo}"))
                 });
             }
@@ -303,16 +302,11 @@ impl App {
                 }
                 let d = daemon.clone();
                 let repo_clone = repo.clone();
-                self.spawn_action(
-                    daemon,
-                    format!("Setting branches for {repo}…"),
-                    true,
-                    async move {
-                        d.set_branches(&repo_clone, &branches)
-                            .await
-                            .map(|()| format!("Branches updated for {repo_clone}"))
-                    },
-                );
+                self.spawn_action(format!("Setting branches for {repo}…"), true, async move {
+                    d.set_branches(&repo_clone, &branches)
+                        .await
+                        .map(|()| format!("Branches updated for {repo_clone}"))
+                });
             }
         }
     }
@@ -371,7 +365,7 @@ impl App {
                     let repo = repo.to_string();
                     let d = daemon.clone();
                     let r = repo.clone();
-                    self.spawn_action(daemon, format!("Removing {repo}…"), true, async move {
+                    self.spawn_action(format!("Removing {repo}…"), true, async move {
                         d.unwatch(&r).await.map(|()| format!("Removed {r}"))
                     });
                 }
@@ -384,7 +378,7 @@ impl App {
                     let d = daemon.clone();
                     let r = repo.clone();
                     let v = verb.to_string();
-                    self.spawn_action(daemon, format!("{verb} {repo}…"), true, async move {
+                    self.spawn_action(format!("{verb} {repo}…"), true, async move {
                         d.set_notifications(&r, action)
                             .await
                             .map(|()| format!("{v} {r}"))
@@ -397,7 +391,7 @@ impl App {
                 // Optimistic update — toggle local state immediately.
                 self.status.paused = new_pause;
                 let msg = if new_pause { "Paused" } else { "Resumed" };
-                self.spawn_action(daemon, msg.to_string(), false, async move {
+                self.spawn_action(msg.to_string(), false, async move {
                     d.pause(new_pause)
                         .await
                         .map(|()| if new_pause { "Paused" } else { "Resumed" }.to_string())
@@ -407,7 +401,7 @@ impl App {
                 if let Some((repo, Some(run_id), _)) = selected {
                     let d = daemon.clone();
                     let r = repo.to_string();
-                    self.spawn_action(daemon, format!("Rerunning {run_id}…"), true, async move {
+                    self.spawn_action(format!("Rerunning {run_id}…"), true, async move {
                         d.rerun(&r, run_id)
                             .await
                             .map(|()| format!("Rerun started: {run_id}"))
@@ -420,12 +414,11 @@ impl App {
                 }
             }
             KeyCode::Char('s') => {
-                if self.sort_ascending {
-                    self.sort_ascending = false;
-                } else {
-                    self.sort_column = self.sort_column.next();
-                    self.sort_ascending = true;
-                }
+                self.sort_column = self.sort_column.next();
+                self.sort_ascending = true;
+            }
+            KeyCode::Char('S') => {
+                self.sort_ascending = !self.sort_ascending;
             }
             _ => {}
         }
@@ -594,13 +587,13 @@ fn sorted_watches(
 }
 
 /// Sort key for status: active runs first (by status), then completed (by conclusion).
-fn watch_sort_status(w: &WatchStatus) -> (u8, String) {
+fn watch_sort_status(w: &WatchStatus) -> (u8, &str) {
     if let Some(run) = w.active_runs.first() {
-        (0, run.status.clone())
+        (0, &run.status)
     } else if let Some(b) = &w.last_build {
-        (1, b.conclusion.clone())
+        (1, &b.conclusion)
     } else {
-        (2, String::new())
+        (2, "")
     }
 }
 
@@ -1041,7 +1034,7 @@ fn render_footer(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
             Span::raw(" mute  "),
             Span::styled("[p]", key_style),
             Span::raw(" pause  "),
-            Span::styled("[s]", key_style),
+            Span::styled("[s/S]", key_style),
             Span::raw(" sort  "),
             Span::styled("[q]", key_style),
             Span::raw(" quit"),
@@ -1678,5 +1671,133 @@ mod tests {
 
         let lb = status.watches[0].last_build.as_ref().unwrap();
         assert_eq!(lb.title, "PR: Add feature");
+    }
+
+    // -- SortColumn --
+
+    #[test]
+    fn sort_column_next_cycles_through_all() {
+        let mut col = SortColumn::Repo;
+        let mut seen = vec![col];
+        for _ in 0..SortColumn::ALL.len() {
+            col = col.next();
+            seen.push(col);
+        }
+        // Should cycle back to Repo after going through all columns.
+        assert_eq!(seen.first(), seen.last());
+        assert_eq!(seen.len(), 6);
+    }
+
+    // -- sorted_watches --
+
+    fn watch_with_build(repo: &str, branch: &str, conclusion: &str, age: f64) -> WatchStatus {
+        WatchStatus {
+            repo: repo.to_string(),
+            branch: branch.to_string(),
+            active_runs: vec![],
+            last_build: Some(LastBuildView {
+                run_id: 1,
+                conclusion: conclusion.to_string(),
+                workflow: "CI".to_string(),
+                title: "Fix".to_string(),
+                failing_steps: None,
+                age_secs: Some(age),
+            }),
+            muted: false,
+        }
+    }
+
+    fn watch_with_active(repo: &str, branch: &str, status: &str, elapsed: f64) -> WatchStatus {
+        WatchStatus {
+            repo: repo.to_string(),
+            branch: branch.to_string(),
+            active_runs: vec![ActiveRunView {
+                run_id: 1,
+                status: status.to_string(),
+                workflow: "Deploy".to_string(),
+                title: "Ship".to_string(),
+                event: "push".to_string(),
+                elapsed_secs: Some(elapsed),
+            }],
+            last_build: None,
+            muted: false,
+        }
+    }
+
+    #[test]
+    fn sorted_watches_by_repo() {
+        let watches = vec![
+            watch_with_build("zoo/app", "main", "success", 10.0),
+            watch_with_build("alice/lib", "main", "failure", 20.0),
+        ];
+        let sorted = sorted_watches(&watches, SortColumn::Repo, true);
+        assert_eq!(sorted[0].repo, "alice/lib");
+        assert_eq!(sorted[1].repo, "zoo/app");
+
+        let desc = sorted_watches(&watches, SortColumn::Repo, false);
+        assert_eq!(desc[0].repo, "zoo/app");
+    }
+
+    #[test]
+    fn sorted_watches_by_branch() {
+        let watches = vec![
+            watch_with_build("alice/app", "release", "success", 10.0),
+            watch_with_build("alice/app", "develop", "success", 20.0),
+            watch_with_build("alice/app", "main", "success", 30.0),
+        ];
+        let sorted = sorted_watches(&watches, SortColumn::Branch, true);
+        assert_eq!(sorted[0].branch, "develop");
+        assert_eq!(sorted[1].branch, "main");
+        assert_eq!(sorted[2].branch, "release");
+    }
+
+    #[test]
+    fn sorted_watches_by_status_active_before_completed() {
+        let watches = vec![
+            watch_with_build("alice/app", "main", "success", 10.0),
+            watch_with_active("bob/lib", "main", "in_progress", 5.0),
+            watch("carol/api", "main"),
+        ];
+        let sorted = sorted_watches(&watches, SortColumn::Status, true);
+        // Active (tier 0) < completed (tier 1) < idle (tier 2)
+        assert_eq!(sorted[0].repo, "bob/lib");
+        assert_eq!(sorted[1].repo, "alice/app");
+        assert_eq!(sorted[2].repo, "carol/api");
+    }
+
+    #[test]
+    fn sorted_watches_by_workflow() {
+        let watches = vec![
+            watch_with_build("alice/app", "main", "success", 10.0), // CI
+            watch_with_active("bob/lib", "main", "in_progress", 5.0), // Deploy
+        ];
+        let sorted = sorted_watches(&watches, SortColumn::Workflow, true);
+        assert_eq!(sorted[0].repo, "alice/app"); // CI < Deploy
+        assert_eq!(sorted[1].repo, "bob/lib");
+    }
+
+    #[test]
+    fn sorted_watches_by_age() {
+        let watches = vec![
+            watch_with_build("alice/app", "main", "success", 100.0),
+            watch_with_build("bob/lib", "main", "failure", 10.0),
+            watch_with_active("carol/api", "main", "in_progress", 5.0),
+        ];
+        let sorted = sorted_watches(&watches, SortColumn::Age, true);
+        assert_eq!(sorted[0].repo, "carol/api"); // 5s elapsed
+        assert_eq!(sorted[1].repo, "bob/lib"); // 10s age
+        assert_eq!(sorted[2].repo, "alice/app"); // 100s age
+    }
+
+    #[test]
+    fn sorted_watches_descending_reverses() {
+        let watches = vec![
+            watch_with_build("alice/app", "main", "success", 10.0),
+            watch_with_build("bob/lib", "main", "failure", 100.0),
+        ];
+        let asc = sorted_watches(&watches, SortColumn::Age, true);
+        let desc = sorted_watches(&watches, SortColumn::Age, false);
+        assert_eq!(asc[0].repo, "alice/app");
+        assert_eq!(desc[0].repo, "bob/lib");
     }
 }
