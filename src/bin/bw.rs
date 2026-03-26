@@ -136,6 +136,41 @@ enum InputMode {
     },
 }
 
+/// How to group rows in the watch list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GroupBy {
+    Org,
+    Branch,
+    Workflow,
+    Status,
+    None,
+}
+
+impl GroupBy {
+    const ALL: [GroupBy; 5] = [
+        GroupBy::Org,
+        GroupBy::Branch,
+        GroupBy::Workflow,
+        GroupBy::Status,
+        GroupBy::None,
+    ];
+
+    fn next(self) -> Self {
+        let idx = Self::ALL.iter().position(|&g| g == self).unwrap_or(0);
+        Self::ALL[(idx + 1) % Self::ALL.len()]
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            GroupBy::Org => "org",
+            GroupBy::Branch => "branch",
+            GroupBy::Workflow => "workflow",
+            GroupBy::Status => "status",
+            GroupBy::None => "none",
+        }
+    }
+}
+
 /// Column used for sorting the watch list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SortColumn {
@@ -178,6 +213,7 @@ struct App {
     bg_tx: mpsc::Sender<SseUpdate>,
     sort_column: SortColumn,
     sort_ascending: bool,
+    group_by: GroupBy,
 }
 
 impl App {
@@ -318,7 +354,7 @@ impl App {
         modifiers: KeyModifiers,
         daemon: &DaemonClient,
     ) -> bool {
-        let flat = flatten_rows(&self.status.watches);
+        let flat = flatten_rows(&self.status.watches, self.group_by);
         let sel_count = flat.selectable.len();
         let selected = flat
             .selectable
@@ -420,6 +456,12 @@ impl App {
             KeyCode::Char('S') => {
                 self.sort_ascending = !self.sort_ascending;
             }
+            KeyCode::Char('g') => {
+                self.group_by = self.group_by.next();
+            }
+            KeyCode::Char('G') => {
+                self.group_by = GroupBy::None;
+            }
             _ => {}
         }
         false
@@ -451,8 +493,8 @@ enum SseState {
 
 /// A flattened display row derived from the status snapshot.
 enum DisplayRow<'a> {
-    OrgHeader {
-        org: &'a str,
+    GroupHeader {
+        label: String,
     },
     ActiveRun {
         repo: &'a str,
@@ -483,17 +525,42 @@ struct FlatRows<'a> {
     selectable: Vec<usize>,
 }
 
-fn flatten_rows(watches: &[WatchStatus]) -> FlatRows<'_> {
+/// Extract the group key for a watch based on the grouping mode.
+fn group_key(w: &WatchStatus, group_by: GroupBy) -> Option<String> {
+    match group_by {
+        GroupBy::Org => Some(w.repo.split('/').next().unwrap_or(&w.repo).to_string()),
+        GroupBy::Branch => Some(w.branch.clone()),
+        GroupBy::Workflow => {
+            let wf = watch_sort_workflow(w);
+            if wf.is_empty() {
+                Some("(none)".to_string())
+            } else {
+                Some(wf.to_string())
+            }
+        }
+        GroupBy::Status => {
+            let (tier, status) = watch_sort_status(w);
+            Some(match tier {
+                0 => status.to_string(),
+                1 => status.to_string(),
+                _ => "idle".to_string(),
+            })
+        }
+        GroupBy::None => None,
+    }
+}
+
+fn flatten_rows(watches: &[WatchStatus], group_by: GroupBy) -> FlatRows<'_> {
     let mut rows = Vec::new();
     let mut selectable = Vec::new();
-    let mut current_org: Option<&str> = None;
+    let mut current_group: Option<String> = None;
 
     for w in watches {
-        // Insert org header when the org changes.
-        let org = w.repo.split('/').next().unwrap_or(&w.repo);
-        if current_org != Some(org) {
-            current_org = Some(org);
-            rows.push(DisplayRow::OrgHeader { org });
+        if let Some(key) = group_key(w, group_by)
+            && current_group.as_deref() != Some(&key)
+        {
+            current_group = Some(key.clone());
+            rows.push(DisplayRow::GroupHeader { label: key });
         }
 
         if w.active_runs.is_empty() {
@@ -547,7 +614,7 @@ impl DisplayRow<'_> {
                 repo, build, muted, ..
             } => (repo, Some(build.run_id), *muted),
             DisplayRow::NeverRan { repo, muted, .. } => (repo, None, *muted),
-            DisplayRow::OrgHeader { .. } | DisplayRow::FailingSteps { .. } => {
+            DisplayRow::GroupHeader { .. } | DisplayRow::FailingSteps { .. } => {
                 unreachable!("not selectable")
             }
         }
@@ -801,8 +868,13 @@ fn render_header(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
     // Line 2: watches + state
     let repo_count = app.status.watches.len();
     let active_count = app.active_count();
+    let group_label = if app.group_by != GroupBy::Org {
+        format!("  group: {}", app.group_by.label())
+    } else {
+        String::new()
+    };
     let mut left2_spans: Vec<Span> = vec![Span::raw(format!(
-        "{repo_count} repos, {active_count} active"
+        "{repo_count} repos, {active_count} active{group_label}"
     ))];
     if app.status.paused {
         left2_spans.push(Span::styled(
@@ -881,7 +953,7 @@ fn render_body(
     ]);
 
     let sorted = sorted_watches(&app.status.watches, app.sort_column, app.sort_ascending);
-    let flat = flatten_rows(&sorted);
+    let flat = flatten_rows(&sorted, app.group_by);
     let selected_display_idx = flat
         .selectable
         .get(app.selected)
@@ -920,8 +992,8 @@ fn render_display_row<'a>(
     mute_indicator: &dyn Fn(bool) -> &'static str,
 ) -> Row<'a> {
     match dr {
-        DisplayRow::OrgHeader { org } => Row::new(vec![
-            Cell::from((*org).to_string()).style(
+        DisplayRow::GroupHeader { label } => Row::new(vec![
+            Cell::from(label.clone()).style(
                 Style::default()
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
@@ -1036,6 +1108,8 @@ fn render_footer(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
             Span::raw(" pause  "),
             Span::styled("[s/S]", key_style),
             Span::raw(" sort  "),
+            Span::styled("[g/G]", key_style),
+            Span::raw(" group  "),
             Span::styled("[q]", key_style),
             Span::raw(" quit"),
         ]))
@@ -1203,6 +1277,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         bg_tx: mpsc::channel(1).0, // placeholder, replaced below
         sort_column: SortColumn::Repo,
         sort_ascending: true,
+        group_by: GroupBy::Org,
     };
 
     // Terminal setup.
@@ -1522,7 +1597,7 @@ mod tests {
 
     #[test]
     fn flatten_rows_empty() {
-        let flat = flatten_rows(&[]);
+        let flat = flatten_rows(&[], GroupBy::Org);
         assert!(flat.rows.is_empty());
         assert!(flat.selectable.is_empty());
     }
@@ -1530,13 +1605,10 @@ mod tests {
     #[test]
     fn flatten_rows_idle_watch() {
         let watches = vec![watch("alice/app", "main")];
-        let flat = flatten_rows(&watches);
-        assert_eq!(flat.rows.len(), 2); // OrgHeader + NeverRan
+        let flat = flatten_rows(&watches, GroupBy::Org);
+        assert_eq!(flat.rows.len(), 2); // GroupHeader + NeverRan
         assert_eq!(flat.selectable.len(), 1);
-        assert!(matches!(
-            flat.rows[0],
-            DisplayRow::OrgHeader { org: "alice" }
-        ));
+        assert!(matches!(flat.rows[0], DisplayRow::GroupHeader { .. }));
         assert!(matches!(flat.rows[1], DisplayRow::NeverRan { .. }));
     }
 
@@ -1556,12 +1628,12 @@ mod tests {
             }),
             muted: false,
         }];
-        let flat = flatten_rows(&watches);
-        // OrgHeader + LastBuild + FailingSteps
+        let flat = flatten_rows(&watches, GroupBy::Org);
+        // GroupHeader + LastBuild + FailingSteps
         assert_eq!(flat.rows.len(), 3);
         // Only the LastBuild row is selectable
         assert_eq!(flat.selectable.len(), 1);
-        assert_eq!(flat.selectable[0], 1); // index 1 (after OrgHeader)
+        assert_eq!(flat.selectable[0], 1); // index 1 (after GroupHeader)
         assert!(matches!(flat.rows[2], DisplayRow::FailingSteps { .. }));
     }
 
@@ -1581,8 +1653,8 @@ mod tests {
             }),
             muted: false,
         }];
-        let flat = flatten_rows(&watches);
-        assert_eq!(flat.rows.len(), 2); // OrgHeader + LastBuild
+        let flat = flatten_rows(&watches, GroupBy::Org);
+        assert_eq!(flat.rows.len(), 2); // GroupHeader + LastBuild
         assert!(matches!(flat.rows[1], DisplayRow::LastBuild { .. }));
     }
 
@@ -1645,8 +1717,8 @@ mod tests {
             last_build: None,
             muted: false,
         }];
-        let flat = flatten_rows(&watches);
-        // First row is OrgHeader, second is the active run
+        let flat = flatten_rows(&watches, GroupBy::Org);
+        // First row is GroupHeader, second is the active run
         let (repo, run_id, _muted) = flat.rows[1].repo_and_run_id();
         assert_eq!(repo, "alice/app");
         assert_eq!(run_id, Some(42));
@@ -1799,5 +1871,99 @@ mod tests {
         let desc = sorted_watches(&watches, SortColumn::Age, false);
         assert_eq!(asc[0].repo, "alice/app");
         assert_eq!(desc[0].repo, "bob/lib");
+    }
+
+    // -- GroupBy --
+
+    #[test]
+    fn group_by_next_cycles_through_all() {
+        let mut g = GroupBy::Org;
+        let mut seen = vec![g];
+        for _ in 0..GroupBy::ALL.len() {
+            g = g.next();
+            seen.push(g);
+        }
+        assert_eq!(seen.first(), seen.last());
+        assert_eq!(seen.len(), 6);
+    }
+
+    fn count_group_headers(flat: &FlatRows) -> usize {
+        flat.rows
+            .iter()
+            .filter(|r| matches!(r, DisplayRow::GroupHeader { .. }))
+            .count()
+    }
+
+    fn group_header_labels(flat: &FlatRows) -> Vec<String> {
+        flat.rows
+            .iter()
+            .filter_map(|r| match r {
+                DisplayRow::GroupHeader { label } => Some(label.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn flatten_rows_group_by_org() {
+        let watches = vec![
+            watch_with_build("alice/app", "main", "success", 10.0),
+            watch_with_build("alice/lib", "main", "success", 20.0),
+            watch_with_build("bob/api", "main", "failure", 30.0),
+        ];
+        let flat = flatten_rows(&watches, GroupBy::Org);
+        assert_eq!(group_header_labels(&flat), vec!["alice", "bob"]);
+    }
+
+    #[test]
+    fn flatten_rows_group_by_branch() {
+        let watches = vec![
+            watch_with_build("alice/app", "main", "success", 10.0),
+            watch_with_build("alice/app", "develop", "success", 20.0),
+            watch_with_build("bob/lib", "main", "failure", 30.0),
+        ];
+        let sorted = sorted_watches(&watches, SortColumn::Branch, true);
+        let flat = flatten_rows(&sorted, GroupBy::Branch);
+        assert_eq!(group_header_labels(&flat), vec!["develop", "main"]);
+    }
+
+    #[test]
+    fn flatten_rows_group_by_status() {
+        let watches = vec![
+            watch_with_build("alice/app", "main", "success", 10.0),
+            watch_with_build("bob/lib", "main", "failure", 20.0),
+            watch_with_active("carol/api", "main", "in_progress", 5.0),
+        ];
+        let sorted = sorted_watches(&watches, SortColumn::Status, true);
+        let flat = flatten_rows(&sorted, GroupBy::Status);
+        let labels = group_header_labels(&flat);
+        assert_eq!(labels.len(), 3);
+        assert_eq!(labels[0], "in_progress"); // active tier
+        assert_eq!(labels[1], "failure"); // completed, alphabetical
+        assert_eq!(labels[2], "success");
+    }
+
+    #[test]
+    fn flatten_rows_group_by_none() {
+        let watches = vec![
+            watch_with_build("alice/app", "main", "success", 10.0),
+            watch_with_build("bob/lib", "main", "failure", 20.0),
+        ];
+        let flat = flatten_rows(&watches, GroupBy::None);
+        assert_eq!(count_group_headers(&flat), 0);
+        // Just the watch rows, no headers
+        assert_eq!(flat.rows.len(), 2);
+    }
+
+    #[test]
+    fn flatten_rows_group_by_workflow() {
+        let watches = vec![
+            watch_with_build("alice/app", "main", "success", 10.0), // CI
+            watch_with_active("bob/lib", "main", "in_progress", 5.0), // Deploy
+            watch("carol/api", "main"),                             // no workflow
+        ];
+        let flat = flatten_rows(&watches, GroupBy::Workflow);
+        let labels = group_header_labels(&flat);
+        assert_eq!(labels, vec!["CI", "Deploy", "(none)"]);
     }
 }
