@@ -5,6 +5,7 @@ use std::time::Duration;
 
 type AnyResult<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 use axum::extract::{Query, State};
+use axum::response::IntoResponse as _;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::routing::get;
 use rmcp::handler::server::tool::ToolRouter;
@@ -126,6 +127,11 @@ fn build_watch_snapshot(
     }
 }
 
+/// Return a `400`-style JSON error response: `{"error": "<msg>"}`.
+fn json_error(msg: impl std::fmt::Display) -> axum::response::Response {
+    axum::Json(serde_json::json!({ "error": msg.to_string() })).into_response()
+}
+
 /// `GET /status` — JSON snapshot of all current watches and their build state.
 async fn status_handler(State(state): State<AppState>) -> axum::Json<StatusResponse> {
     let now = tokio::time::Instant::now();
@@ -215,7 +221,6 @@ async fn rerun_handler(
     axum::Json(body): axum::Json<RerunRequest>,
 ) -> axum::response::Response {
     use axum::http::StatusCode;
-    use axum::response::IntoResponse;
 
     match state.github.run_rerun(&body.repo, body.run_id, false).await {
         Ok(_) => axum::Json(serde_json::json!({ "ok": true })).into_response(),
@@ -403,11 +408,9 @@ async fn watch_handler(
     State(state): State<AppState>,
     axum::Json(body): axum::Json<WatchRequest>,
 ) -> axum::response::Response {
-    use axum::response::IntoResponse;
-
     for repo in &body.repos {
         if let Err(e) = validate_repo(repo) {
-            return axum::Json(serde_json::json!({ "error": e })).into_response();
+            return json_error(e);
         }
     }
 
@@ -445,19 +448,16 @@ async fn branches_handler(
     State(state): State<AppState>,
     axum::Json(body): axum::Json<BranchesRequest>,
 ) -> axum::response::Response {
-    use axum::response::IntoResponse;
-
     if let Err(e) = validate_repo(&body.repo) {
-        return axum::Json(serde_json::json!({ "error": e })).into_response();
+        return json_error(e);
     }
     for b in &body.branches {
         if let Err(e) = validate_branch(b) {
-            return axum::Json(serde_json::json!({ "error": e })).into_response();
+            return json_error(e);
         }
     }
     if body.branches.is_empty() {
-        return axum::Json(serde_json::json!({ "error": "branches must not be empty" }))
-            .into_response();
+        return json_error("branches must not be empty");
     }
 
     let results = do_configure_branches(
@@ -508,15 +508,10 @@ async fn notifications_handler(
     State(state): State<AppState>,
     axum::Json(body): axum::Json<NotificationsRequest>,
 ) -> axum::response::Response {
-    use axum::response::IntoResponse;
-
     let (snapshot, msg) = {
         let mut cfg = state.config.lock().await;
         let Some(rc) = cfg.repos.get_mut(&body.repo) else {
-            return axum::Json(
-                serde_json::json!({ "error": format!("{}: not being watched", body.repo) }),
-            )
-            .into_response();
+            return json_error(format!("{}: not being watched", body.repo));
         };
         let all_off = NotificationOverrides {
             build_started: Some(NotificationLevel::Off),
@@ -577,10 +572,7 @@ async fn notifications_handler(
                 format!("{target_label}: notification levels updated")
             }
             (other, _) => {
-                return axum::Json(
-                    serde_json::json!({ "error": format!("unknown action: {other:?}") }),
-                )
-                .into_response();
+                return json_error(format!("unknown action: {other:?}"));
             }
         };
         (cfg.clone(), msg)
@@ -620,22 +612,17 @@ async fn set_defaults_handler(
     State(state): State<AppState>,
     axum::Json(body): axum::Json<SetDefaultsRequest>,
 ) -> axum::response::Response {
-    use axum::response::IntoResponse;
-
     let (snapshot, messages) = {
         let mut cfg = state.config.lock().await;
         let mut messages = Vec::new();
         if let Some(branches) = body.default_branches {
             for b in &branches {
                 if let Err(e) = validate_branch(b) {
-                    return axum::Json(serde_json::json!({ "error": e })).into_response();
+                    return json_error(e);
                 }
             }
             if branches.is_empty() {
-                return axum::Json(
-                    serde_json::json!({ "error": "default_branches must not be empty" }),
-                )
-                .into_response();
+                return json_error("default_branches must not be empty");
             }
             cfg.default_branches = branches.clone();
             messages.push(format!("default branches: {}", branches.join(", ")));
@@ -900,14 +887,7 @@ where
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-struct WatchBuildsParams {
-    /// List of GitHub repos in "owner/repo" format
-    #[serde(deserialize_with = "deserialize_string_or_vec")]
-    repos: Vec<String>,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-struct StopWatchesParams {
+struct ReposParams {
     /// List of GitHub repos in "owner/repo" format
     #[serde(deserialize_with = "deserialize_string_or_vec")]
     repos: Vec<String>,
@@ -1032,7 +1012,7 @@ impl BuildWatcher {
     )]
     async fn watch_builds(
         &self,
-        Parameters(params): Parameters<WatchBuildsParams>,
+        Parameters(params): Parameters<ReposParams>,
     ) -> Result<CallToolResult, McpError> {
         for repo in &params.repos {
             if let Err(e) = validate_repo(repo) {
@@ -1059,7 +1039,7 @@ impl BuildWatcher {
     )]
     async fn stop_watches(
         &self,
-        Parameters(params): Parameters<StopWatchesParams>,
+        Parameters(params): Parameters<ReposParams>,
     ) -> Result<CallToolResult, McpError> {
         let results =
             do_stop_watches(&self.watches, &self.config, &self.handle, &params.repos).await;
