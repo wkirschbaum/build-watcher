@@ -26,8 +26,14 @@ Claude Code ──HTTP/MCP──► server.rs (axum + rmcp)
                                    bw TUI (bin/bw.rs)
                                    ├── GET /status
                                    ├── GET /stats
+                                   ├── GET|POST /notifications
+                                   ├── GET|POST /defaults
                                    ├── POST /pause
-                                   └── POST /rerun
+                                   ├── POST /rerun
+                                   ├── POST /watch
+                                   ├── POST /unwatch
+                                   ├── POST /branches
+                                   └── POST /shutdown
 ```
 
 ## Source layout
@@ -164,8 +170,16 @@ Alongside the MCP endpoint, the daemon exposes REST endpoints on the same port f
 | `/status` | GET | JSON snapshot of all watches, active runs, and last builds |
 | `/stats` | GET | Daemon stats: uptime, polling intervals, API rate limit |
 | `/events` | GET | SSE stream of `WatchEvent`s (RunStarted, RunCompleted, StatusChanged) |
+| `/notifications` | GET | Resolved notification config for `?repo=&branch=` |
+| `/notifications` | POST | Mute, unmute, or set per-event levels (`action: mute\|unmute\|set_levels`) |
+| `/defaults` | GET | Global config defaults (branches, ignored workflows) |
+| `/defaults` | POST | Update global default branches and/or ignored workflows |
 | `/pause` | POST | Toggle notification pause (`{"pause": true/false}`) |
 | `/rerun` | POST | Rerun a build (`{"repo": "owner/repo", "run_id": 123}`) |
+| `/watch` | POST | Add a repo/branch to watches |
+| `/unwatch` | POST | Remove a repo from watches |
+| `/branches` | POST | Update branch config for a repo |
+| `/shutdown` | POST | Initiate graceful daemon shutdown |
 
 ## TUI dashboard (`bw`)
 
@@ -174,15 +188,24 @@ The `bw` binary (`src/bin/bw.rs`) is a ratatui-based live terminal dashboard. It
 - **Real-time updates** via SSE (`GET /events`), with `apply_event` updating local state in-place
 - **Periodic resync** via `GET /status` + `GET /stats` every 30 seconds and on SSE reconnect
 - **Local ticking** of elapsed times and build ages every second between resyncs
-- **Row selection** (`↑`/`↓`/`j`/`k`) with actions: rerun (`r`), open in browser (`o`), pause notifications (`p`)
+- **Row selection** (`↑`/`↓`/`j`/`k`) with actions on the selected repo/branch
+- **Watch management** — add (`a`), remove (`d`), configure branches (`b`) via inline text prompts
+- **Sortable columns** — cycle repo, branch, status, workflow, age with `s`/`S`; direction toggles within the same column before advancing
+- **Configurable grouping** — cycle org, branch, workflow, status, none with `g`/`G`; group header rows separate each group
+- **Notification picker popup** (`N`) — loads current resolved levels via `GET /notifications`, then presents a `←`/`→` cycling picker per event type, saved via `POST /notifications`
+- **Config form popup** (`C`) — loads `GET /defaults`, edits default branches + ignored workflows, saves via `POST /defaults`
+- **Auto-start** — if no port file exists or the port is unreachable, `bw` spawns the `build-watcher` daemon and waits up to 5 seconds for it to bind
+- **Non-blocking actions** — all HTTP mutations are `spawn_action` calls; the UI stays responsive with transient flash messages
 - **Responsive layout** with column widths scaling to terminal width
 - **Reconnection** with exponential backoff (1s → 30s), resetting on successful connection
+- **Quit+shutdown** (`Q`) — calls `POST /shutdown` before exiting, stopping the daemon
 
 The TUI shares types from the `build_watcher` library crate (`status.rs`, `events.rs`, `format.rs`) but has no dependency on daemon-only code.
 
 ## Graceful shutdown
 
-On SIGINT (ctrl-c):
+Triggered by SIGINT (ctrl-c) or `POST /shutdown` (from the TUI `Q` key). The server uses `tokio::select!` to wait for either signal, then cancels the shared `CancellationToken`:
+
 1. Cancel the `CancellationToken` — all pollers exit their sleep loops.
 2. Close the `TaskTracker` and wait for all poller tasks to complete.
 3. Save final watch state to disk.

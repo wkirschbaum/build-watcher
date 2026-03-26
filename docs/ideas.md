@@ -8,7 +8,7 @@ Personal desktop tool — all features should improve the local daily experience
 Detect `origin` remote of the current working directory and auto-suggest watching it via MCP. Saves the manual `owner/repo` lookup.
 
 ### Per-repo/branch snooze
-Snooze a specific repo or branch for N minutes without silencing all notifications globally. Finer control than the current global pause.
+Snooze a specific repo or branch for N minutes without silencing all notifications globally. Finer control than the current global pause. (Branch-level mute and per-event level overrides are now supported via the TUI `n`/`N` keys and `POST /notifications`; timed snooze with automatic expiry is still unimplemented.)
 
 ### Workflow filtering by event type
 Ignore runs triggered by specific GitHub events (e.g. `schedule`, `dependabot`) globally or per-repo. Reduces noise from automated runs that don't need human attention.
