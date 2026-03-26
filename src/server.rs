@@ -38,12 +38,13 @@ pub const DEFAULT_PORT: u16 = 8417;
 
 // -- SSE / status endpoints --
 
-/// Shared state for the `/status` and `/events` HTTP routes.
+/// Shared state for the HTTP routes (`/status`, `/events`, `/pause`, `/rerun`).
 #[derive(Clone)]
 struct AppState {
     watches: Watches,
     pause: PauseState,
     events: EventBus,
+    github: Arc<dyn build_watcher::github::GitHubClient>,
 }
 
 /// Build a snapshot of all current watches from already-locked state.
@@ -133,6 +134,53 @@ async fn events_handler(State(state): State<AppState>) -> impl axum::response::I
     Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(30)))
 }
 
+// -- Pause / rerun endpoints --
+
+#[derive(Deserialize)]
+struct PauseRequest {
+    pause: bool,
+}
+
+/// `POST /pause` — Toggle notification pause.
+async fn pause_handler(
+    State(state): State<AppState>,
+    axum::Json(body): axum::Json<PauseRequest>,
+) -> axum::Json<serde_json::Value> {
+    let mut p = state.pause.lock().await;
+    if body.pause {
+        const INDEFINITE: u64 = u32::MAX as u64;
+        *p = Some(tokio::time::Instant::now() + Duration::from_secs(INDEFINITE));
+    } else {
+        *p = None;
+    }
+    let paused = p.is_some_and(|d| tokio::time::Instant::now() < d);
+    axum::Json(serde_json::json!({ "paused": paused }))
+}
+
+#[derive(Deserialize)]
+struct RerunRequest {
+    repo: String,
+    run_id: u64,
+}
+
+/// `POST /rerun` — Rerun a GitHub Actions build by run ID.
+async fn rerun_handler(
+    State(state): State<AppState>,
+    axum::Json(body): axum::Json<RerunRequest>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    match state.github.run_rerun(&body.repo, body.run_id, false).await {
+        Ok(_) => axum::Json(serde_json::json!({ "ok": true })).into_response(),
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            axum::Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
 /// Bind to the preferred port, trying up to 9 consecutive ports on conflict.
 async fn bind_with_fallback(preferred: u16) -> AnyResult<tokio::net::TcpListener> {
     let last = preferred.saturating_add(9);
@@ -168,6 +216,7 @@ fn build_router(
         watches: watches.clone(),
         pause: pause.clone(),
         events: handle.events.clone(),
+        github: handle.github.clone(),
     };
 
     let service: StreamableHttpService<BuildWatcher, LocalSessionManager> =
@@ -189,6 +238,8 @@ fn build_router(
     axum::Router::new()
         .route("/status", get(status_handler))
         .route("/events", get(events_handler))
+        .route("/pause", axum::routing::post(pause_handler))
+        .route("/rerun", axum::routing::post(rerun_handler))
         .with_state(app_state)
         .nest_service("/mcp", service)
 }
@@ -1508,11 +1559,61 @@ mod tests {
         (watches, pause, events)
     }
 
+    struct StubGitHub;
+
+    #[async_trait::async_trait]
+    impl build_watcher::github::GitHubClient for StubGitHub {
+        async fn recent_runs(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<Vec<build_watcher::github::RunInfo>, build_watcher::github::GhError> {
+            Ok(vec![])
+        }
+        async fn run_status(
+            &self,
+            _: &str,
+            _: u64,
+        ) -> Result<build_watcher::github::RunInfo, build_watcher::github::GhError> {
+            Err(build_watcher::github::GhError::MissingFields {
+                repo: "stub".to_string(),
+            })
+        }
+        async fn run_rerun(
+            &self,
+            _: &str,
+            _: u64,
+            _: bool,
+        ) -> Result<String, build_watcher::github::GhError> {
+            Ok(String::new())
+        }
+        async fn run_list_history(
+            &self,
+            _: &str,
+            _: Option<&str>,
+            _: u32,
+        ) -> Result<Vec<build_watcher::github::HistoryEntry>, build_watcher::github::GhError>
+        {
+            Ok(vec![])
+        }
+        async fn rate_limit(
+            &self,
+        ) -> Result<build_watcher::github::RateLimit, build_watcher::github::GhError> {
+            Err(build_watcher::github::GhError::MissingFields {
+                repo: "stub".to_string(),
+            })
+        }
+        async fn failing_steps(&self, _: &str, _: u64) -> Option<String> {
+            None
+        }
+    }
+
     fn test_router(watches: Watches, pause: PauseState, events: EventBus) -> axum::Router {
         let app_state = super::AppState {
             watches,
             pause,
             events,
+            github: Arc::new(StubGitHub),
         };
         axum::Router::new()
             .route("/status", axum::routing::get(super::status_handler))
