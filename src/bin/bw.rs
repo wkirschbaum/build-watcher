@@ -3,6 +3,7 @@
 //! Subscribes to `GET /events` (SSE) for real-time updates and resyncs
 //! from `GET /status` on connect and every 30 seconds as a fallback.
 
+use std::future::Future;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind, KeyModifiers};
@@ -22,7 +23,7 @@ use tokio_stream::StreamExt as _;
 use build_watcher::config::state_dir;
 use build_watcher::events::WatchEvent;
 use build_watcher::format;
-use build_watcher::github::validate_repo;
+use build_watcher::github::{validate_branch, validate_repo};
 use build_watcher::status::{
     ActiveRunView, LastBuildView, StatsResponse, StatusResponse, WatchStatus,
 };
@@ -30,6 +31,7 @@ use build_watcher::status::{
 // -- Daemon client --
 
 /// HTTP client for the build-watcher daemon REST API.
+#[derive(Clone)]
 struct DaemonClient {
     client: reqwest::Client,
     port: u16,
@@ -102,6 +104,14 @@ impl DaemonClient {
         .await
     }
 
+    async fn set_branches(&self, repo: &str, branches: &[String]) -> Result<(), String> {
+        self.post_json(
+            "/branches",
+            &serde_json::json!({ "repo": repo, "branches": branches }),
+        )
+        .await
+    }
+
     /// Inner client ref for the SSE background task (which needs `bytes_stream`).
     fn inner(&self) -> &reqwest::Client {
         &self.client
@@ -110,10 +120,20 @@ impl DaemonClient {
 
 // -- App state --
 
+/// What the current text input prompt is for.
+enum TextAction {
+    AddRepo,
+    SetBranches { repo: String },
+}
+
 /// Text input mode for interactive prompts (e.g. "Add repo: ").
 enum InputMode {
     Normal,
-    TextInput { prompt: String, buffer: String },
+    TextInput {
+        prompt: String,
+        buffer: String,
+        action: TextAction,
+    },
 }
 
 struct App {
@@ -129,6 +149,8 @@ struct App {
     /// Transient feedback message shown in the header (e.g. "Rerunning…").
     flash: Option<(String, Instant)>,
     input_mode: InputMode,
+    /// Sender for background task results back to the main loop.
+    bg_tx: mpsc::Sender<SseUpdate>,
 }
 
 impl App {
@@ -174,10 +196,29 @@ impl App {
         }
     }
 
+    /// Spawn a background HTTP action that reports its result via the channel.
+    fn spawn_action(
+        &mut self,
+        _daemon: &DaemonClient,
+        flash: impl Into<String>,
+        resync: bool,
+        action: impl Future<Output = Result<String, String>> + Send + 'static,
+    ) {
+        self.set_flash(flash);
+        let tx = self.bg_tx.clone();
+        tokio::spawn(async move {
+            let flash = match action.await {
+                Ok(msg) => msg,
+                Err(e) => e,
+            };
+            let _ = tx.send(SseUpdate::BackgroundResult { flash, resync }).await;
+        });
+    }
+
     /// Handle a key press while in text input mode.
     /// Returns `true` if the event was consumed (i.e. we were in input mode).
-    async fn handle_text_input(&mut self, code: KeyCode, daemon: &DaemonClient) -> bool {
-        let InputMode::TextInput { buffer, .. } = &mut self.input_mode else {
+    fn handle_text_input(&mut self, code: KeyCode, daemon: &DaemonClient) -> bool {
+        let InputMode::TextInput { buffer, action, .. } = &mut self.input_mode else {
             return false;
         };
 
@@ -186,20 +227,11 @@ impl App {
                 self.input_mode = InputMode::Normal;
             }
             KeyCode::Enter => {
-                let repo = buffer.trim().to_string();
+                let input = buffer.trim().to_string();
+                let action = std::mem::replace(action, TextAction::AddRepo); // take ownership
                 self.input_mode = InputMode::Normal;
-                if !repo.is_empty() {
-                    if let Err(e) = validate_repo(&repo) {
-                        self.set_flash(e);
-                    } else {
-                        match daemon.watch(&repo).await {
-                            Ok(()) => {
-                                self.set_flash(format!("Watching {repo}"));
-                                self.resync(daemon).await;
-                            }
-                            Err(e) => self.set_flash(e),
-                        }
-                    }
+                if !input.is_empty() {
+                    self.submit_text_input(input, action, daemon);
                 }
             }
             KeyCode::Backspace => {
@@ -213,8 +245,53 @@ impl App {
         true
     }
 
+    fn submit_text_input(&mut self, input: String, action: TextAction, daemon: &DaemonClient) {
+        match action {
+            TextAction::AddRepo => {
+                if let Err(e) = validate_repo(&input) {
+                    self.set_flash(e);
+                    return;
+                }
+                let d = daemon.clone();
+                let repo = input.clone();
+                self.spawn_action(daemon, format!("Adding {input}…"), true, async move {
+                    d.watch(&repo).await.map(|()| format!("Watching {repo}"))
+                });
+            }
+            TextAction::SetBranches { repo } => {
+                let branches: Vec<String> = input
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                if branches.is_empty() {
+                    self.set_flash("No branches specified");
+                    return;
+                }
+                for b in &branches {
+                    if let Err(e) = validate_branch(b) {
+                        self.set_flash(e);
+                        return;
+                    }
+                }
+                let d = daemon.clone();
+                let repo_clone = repo.clone();
+                self.spawn_action(
+                    daemon,
+                    format!("Setting branches for {repo}…"),
+                    true,
+                    async move {
+                        d.set_branches(&repo_clone, &branches)
+                            .await
+                            .map(|()| format!("Branches updated for {repo_clone}"))
+                    },
+                );
+            }
+        }
+    }
+
     /// Handle a key press in normal mode. Returns `true` if the app should quit.
-    async fn handle_normal_key(
+    fn handle_normal_key(
         &mut self,
         code: KeyCode,
         modifiers: KeyModifiers,
@@ -242,53 +319,72 @@ impl App {
                 self.input_mode = InputMode::TextInput {
                     prompt: "Add repo (owner/repo): ".to_string(),
                     buffer: String::new(),
+                    action: TextAction::AddRepo,
                 };
+            }
+            KeyCode::Char('b') => {
+                if let Some((repo, _, _)) = selected {
+                    let repo = repo.to_string();
+                    let current: Vec<&str> = self
+                        .status
+                        .watches
+                        .iter()
+                        .filter(|w| w.repo == repo)
+                        .map(|w| w.branch.as_str())
+                        .collect();
+                    self.input_mode = InputMode::TextInput {
+                        prompt: format!("Branches for {repo}: "),
+                        buffer: current.join(", "),
+                        action: TextAction::SetBranches { repo },
+                    };
+                }
             }
             KeyCode::Char('d') => {
                 if let Some((repo, _, _)) = selected {
                     let repo = repo.to_string();
-                    match daemon.unwatch(&repo).await {
-                        Ok(()) => {
-                            self.set_flash(format!("Removed {repo}"));
-                            self.resync(daemon).await;
-                        }
-                        Err(e) => self.set_flash(e),
-                    }
+                    let d = daemon.clone();
+                    let r = repo.clone();
+                    self.spawn_action(daemon, format!("Removing {repo}…"), true, async move {
+                        d.unwatch(&r).await.map(|()| format!("Removed {r}"))
+                    });
                 }
             }
             KeyCode::Char('n') => {
                 if let Some((repo, _, muted)) = selected {
                     let repo = repo.to_string();
                     let action = if muted { "unmute" } else { "mute" };
-                    match daemon.set_notifications(&repo, action).await {
-                        Ok(()) => {
-                            let verb = if muted { "Unmuted" } else { "Muted" };
-                            self.set_flash(format!("{verb} {repo}"));
-                            self.resync(daemon).await;
-                        }
-                        Err(e) => self.set_flash(e),
-                    }
+                    let verb = if muted { "Unmuted" } else { "Muted" };
+                    let d = daemon.clone();
+                    let r = repo.clone();
+                    let v = verb.to_string();
+                    self.spawn_action(daemon, format!("{verb} {repo}…"), true, async move {
+                        d.set_notifications(&r, action)
+                            .await
+                            .map(|()| format!("{v} {r}"))
+                    });
                 }
             }
             KeyCode::Char('p') => {
                 let new_pause = !self.status.paused;
-                match daemon.pause(new_pause).await {
-                    Ok(()) => {
-                        self.status.paused = new_pause;
-                        self.set_flash(if new_pause { "Paused" } else { "Resumed" });
-                    }
-                    Err(e) => self.set_flash(e),
-                }
+                let d = daemon.clone();
+                // Optimistic update — toggle local state immediately.
+                self.status.paused = new_pause;
+                let msg = if new_pause { "Paused" } else { "Resumed" };
+                self.spawn_action(daemon, msg.to_string(), false, async move {
+                    d.pause(new_pause)
+                        .await
+                        .map(|()| if new_pause { "Paused" } else { "Resumed" }.to_string())
+                });
             }
             KeyCode::Char('r') => {
                 if let Some((repo, Some(run_id), _)) = selected {
-                    match daemon.rerun(repo, run_id).await {
-                        Ok(()) => {
-                            self.set_flash(format!("Rerun started: {run_id}"));
-                            self.resync(daemon).await;
-                        }
-                        Err(e) => self.set_flash(e),
-                    }
+                    let d = daemon.clone();
+                    let r = repo.to_string();
+                    self.spawn_action(daemon, format!("Rerunning {run_id}…"), true, async move {
+                        d.rerun(&r, run_id)
+                            .await
+                            .map(|()| format!("Rerun started: {run_id}"))
+                    });
                 }
             }
             KeyCode::Char('o') => {
@@ -304,14 +400,16 @@ impl App {
 
 // -- SSE state --
 
-/// Message sent from the SSE background task to the main render loop.
+/// Message sent from background tasks to the main render loop.
 enum SseUpdate {
-    /// A watch event received from the stream.
+    /// A watch event received from the SSE stream.
     Event(Box<WatchEvent>),
     /// SSE stream successfully connected.
     Connected,
     /// SSE stream disconnected; task will retry with backoff.
     Disconnected,
+    /// Result from a background HTTP action (e.g. adding a repo).
+    BackgroundResult { flash: String, resync: bool },
 }
 
 /// Tracks the SSE connection state for header display.
@@ -806,7 +904,7 @@ fn render_footer(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
         .fg(Color::DarkGray)
         .add_modifier(Modifier::BOLD);
     let footer = match &app.input_mode {
-        InputMode::TextInput { prompt, buffer } => Paragraph::new(Line::from(vec![
+        InputMode::TextInput { prompt, buffer, .. } => Paragraph::new(Line::from(vec![
             Span::styled(prompt.as_str(), Style::default().fg(Color::Cyan)),
             Span::raw(buffer.as_str()),
             Span::styled("█", Style::default().fg(Color::Cyan)),
@@ -820,6 +918,8 @@ fn render_footer(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
             Span::raw(" select  "),
             Span::styled("[a]", key_style),
             Span::raw(" add  "),
+            Span::styled("[b]", key_style),
+            Span::raw(" branches  "),
             Span::styled("[d]", key_style),
             Span::raw(" remove  "),
             Span::styled("[r]", key_style),
@@ -994,6 +1094,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         selected: 0,
         flash: None,
         input_mode: InputMode::Normal,
+        bg_tx: mpsc::channel(1).0, // placeholder, replaced below
     };
 
     // Terminal setup.
@@ -1003,8 +1104,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    // SSE background task feeds events into this channel.
+    // Shared channel for SSE events and background action results.
     let (sse_tx, mut sse_rx) = mpsc::channel::<SseUpdate>(64);
+    app.bg_tx = sse_tx.clone();
     tokio::spawn(sse_task(daemon.inner().clone(), port, sse_tx));
 
     let mut keyboard = EventStream::new();
@@ -1044,16 +1146,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         Some(SseUpdate::Disconnected) => {
                             app.sse_state = SseState::Disconnected { since: Instant::now() };
                         }
+                        Some(SseUpdate::BackgroundResult { flash, resync }) => {
+                            app.set_flash(flash);
+                            if resync {
+                                app.resync(&daemon).await;
+                            }
+                        }
                         None => {}
                     }
                 }
                 maybe_event = keyboard.next() => {
                     match maybe_event {
                         Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
-                            if app.handle_text_input(key.code, &daemon).await {
+                            if app.handle_text_input(key.code, &daemon) {
                                 continue;
                             }
-                            if app.handle_normal_key(key.code, key.modifiers, &daemon).await {
+                            if app.handle_normal_key(key.code, key.modifiers, &daemon) {
                                 break;
                             }
                         }

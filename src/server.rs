@@ -21,8 +21,7 @@ use tokio_stream::wrappers::BroadcastStream;
 use tokio_util::sync::CancellationToken;
 
 use build_watcher::config::{
-    NotificationLevel, NotificationOverrides, QuietHours, RepoConfig, config_dir, state_dir,
-    unix_now,
+    NotificationLevel, NotificationOverrides, QuietHours, config_dir, state_dir, unix_now,
 };
 use build_watcher::events::{EventBus, WatchEvent};
 use build_watcher::format;
@@ -329,6 +328,70 @@ async fn do_stop_watches(
     results
 }
 
+/// Shared logic for updating which branches are watched for a repo.
+///
+/// Stops watches for branches no longer in the list, starts watches for new
+/// branches, updates config, and persists both.
+async fn do_configure_branches(
+    watches: &Watches,
+    config: &SharedConfig,
+    handle: &WatcherHandle,
+    rate_limit: &RateLimitState,
+    repo: &str,
+    new_branches: Vec<String>,
+) -> Vec<String> {
+    let mut results = Vec::new();
+
+    // Current branches from live watches.
+    let current_branches: Vec<String> = {
+        let w = watches.lock().await;
+        w.keys()
+            .filter(|k| k.matches_repo(repo))
+            .map(|k| k.branch.clone())
+            .collect()
+    };
+
+    // Stop watches for removed branches.
+    {
+        let mut w = watches.lock().await;
+        for branch in &current_branches {
+            if !new_branches.contains(branch) {
+                let key = WatchKey::new(repo, branch);
+                if w.remove(&key).is_some() {
+                    results.push(format!("Stopped watching {repo} [{branch}]"));
+                }
+            }
+        }
+    }
+
+    // Start watches for new branches.
+    for branch in &new_branches {
+        if !current_branches.contains(branch) {
+            match start_watch(watches, config, handle, rate_limit, repo, branch).await {
+                Ok(msg) => results.push(msg),
+                Err(msg) => results.push(msg),
+            }
+        }
+    }
+
+    // Update config and persist.
+    {
+        let mut cfg = config.lock().await;
+        let rc = cfg.repos.entry(repo.to_string()).or_default();
+        rc.branches = new_branches;
+    }
+    handle
+        .persistence
+        .save_watches(&collect_persisted(watches).await)
+        .await;
+    let snapshot = config.lock().await.clone();
+    if let Some(warning) = persist_config(&*handle.persistence, snapshot).await {
+        results.push(warning);
+    }
+
+    results
+}
+
 #[derive(Deserialize)]
 struct WatchRequest {
     repos: Vec<String>,
@@ -365,6 +428,47 @@ async fn unwatch_handler(
 ) -> axum::Json<serde_json::Value> {
     let results = do_stop_watches(&state.watches, &state.config, &state.handle, &body.repos).await;
     axum::Json(serde_json::json!({ "ok": true, "messages": results }))
+}
+
+#[derive(Deserialize)]
+struct BranchesRequest {
+    repo: String,
+    branches: Vec<String>,
+}
+
+/// `POST /branches` — Set which branches to watch for a repo.
+///
+/// Stops watches for branches no longer in the list, starts watches for new
+/// branches, and updates the config.
+async fn branches_handler(
+    State(state): State<AppState>,
+    axum::Json(body): axum::Json<BranchesRequest>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    if let Err(e) = validate_repo(&body.repo) {
+        return axum::Json(serde_json::json!({ "error": e })).into_response();
+    }
+    for b in &body.branches {
+        if let Err(e) = validate_branch(b) {
+            return axum::Json(serde_json::json!({ "error": e })).into_response();
+        }
+    }
+    if body.branches.is_empty() {
+        return axum::Json(serde_json::json!({ "error": "branches must not be empty" }))
+            .into_response();
+    }
+
+    let results = do_configure_branches(
+        &state.watches,
+        &state.config,
+        &state.handle,
+        &state.rate_limit,
+        &body.repo,
+        body.branches,
+    )
+    .await;
+    axum::Json(serde_json::json!({ "ok": true, "messages": results })).into_response()
 }
 
 #[derive(Deserialize)]
@@ -483,6 +587,7 @@ fn build_router(
         .route("/watch", axum::routing::post(watch_handler))
         .route("/unwatch", axum::routing::post(unwatch_handler))
         .route("/notifications", axum::routing::post(notifications_handler))
+        .route("/branches", axum::routing::post(branches_handler))
         .with_state(app_state)
         .nest_service("/mcp", service)
 }
@@ -890,30 +995,18 @@ impl BuildWatcher {
                 if let Err(e) = validate_repo(&repo) {
                     return Ok(CallToolResult::error(vec![Content::text(e)]));
                 }
-                let snapshot = {
-                    let mut config = self.config.lock().await;
-                    let Some(existing) = config.repos.get(&repo).cloned() else {
-                        return Ok(CallToolResult::error(vec![Content::text(format!(
-                            "{repo} is not being watched — use watch_builds first"
-                        ))]));
-                    };
-                    config.repos.insert(
-                        repo.clone(),
-                        RepoConfig {
-                            branches: params.branches.clone(),
-                            ..existing
-                        },
-                    );
-                    config.clone()
-                };
-                let mut msg = format!(
-                    "Set {repo}: watching branches {:?}\nRestart watches with watch_builds to apply.",
+                let results = do_configure_branches(
+                    &self.watches,
+                    &self.config,
+                    &self.handle,
+                    &self.rate_limit,
+                    &repo,
                     params.branches,
-                );
-                if let Some(warning) = persist_config(&*self.handle.persistence, snapshot).await {
-                    msg.push_str(&warning);
-                }
-                Ok(CallToolResult::success(vec![Content::text(msg)]))
+                )
+                .await;
+                Ok(CallToolResult::success(vec![Content::text(
+                    results.join("\n"),
+                )]))
             }
         }
     }
