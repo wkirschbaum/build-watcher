@@ -35,12 +35,15 @@ pub fn age(secs: u64) -> String {
 
 /// Truncate a string to `max` characters, appending "…" if truncated.
 pub fn truncate(s: &str, max: usize) -> String {
-    match s.char_indices().nth(max) {
+    // Collect char boundary indices in a single pass.
+    let mut indices = s.char_indices();
+    match indices.nth(max.saturating_sub(1)) {
+        // Fewer than `max` chars — nothing to truncate.
         None => s.to_string(),
-        Some(_) => {
-            let end = s.char_indices().nth(max - 1).map_or(s.len(), |(i, _)| i);
-            format!("{}…", &s[..end])
-        }
+        // Exactly `max` chars and nothing after — fits exactly.
+        Some((_, _)) if indices.next().is_none() => s.to_string(),
+        // More than `max` chars — truncate at the boundary before `max`.
+        Some((end, _)) => format!("{}…", &s[..end]),
     }
 }
 
@@ -74,7 +77,11 @@ mod tests {
 
     #[test]
     fn truncate_behavior() {
-        assert_eq!(truncate("hello", 10), "hello");
+        assert_eq!(truncate("hello", 10), "hello"); // shorter than max
+        assert_eq!(truncate("hello", 5), "hello"); // exactly max — no ellipsis
+        assert_eq!(truncate("hello!", 5), "hell…"); // one over max
         assert_eq!(truncate("hello world!", 8), "hello w…");
+        assert_eq!(truncate("", 5), ""); // empty string
+        assert_eq!(truncate("héllo", 3), "hé…"); // multibyte chars
     }
 }

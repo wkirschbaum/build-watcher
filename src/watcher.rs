@@ -419,7 +419,8 @@ pub async fn start_watch(
         }
         w.insert(key.clone(), entry);
     }
-    save_watches(watches).await;
+    // Persistence is the caller's responsibility — start_watch only updates
+    // in-memory state and spawns the poller.
 
     spawn_poller(watches, config, handle, rate_limit, key);
     Ok(msg)

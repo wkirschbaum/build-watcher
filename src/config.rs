@@ -28,6 +28,9 @@ fn home_dir() -> String {
     })
 }
 
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+compile_error!("Unsupported platform: only Linux and macOS are supported");
+
 #[cfg(target_os = "linux")]
 fn default_state_dir() -> String {
     format!("{}/.local/state/build-watcher", home_dir())

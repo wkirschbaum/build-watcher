@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
@@ -14,19 +15,21 @@ use rmcp::transport::streamable_http_server::{
 };
 use rmcp::{ErrorData as McpError, ServerHandler, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use tokio_stream::StreamExt as _;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_util::sync::CancellationToken;
 
 use build_watcher::config::{
     NotificationLevel, NotificationOverrides, QuietHours, RepoConfig, config_dir,
-    save_config_async, state_dir,
+    save_config_async, state_dir, unix_now,
 };
+use build_watcher::events::{EventBus, WatchEvent};
 use build_watcher::format;
 use build_watcher::github::{validate_branch, validate_repo};
+use build_watcher::status::{ActiveRunView, LastBuildView, StatusResponse, WatchStatus};
 use build_watcher::watcher::{
-    MIN_ACTIVE_SECS, MIN_IDLE_SECS, PauseState, RateLimitState, SharedConfig, WatchKey,
+    MIN_ACTIVE_SECS, MIN_IDLE_SECS, PauseState, RateLimitState, SharedConfig, WatchEntry, WatchKey,
     WatcherHandle, Watches, compute_intervals, count_api_calls, is_paused, last_failed_build,
     save_watches, start_watch,
 };
@@ -40,48 +43,7 @@ pub const DEFAULT_PORT: u16 = 8417;
 struct AppState {
     watches: Watches,
     pause: PauseState,
-    events: build_watcher::events::EventBus,
-}
-
-/// A single active run as returned by `GET /status`.
-#[derive(Serialize, Deserialize)]
-struct ActiveRunView {
-    run_id: u64,
-    status: String,
-    workflow: String,
-    /// Human-readable title: plain commit title for pushes, "PR: …" for PRs.
-    title: String,
-    /// GitHub event type (e.g. `"push"`, `"pull_request"`).
-    event: String,
-    elapsed_secs: Option<f64>,
-}
-
-/// Summary of the last completed build as returned by `GET /status`.
-#[derive(Serialize, Deserialize)]
-struct LastBuildView {
-    run_id: u64,
-    conclusion: String,
-    workflow: String,
-    title: String,
-    /// Comma-separated list of step names that failed, if available.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    failing_steps: Option<String>,
-}
-
-/// One watched repo/branch as returned by `GET /status`.
-#[derive(Serialize)]
-struct WatchStatus {
-    repo: String,
-    branch: String,
-    active_runs: Vec<ActiveRunView>,
-    last_build: Option<LastBuildView>,
-}
-
-/// Full response body for `GET /status`.
-#[derive(Serialize)]
-struct StatusResponse {
-    paused: bool,
-    watches: Vec<WatchStatus>,
+    events: EventBus,
 }
 
 /// Build a snapshot of all current watches from already-locked state.
@@ -89,10 +51,7 @@ struct StatusResponse {
 /// Pure function (no async, no locks) — callers acquire the locks and pass
 /// the data in. Both the `GET /status` HTTP handler and the `list_watches`
 /// MCP tool call this so the watch-enumeration logic lives in one place.
-fn build_watch_snapshot(
-    watches: &std::collections::HashMap<WatchKey, build_watcher::watcher::WatchEntry>,
-    paused: bool,
-) -> StatusResponse {
+fn build_watch_snapshot(watches: &HashMap<WatchKey, WatchEntry>, paused: bool) -> StatusResponse {
     let now = tokio::time::Instant::now();
     let mut watch_list: Vec<WatchStatus> = watches
         .iter()
@@ -156,9 +115,9 @@ async fn events_handler(State(state): State<AppState>) -> impl axum::response::I
         .filter_map(|result| result.ok())
         .map(|event| {
             let event_type = match &event {
-                build_watcher::events::WatchEvent::RunStarted(_) => "RunStarted",
-                build_watcher::events::WatchEvent::RunCompleted { .. } => "RunCompleted",
-                build_watcher::events::WatchEvent::StatusChanged { .. } => "StatusChanged",
+                WatchEvent::RunStarted(_) => "RunStarted",
+                WatchEvent::RunCompleted { .. } => "RunCompleted",
+                WatchEvent::StatusChanged { .. } => "StatusChanged",
             };
             let data = serde_json::to_string(&event).unwrap_or_default();
             Ok::<_, Infallible>(Event::default().event(event_type).data(data))
@@ -556,6 +515,7 @@ impl BuildWatcher {
         // Persist only the repos that actually got a poller running. Repos whose
         // every branch failed (e.g. no runs, bad name) are not saved.
         if !started_repos.is_empty() {
+            save_watches(&self.watches).await;
             let snapshot = {
                 let mut config = self.config.lock().await;
                 config.add_repos(&started_repos);
@@ -750,7 +710,7 @@ impl BuildWatcher {
     )]
     async fn get_stats(&self) -> Result<CallToolResult, McpError> {
         // Lock order: rate_limit → watches → pause → config (matches poller order).
-        let now = build_watcher::config::unix_now();
+        let now = unix_now();
         let rl = self.rate_limit.lock().await;
         let (watches_snap, api_calls) = {
             let w = self.watches.lock().await;
@@ -764,10 +724,7 @@ impl BuildWatcher {
         let (active_secs, idle_secs) = compute_intervals(rl.as_ref(), api_calls, now);
         let throttled = active_secs > MIN_ACTIVE_SECS || idle_secs > MIN_IDLE_SECS;
 
-        let paused = {
-            let p = self.pause.lock().await;
-            p.is_some_and(|d| tokio::time::Instant::now() < d)
-        };
+        let paused = is_paused(&self.pause).await;
         let (quiet_hours_label, quiet_active, notif_levels, ignored_workflows, repo_count) = {
             let cfg = self.config.lock().await;
             let label = cfg.quiet_hours.as_ref().map_or_else(
@@ -1140,7 +1097,7 @@ impl BuildWatcher {
             ));
         }
 
-        let now = build_watcher::config::unix_now();
+        let now = unix_now();
         for entry in &entries {
             let duration = entry
                 .duration_secs()

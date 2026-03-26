@@ -385,67 +385,9 @@ impl HistoryEntry {
     }
 }
 
-/// Minimal ISO 8601 parser -> Unix epoch seconds. Handles "2026-03-24T10:30:00Z" format.
+/// Parse an ISO 8601 / RFC 3339 timestamp (e.g. `"2026-03-24T10:30:00Z"`) to Unix epoch seconds.
 fn parse_iso_epoch(s: &str) -> Option<u64> {
-    // Format: YYYY-MM-DDTHH:MM:SSZ (GitHub always returns UTC)
-    let s = s.trim().trim_end_matches('Z');
-    let (date, time) = s.split_once('T')?;
-    let parts: Vec<&str> = date.split('-').collect();
-    if parts.len() != 3 {
-        return None;
-    }
-    let year: u64 = parts[0].parse().ok()?;
-    let month: u64 = parts[1].parse().ok()?;
-    let day: u64 = parts[2].parse().ok()?;
-
-    let time_parts: Vec<&str> = time.split(':').collect();
-    if time_parts.len() < 2 {
-        return None;
-    }
-    let hour: u64 = time_parts[0].parse().ok()?;
-    let min: u64 = time_parts[1].parse().ok()?;
-    // Handle fractional seconds (e.g. "30.123")
-    let sec: u64 = time_parts
-        .get(2)
-        .and_then(|s| s.split('.').next()?.parse().ok())
-        .unwrap_or(0);
-
-    if !(1..=12).contains(&month) || day == 0 || hour > 23 || min > 59 || sec > 59 {
-        return None;
-    }
-
-    let is_leap = year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
-    let month_days: [u64; 12] = [
-        31,
-        if is_leap { 29 } else { 28 },
-        31,
-        30,
-        31,
-        30,
-        31,
-        31,
-        30,
-        31,
-        30,
-        31,
-    ];
-    #[allow(clippy::cast_possible_truncation)]
-    // month is validated 1-12, value fits usize on all targets
-    if day > month_days[(month - 1) as usize] {
-        return None;
-    }
-
-    // Days from epoch (constant-time calculation)
-    let leap_days = |y: u64| -> u64 { y / 4 - y / 100 + y / 400 };
-    let y0 = year - 1;
-    let days_to_year = year * 365 + leap_days(y0) - (1970 * 365 + leap_days(1969));
-    let mut days: u64 = days_to_year;
-    for md in &month_days[..((month - 1) as usize)] {
-        days += md;
-    }
-    days += day - 1;
-
-    Some(days * 86400 + hour * 3600 + min * 60 + sec)
+    u64::try_from(chrono::DateTime::parse_from_rfc3339(s).ok()?.timestamp()).ok()
 }
 
 const GH_HISTORY_FIELDS: &str =

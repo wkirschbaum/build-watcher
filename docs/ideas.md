@@ -16,6 +16,9 @@ Ignore runs triggered by specific GitHub events (e.g. `schedule`, `dependabot`) 
 ### `bw status` CLI command
 One-shot terminal snapshot of all watched repos and their current build status, without launching the full TUI. Useful for a quick check from any terminal.
 
+### Author in notifications
+Show the commit author or triggering user in the notification body (e.g. last line: "by Kynan Ware"). **Limitation:** `gh run list --json` does not expose author or actor fields. The data is available via `gh api repos/{owner}/{repo}/actions/runs/{id}` (`head_commit.author.name` and `triggering_actor.login`), but that requires one extra API call per newly detected run — too expensive given rate-limit constraints. Feasible once we track per-run state and can batch the lookup.
+
 ## Medium Effort
 
 ### TUI dashboard
