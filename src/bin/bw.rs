@@ -5,7 +5,7 @@
 
 use std::time::{Duration, Instant};
 
-use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind};
+use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
@@ -363,7 +363,7 @@ fn render(frame: &mut ratatui::Frame, app: &App) {
     ))];
     if app.status.paused {
         left2_spans.push(Span::styled(
-            "  ⏸ PAUSED",
+            "  ⏸ NOTIFS PAUSED",
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
@@ -786,6 +786,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                             match key.code {
                                 KeyCode::Char('q') => break,
+                                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
                                 KeyCode::Up | KeyCode::Char('k') => {
                                     app.selected = app.selected.saturating_sub(1);
                                 }
