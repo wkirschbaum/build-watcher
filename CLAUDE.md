@@ -30,7 +30,7 @@ cargo clippy                # Lint
 ### Key files
 
 - `src/main.rs` — Entry point, wires up config, watches, event bus, and server
-- `src/server.rs` — MCP tool handlers (`BuildWatcher` struct), axum router
+- `src/server.rs` — MCP tool handlers (`BuildWatcher` struct), axum router, REST endpoints (`/status`, `/stats`, `/events`, `/pause`, `/rerun`)
 - `src/watcher.rs` — Watch lifecycle, `Poller` task, state persistence, rate limiting
 - `src/events.rs` — `EventBus` (broadcast channel), `WatchEvent` and `RunSnapshot` types (pure, no I/O)
 - `src/config.rs` — Config structs, crash-safe JSON persistence helpers
@@ -38,7 +38,8 @@ cargo clippy                # Lint
 - `src/format.rs` — Duration, age, and truncation formatting
 - `src/register.rs` — MCP server registration in `~/.claude.json` (invoked via `--register` flag)
 - `src/notification.rs` — Daemon-only notification handler; subscribes to the event bus and dispatches platform notifications
-- `src/bin/bw.rs` — `bw` CLI companion; reads the port file and queries `/status`
+- `src/status.rs` — Shared HTTP response types (`StatusResponse`, `StatsResponse`) used by both daemon and TUI
+- `src/bin/bw.rs` — `bw` TUI dashboard; SSE real-time updates, row selection, rerun/open/pause actions
 - `src/platform/` — `Notifier` trait + backends (Linux: D-Bus via `zbus`; macOS: `terminal-notifier` → `osascript` fallback)
 
 ### How it works

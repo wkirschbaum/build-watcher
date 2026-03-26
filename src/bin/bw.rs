@@ -15,19 +15,22 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Cell, Paragraph, Row, Table};
+use ratatui::widgets::{Cell, Paragraph, Row, Table};
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt as _;
 
 use build_watcher::config::state_dir;
 use build_watcher::events::WatchEvent;
 use build_watcher::format;
-use build_watcher::status::{ActiveRunView, LastBuildView, StatusResponse, WatchStatus};
+use build_watcher::status::{
+    ActiveRunView, LastBuildView, StatsResponse, StatusResponse, WatchStatus,
+};
 
 // -- App state --
 
 struct App {
     status: StatusResponse,
+    stats: StatsResponse,
     /// When we last successfully fetched /status.
     last_fetch: Instant,
     /// Error message from the most recent failed fetch, if any.
@@ -49,13 +52,16 @@ impl App {
     }
 
     async fn resync(&mut self, client: &reqwest::Client, port: u16) {
-        match fetch_status(client, port).await {
+        match fetch_json::<StatusResponse>(client, port, "/status").await {
             Ok(status) => {
                 self.status = status;
                 self.last_fetch = Instant::now();
                 self.fetch_error = None;
             }
             Err(e) => self.fetch_error = Some(e),
+        }
+        if let Ok(stats) = fetch_json::<StatsResponse>(client, port, "/stats").await {
+            self.stats = stats;
         }
     }
 }
@@ -164,6 +170,16 @@ impl DisplayRow<'_> {
 
 // -- Event application --
 
+fn find_watch_mut<'a>(
+    watches: &'a mut [WatchStatus],
+    repo: &str,
+    branch: &str,
+) -> Option<&'a mut WatchStatus> {
+    watches
+        .iter_mut()
+        .find(|w| w.repo == repo && w.branch == branch)
+}
+
 /// Apply a watch event to the local status snapshot.
 ///
 /// Updates only watches that already exist in the snapshot; new watches
@@ -171,11 +187,7 @@ impl DisplayRow<'_> {
 fn apply_event(status: &mut StatusResponse, event: WatchEvent) {
     match event {
         WatchEvent::RunStarted(snap) => {
-            let Some(watch) = status
-                .watches
-                .iter_mut()
-                .find(|w| w.repo == snap.repo && w.branch == snap.branch)
-            else {
+            let Some(watch) = find_watch_mut(&mut status.watches, &snap.repo, &snap.branch) else {
                 return;
             };
             if !watch.active_runs.iter().any(|r| r.run_id == snap.run_id) {
@@ -196,11 +208,7 @@ fn apply_event(status: &mut StatusResponse, event: WatchEvent) {
             failing_steps,
             ..
         } => {
-            let Some(watch) = status
-                .watches
-                .iter_mut()
-                .find(|w| w.repo == run.repo && w.branch == run.branch)
-            else {
+            let Some(watch) = find_watch_mut(&mut status.watches, &run.repo, &run.branch) else {
                 return;
             };
             watch.active_runs.retain(|r| r.run_id != run.run_id);
@@ -215,11 +223,7 @@ fn apply_event(status: &mut StatusResponse, event: WatchEvent) {
             });
         }
         WatchEvent::StatusChanged { run, to, .. } => {
-            let Some(watch) = status
-                .watches
-                .iter_mut()
-                .find(|w| w.repo == run.repo && w.branch == run.branch)
-            else {
+            let Some(watch) = find_watch_mut(&mut status.watches, &run.repo, &run.branch) else {
                 return;
             };
             if let Some(active) = watch
@@ -308,44 +312,81 @@ const FLASH_DURATION: Duration = Duration::from_secs(3);
 fn render(frame: &mut ratatui::Frame, app: &App) {
     let area = frame.area();
     let cw = ColWidths::from_terminal_width(area.width);
+    let w = area.width as usize;
+    let dim = Style::default().fg(Color::DarkGray);
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1), // header
+            Constraint::Length(3), // header (2 info lines + separator)
             Constraint::Length(1), // column headings
             Constraint::Min(0),    // table body
             Constraint::Length(1), // footer
         ])
         .split(area);
 
-    // -- Header --
-    let repo_count = app.status.watches.len();
-    let active_count = app.active_count();
-    let mut header_spans = vec![
+    // -- Header line 1: title + stats --
+    let s = &app.stats;
+    let uptime = format::seconds(s.uptime_secs);
+    let poll = format!("poll {}s/{}s", s.active_poll_secs, s.idle_poll_secs);
+    let api = match (s.rate_remaining, s.rate_limit) {
+        (Some(rem), Some(lim)) => {
+            let pct = if lim > 0 { rem * 100 / lim } else { 0 };
+            let reset = s
+                .rate_reset_mins
+                .map(|m| format!("  reset {m}m"))
+                .unwrap_or_default();
+            format!("API {rem}/{lim} ({pct}%){reset}")
+        }
+        _ => "API —".to_string(),
+    };
+
+    let left1_suffix = format!(" — up {uptime}");
+    let right1 = format!("{poll}  {api}");
+    let left1_len = "build-watcher".len() + left1_suffix.len();
+    let gap1 = w.saturating_sub(left1_len + right1.len());
+    let line1 = Line::from(vec![
         Span::styled(
             "build-watcher",
             Style::default().add_modifier(Modifier::BOLD),
         ),
-        Span::raw(format!("  {repo_count} repos  {active_count} active")),
-    ];
+        Span::raw(left1_suffix),
+        Span::raw(" ".repeat(gap1)),
+        Span::styled(right1, dim),
+    ]);
+
+    // -- Header line 2: watches + state --
+    let repo_count = app.status.watches.len();
+    let active_count = app.active_count();
+    let mut left2_spans: Vec<Span> = vec![Span::raw(format!(
+        "{repo_count} repos, {active_count} active"
+    ))];
     if app.status.paused {
-        header_spans.push(Span::styled(
+        left2_spans.push(Span::styled(
             "  ⏸ PAUSED",
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
         ));
     }
-    if let SseState::Disconnected { since } = &app.sse_state {
-        header_spans.push(Span::styled(
-            format!("  ⚡ reconnecting ({}s)", since.elapsed().as_secs()),
-            Style::default().fg(Color::Yellow),
-        ));
+    match &app.sse_state {
+        SseState::Connecting => {
+            left2_spans.push(Span::styled(
+                "  ⚡ connecting…",
+                Style::default().fg(Color::Yellow),
+            ));
+        }
+        SseState::Disconnected { since } => {
+            left2_spans.push(Span::styled(
+                format!("  ⚡ reconnecting ({}s)", since.elapsed().as_secs()),
+                Style::default().fg(Color::Yellow),
+            ));
+        }
+        SseState::Connected => {}
     }
     if let Some(err) = &app.fetch_error {
         let stale_secs = app.last_fetch.elapsed().as_secs();
-        header_spans.push(Span::styled(
+        left2_spans.push(Span::styled(
             format!("  ⚠ {err} ({stale_secs}s stale)"),
             Style::default().fg(Color::Red),
         ));
@@ -353,12 +394,17 @@ fn render(frame: &mut ratatui::Frame, app: &App) {
     if let Some((msg, at)) = &app.flash
         && at.elapsed() < FLASH_DURATION
     {
-        header_spans.push(Span::styled(
+        left2_spans.push(Span::styled(
             format!("  {msg}"),
             Style::default().fg(Color::Cyan),
         ));
     }
-    frame.render_widget(Paragraph::new(Line::from(header_spans)), chunks[0]);
+    let line2 = Line::from(left2_spans);
+
+    // -- Header line 3: separator --
+    let line3 = Line::from(Span::styled("─".repeat(w), dim));
+
+    frame.render_widget(Paragraph::new(vec![line1, line2, line3]), chunks[0]);
 
     // -- Column headings --
     let header_style = Style::default()
@@ -454,14 +500,10 @@ fn render(frame: &mut ratatui::Frame, app: &App) {
     let widths = cw.constraints();
 
     // Render headings row as a table so columns align with the body.
-    let heading_table = Table::new(vec![col_header], widths)
-        .block(Block::default())
-        .column_spacing(COL_SPACING);
+    let heading_table = Table::new(vec![col_header], widths).column_spacing(COL_SPACING);
     frame.render_widget(heading_table, chunks[1]);
 
-    let body_table = Table::new(rows, widths)
-        .block(Block::default())
-        .column_spacing(COL_SPACING);
+    let body_table = Table::new(rows, widths).column_spacing(COL_SPACING);
     frame.render_widget(body_table, chunks[2]);
 
     // -- Footer --
@@ -476,7 +518,7 @@ fn render(frame: &mut ratatui::Frame, app: &App) {
         Span::styled("[o]", key_style),
         Span::raw(" open  "),
         Span::styled("[p]", key_style),
-        Span::raw(" pause  "),
+        Span::raw(" pause notifs  "),
         Span::styled("[q]", key_style),
         Span::raw(" quit"),
     ]))
@@ -486,16 +528,18 @@ fn render(frame: &mut ratatui::Frame, app: &App) {
 
 // -- HTTP --
 
-async fn fetch_status(client: &reqwest::Client, port: u16) -> Result<StatusResponse, String> {
-    let url = format!("http://127.0.0.1:{port}/status");
+async fn fetch_json<T: serde::de::DeserializeOwned>(
+    client: &reqwest::Client,
+    port: u16,
+    path: &str,
+) -> Result<T, String> {
+    let url = format!("http://127.0.0.1:{port}{path}");
     let resp = client
         .get(&url)
         .send()
         .await
         .map_err(|e| format!("connect: {e}"))?;
-    resp.json::<StatusResponse>()
-        .await
-        .map_err(|e| format!("parse: {e}"))
+    resp.json::<T>().await.map_err(|e| format!("parse: {e}"))
 }
 
 // -- SSE background task --
@@ -645,16 +689,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Initial fetch so there's something to display before SSE connects.
     let client = reqwest::Client::new();
-    let initial = fetch_status(&client, port).await.unwrap_or_else(|e| {
-        eprintln!("Warning: could not fetch initial status: {e}");
-        StatusResponse {
-            paused: false,
-            watches: vec![],
-        }
-    });
+    let initial = fetch_json::<StatusResponse>(&client, port, "/status")
+        .await
+        .unwrap_or_else(|e| {
+            eprintln!("Warning: could not fetch initial status: {e}");
+            StatusResponse {
+                paused: false,
+                watches: vec![],
+            }
+        });
+    let initial_stats = fetch_json::<StatsResponse>(&client, port, "/stats")
+        .await
+        .unwrap_or_default();
 
     let mut app = App {
         status: initial,
+        stats: initial_stats,
         last_fetch: Instant::now(),
         fetch_error: None,
         sse_state: SseState::Connecting,
@@ -756,11 +806,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                                 KeyCode::Char('r') => {
                                     if let Some((repo, Some(run_id))) = selected {
-                                        app.flash = Some(("Rerunning…".to_string(), Instant::now()));
                                         if let Err(e) = post_rerun(&client, port, repo, run_id).await {
                                             app.flash = Some((e, Instant::now()));
                                         } else {
                                             app.flash = Some((format!("Rerun started: {run_id}"), Instant::now()));
+                                            app.resync(&client, port).await;
                                         }
                                     }
                                 }

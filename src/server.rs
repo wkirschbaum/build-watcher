@@ -27,7 +27,9 @@ use build_watcher::config::{
 use build_watcher::events::{EventBus, WatchEvent};
 use build_watcher::format;
 use build_watcher::github::{validate_branch, validate_repo};
-use build_watcher::status::{ActiveRunView, LastBuildView, StatusResponse, WatchStatus};
+use build_watcher::status::{
+    ActiveRunView, LastBuildView, StatsResponse, StatusResponse, WatchStatus,
+};
 use build_watcher::watcher::{
     MIN_ACTIVE_SECS, MIN_IDLE_SECS, PauseState, RateLimitState, SharedConfig, WatchEntry, WatchKey,
     WatcherHandle, Watches, compute_intervals, count_api_calls, is_paused, last_failed_build,
@@ -38,13 +40,15 @@ pub const DEFAULT_PORT: u16 = 8417;
 
 // -- SSE / status endpoints --
 
-/// Shared state for the HTTP routes (`/status`, `/events`, `/pause`, `/rerun`).
+/// Shared state for the HTTP routes.
 #[derive(Clone)]
 struct AppState {
     watches: Watches,
     pause: PauseState,
     events: EventBus,
     github: Arc<dyn build_watcher::github::GitHubClient>,
+    rate_limit: RateLimitState,
+    started_at: std::time::Instant,
 }
 
 /// Build a snapshot of all current watches from already-locked state.
@@ -134,6 +138,31 @@ async fn events_handler(State(state): State<AppState>) -> impl axum::response::I
     Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(30)))
 }
 
+/// `GET /stats` — Daemon stats: uptime, polling intervals, rate limit.
+async fn stats_handler(State(state): State<AppState>) -> axum::Json<StatsResponse> {
+    let uptime_secs = state.started_at.elapsed().as_secs();
+    let api_calls = count_api_calls(&*state.watches.lock().await);
+    let rl = state.rate_limit.lock().await;
+    let (active_poll_secs, idle_poll_secs) = compute_intervals(rl.as_ref(), api_calls, unix_now());
+
+    let (rate_remaining, rate_limit, rate_reset_mins) = match rl.as_ref() {
+        Some(r) => {
+            let reset_mins = r.reset.saturating_sub(unix_now()) / 60;
+            (Some(r.remaining), Some(r.limit), Some(reset_mins))
+        }
+        None => (None, None, None),
+    };
+
+    axum::Json(StatsResponse {
+        uptime_secs,
+        active_poll_secs,
+        idle_poll_secs,
+        rate_remaining,
+        rate_limit,
+        rate_reset_mins,
+    })
+}
+
 // -- Pause / rerun endpoints --
 
 #[derive(Deserialize)]
@@ -217,6 +246,8 @@ fn build_router(
         pause: pause.clone(),
         events: handle.events.clone(),
         github: handle.github.clone(),
+        rate_limit: rate_limit.clone(),
+        started_at,
     };
 
     let service: StreamableHttpService<BuildWatcher, LocalSessionManager> =
@@ -237,6 +268,7 @@ fn build_router(
 
     axum::Router::new()
         .route("/status", get(status_handler))
+        .route("/stats", get(stats_handler))
         .route("/events", get(events_handler))
         .route("/pause", axum::routing::post(pause_handler))
         .route("/rerun", axum::routing::post(rerun_handler))
@@ -1614,6 +1646,8 @@ mod tests {
             pause,
             events,
             github: Arc::new(StubGitHub),
+            rate_limit: Arc::new(Mutex::new(None)),
+            started_at: std::time::Instant::now(),
         };
         axum::Router::new()
             .route("/status", axum::routing::get(super::status_handler))

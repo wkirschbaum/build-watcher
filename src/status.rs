@@ -1,4 +1,4 @@
-/// HTTP response types for `GET /status`.
+/// HTTP response types for `GET /status` and `GET /stats`.
 ///
 /// Shared between the daemon (`server.rs`) and the TUI (`bin/bw.rs`).
 use serde::{Deserialize, Serialize};
@@ -45,4 +45,15 @@ pub struct WatchStatus {
 pub struct StatusResponse {
     pub paused: bool,
     pub watches: Vec<WatchStatus>,
+}
+
+/// Daemon stats returned by `GET /stats`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct StatsResponse {
+    pub uptime_secs: u64,
+    pub active_poll_secs: u64,
+    pub idle_poll_secs: u64,
+    pub rate_remaining: Option<u64>,
+    pub rate_limit: Option<u64>,
+    pub rate_reset_mins: Option<u64>,
 }

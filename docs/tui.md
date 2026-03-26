@@ -1,28 +1,33 @@
-# `bw` TUI Plan
+# `bw` TUI Dashboard
 
-A top-like live terminal dashboard for build-watcher.
+A top-like live terminal dashboard for the build-watcher daemon.
 
----
+## Usage
 
-## Status — all phases complete ✅
+```bash
+cargo run --bin bw
+```
 
-### Phase 1 — Basic live display ✅
+Requires the `build-watcher` daemon to be running. The TUI reads the port file from `~/.local/state/build-watcher/port` and connects to the daemon's HTTP API.
 
-ratatui table, 1s polling, colour coding, `q` quit, `⏸ PAUSED` header indicator, failing-steps sub-row, column truncation.
+## Layout
 
-### Phase 2 — SSE real-time updates ✅
+```
+build-watcher — up 2h 15m                    poll 15s/60s  API 4521/5000 (90%)  reset 42m
+7 repos, 3 active
+────────────────────────────────────────────────────────────────────────────────
+REPO                BRANCH    STATUS          WORKFLOW       TITLE              ELAPSED / AGE
+floatpays/benefits  main      ⏳ in_progress  CI             Fix login bug      1m 12s
+floatpays/moneyclub main      ❌ failure      CI             Update deps        3m ago
+  ↳ Build / Run tests
+wkirschbaum/build…  main      ✅ success      CI             Add TUI            2h ago
+────────────────────────────────────────────────────────────────────────────────
+[↑↓] select  [r] rerun  [o] open  [p] pause notifs  [q] quit
+```
 
-SSE background task subscribes to `GET /events`; events applied in-place via `apply_event`. Reconnects with exponential backoff (1s → 2s → … → 30s), resetting after each successful connection. `/status` resync on every (re)connect and every 30 s as a fallback. Header shows `⚡ reconnecting (Xs)` when disconnected.
+**Header line 1:** daemon uptime, polling intervals (active/idle), GitHub API rate limit and reset time.
 
-### Phase 3 — Navigation and actions ✅
-
-Row selection (`↑`/`↓`/`j`/`k`) with highlight. `r` reruns the selected build via `POST /rerun`, `o` opens the run URL in the browser (`xdg-open` / `open`), `p` toggles notification pause via `POST /pause`. Flash messages in the header for action feedback.
-
-### Phase 4 — Polish ✅
-
-Completed build age ("3m ago", "2h ago") with local ticking, responsive column widths scaling to terminal width, terminal resize handling.
-
----
+**Header line 2:** watch count, active build count, plus status indicators (paused, SSE connection state, errors, flash messages).
 
 ## Keybindings
 
@@ -30,16 +35,26 @@ Completed build age ("3m ago", "2h ago") with local ticking, responsive column w
 |-----|--------|
 | `↑` / `k` | Move cursor up |
 | `↓` / `j` | Move cursor down |
-| `r` | Rerun selected build |
+| `r` | Rerun selected build (via `POST /rerun`) |
 | `o` | Open selected run in browser |
-| `p` | Toggle pause notifications |
+| `p` | Toggle notification pause (via `POST /pause`) |
 | `q` | Quit |
 
----
+## Architecture
 
-## Verification
+The TUI connects to the daemon via three HTTP endpoints:
 
-```bash
-cargo fmt && cargo clippy && cargo test
-cargo run --bin bw
-```
+- **`GET /status`** — Watch state snapshot (repos, active runs, last builds)
+- **`GET /stats`** — Daemon stats (uptime, polling intervals, rate limit)
+- **`GET /events`** — SSE stream of `WatchEvent`s for real-time updates
+
+Updates arrive via SSE and are applied in-place to the local state. A `/status` + `/stats` resync runs on every SSE (re)connect and every 30 seconds as a fallback. Elapsed times and build ages tick locally every second.
+
+Actions (`r`, `p`) call `POST /rerun` or `POST /pause` on the daemon, then resync to reflect the new state immediately.
+
+## Implementation phases (all complete)
+
+1. **Basic display** — ratatui table, 1s polling, colour coding, failing-steps sub-rows
+2. **SSE real-time** — background SSE task, `apply_event`, reconnect with exponential backoff
+3. **Navigation & actions** — row selection, rerun, open in browser, pause toggle, flash messages
+4. **Polish** — build age, responsive columns, resize handling, top-like multi-line header with stats
