@@ -78,14 +78,6 @@ impl DaemonClient {
             .await
     }
 
-    async fn rerun(&self, repo: &str, run_id: u64) -> Result<(), String> {
-        self.post_json(
-            "/rerun",
-            &serde_json::json!({ "repo": repo, "run_id": run_id }),
-        )
-        .await
-    }
-
     async fn watch(&self, repo: &str) -> Result<(), String> {
         self.post_json("/watch", &serde_json::json!({ "repos": [repo] }))
             .await
@@ -136,6 +128,25 @@ enum InputMode {
     },
 }
 
+/// Implements `next()` and `prev()` cycling through all variants of a `Copy + Eq` enum.
+macro_rules! impl_cycle {
+    ($T:ty, [$($variant:expr),+ $(,)?]) => {
+        impl $T {
+            const ALL: &[Self] = &[$($variant),+];
+
+            fn next(self) -> Self {
+                let idx = Self::ALL.iter().position(|&v| v == self).unwrap_or(0);
+                Self::ALL[(idx + 1) % Self::ALL.len()]
+            }
+
+            fn prev(self) -> Self {
+                let idx = Self::ALL.iter().position(|&v| v == self).unwrap_or(0);
+                Self::ALL[(idx + Self::ALL.len() - 1) % Self::ALL.len()]
+            }
+        }
+    };
+}
+
 /// How to group rows in the watch list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GroupBy {
@@ -146,20 +157,18 @@ enum GroupBy {
     None,
 }
 
-impl GroupBy {
-    const ALL: [GroupBy; 5] = [
+impl_cycle!(
+    GroupBy,
+    [
         GroupBy::Org,
         GroupBy::Branch,
         GroupBy::Workflow,
         GroupBy::Status,
-        GroupBy::None,
-    ];
+        GroupBy::None
+    ]
+);
 
-    fn next(self) -> Self {
-        let idx = Self::ALL.iter().position(|&g| g == self).unwrap_or(0);
-        Self::ALL[(idx + 1) % Self::ALL.len()]
-    }
-
+impl GroupBy {
     fn label(self) -> &'static str {
         match self {
             GroupBy::Org => "org",
@@ -181,20 +190,16 @@ enum SortColumn {
     Age,
 }
 
-impl SortColumn {
-    const ALL: [SortColumn; 5] = [
+impl_cycle!(
+    SortColumn,
+    [
         SortColumn::Repo,
         SortColumn::Branch,
         SortColumn::Status,
         SortColumn::Workflow,
-        SortColumn::Age,
-    ];
-
-    fn next(self) -> Self {
-        let idx = Self::ALL.iter().position(|&c| c == self).unwrap_or(0);
-        Self::ALL[(idx + 1) % Self::ALL.len()]
-    }
-}
+        SortColumn::Age
+    ]
+);
 
 struct App {
     status: StatusResponse,
@@ -206,7 +211,7 @@ struct App {
     sse_state: SseState,
     /// Index into the selectable (non-sub-row) display rows.
     selected: usize,
-    /// Transient feedback message shown in the header (e.g. "Rerunning…").
+    /// Transient feedback message shown in the header (e.g. "Adding…").
     flash: Option<(String, Instant)>,
     input_mode: InputMode,
     /// Sender for background task results back to the main loop.
@@ -398,26 +403,23 @@ impl App {
             }
             KeyCode::Char('d') => {
                 if let Some((repo, _, _)) = selected {
-                    let repo = repo.to_string();
                     let d = daemon.clone();
-                    let r = repo.clone();
+                    let repo = repo.to_string();
                     self.spawn_action(format!("Removing {repo}…"), true, async move {
-                        d.unwatch(&r).await.map(|()| format!("Removed {r}"))
+                        d.unwatch(&repo).await.map(|()| format!("Removed {repo}"))
                     });
                 }
             }
             KeyCode::Char('n') => {
                 if let Some((repo, _, muted)) = selected {
+                    let d = daemon.clone();
                     let repo = repo.to_string();
                     let action = if muted { "unmute" } else { "mute" };
                     let verb = if muted { "Unmuted" } else { "Muted" };
-                    let d = daemon.clone();
-                    let r = repo.clone();
-                    let v = verb.to_string();
                     self.spawn_action(format!("{verb} {repo}…"), true, async move {
-                        d.set_notifications(&r, action)
+                        d.set_notifications(&repo, action)
                             .await
-                            .map(|()| format!("{v} {r}"))
+                            .map(|()| format!("{verb} {repo}"))
                     });
                 }
             }
@@ -433,34 +435,32 @@ impl App {
                         .map(|()| if new_pause { "Paused" } else { "Resumed" }.to_string())
                 });
             }
-            KeyCode::Char('r') => {
-                if let Some((repo, Some(run_id), _)) = selected {
-                    let d = daemon.clone();
-                    let r = repo.to_string();
-                    self.spawn_action(format!("Rerunning {run_id}…"), true, async move {
-                        d.rerun(&r, run_id)
-                            .await
-                            .map(|()| format!("Rerun started: {run_id}"))
-                    });
-                }
-            }
             KeyCode::Char('o') => {
                 if let Some((repo, Some(run_id), _)) = selected {
                     open_url(repo, run_id);
                 }
             }
             KeyCode::Char('s') => {
-                self.sort_column = self.sort_column.next();
-                self.sort_ascending = true;
+                if self.sort_ascending {
+                    self.sort_ascending = false;
+                } else {
+                    self.sort_column = self.sort_column.next();
+                    self.sort_ascending = true;
+                }
             }
             KeyCode::Char('S') => {
-                self.sort_ascending = !self.sort_ascending;
+                if !self.sort_ascending {
+                    self.sort_ascending = true;
+                } else {
+                    self.sort_column = self.sort_column.prev();
+                    self.sort_ascending = false;
+                }
             }
             KeyCode::Char('g') => {
                 self.group_by = self.group_by.next();
             }
             KeyCode::Char('G') => {
-                self.group_by = GroupBy::None;
+                self.group_by = self.group_by.prev();
             }
             _ => {}
         }
@@ -531,7 +531,7 @@ fn group_key(w: &WatchStatus, group_by: GroupBy) -> Option<String> {
         GroupBy::Org => Some(w.repo.split('/').next().unwrap_or(&w.repo).to_string()),
         GroupBy::Branch => Some(w.branch.clone()),
         GroupBy::Workflow => {
-            let wf = watch_sort_workflow(w);
+            let wf = watch_workflow(w);
             if wf.is_empty() {
                 Some("(none)".to_string())
             } else {
@@ -539,11 +539,11 @@ fn group_key(w: &WatchStatus, group_by: GroupBy) -> Option<String> {
             }
         }
         GroupBy::Status => {
-            let (tier, status) = watch_sort_status(w);
-            Some(match tier {
-                0 => status.to_string(),
-                1 => status.to_string(),
-                _ => "idle".to_string(),
+            let (tier, status) = watch_status(w);
+            Some(if tier <= 1 {
+                status.to_string()
+            } else {
+                "idle".to_string()
             })
         }
         GroupBy::None => None,
@@ -633,18 +633,18 @@ fn sorted_watches(
             SortColumn::Repo => a.repo.cmp(&b.repo).then(a.branch.cmp(&b.branch)),
             SortColumn::Branch => a.branch.cmp(&b.branch).then(a.repo.cmp(&b.repo)),
             SortColumn::Status => {
-                let sa = watch_sort_status(a);
-                let sb = watch_sort_status(b);
+                let sa = watch_status(a);
+                let sb = watch_status(b);
                 sa.cmp(&sb)
             }
             SortColumn::Workflow => {
-                let wa = watch_sort_workflow(a);
-                let wb = watch_sort_workflow(b);
+                let wa = watch_workflow(a);
+                let wb = watch_workflow(b);
                 wa.cmp(wb)
             }
             SortColumn::Age => {
-                let aa = watch_sort_age(a);
-                let ab = watch_sort_age(b);
+                let aa = watch_age(a);
+                let ab = watch_age(b);
                 aa.partial_cmp(&ab).unwrap_or(std::cmp::Ordering::Equal)
             }
         };
@@ -653,8 +653,8 @@ fn sorted_watches(
     sorted
 }
 
-/// Sort key for status: active runs first (by status), then completed (by conclusion).
-fn watch_sort_status(w: &WatchStatus) -> (u8, &str) {
+/// Status key: active runs (tier 0), completed (tier 1), idle (tier 2).
+fn watch_status(w: &WatchStatus) -> (u8, &str) {
     if let Some(run) = w.active_runs.first() {
         (0, &run.status)
     } else if let Some(b) = &w.last_build {
@@ -664,7 +664,7 @@ fn watch_sort_status(w: &WatchStatus) -> (u8, &str) {
     }
 }
 
-fn watch_sort_workflow(w: &WatchStatus) -> &str {
+fn watch_workflow(w: &WatchStatus) -> &str {
     if let Some(run) = w.active_runs.first() {
         &run.workflow
     } else if let Some(b) = &w.last_build {
@@ -674,8 +674,8 @@ fn watch_sort_workflow(w: &WatchStatus) -> &str {
     }
 }
 
-/// Sort key for age: active runs by elapsed (smallest first), then completed by age.
-fn watch_sort_age(w: &WatchStatus) -> f64 {
+/// Age/elapsed key: active run elapsed, completed build age, or MAX for idle.
+fn watch_age(w: &WatchStatus) -> f64 {
     if let Some(run) = w.active_runs.first() {
         run.elapsed_secs.unwrap_or(f64::MAX)
     } else if let Some(b) = &w.last_build {
@@ -1098,8 +1098,6 @@ fn render_footer(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
             Span::raw(" branches  "),
             Span::styled("[d]", key_style),
             Span::raw(" remove  "),
-            Span::styled("[r]", key_style),
-            Span::raw(" rerun  "),
             Span::styled("[o]", key_style),
             Span::raw(" open  "),
             Span::styled("[n]", key_style),
@@ -1265,6 +1263,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await
         .unwrap_or_default();
 
+    // Shared channel for SSE events and background action results.
+    let (sse_tx, mut sse_rx) = mpsc::channel::<SseUpdate>(64);
+
     let mut app = App {
         status: initial,
         stats: initial_stats,
@@ -1274,7 +1275,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         selected: 0,
         flash: None,
         input_mode: InputMode::Normal,
-        bg_tx: mpsc::channel(1).0, // placeholder, replaced below
+        bg_tx: sse_tx.clone(),
         sort_column: SortColumn::Repo,
         sort_ascending: true,
         group_by: GroupBy::Org,
@@ -1287,9 +1288,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    // Shared channel for SSE events and background action results.
-    let (sse_tx, mut sse_rx) = mpsc::channel::<SseUpdate>(64);
-    app.bg_tx = sse_tx.clone();
     tokio::spawn(sse_task(daemon.inner().clone(), port, sse_tx));
 
     let mut keyboard = EventStream::new();
@@ -1590,8 +1588,6 @@ mod tests {
         // No panic, no state change.
         assert!(status.watches[0].active_runs.is_empty());
     }
-
-    // -- LastBuildView title --
 
     // -- flatten_rows --
 
