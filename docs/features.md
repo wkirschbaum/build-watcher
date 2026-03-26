@@ -26,6 +26,8 @@ On macOS, the preferred backend is `terminal-notifier` (supports URL open and no
 
 Notification levels (`off`, `low`, `normal`, `critical`) are configurable per event type (`build_started`, `build_success`, `build_failure`) at three scopes: global defaults, per-repo overrides, and per-branch overrides. Resolution follows branch > repo > global priority — a branch override wins over a repo override, which wins over the global default. Only the events you specify are changed; others inherit from the parent scope.
 
+Levels can be configured via the MCP `update_notifications` tool, the REST `/notifications` endpoint, or interactively from the TUI using the notification level picker (`N` key).
+
 ## Notification Pause and Resume
 
 Notifications can be temporarily paused for a specified number of minutes or indefinitely until manually resumed or the daemon restarts. While paused, builds continue to be tracked and state is updated — only the desktop notification dispatch is suppressed. The pause state is visible in `list_watches` and `get_config` output.
@@ -99,15 +101,23 @@ Repo names are validated to match the `owner/repo` format with safe characters (
 
 ## TUI Dashboard (`bw`)
 
-A top-like live terminal dashboard for monitoring all watched builds. Run with `cargo run --bin bw` (or the installed `bw` binary). The TUI connects to the daemon's REST API and SSE stream for real-time updates.
+A top-like live terminal dashboard for monitoring all watched builds. Run with `bw` (auto-starts the daemon if it isn't running). The TUI connects to the daemon's REST API and SSE stream for real-time updates.
 
 Features:
 - **Live build status table** with colour-coded status, failing steps sub-rows, and elapsed/age columns
 - **Top-like header** showing daemon uptime, polling intervals, and GitHub API rate limit
-- **Row selection** (`↑`/`↓`/`j`/`k`) with actions: rerun build (`r`), open in browser (`o`), toggle notification pause (`p`)
+- **Row selection** (`↑`/`↓`/`j`/`k`) with actions on the selected repo/branch
+- **Watch management** — add (`a`), remove (`d`), and configure branches (`b`) without leaving the TUI
+- **Sortable columns** — cycle through repo, branch, status, workflow, age with `s`/`S`
+- **Configurable grouping** — cycle through org, branch, workflow, status, none with `g`/`G`
+- **Notification controls** — mute/unmute toggle (`n`), per-event level picker popup (`N`) with `←`/`→` cycling through `off`/`low`/`normal`/`critical`
+- **Open in browser** — `o` opens the current run, `O` opens the repo page
+- **Config popup** (`C`) — edit global default branches and ignored workflows inline
+- **Auto-start** — if the daemon isn't running, `bw` starts it automatically
 - **SSE real-time updates** — builds appear and complete instantly without waiting for poll cycles
 - **Responsive columns** that scale to terminal width
 - **Reconnection** with exponential backoff when the daemon connection drops
+- **Quit and shutdown** — `Q` exits the TUI and also stops the daemon
 
 ## REST API
 
@@ -116,8 +126,13 @@ The daemon exposes REST endpoints alongside the MCP server for the TUI and other
 - `GET /status` — JSON snapshot of all watches, active runs, and last builds
 - `GET /stats` — daemon stats (uptime, polling intervals, API rate limit)
 - `GET /events` — SSE stream of typed watch events
+- `GET /notifications?repo=&branch=` — resolved (merged) notification config for a specific repo/branch
+- `POST /notifications` — mute, unmute, or set per-event levels for a repo/branch; supports `action: "mute" | "unmute" | "set_levels"` and optional `branch`
+- `GET /defaults` — global config defaults (default branches and ignored workflows)
+- `POST /defaults` — update global default branches and/or ignored workflows
 - `POST /pause` — toggle notification pause
 - `POST /rerun` — rerun a build by repo and run ID
+- `POST /shutdown` — initiate graceful daemon shutdown
 
 ## Graceful Shutdown
 

@@ -16,14 +16,14 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Cell, Paragraph, Row, Table};
+use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table};
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt as _;
 
-use build_watcher::config::state_dir;
+use build_watcher::config::{NotificationConfig, NotificationLevel, state_dir};
 use build_watcher::events::WatchEvent;
 use build_watcher::format;
-use build_watcher::github::{validate_branch, validate_repo};
+use build_watcher::github::{repo_url, run_url, validate_branch, validate_repo};
 use build_watcher::status::{
     ActiveRunView, LastBuildView, StatsResponse, StatusResponse, WatchStatus,
 };
@@ -70,6 +70,11 @@ impl DaemonClient {
         if !resp.status().is_success() {
             return Err(format!("{path}: HTTP {}", resp.status()));
         }
+        // Daemon handlers return {"error": "..."} on validation failures (with 200 status).
+        let json: serde_json::Value = resp.json().await.map_err(|e| format!("{path}: {e}"))?;
+        if let Some(err) = json.get("error").and_then(|v| v.as_str()) {
+            return Err(err.to_string());
+        }
         Ok(())
     }
 
@@ -88,10 +93,54 @@ impl DaemonClient {
             .await
     }
 
-    async fn set_notifications(&self, repo: &str, action: &str) -> Result<(), String> {
+    async fn set_notifications(
+        &self,
+        repo: &str,
+        branch: &str,
+        action: &str,
+    ) -> Result<(), String> {
         self.post_json(
             "/notifications",
-            &serde_json::json!({ "repo": repo, "action": action }),
+            &serde_json::json!({ "repo": repo, "branch": branch, "action": action }),
+        )
+        .await
+    }
+
+    async fn get_notifications(
+        &self,
+        repo: &str,
+        branch: &str,
+    ) -> Result<NotificationConfig, String> {
+        let resp = self
+            .client
+            .get(self.url("/notifications"))
+            .query(&[("repo", repo), ("branch", branch)])
+            .send()
+            .await
+            .map_err(|e| format!("connect: {e}"))?;
+        resp.json::<NotificationConfig>()
+            .await
+            .map_err(|e| format!("parse: {e}"))
+    }
+
+    async fn set_notification_levels(
+        &self,
+        repo: &str,
+        branch: &str,
+        started: NotificationLevel,
+        success: NotificationLevel,
+        failure: NotificationLevel,
+    ) -> Result<(), String> {
+        self.post_json(
+            "/notifications",
+            &serde_json::json!({
+                "repo": repo,
+                "branch": branch,
+                "action": "set_levels",
+                "build_started": started.to_string(),
+                "build_success": success.to_string(),
+                "build_failure": failure.to_string(),
+            }),
         )
         .await
     }
@@ -104,10 +153,47 @@ impl DaemonClient {
         .await
     }
 
+    async fn shutdown(&self) -> Result<(), String> {
+        self.post_json("/shutdown", &serde_json::json!({})).await
+    }
+
+    async fn get_defaults(&self) -> Result<Defaults, String> {
+        self.get_json("/defaults").await
+    }
+
+    async fn set_defaults(
+        &self,
+        default_branches: Option<Vec<String>>,
+        ignored_workflows: Option<Vec<String>>,
+    ) -> Result<(), String> {
+        self.post_json(
+            "/defaults",
+            &serde_json::json!({
+                "default_branches": default_branches,
+                "ignored_workflows": ignored_workflows,
+            }),
+        )
+        .await
+    }
+
     /// Inner client ref for the SSE background task (which needs `bytes_stream`).
     fn inner(&self) -> &reqwest::Client {
         &self.client
     }
+}
+
+/// Global defaults returned by `GET /defaults`.
+#[derive(serde::Deserialize)]
+struct Defaults {
+    default_branches: Vec<String>,
+    ignored_workflows: Vec<String>,
+}
+
+/// What to do when the user presses a quit key.
+enum QuitAction {
+    None,
+    Quit,
+    QuitAndShutdown,
 }
 
 // -- App state --
@@ -118,6 +204,12 @@ enum TextAction {
     SetBranches { repo: String },
 }
 
+/// A labeled text field in a form popup.
+struct FormField {
+    label: String,
+    buffer: String,
+}
+
 /// Text input mode for interactive prompts (e.g. "Add repo: ").
 enum InputMode {
     Normal,
@@ -125,6 +217,21 @@ enum InputMode {
         prompt: String,
         buffer: String,
         action: TextAction,
+    },
+    /// Multi-field form popup (e.g. config defaults).
+    Form {
+        title: String,
+        fields: Vec<FormField>,
+        active: usize,
+    },
+    /// Per-event notification level picker popup (opened with `N`).
+    NotificationPicker {
+        repo: String,
+        branch: String,
+        /// [started, success, failure]
+        levels: [NotificationLevel; 3],
+        /// Active row index (0..3).
+        active: usize,
     },
 }
 
@@ -282,34 +389,141 @@ impl App {
         });
     }
 
-    /// Handle a key press while in text input mode.
-    /// Returns `true` if the event was consumed (i.e. we were in input mode).
-    fn handle_text_input(&mut self, code: KeyCode, daemon: &DaemonClient) -> bool {
-        let InputMode::TextInput { buffer, action, .. } = &mut self.input_mode else {
-            return false;
+    /// Handle a key press while in a non-normal input mode.
+    /// Returns `true` if the event was consumed.
+    fn handle_input(&mut self, code: KeyCode, daemon: &DaemonClient) -> bool {
+        match &mut self.input_mode {
+            InputMode::Normal => false,
+            InputMode::TextInput { buffer, action, .. } => {
+                match code {
+                    KeyCode::Esc => {
+                        self.input_mode = InputMode::Normal;
+                    }
+                    KeyCode::Enter => {
+                        let input = buffer.trim().to_string();
+                        let action = std::mem::replace(action, TextAction::AddRepo);
+                        self.input_mode = InputMode::Normal;
+                        if !input.is_empty() {
+                            self.submit_text_input(input, action, daemon);
+                        }
+                    }
+                    KeyCode::Backspace => {
+                        buffer.pop();
+                    }
+                    KeyCode::Char(c) => {
+                        buffer.push(c);
+                    }
+                    _ => {}
+                }
+                true
+            }
+            InputMode::Form { fields, active, .. } => {
+                match code {
+                    KeyCode::Esc => {
+                        self.input_mode = InputMode::Normal;
+                    }
+                    KeyCode::Tab | KeyCode::Down => {
+                        *active = (*active + 1) % fields.len();
+                    }
+                    KeyCode::BackTab | KeyCode::Up => {
+                        *active = (*active + fields.len() - 1) % fields.len();
+                    }
+                    KeyCode::Backspace => {
+                        fields[*active].buffer.pop();
+                    }
+                    KeyCode::Char(c) => {
+                        fields[*active].buffer.push(c);
+                    }
+                    KeyCode::Enter => {
+                        self.submit_config_form(daemon);
+                    }
+                    _ => {}
+                }
+                true
+            }
+            InputMode::NotificationPicker {
+                repo,
+                branch,
+                levels,
+                active,
+            } => {
+                match code {
+                    KeyCode::Esc => {
+                        self.input_mode = InputMode::Normal;
+                    }
+                    KeyCode::Tab | KeyCode::Down => {
+                        *active = (*active + 1) % 3;
+                    }
+                    KeyCode::BackTab | KeyCode::Up => {
+                        *active = (*active + 2) % 3;
+                    }
+                    KeyCode::Right | KeyCode::Char(' ') => {
+                        levels[*active] = levels[*active].next();
+                    }
+                    KeyCode::Left => {
+                        levels[*active] = levels[*active].prev();
+                    }
+                    KeyCode::Enter => {
+                        let repo = repo.clone();
+                        let branch = branch.clone();
+                        let [started, success, failure] = *levels;
+                        self.input_mode = InputMode::Normal;
+                        let d = daemon.clone();
+                        self.spawn_action("Saving notification levels…", true, async move {
+                            d.set_notification_levels(&repo, &branch, started, success, failure)
+                                .await
+                                .map(|()| "Notification levels saved".to_string())
+                        });
+                    }
+                    _ => {}
+                }
+                true
+            }
+        }
+    }
+
+    /// Submit the config form fields to the daemon.
+    fn submit_config_form(&mut self, daemon: &DaemonClient) {
+        let InputMode::Form { fields, .. } = &self.input_mode else {
+            return;
         };
 
-        match code {
-            KeyCode::Esc => {
-                self.input_mode = InputMode::Normal;
-            }
-            KeyCode::Enter => {
-                let input = buffer.trim().to_string();
-                let action = std::mem::replace(action, TextAction::AddRepo); // take ownership
-                self.input_mode = InputMode::Normal;
-                if !input.is_empty() {
-                    self.submit_text_input(input, action, daemon);
-                }
-            }
-            KeyCode::Backspace => {
-                buffer.pop();
-            }
-            KeyCode::Char(c) => {
-                buffer.push(c);
-            }
-            _ => {}
+        let parse_csv = |s: &str| -> Vec<String> {
+            s.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        };
+
+        let branches: Vec<String> = fields
+            .iter()
+            .find(|f| f.label == "Default branches")
+            .map(|f| parse_csv(&f.buffer))
+            .unwrap_or_default();
+        let workflows: Vec<String> = fields
+            .iter()
+            .find(|f| f.label == "Ignored workflows")
+            .map(|f| parse_csv(&f.buffer))
+            .unwrap_or_default();
+
+        if branches.is_empty() {
+            self.set_flash("Default branches must not be empty");
+            return;
         }
-        true
+        for b in &branches {
+            if let Err(e) = validate_branch(b) {
+                self.set_flash(e);
+                return;
+            }
+        }
+
+        let d = daemon.clone();
+        self.input_mode = InputMode::Normal;
+        self.spawn_action("Saving config…", false, async move {
+            d.set_defaults(Some(branches), Some(workflows))
+                .await
+                .map(|()| "Config saved".to_string())
+        });
     }
 
     fn submit_text_input(&mut self, input: String, action: TextAction, daemon: &DaemonClient) {
@@ -352,23 +566,26 @@ impl App {
         }
     }
 
-    /// Handle a key press in normal mode. Returns `true` if the app should quit.
+    /// Handle a key press in normal mode.
     fn handle_normal_key(
         &mut self,
         code: KeyCode,
         modifiers: KeyModifiers,
         daemon: &DaemonClient,
-    ) -> bool {
+    ) -> QuitAction {
         let flat = flatten_rows(&self.status.watches, self.group_by);
         let sel_count = flat.selectable.len();
         let selected = flat
             .selectable
             .get(self.selected)
-            .map(|&idx| flat.rows[idx].repo_and_run_id());
+            .map(|&idx| flat.rows[idx].repo_branch_run());
 
         match code {
-            KeyCode::Char('q') => return true,
-            KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => return true,
+            KeyCode::Char('q') => return QuitAction::Quit,
+            KeyCode::Char('Q') => return QuitAction::QuitAndShutdown,
+            KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => {
+                return QuitAction::Quit;
+            }
             KeyCode::Up | KeyCode::Char('k') => {
                 self.selected = self.selected.saturating_sub(1);
             }
@@ -385,7 +602,7 @@ impl App {
                 };
             }
             KeyCode::Char('b') => {
-                if let Some((repo, _, _)) = selected {
+                if let Some((repo, _, _, _)) = selected {
                     let repo = repo.to_string();
                     let current: Vec<&str> = self
                         .status
@@ -402,7 +619,7 @@ impl App {
                 }
             }
             KeyCode::Char('d') => {
-                if let Some((repo, _, _)) = selected {
+                if let Some((repo, _, _, _)) = selected {
                     let d = daemon.clone();
                     let repo = repo.to_string();
                     self.spawn_action(format!("Removing {repo}…"), true, async move {
@@ -411,15 +628,51 @@ impl App {
                 }
             }
             KeyCode::Char('n') => {
-                if let Some((repo, _, muted)) = selected {
+                if let Some((repo, branch, _, muted)) = selected {
                     let d = daemon.clone();
                     let repo = repo.to_string();
+                    let branch = branch.to_string();
                     let action = if muted { "unmute" } else { "mute" };
                     let verb = if muted { "Unmuted" } else { "Muted" };
-                    self.spawn_action(format!("{verb} {repo}…"), true, async move {
-                        d.set_notifications(&repo, action)
+                    let label = format!("{repo}/{branch}");
+                    self.spawn_action(format!("{verb} {label}…"), true, async move {
+                        d.set_notifications(&repo, &branch, action)
                             .await
-                            .map(|()| format!("{verb} {repo}"))
+                            .map(|()| format!("{verb} {label}"))
+                    });
+                }
+            }
+            KeyCode::Char('N') => {
+                if let Some((repo, branch, _, _)) = selected {
+                    let d = daemon.clone();
+                    let repo = repo.to_string();
+                    let branch = branch.to_string();
+                    let tx = self.bg_tx.clone();
+                    self.set_flash("Loading notification levels…");
+                    tokio::spawn(async move {
+                        match d.get_notifications(&repo, &branch).await {
+                            Ok(cfg) => {
+                                let _ = tx
+                                    .send(SseUpdate::EnterNotificationPicker {
+                                        repo,
+                                        branch,
+                                        levels: [
+                                            cfg.build_started,
+                                            cfg.build_success,
+                                            cfg.build_failure,
+                                        ],
+                                    })
+                                    .await;
+                            }
+                            Err(e) => {
+                                let _ = tx
+                                    .send(SseUpdate::BackgroundResult {
+                                        flash: e,
+                                        resync: false,
+                                    })
+                                    .await;
+                            }
+                        }
                     });
                 }
             }
@@ -436,8 +689,13 @@ impl App {
                 });
             }
             KeyCode::Char('o') => {
-                if let Some((repo, Some(run_id), _)) = selected {
-                    open_url(repo, run_id);
+                if let Some((repo, _, Some(run_id), _)) = selected {
+                    open_browser(&run_url(repo, run_id));
+                }
+            }
+            KeyCode::Char('O') => {
+                if let Some((repo, _, _, _)) = selected {
+                    open_browser(&repo_url(repo));
                 }
             }
             KeyCode::Char('s') => {
@@ -462,9 +720,43 @@ impl App {
             KeyCode::Char('G') => {
                 self.group_by = self.group_by.prev();
             }
+            KeyCode::Char('C') => {
+                let d = daemon.clone();
+                let tx = self.bg_tx.clone();
+                self.set_flash("Loading config…");
+                tokio::spawn(async move {
+                    match d.get_defaults().await {
+                        Ok(defaults) => {
+                            let _ = tx
+                                .send(SseUpdate::EnterForm {
+                                    title: "Config".to_string(),
+                                    fields: vec![
+                                        FormField {
+                                            label: "Default branches".to_string(),
+                                            buffer: defaults.default_branches.join(", "),
+                                        },
+                                        FormField {
+                                            label: "Ignored workflows".to_string(),
+                                            buffer: defaults.ignored_workflows.join(", "),
+                                        },
+                                    ],
+                                })
+                                .await;
+                        }
+                        Err(e) => {
+                            let _ = tx
+                                .send(SseUpdate::BackgroundResult {
+                                    flash: e,
+                                    resync: false,
+                                })
+                                .await;
+                        }
+                    }
+                });
+            }
             _ => {}
         }
-        false
+        QuitAction::None
     }
 }
 
@@ -480,6 +772,17 @@ enum SseUpdate {
     Disconnected,
     /// Result from a background HTTP action (e.g. adding a repo).
     BackgroundResult { flash: String, resync: bool },
+    /// Open the config form popup (used after fetching current defaults).
+    EnterForm {
+        title: String,
+        fields: Vec<FormField>,
+    },
+    /// Open the per-event notification level picker popup.
+    EnterNotificationPicker {
+        repo: String,
+        branch: String,
+        levels: [NotificationLevel; 3],
+    },
 }
 
 /// Tracks the SSE connection state for header display.
@@ -500,6 +803,9 @@ enum DisplayRow<'a> {
         repo: &'a str,
         branch: &'a str,
         run: &'a ActiveRunView,
+        /// Pre-computed badge for extra active runs, e.g. "+2⏸" or "+1⏳ +1⏸".
+        /// Empty when this is the only active run.
+        extra_badge: String,
         muted: bool,
     },
     FailingSteps {
@@ -523,6 +829,11 @@ struct FlatRows<'a> {
     rows: Vec<DisplayRow<'a>>,
     /// Indices into `rows` that are selectable (everything except `FailingSteps`).
     selectable: Vec<usize>,
+}
+
+/// Group key as a sortable string (used to ensure items with the same group are contiguous).
+fn group_key_for_sort(w: &WatchStatus, group_by: GroupBy) -> String {
+    group_key(w, group_by).unwrap_or_default()
 }
 
 /// Extract the group key for a watch based on the grouping mode.
@@ -589,31 +900,49 @@ fn flatten_rows(watches: &[WatchStatus], group_by: GroupBy) -> FlatRows<'_> {
                 }
             }
         } else {
-            for run in &w.active_runs {
-                selectable.push(rows.len());
-                rows.push(DisplayRow::ActiveRun {
-                    repo: &w.repo,
-                    branch: &w.branch,
-                    run,
-                    muted: w.muted,
-                });
-            }
+            // Prefer in_progress as the primary row; fall back to the last (newest) run.
+            let primary_idx = w
+                .active_runs
+                .iter()
+                .rposition(|r| r.status == "in_progress")
+                .unwrap_or(w.active_runs.len() - 1);
+            let primary = &w.active_runs[primary_idx];
+            let extra_badge = extra_runs_badge(&w.active_runs, primary_idx);
+            selectable.push(rows.len());
+            rows.push(DisplayRow::ActiveRun {
+                repo: &w.repo,
+                branch: &w.branch,
+                run: primary,
+                extra_badge,
+                muted: w.muted,
+            });
         }
     }
     FlatRows { rows, selectable }
 }
 
 impl DisplayRow<'_> {
-    /// Returns `(repo, run_id, muted)` for the selected row. Only valid for selectable rows.
-    fn repo_and_run_id(&self) -> (&str, Option<u64>, bool) {
+    /// Returns `(repo, branch, run_id, muted)` for the selected row. Only valid for selectable rows.
+    fn repo_branch_run(&self) -> (&str, &str, Option<u64>, bool) {
         match self {
             DisplayRow::ActiveRun {
-                repo, run, muted, ..
-            } => (repo, Some(run.run_id), *muted),
+                repo,
+                branch,
+                run,
+                muted,
+                ..
+            } => (repo, branch, Some(run.run_id), *muted),
             DisplayRow::LastBuild {
-                repo, build, muted, ..
-            } => (repo, Some(build.run_id), *muted),
-            DisplayRow::NeverRan { repo, muted, .. } => (repo, None, *muted),
+                repo,
+                branch,
+                build,
+                muted,
+            } => (repo, branch, Some(build.run_id), *muted),
+            DisplayRow::NeverRan {
+                repo,
+                branch,
+                muted,
+            } => (repo, branch, None, *muted),
             DisplayRow::GroupHeader { .. } | DisplayRow::FailingSteps { .. } => {
                 unreachable!("not selectable")
             }
@@ -622,13 +951,24 @@ impl DisplayRow<'_> {
 }
 
 /// Sort watches by the selected column. Returns a new sorted vec.
+/// When `group_by` is active, the group key is used as the primary sort key
+/// so that items in the same group are contiguous for header insertion.
 fn sorted_watches(
     watches: &[WatchStatus],
     column: SortColumn,
     ascending: bool,
+    group_by: GroupBy,
 ) -> Vec<WatchStatus> {
     let mut sorted = watches.to_vec();
     sorted.sort_by(|a, b| {
+        // Group key as primary sort when grouping is active.
+        let group_ord = match group_by {
+            GroupBy::None => std::cmp::Ordering::Equal,
+            _ => group_key_for_sort(a, group_by).cmp(&group_key_for_sort(b, group_by)),
+        };
+        if group_ord != std::cmp::Ordering::Equal {
+            return group_ord;
+        }
         let cmp = match column {
             SortColumn::Repo => a.repo.cmp(&b.repo).then(a.branch.cmp(&b.branch)),
             SortColumn::Branch => a.branch.cmp(&b.branch).then(a.repo.cmp(&b.repo)),
@@ -651,6 +991,40 @@ fn sorted_watches(
         if ascending { cmp } else { cmp.reverse() }
     });
     sorted
+}
+
+/// Build a compact badge summarising the non-primary active runs.
+///
+/// Returns an empty string when there is only one run (primary_idx is the sole element).
+/// Examples: `"+2⏸"`, `"+1⏳ +2⏸"`.
+fn extra_runs_badge(runs: &[ActiveRunView], primary_idx: usize) -> String {
+    if runs.len() <= 1 {
+        return String::new();
+    }
+    let mut in_progress = 0usize;
+    let mut queued = 0usize;
+    let mut other = 0usize;
+    for (i, r) in runs.iter().enumerate() {
+        if i == primary_idx {
+            continue;
+        }
+        match r.status.as_str() {
+            "in_progress" => in_progress += 1,
+            "queued" | "waiting" | "requested" | "pending" => queued += 1,
+            _ => other += 1,
+        }
+    }
+    let mut parts = Vec::new();
+    if in_progress > 0 {
+        parts.push(format!("+{in_progress}⏳"));
+    }
+    if queued > 0 {
+        parts.push(format!("+{queued}⏸"));
+    }
+    if other > 0 {
+        parts.push(format!("+{other}·"));
+    }
+    parts.join(" ")
 }
 
 /// Status key: active runs (tier 0), completed (tier 1), idle (tier 2).
@@ -952,7 +1326,12 @@ fn render_body(
         hdr("ELAPSED / AGE", SortColumn::Age),
     ]);
 
-    let sorted = sorted_watches(&app.status.watches, app.sort_column, app.sort_ascending);
+    let sorted = sorted_watches(
+        &app.status.watches,
+        app.sort_column,
+        app.sort_ascending,
+        app.group_by,
+    );
     let flat = flatten_rows(&sorted, app.group_by);
     let selected_display_idx = flat
         .selectable
@@ -1008,6 +1387,7 @@ fn render_display_row<'a>(
             repo,
             branch,
             run,
+            extra_badge,
             muted,
         } => {
             let style = status_style(&run.status);
@@ -1017,10 +1397,15 @@ fn render_display_row<'a>(
                 .map(|s| format::duration(Duration::from_secs_f64(s)))
                 .unwrap_or_default();
             let name = format!("  {}{}", short_repo(repo), mute_indicator(*muted));
+            let status_text = if extra_badge.is_empty() {
+                format!("{emoji} {}", format::status(&run.status))
+            } else {
+                format!("{emoji} {} {extra_badge}", format::status(&run.status))
+            };
             Row::new(vec![
                 Cell::from(format::truncate(&name, cw.repo)),
                 Cell::from(format::truncate(branch, BRANCH_W)),
-                Cell::from(format!("{emoji} {}", format::status(&run.status))).style(style),
+                Cell::from(format::truncate(&status_text, STATUS_W)).style(style),
                 Cell::from(format::truncate(&run.workflow, cw.workflow)),
                 Cell::from(format::truncate(&run.title, cw.title)),
                 Cell::from(elapsed).style(style),
@@ -1089,6 +1474,7 @@ fn render_footer(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
                 Style::default().fg(Color::DarkGray),
             ),
         ])),
+        InputMode::Form { .. } | InputMode::NotificationPicker { .. } => Paragraph::new(""),
         InputMode::Normal => Paragraph::new(Line::from(vec![
             Span::styled("[↑↓]", key_style),
             Span::raw(" select  "),
@@ -1098,18 +1484,22 @@ fn render_footer(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
             Span::raw(" branches  "),
             Span::styled("[d]", key_style),
             Span::raw(" remove  "),
-            Span::styled("[o]", key_style),
+            Span::styled("[o/O]", key_style),
             Span::raw(" open  "),
-            Span::styled("[n]", key_style),
-            Span::raw(" mute  "),
+            Span::styled("[n/N]", key_style),
+            Span::raw(" mute/levels  "),
             Span::styled("[p]", key_style),
             Span::raw(" pause  "),
             Span::styled("[s/S]", key_style),
             Span::raw(" sort  "),
             Span::styled("[g/G]", key_style),
             Span::raw(" group  "),
+            Span::styled("[C]", key_style),
+            Span::raw(" config  "),
             Span::styled("[q]", key_style),
-            Span::raw(" quit"),
+            Span::raw(" quit  "),
+            Span::styled("[Q]", key_style),
+            Span::raw(" quit+stop"),
         ]))
         .style(Style::default().fg(Color::DarkGray)),
     };
@@ -1133,6 +1523,213 @@ fn render(frame: &mut ratatui::Frame, app: &App) {
     render_header(frame, chunks[0], app);
     render_body(frame, chunks[1], chunks[2], app, &cw);
     render_footer(frame, chunks[3], app);
+
+    // Overlay the form popup if active.
+    if let InputMode::Form {
+        title,
+        fields,
+        active,
+    } = &app.input_mode
+    {
+        render_form_popup(frame, title, fields, *active);
+    }
+
+    // Overlay the notification picker popup if active.
+    if let InputMode::NotificationPicker {
+        repo,
+        branch,
+        levels,
+        active,
+    } = &app.input_mode
+    {
+        render_notification_picker_popup(frame, repo, branch, levels, *active);
+    }
+}
+
+/// Compute a centered rectangle of `percent_w` x height within `area`.
+fn centered_rect(
+    percent_w: u16,
+    height: u16,
+    area: ratatui::layout::Rect,
+) -> ratatui::layout::Rect {
+    let w = (area.width as u32 * percent_w as u32 / 100).min(area.width as u32) as u16;
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    let h = height.min(area.height);
+    ratatui::layout::Rect::new(x, y, w, h)
+}
+
+fn render_form_popup(frame: &mut ratatui::Frame, title: &str, fields: &[FormField], active: usize) {
+    // 3 lines per field (label + input + blank) + 2 for border + 2 for footer hints
+    let inner_height = fields.len() as u16 * 3 + 1;
+    let popup_height = inner_height + 2; // borders
+    let popup = centered_rect(60, popup_height, frame.area());
+
+    frame.render_widget(Clear, popup);
+
+    let block = Block::default()
+        .title(format!(" {title} "))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let label_style = Style::default().fg(Color::DarkGray);
+    let active_label_style = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
+    let cursor_style = Style::default().fg(Color::Cyan);
+
+    let mut constraints: Vec<Constraint> = Vec::new();
+    for _ in fields {
+        constraints.push(Constraint::Length(1)); // label
+        constraints.push(Constraint::Length(1)); // input
+        constraints.push(Constraint::Length(1)); // spacing
+    }
+    // Replace last spacing with the footer hint
+    if let Some(last) = constraints.last_mut() {
+        *last = Constraint::Length(1);
+    }
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
+        .split(inner);
+
+    for (i, field) in fields.iter().enumerate() {
+        let base = i * 3;
+        let is_active = i == active;
+        let style = if is_active {
+            active_label_style
+        } else {
+            label_style
+        };
+
+        // Label
+        let label = Paragraph::new(Line::from(Span::styled(&field.label, style)));
+        frame.render_widget(label, rows[base]);
+
+        // Input line
+        let input_text = if is_active {
+            Line::from(vec![
+                Span::raw(&field.buffer),
+                Span::styled("█", cursor_style),
+            ])
+        } else {
+            Line::from(Span::raw(&field.buffer))
+        };
+        frame.render_widget(Paragraph::new(input_text), rows[base + 1]);
+    }
+
+    // Footer hint in the last row
+    let hint_row = fields.len() * 3 - 1;
+    if hint_row < rows.len() {
+        let hint = Paragraph::new(Line::from(vec![
+            Span::styled(
+                "[Tab]",
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" next  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                "[Enter]",
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" save  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                "[Esc]",
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" cancel", Style::default().fg(Color::DarkGray)),
+        ]));
+        frame.render_widget(hint, rows[hint_row]);
+    }
+}
+
+fn render_notification_picker_popup(
+    frame: &mut ratatui::Frame,
+    repo: &str,
+    branch: &str,
+    levels: &[NotificationLevel; 3],
+    active: usize,
+) {
+    // 3 data rows + 1 blank top + 1 blank bottom + 1 hint + 2 borders = 8
+    let popup_height = 8u16;
+    let popup = centered_rect(55, popup_height, frame.area());
+
+    frame.render_widget(Clear, popup);
+
+    let title = format!(" Notifications: {} @ {} ", repo, branch);
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // blank
+            Constraint::Length(1), // started
+            Constraint::Length(1), // success
+            Constraint::Length(1), // failure
+            Constraint::Length(1), // blank
+            Constraint::Length(1), // hint
+        ])
+        .split(inner);
+
+    let labels = ["Build started", "Build success", "Build failure"];
+    let normal_style = Style::default().fg(Color::DarkGray);
+    let active_style = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
+
+    for (i, (label, level)) in labels.iter().zip(levels.iter()).enumerate() {
+        let is_active = i == active;
+        let row_style = if is_active {
+            active_style
+        } else {
+            normal_style
+        };
+        let arrow = if is_active { "▸ " } else { "  " };
+        let level_str = format!("[{:^8}]", level.to_string());
+        let line = Line::from(vec![
+            Span::styled(format!("{arrow}{label:<16}"), row_style),
+            Span::styled(level_str, row_style),
+        ]);
+        frame.render_widget(Paragraph::new(line), rows[i + 1]);
+    }
+
+    let hint = Line::from(vec![
+        Span::styled(
+            "[←/→]",
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" cycle  ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            "[Enter]",
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" save  ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            "[Esc]",
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" cancel", Style::default().fg(Color::DarkGray)),
+    ]);
+    frame.render_widget(Paragraph::new(hint), rows[5]);
 }
 
 // -- SSE background task --
@@ -1214,15 +1811,14 @@ async fn sse_task(client: reqwest::Client, port: u16, tx: mpsc::Sender<SseUpdate
 
 // -- Actions --
 
-fn open_url(repo: &str, run_id: u64) {
-    let url = format!("https://github.com/{repo}/actions/runs/{run_id}");
+fn open_browser(url: &str) {
     let cmd = if cfg!(target_os = "macos") {
         "open"
     } else {
-        "xdg-open" // Linux and other Unix-likes
+        "xdg-open"
     };
     let _ = std::process::Command::new(cmd)
-        .arg(&url)
+        .arg(url)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -1231,20 +1827,61 @@ fn open_url(repo: &str, run_id: u64) {
 
 // -- Entry point --
 
+/// Read the daemon port from the port file, or start the daemon if it's not running.
+fn discover_or_start_daemon() -> Result<u16, Box<dyn std::error::Error>> {
+    let port_file = state_dir().join("port");
+
+    // Try reading existing port file first.
+    if let Ok(contents) = std::fs::read_to_string(&port_file)
+        && let Ok(port) = contents.trim().parse::<u16>()
+    {
+        if std::net::TcpStream::connect(format!("127.0.0.1:{port}")).is_ok() {
+            return Ok(port);
+        }
+        // Port file exists but daemon is not responding — stale file.
+        let _ = std::fs::remove_file(&port_file);
+    }
+
+    // Daemon not running — try to start it.
+    eprintln!("Daemon not running, starting build-watcher…");
+    let exe = std::env::current_exe()?;
+    let daemon_bin = exe
+        .parent()
+        .ok_or("cannot resolve binary directory")?
+        .join("build-watcher");
+
+    if !daemon_bin.exists() {
+        return Err(format!(
+            "build-watcher binary not found at {}\nInstall it with ./install.sh",
+            daemon_bin.display()
+        )
+        .into());
+    }
+
+    std::process::Command::new(&daemon_bin)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("Failed to start daemon: {e}"))?;
+
+    // Wait for the port file to appear (up to 5 seconds).
+    for _ in 0..50 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        if let Ok(contents) = std::fs::read_to_string(&port_file)
+            && let Ok(port) = contents.trim().parse::<u16>()
+            && std::net::TcpStream::connect(format!("127.0.0.1:{port}")).is_ok()
+        {
+            return Ok(port);
+        }
+    }
+
+    Err("Timed out waiting for daemon to start".into())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Port discovery.
-    let port_file = state_dir().join("port");
-    let port_str = std::fs::read_to_string(&port_file).map_err(|e| {
-        format!(
-            "Could not read port file {}: {e}\nIs build-watcher running?",
-            port_file.display()
-        )
-    })?;
-    let port: u16 = port_str
-        .trim()
-        .parse()
-        .map_err(|e| format!("Invalid port in {}: {e}", port_file.display()))?;
+    let port = discover_or_start_daemon()?;
 
     // Initial fetch so there's something to display before SSE connects.
     let daemon = DaemonClient::new(port);
@@ -1333,17 +1970,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 app.resync(&daemon).await;
                             }
                         }
+                        Some(SseUpdate::EnterForm { title, fields }) => {
+                            app.input_mode = InputMode::Form {
+                                title,
+                                fields,
+                                active: 0,
+                            };
+                        }
+                        Some(SseUpdate::EnterNotificationPicker {
+                            repo,
+                            branch,
+                            levels,
+                        }) => {
+                            app.input_mode = InputMode::NotificationPicker {
+                                repo,
+                                branch,
+                                levels,
+                                active: 0,
+                            };
+                        }
                         None => {}
                     }
                 }
                 maybe_event = keyboard.next() => {
                     match maybe_event {
                         Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
-                            if app.handle_text_input(key.code, &daemon) {
+                            if app.handle_input(key.code, &daemon) {
                                 continue;
                             }
-                            if app.handle_normal_key(key.code, key.modifiers, &daemon) {
-                                break;
+                            match app.handle_normal_key(key.code, key.modifiers, &daemon) {
+                                QuitAction::Quit => break,
+                                QuitAction::QuitAndShutdown => {
+                                    let _ = daemon.shutdown().await;
+                                    break;
+                                }
+                                QuitAction::None => {}
                             }
                         }
                         Some(Ok(Event::Resize(_, _))) => {} // triggers redraw at top of loop
@@ -1695,10 +2356,10 @@ mod tests {
         assert!(cw.title > cw.workflow); // title gets 45% vs workflow 25%
     }
 
-    // -- DisplayRow::repo_and_run_id --
+    // -- DisplayRow::repo_branch_run --
 
     #[test]
-    fn display_row_repo_and_run_id() {
+    fn display_row_repo_branch_run() {
         let watches = vec![WatchStatus {
             repo: "alice/app".to_string(),
             branch: "main".to_string(),
@@ -1715,8 +2376,9 @@ mod tests {
         }];
         let flat = flatten_rows(&watches, GroupBy::Org);
         // First row is GroupHeader, second is the active run
-        let (repo, run_id, _muted) = flat.rows[1].repo_and_run_id();
+        let (repo, branch, run_id, _muted) = flat.rows[1].repo_branch_run();
         assert_eq!(repo, "alice/app");
+        assert_eq!(branch, "main");
         assert_eq!(run_id, Some(42));
     }
 
@@ -1798,11 +2460,11 @@ mod tests {
             watch_with_build("zoo/app", "main", "success", 10.0),
             watch_with_build("alice/lib", "main", "failure", 20.0),
         ];
-        let sorted = sorted_watches(&watches, SortColumn::Repo, true);
+        let sorted = sorted_watches(&watches, SortColumn::Repo, true, GroupBy::None);
         assert_eq!(sorted[0].repo, "alice/lib");
         assert_eq!(sorted[1].repo, "zoo/app");
 
-        let desc = sorted_watches(&watches, SortColumn::Repo, false);
+        let desc = sorted_watches(&watches, SortColumn::Repo, false, GroupBy::None);
         assert_eq!(desc[0].repo, "zoo/app");
     }
 
@@ -1813,7 +2475,7 @@ mod tests {
             watch_with_build("alice/app", "develop", "success", 20.0),
             watch_with_build("alice/app", "main", "success", 30.0),
         ];
-        let sorted = sorted_watches(&watches, SortColumn::Branch, true);
+        let sorted = sorted_watches(&watches, SortColumn::Branch, true, GroupBy::None);
         assert_eq!(sorted[0].branch, "develop");
         assert_eq!(sorted[1].branch, "main");
         assert_eq!(sorted[2].branch, "release");
@@ -1826,7 +2488,7 @@ mod tests {
             watch_with_active("bob/lib", "main", "in_progress", 5.0),
             watch("carol/api", "main"),
         ];
-        let sorted = sorted_watches(&watches, SortColumn::Status, true);
+        let sorted = sorted_watches(&watches, SortColumn::Status, true, GroupBy::None);
         // Active (tier 0) < completed (tier 1) < idle (tier 2)
         assert_eq!(sorted[0].repo, "bob/lib");
         assert_eq!(sorted[1].repo, "alice/app");
@@ -1839,7 +2501,7 @@ mod tests {
             watch_with_build("alice/app", "main", "success", 10.0), // CI
             watch_with_active("bob/lib", "main", "in_progress", 5.0), // Deploy
         ];
-        let sorted = sorted_watches(&watches, SortColumn::Workflow, true);
+        let sorted = sorted_watches(&watches, SortColumn::Workflow, true, GroupBy::None);
         assert_eq!(sorted[0].repo, "alice/app"); // CI < Deploy
         assert_eq!(sorted[1].repo, "bob/lib");
     }
@@ -1851,7 +2513,7 @@ mod tests {
             watch_with_build("bob/lib", "main", "failure", 10.0),
             watch_with_active("carol/api", "main", "in_progress", 5.0),
         ];
-        let sorted = sorted_watches(&watches, SortColumn::Age, true);
+        let sorted = sorted_watches(&watches, SortColumn::Age, true, GroupBy::None);
         assert_eq!(sorted[0].repo, "carol/api"); // 5s elapsed
         assert_eq!(sorted[1].repo, "bob/lib"); // 10s age
         assert_eq!(sorted[2].repo, "alice/app"); // 100s age
@@ -1863,8 +2525,8 @@ mod tests {
             watch_with_build("alice/app", "main", "success", 10.0),
             watch_with_build("bob/lib", "main", "failure", 100.0),
         ];
-        let asc = sorted_watches(&watches, SortColumn::Age, true);
-        let desc = sorted_watches(&watches, SortColumn::Age, false);
+        let asc = sorted_watches(&watches, SortColumn::Age, true, GroupBy::None);
+        let desc = sorted_watches(&watches, SortColumn::Age, false, GroupBy::None);
         assert_eq!(asc[0].repo, "alice/app");
         assert_eq!(desc[0].repo, "bob/lib");
     }
@@ -1918,7 +2580,7 @@ mod tests {
             watch_with_build("alice/app", "develop", "success", 20.0),
             watch_with_build("bob/lib", "main", "failure", 30.0),
         ];
-        let sorted = sorted_watches(&watches, SortColumn::Branch, true);
+        let sorted = sorted_watches(&watches, SortColumn::Branch, true, GroupBy::None);
         let flat = flatten_rows(&sorted, GroupBy::Branch);
         assert_eq!(group_header_labels(&flat), vec!["develop", "main"]);
     }
@@ -1930,7 +2592,7 @@ mod tests {
             watch_with_build("bob/lib", "main", "failure", 20.0),
             watch_with_active("carol/api", "main", "in_progress", 5.0),
         ];
-        let sorted = sorted_watches(&watches, SortColumn::Status, true);
+        let sorted = sorted_watches(&watches, SortColumn::Status, true, GroupBy::None);
         let flat = flatten_rows(&sorted, GroupBy::Status);
         let labels = group_header_labels(&flat);
         assert_eq!(labels.len(), 3);
@@ -1961,5 +2623,27 @@ mod tests {
         let flat = flatten_rows(&watches, GroupBy::Workflow);
         let labels = group_header_labels(&flat);
         assert_eq!(labels, vec!["CI", "Deploy", "(none)"]);
+    }
+
+    #[test]
+    fn notification_level_next_wraps() {
+        assert_eq!(NotificationLevel::Off.next(), NotificationLevel::Low);
+        assert_eq!(NotificationLevel::Low.next(), NotificationLevel::Normal);
+        assert_eq!(
+            NotificationLevel::Normal.next(),
+            NotificationLevel::Critical
+        );
+        assert_eq!(NotificationLevel::Critical.next(), NotificationLevel::Off);
+    }
+
+    #[test]
+    fn notification_level_prev_wraps() {
+        assert_eq!(NotificationLevel::Off.prev(), NotificationLevel::Critical);
+        assert_eq!(
+            NotificationLevel::Critical.prev(),
+            NotificationLevel::Normal
+        );
+        assert_eq!(NotificationLevel::Normal.prev(), NotificationLevel::Low);
+        assert_eq!(NotificationLevel::Low.prev(), NotificationLevel::Off);
     }
 }

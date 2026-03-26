@@ -246,6 +246,22 @@ impl std::fmt::Display for NotificationLevel {
     }
 }
 
+impl NotificationLevel {
+    const ALL: &[Self] = &[Self::Off, Self::Low, Self::Normal, Self::Critical];
+
+    /// Advance to the next level, wrapping around.
+    pub fn next(self) -> Self {
+        let idx = Self::ALL.iter().position(|&v| v == self).unwrap_or(0);
+        Self::ALL[(idx + 1) % Self::ALL.len()]
+    }
+
+    /// Retreat to the previous level, wrapping around.
+    pub fn prev(self) -> Self {
+        let idx = Self::ALL.iter().position(|&v| v == self).unwrap_or(0);
+        Self::ALL[(idx + Self::ALL.len() - 1) % Self::ALL.len()]
+    }
+}
+
 /// Per-event notification levels.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(clippy::struct_field_names)] // `build_` prefix is intentional domain naming
@@ -259,7 +275,7 @@ pub struct NotificationConfig {
 }
 
 /// Optional per-event notification overrides. `None` means inherit from parent.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[allow(clippy::struct_field_names)] // `build_` prefix is intentional domain naming
 pub struct NotificationOverrides {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -306,7 +322,7 @@ pub struct QuietHours {
 }
 
 /// Per-branch notification overrides.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct BranchConfig {
     #[serde(default, skip_serializing_if = "NotificationOverrides::is_empty")]
     pub notifications: NotificationOverrides,

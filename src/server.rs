@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 type AnyResult<T> = std::result::Result<T, Box<dyn std::error::Error>>;
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::routing::get;
 use rmcp::handler::server::tool::ToolRouter;
@@ -15,13 +15,14 @@ use rmcp::transport::streamable_http_server::{
 };
 use rmcp::{ErrorData as McpError, ServerHandler, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio_stream::StreamExt as _;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_util::sync::CancellationToken;
 
 use build_watcher::config::{
-    NotificationLevel, NotificationOverrides, QuietHours, config_dir, state_dir, unix_now,
+    BranchConfig, NotificationConfig, NotificationLevel, NotificationOverrides, QuietHours,
+    config_dir, state_dir, unix_now,
 };
 use build_watcher::events::{EventBus, WatchEvent};
 use build_watcher::format;
@@ -62,8 +63,8 @@ fn build_watch_snapshot(
     watches: &HashMap<WatchKey, WatchEntry>,
     config: Option<&build_watcher::config::Config>,
     paused: bool,
+    now: tokio::time::Instant,
 ) -> StatusResponse {
-    let now = tokio::time::Instant::now();
     let mut watch_list: Vec<WatchStatus> = watches
         .iter()
         .map(|(key, entry)| {
@@ -101,13 +102,12 @@ fn build_watch_snapshot(
                 }
             });
 
-            let muted = config
-                .and_then(|cfg| cfg.repos.get(&key.repo))
-                .is_some_and(|rc| {
-                    rc.notifications.build_started == Some(NotificationLevel::Off)
-                        && rc.notifications.build_success == Some(NotificationLevel::Off)
-                        && rc.notifications.build_failure == Some(NotificationLevel::Off)
-                });
+            let muted = config.is_some_and(|cfg| {
+                let n = cfg.notifications_for(&key.repo, &key.branch);
+                n.build_started == NotificationLevel::Off
+                    && n.build_success == NotificationLevel::Off
+                    && n.build_failure == NotificationLevel::Off
+            });
 
             WatchStatus {
                 repo: key.repo.clone(),
@@ -128,10 +128,11 @@ fn build_watch_snapshot(
 
 /// `GET /status` — JSON snapshot of all current watches and their build state.
 async fn status_handler(State(state): State<AppState>) -> axum::Json<StatusResponse> {
+    let now = tokio::time::Instant::now();
     let paused = is_paused(&state.pause).await;
     let watches = state.watches.lock().await;
     let cfg = state.config.lock().await;
-    axum::Json(build_watch_snapshot(&watches, Some(&cfg), paused))
+    axum::Json(build_watch_snapshot(&watches, Some(&cfg), paused, now))
 }
 
 /// `GET /events` — SSE stream of `WatchEvent`s as they occur.
@@ -472,52 +473,197 @@ async fn branches_handler(
 }
 
 #[derive(Deserialize)]
-struct NotificationsRequest {
+struct NotificationsQuery {
     repo: String,
-    /// "mute" sets all levels to off; "unmute" clears overrides (inherit global).
-    action: String,
+    branch: String,
 }
 
-/// `POST /notifications` — Mute or unmute per-repo notifications.
+/// `GET /notifications` — Resolved notification config for a specific repo/branch.
+async fn get_notifications_handler(
+    State(state): State<AppState>,
+    Query(q): Query<NotificationsQuery>,
+) -> axum::Json<NotificationConfig> {
+    let cfg = state.config.lock().await;
+    axum::Json(cfg.notifications_for(&q.repo, &q.branch))
+}
+
+#[derive(Deserialize)]
+struct NotificationsRequest {
+    repo: String,
+    /// Optional branch — when set, mute/unmute applies to that branch only.
+    #[serde(default)]
+    branch: Option<String>,
+    /// "mute" sets all levels to off; "unmute" clears overrides; "set_levels" sets per-event levels.
+    action: String,
+    #[serde(default)]
+    build_started: Option<NotificationLevel>,
+    #[serde(default)]
+    build_success: Option<NotificationLevel>,
+    #[serde(default)]
+    build_failure: Option<NotificationLevel>,
+}
+
+/// `POST /notifications` — Mute, unmute, or set per-event levels for repo/branch notifications.
 async fn notifications_handler(
     State(state): State<AppState>,
     axum::Json(body): axum::Json<NotificationsRequest>,
-) -> axum::Json<serde_json::Value> {
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
     let (snapshot, msg) = {
         let mut cfg = state.config.lock().await;
         let Some(rc) = cfg.repos.get_mut(&body.repo) else {
             return axum::Json(
                 serde_json::json!({ "error": format!("{}: not being watched", body.repo) }),
-            );
+            )
+            .into_response();
         };
-        let msg = match body.action.as_str() {
-            "mute" => {
-                rc.notifications = NotificationOverrides {
-                    build_started: Some(NotificationLevel::Off),
-                    build_success: Some(NotificationLevel::Off),
-                    build_failure: Some(NotificationLevel::Off),
-                };
-                format!("{}: notifications muted", body.repo)
+        let all_off = NotificationOverrides {
+            build_started: Some(NotificationLevel::Off),
+            build_success: Some(NotificationLevel::Off),
+            build_failure: Some(NotificationLevel::Off),
+        };
+        let target_label = if let Some(b) = &body.branch {
+            format!("{}/{}", body.repo, b)
+        } else {
+            body.repo.clone()
+        };
+        let msg = match (body.action.as_str(), &body.branch) {
+            ("mute", Some(branch)) => {
+                rc.branch_notifications
+                    .entry(branch.clone())
+                    .or_default()
+                    .notifications = all_off;
+                format!("{target_label}: notifications muted")
             }
-            "unmute" => {
+            ("unmute", Some(branch)) => {
+                if let Some(bc) = rc.branch_notifications.get_mut(branch) {
+                    bc.notifications = NotificationOverrides::default();
+                    if bc == &BranchConfig::default() {
+                        rc.branch_notifications.remove(branch);
+                    }
+                }
+                format!("{target_label}: notifications unmuted (using repo/global defaults)")
+            }
+            ("mute", None) => {
+                rc.notifications = all_off;
+                format!("{target_label}: notifications muted")
+            }
+            ("unmute", None) => {
                 rc.notifications = NotificationOverrides::default();
-                format!(
-                    "{}: notifications unmuted (using global defaults)",
-                    body.repo
-                )
+                format!("{target_label}: notifications unmuted (using global defaults)")
             }
-            other => {
+            ("set_levels", Some(branch)) => {
+                let overrides = &mut rc
+                    .branch_notifications
+                    .entry(branch.clone())
+                    .or_default()
+                    .notifications;
+                apply_level_overrides(
+                    overrides,
+                    body.build_started,
+                    body.build_success,
+                    body.build_failure,
+                );
+                format!("{target_label}: notification levels updated")
+            }
+            ("set_levels", None) => {
+                apply_level_overrides(
+                    &mut rc.notifications,
+                    body.build_started,
+                    body.build_success,
+                    body.build_failure,
+                );
+                format!("{target_label}: notification levels updated")
+            }
+            (other, _) => {
                 return axum::Json(
                     serde_json::json!({ "error": format!("unknown action: {other:?}") }),
-                );
+                )
+                .into_response();
             }
         };
         (cfg.clone(), msg)
     };
     if let Some(warning) = persist_config(&*state.handle.persistence, snapshot).await {
-        return axum::Json(serde_json::json!({ "ok": true, "message": msg, "warning": warning }));
+        return axum::Json(serde_json::json!({ "ok": true, "message": msg, "warning": warning }))
+            .into_response();
     }
-    axum::Json(serde_json::json!({ "ok": true, "message": msg }))
+    axum::Json(serde_json::json!({ "ok": true, "message": msg })).into_response()
+}
+
+#[derive(Serialize)]
+struct DefaultsResponse {
+    default_branches: Vec<String>,
+    ignored_workflows: Vec<String>,
+}
+
+/// `GET /defaults` — Read global default config (branches, ignored workflows).
+async fn get_defaults_handler(State(state): State<AppState>) -> axum::Json<DefaultsResponse> {
+    let cfg = state.config.lock().await;
+    axum::Json(DefaultsResponse {
+        default_branches: cfg.default_branches.clone(),
+        ignored_workflows: cfg.ignored_workflows.clone(),
+    })
+}
+
+#[derive(Deserialize)]
+struct SetDefaultsRequest {
+    #[serde(default)]
+    default_branches: Option<Vec<String>>,
+    #[serde(default)]
+    ignored_workflows: Option<Vec<String>>,
+}
+
+/// `POST /defaults` — Update global default config fields.
+async fn set_defaults_handler(
+    State(state): State<AppState>,
+    axum::Json(body): axum::Json<SetDefaultsRequest>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    let (snapshot, messages) = {
+        let mut cfg = state.config.lock().await;
+        let mut messages = Vec::new();
+        if let Some(branches) = body.default_branches {
+            for b in &branches {
+                if let Err(e) = validate_branch(b) {
+                    return axum::Json(serde_json::json!({ "error": e })).into_response();
+                }
+            }
+            if branches.is_empty() {
+                return axum::Json(
+                    serde_json::json!({ "error": "default_branches must not be empty" }),
+                )
+                .into_response();
+            }
+            cfg.default_branches = branches.clone();
+            messages.push(format!("default branches: {}", branches.join(", ")));
+        }
+        if let Some(workflows) = body.ignored_workflows {
+            cfg.ignored_workflows = workflows.clone();
+            if workflows.is_empty() {
+                messages.push("ignored workflows cleared".to_string());
+            } else {
+                messages.push(format!("ignored workflows: {}", workflows.join(", ")));
+            }
+        }
+        (cfg.clone(), messages)
+    };
+    if let Some(warning) = persist_config(&*state.handle.persistence, snapshot).await {
+        return axum::Json(
+            serde_json::json!({ "ok": true, "messages": messages, "warning": warning }),
+        )
+        .into_response();
+    }
+    axum::Json(serde_json::json!({ "ok": true, "messages": messages })).into_response()
+}
+
+/// `POST /shutdown` — Initiate graceful daemon shutdown.
+async fn shutdown_handler(State(state): State<AppState>) -> axum::Json<serde_json::Value> {
+    tracing::info!("Shutdown requested via REST API");
+    state.handle.cancel.cancel();
+    axum::Json(serde_json::json!({ "ok": true, "message": "shutting down" }))
 }
 
 /// Bind to the preferred port, trying up to 9 consecutive ports on conflict.
@@ -586,8 +732,16 @@ fn build_router(
         .route("/rerun", axum::routing::post(rerun_handler))
         .route("/watch", axum::routing::post(watch_handler))
         .route("/unwatch", axum::routing::post(unwatch_handler))
-        .route("/notifications", axum::routing::post(notifications_handler))
+        .route(
+            "/notifications",
+            axum::routing::get(get_notifications_handler).post(notifications_handler),
+        )
         .route("/branches", axum::routing::post(branches_handler))
+        .route(
+            "/defaults",
+            axum::routing::get(get_defaults_handler).post(set_defaults_handler),
+        )
+        .route("/shutdown", axum::routing::post(shutdown_handler))
         .with_state(app_state)
         .nest_service("/mcp", service)
 }
@@ -634,8 +788,14 @@ pub async fn serve(
 
     axum::serve(listener, router)
         .with_graceful_shutdown(async move {
-            tokio::signal::ctrl_c().await.ok();
-            tracing::info!("Shutting down...");
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {
+                    tracing::info!("Ctrl-C received, shutting down...");
+                }
+                _ = ct.cancelled() => {
+                    tracing::info!("Shutdown requested, shutting down...");
+                }
+            }
             ct.cancel();
         })
         .await?;
@@ -917,7 +1077,7 @@ impl BuildWatcher {
                 "No active watches",
             )]));
         }
-        let snapshot = build_watch_snapshot(&watches, None, paused);
+        let snapshot = build_watch_snapshot(&watches, None, paused, tokio::time::Instant::now());
 
         let mut lines: Vec<String> = Vec::new();
         if snapshot.paused {
@@ -972,6 +1132,11 @@ impl BuildWatcher {
         &self,
         Parameters(params): Parameters<ConfigureBranchesParams>,
     ) -> Result<CallToolResult, McpError> {
+        if params.branches.is_empty() {
+            return Ok(CallToolResult::error(vec![Content::text(
+                "branches must not be empty",
+            )]));
+        }
         for branch in &params.branches {
             if let Err(e) = validate_branch(branch) {
                 return Ok(CallToolResult::error(vec![Content::text(e)]));
@@ -1653,20 +1818,37 @@ fn apply_notification_levels(
     }
 }
 
+/// Apply optional per-event levels to a `NotificationOverrides` struct.
+///
+/// Only fields present (`Some`) are updated; `None` fields are left unchanged.
+fn apply_level_overrides(
+    overrides: &mut NotificationOverrides,
+    started: Option<NotificationLevel>,
+    success: Option<NotificationLevel>,
+    failure: Option<NotificationLevel>,
+) {
+    if let Some(l) = started {
+        overrides.build_started = Some(l);
+    }
+    if let Some(l) = success {
+        overrides.build_success = Some(l);
+    }
+    if let Some(l) = failure {
+        overrides.build_failure = Some(l);
+    }
+}
+
 /// Apply notification level params to an override struct (sets Option values).
 fn apply_notification_overrides(
     overrides: &mut NotificationOverrides,
     params: &UpdateNotificationsParams,
 ) {
-    if let Some(l) = params.build_started {
-        overrides.build_started = Some(l);
-    }
-    if let Some(l) = params.build_success {
-        overrides.build_success = Some(l);
-    }
-    if let Some(l) = params.build_failure {
-        overrides.build_failure = Some(l);
-    }
+    apply_level_overrides(
+        overrides,
+        params.build_started,
+        params.build_success,
+        params.build_failure,
+    );
 }
 
 /// Validate a time string in HH:MM (24-hour) format.
@@ -1900,6 +2082,30 @@ mod tests {
         axum::Router::new()
             .route("/status", axum::routing::get(super::status_handler))
             .route("/events", axum::routing::get(super::events_handler))
+            .with_state(app_state)
+    }
+
+    fn notifications_test_router(
+        config: Arc<Mutex<build_watcher::config::Config>>,
+    ) -> axum::Router {
+        let (watches, pause, events) = empty_state();
+        let handle = stub_handle();
+        let app_state = super::AppState {
+            watches,
+            config,
+            handle,
+            pause,
+            events,
+            github: Arc::new(StubGitHub),
+            rate_limit: Arc::new(Mutex::new(None)),
+            started_at: std::time::Instant::now(),
+        };
+        axum::Router::new()
+            .route(
+                "/notifications",
+                axum::routing::get(super::get_notifications_handler)
+                    .post(super::notifications_handler),
+            )
             .with_state(app_state)
     }
 
@@ -2166,6 +2372,79 @@ mod tests {
         assert!(
             frame_text.contains("alice/app"),
             "expected repo in frame, got: {frame_text:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_notifications_returns_resolved_config() {
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        let mut config = build_watcher::config::Config::default();
+        config.repos.insert(
+            "alice/app".to_string(),
+            build_watcher::config::RepoConfig {
+                notifications: NotificationOverrides {
+                    build_started: Some(NotificationLevel::Off),
+                    build_success: None,
+                    build_failure: Some(NotificationLevel::Low),
+                },
+                ..Default::default()
+            },
+        );
+        let config = Arc::new(Mutex::new(config));
+        let router = notifications_test_router(config);
+
+        let req = http::Request::get("/notifications?repo=alice%2Fapp&branch=main")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["build_started"], "off");
+        assert_eq!(body["build_success"], "normal"); // global default
+        assert_eq!(body["build_failure"], "low");
+    }
+
+    #[tokio::test]
+    async fn post_notifications_set_levels() {
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        let mut config = build_watcher::config::Config::default();
+        config.repos.insert(
+            "alice/app".to_string(),
+            build_watcher::config::RepoConfig::default(),
+        );
+        let config = Arc::new(Mutex::new(config));
+        let router = notifications_test_router(config.clone());
+
+        let body = serde_json::json!({
+            "repo": "alice/app",
+            "branch": "main",
+            "action": "set_levels",
+            "build_started": "off",
+            "build_failure": "critical",
+        });
+        let req = http::Request::post("/notifications")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let resp_body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(resp_body["ok"], true);
+
+        let cfg = config.lock().await;
+        let rc = cfg.repos.get("alice/app").unwrap();
+        let bn = rc.branch_notifications.get("main").unwrap();
+        assert_eq!(bn.notifications.build_started, Some(NotificationLevel::Off));
+        assert_eq!(bn.notifications.build_success, None); // not set
+        assert_eq!(
+            bn.notifications.build_failure,
+            Some(NotificationLevel::Critical)
         );
     }
 }

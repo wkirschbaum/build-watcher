@@ -418,7 +418,7 @@ pub async fn start_watch(
         active_runs: active,
         failure_counts: HashMap::new(),
         last_build: last_completed.map(|r| (*r).to_last_build()),
-        completed_at: last_completed.map(|_| Instant::now()),
+        completed_at: last_completed.map(|_| now),
     };
 
     {
