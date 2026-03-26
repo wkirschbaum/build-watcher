@@ -26,6 +26,87 @@ use build_watcher::status::{
     ActiveRunView, LastBuildView, StatsResponse, StatusResponse, WatchStatus,
 };
 
+// -- Daemon client --
+
+/// HTTP client for the build-watcher daemon REST API.
+struct DaemonClient {
+    client: reqwest::Client,
+    port: u16,
+}
+
+impl DaemonClient {
+    fn new(port: u16) -> Self {
+        Self {
+            client: reqwest::Client::new(),
+            port,
+        }
+    }
+
+    fn url(&self, path: &str) -> String {
+        format!("http://127.0.0.1:{}{path}", self.port)
+    }
+
+    async fn get_json<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T, String> {
+        let resp = self
+            .client
+            .get(self.url(path))
+            .send()
+            .await
+            .map_err(|e| format!("connect: {e}"))?;
+        resp.json::<T>().await.map_err(|e| format!("parse: {e}"))
+    }
+
+    async fn post_json(&self, path: &str, body: &serde_json::Value) -> Result<(), String> {
+        let resp = self
+            .client
+            .post(self.url(path))
+            .json(body)
+            .send()
+            .await
+            .map_err(|e| format!("{path}: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!("{path}: HTTP {}", resp.status()));
+        }
+        Ok(())
+    }
+
+    async fn pause(&self, pause: bool) -> Result<(), String> {
+        self.post_json("/pause", &serde_json::json!({ "pause": pause }))
+            .await
+    }
+
+    async fn rerun(&self, repo: &str, run_id: u64) -> Result<(), String> {
+        self.post_json(
+            "/rerun",
+            &serde_json::json!({ "repo": repo, "run_id": run_id }),
+        )
+        .await
+    }
+
+    async fn watch(&self, repo: &str) -> Result<(), String> {
+        self.post_json("/watch", &serde_json::json!({ "repos": [repo] }))
+            .await
+    }
+
+    async fn unwatch(&self, repo: &str) -> Result<(), String> {
+        self.post_json("/unwatch", &serde_json::json!({ "repos": [repo] }))
+            .await
+    }
+
+    async fn set_notifications(&self, repo: &str, action: &str) -> Result<(), String> {
+        self.post_json(
+            "/notifications",
+            &serde_json::json!({ "repo": repo, "action": action }),
+        )
+        .await
+    }
+
+    /// Inner client ref for the SSE background task (which needs `bytes_stream`).
+    fn inner(&self) -> &reqwest::Client {
+        &self.client
+    }
+}
+
 // -- App state --
 
 /// Text input mode for interactive prompts (e.g. "Add repo: ").
@@ -58,8 +139,12 @@ impl App {
             .sum()
     }
 
-    async fn resync(&mut self, client: &reqwest::Client, port: u16) {
-        match fetch_json::<StatusResponse>(client, port, "/status").await {
+    fn set_flash(&mut self, msg: impl Into<String>) {
+        self.flash = Some((msg.into(), Instant::now()));
+    }
+
+    async fn resync(&mut self, daemon: &DaemonClient) {
+        match daemon.get_json::<StatusResponse>("/status").await {
             Ok(status) => {
                 self.status = status;
                 self.last_fetch = Instant::now();
@@ -67,9 +152,148 @@ impl App {
             }
             Err(e) => self.fetch_error = Some(e),
         }
-        if let Ok(stats) = fetch_json::<StatsResponse>(client, port, "/stats").await {
+        if let Ok(stats) = daemon.get_json::<StatsResponse>("/stats").await {
             self.stats = stats;
         }
+    }
+
+    /// Advance local elapsed/age counters by one second between resyncs.
+    fn tick_timers(&mut self) {
+        for watch in &mut self.status.watches {
+            for run in &mut watch.active_runs {
+                if let Some(e) = &mut run.elapsed_secs {
+                    *e += 1.0;
+                }
+            }
+            if let Some(lb) = &mut watch.last_build
+                && let Some(a) = &mut lb.age_secs
+            {
+                *a += 1.0;
+            }
+        }
+    }
+
+    /// Handle a key press while in text input mode.
+    /// Returns `true` if the event was consumed (i.e. we were in input mode).
+    async fn handle_text_input(&mut self, code: KeyCode, daemon: &DaemonClient) -> bool {
+        let InputMode::TextInput { buffer, .. } = &mut self.input_mode else {
+            return false;
+        };
+
+        match code {
+            KeyCode::Esc => {
+                self.input_mode = InputMode::Normal;
+            }
+            KeyCode::Enter => {
+                let repo = buffer.trim().to_string();
+                self.input_mode = InputMode::Normal;
+                if !repo.is_empty() {
+                    match daemon.watch(&repo).await {
+                        Ok(()) => {
+                            self.set_flash(format!("Watching {repo}"));
+                            self.resync(daemon).await;
+                        }
+                        Err(e) => self.set_flash(e),
+                    }
+                }
+            }
+            KeyCode::Backspace => {
+                buffer.pop();
+            }
+            KeyCode::Char(c) => {
+                buffer.push(c);
+            }
+            _ => {}
+        }
+        true
+    }
+
+    /// Handle a key press in normal mode. Returns `true` if the app should quit.
+    async fn handle_normal_key(
+        &mut self,
+        code: KeyCode,
+        modifiers: KeyModifiers,
+        daemon: &DaemonClient,
+    ) -> bool {
+        let flat = flatten_rows(&self.status.watches);
+        let sel_count = flat.selectable.len();
+        let selected = flat
+            .selectable
+            .get(self.selected)
+            .map(|&idx| flat.rows[idx].repo_and_run_id());
+
+        match code {
+            KeyCode::Char('q') => return true,
+            KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => return true,
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.selected = self.selected.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if sel_count > 0 {
+                    self.selected = (self.selected + 1).min(sel_count - 1);
+                }
+            }
+            KeyCode::Char('a') => {
+                self.input_mode = InputMode::TextInput {
+                    prompt: "Add repo (owner/repo): ".to_string(),
+                    buffer: String::new(),
+                };
+            }
+            KeyCode::Char('d') => {
+                if let Some((repo, _, _)) = selected {
+                    let repo = repo.to_string();
+                    match daemon.unwatch(&repo).await {
+                        Ok(()) => {
+                            self.set_flash(format!("Removed {repo}"));
+                            self.resync(daemon).await;
+                        }
+                        Err(e) => self.set_flash(e),
+                    }
+                }
+            }
+            KeyCode::Char('n') => {
+                if let Some((repo, _, muted)) = selected {
+                    let repo = repo.to_string();
+                    let action = if muted { "unmute" } else { "mute" };
+                    match daemon.set_notifications(&repo, action).await {
+                        Ok(()) => {
+                            let verb = if muted { "Unmuted" } else { "Muted" };
+                            self.set_flash(format!("{verb} {repo}"));
+                            self.resync(daemon).await;
+                        }
+                        Err(e) => self.set_flash(e),
+                    }
+                }
+            }
+            KeyCode::Char('p') => {
+                let new_pause = !self.status.paused;
+                match daemon.pause(new_pause).await {
+                    Ok(()) => {
+                        self.status.paused = new_pause;
+                        self.set_flash(if new_pause { "Paused" } else { "Resumed" });
+                    }
+                    Err(e) => self.set_flash(e),
+                }
+            }
+            KeyCode::Char('r') => {
+                if let Some((repo, Some(run_id), _)) = selected {
+                    match daemon.rerun(repo, run_id).await {
+                        Ok(()) => {
+                            self.set_flash(format!("Rerun started: {run_id}"));
+                            self.resync(daemon).await;
+                        }
+                        Err(e) => self.set_flash(e),
+                    }
+                }
+            }
+            KeyCode::Char('o') => {
+                if let Some((repo, Some(run_id), _)) = selected {
+                    open_url(repo, run_id);
+                }
+            }
+            _ => {}
+        }
+        false
     }
 }
 
@@ -345,23 +569,11 @@ impl ColWidths {
 
 const FLASH_DURATION: Duration = Duration::from_secs(3);
 
-fn render(frame: &mut ratatui::Frame, app: &App) {
-    let area = frame.area();
-    let cw = ColWidths::from_terminal_width(area.width);
+fn render_header(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &App) {
     let w = area.width as usize;
     let dim = Style::default().fg(Color::DarkGray);
 
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3), // header (2 info lines + separator)
-            Constraint::Length(1), // column headings
-            Constraint::Min(0),    // table body
-            Constraint::Length(1), // footer
-        ])
-        .split(area);
-
-    // -- Header line 1: title + stats --
+    // Line 1: title + stats
     let s = &app.stats;
     let uptime = format::seconds(s.uptime_secs);
     let poll = format!("poll {}s/{}s", s.active_poll_secs, s.idle_poll_secs);
@@ -391,7 +603,7 @@ fn render(frame: &mut ratatui::Frame, app: &App) {
         Span::styled(right1, dim),
     ]);
 
-    // -- Header line 2: watches + state --
+    // Line 2: watches + state
     let repo_count = app.status.watches.len();
     let active_count = app.active_count();
     let mut left2_spans: Vec<Span> = vec![Span::raw(format!(
@@ -437,12 +649,19 @@ fn render(frame: &mut ratatui::Frame, app: &App) {
     }
     let line2 = Line::from(left2_spans);
 
-    // -- Header line 3: separator --
+    // Line 3: separator
     let line3 = Line::from(Span::styled("─".repeat(w), dim));
 
-    frame.render_widget(Paragraph::new(vec![line1, line2, line3]), chunks[0]);
+    frame.render_widget(Paragraph::new(vec![line1, line2, line3]), area);
+}
 
-    // -- Column headings --
+fn render_body(
+    frame: &mut ratatui::Frame,
+    heading_area: ratatui::layout::Rect,
+    body_area: ratatui::layout::Rect,
+    app: &App,
+    cw: &ColWidths,
+) {
     let header_style = Style::default()
         .fg(Color::DarkGray)
         .add_modifier(Modifier::BOLD);
@@ -455,7 +674,6 @@ fn render(frame: &mut ratatui::Frame, app: &App) {
         Cell::from("ELAPSED / AGE").style(header_style),
     ]);
 
-    // -- Table rows --
     let flat = flatten_rows(&app.status.watches);
     let selected_display_idx = flat
         .selectable
@@ -471,90 +689,8 @@ fn render(frame: &mut ratatui::Frame, app: &App) {
         .iter()
         .enumerate()
         .map(|(i, dr)| {
-            let is_selected = i == selected_display_idx;
-            let row = match dr {
-                DisplayRow::OrgHeader { org } => Row::new(vec![
-                    Cell::from((*org).to_string()).style(
-                        Style::default()
-                            .fg(Color::Cyan)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Cell::from(""),
-                    Cell::from(""),
-                    Cell::from(""),
-                    Cell::from(""),
-                    Cell::from(""),
-                ]),
-                DisplayRow::ActiveRun {
-                    repo,
-                    branch,
-                    run,
-                    muted,
-                } => {
-                    let style = status_style(&run.status);
-                    let emoji = status_emoji(&run.status);
-                    let elapsed = run
-                        .elapsed_secs
-                        .map(|s| format::duration(Duration::from_secs_f64(s)))
-                        .unwrap_or_default();
-                    let name = format!("  {}{}", short_repo(repo), mute_indicator(*muted));
-                    Row::new(vec![
-                        Cell::from(format::truncate(&name, cw.repo)),
-                        Cell::from(format::truncate(branch, BRANCH_W)),
-                        Cell::from(format!("{emoji} {}", run.status)).style(style),
-                        Cell::from(format::truncate(&run.workflow, cw.workflow)),
-                        Cell::from(format::truncate(&run.title, cw.title)),
-                        Cell::from(elapsed).style(style),
-                    ])
-                }
-                DisplayRow::FailingSteps { steps } => Row::new(vec![
-                    Cell::from(""),
-                    Cell::from(""),
-                    Cell::from(""),
-                    Cell::from(""),
-                    Cell::from(format!("  ↳ {}", format::truncate(steps, cw.title)))
-                        .style(Style::default().fg(Color::Red)),
-                    Cell::from(""),
-                ]),
-                DisplayRow::LastBuild {
-                    repo,
-                    branch,
-                    build,
-                    muted,
-                } => {
-                    let style = status_style(&build.conclusion);
-                    let emoji = status_emoji(&build.conclusion);
-                    let age = build
-                        .age_secs
-                        .map(|s| format::age(s as u64))
-                        .unwrap_or_default();
-                    let name = format!("  {}{}", short_repo(repo), mute_indicator(*muted));
-                    Row::new(vec![
-                        Cell::from(format::truncate(&name, cw.repo)),
-                        Cell::from(format::truncate(branch, BRANCH_W)),
-                        Cell::from(format!("{emoji} {}", build.conclusion)).style(style),
-                        Cell::from(format::truncate(&build.workflow, cw.workflow)),
-                        Cell::from(format::truncate(&build.title, cw.title)),
-                        Cell::from(age).style(style),
-                    ])
-                }
-                DisplayRow::NeverRan {
-                    repo,
-                    branch,
-                    muted,
-                } => {
-                    let name = format!("  {}{}", short_repo(repo), mute_indicator(*muted));
-                    Row::new(vec![
-                        Cell::from(format::truncate(&name, cw.repo)),
-                        Cell::from(format::truncate(branch, BRANCH_W)),
-                        Cell::from("· idle").style(Style::default().fg(Color::DarkGray)),
-                        Cell::from(""),
-                        Cell::from(""),
-                        Cell::from(""),
-                    ])
-                }
-            };
-            if is_selected {
+            let row = render_display_row(dr, cw, &mute_indicator);
+            if i == selected_display_idx {
                 row.style(highlight_style)
             } else {
                 row
@@ -564,14 +700,103 @@ fn render(frame: &mut ratatui::Frame, app: &App) {
 
     let widths = cw.constraints();
 
-    // Render headings row as a table so columns align with the body.
     let heading_table = Table::new(vec![col_header], widths).column_spacing(COL_SPACING);
-    frame.render_widget(heading_table, chunks[1]);
+    frame.render_widget(heading_table, heading_area);
 
     let body_table = Table::new(rows, widths).column_spacing(COL_SPACING);
-    frame.render_widget(body_table, chunks[2]);
+    frame.render_widget(body_table, body_area);
+}
 
-    // -- Footer --
+fn render_display_row<'a>(
+    dr: &DisplayRow<'_>,
+    cw: &ColWidths,
+    mute_indicator: &dyn Fn(bool) -> &'static str,
+) -> Row<'a> {
+    match dr {
+        DisplayRow::OrgHeader { org } => Row::new(vec![
+            Cell::from((*org).to_string()).style(
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Cell::from(""),
+            Cell::from(""),
+            Cell::from(""),
+            Cell::from(""),
+            Cell::from(""),
+        ]),
+        DisplayRow::ActiveRun {
+            repo,
+            branch,
+            run,
+            muted,
+        } => {
+            let style = status_style(&run.status);
+            let emoji = status_emoji(&run.status);
+            let elapsed = run
+                .elapsed_secs
+                .map(|s| format::duration(Duration::from_secs_f64(s)))
+                .unwrap_or_default();
+            let name = format!("  {}{}", short_repo(repo), mute_indicator(*muted));
+            Row::new(vec![
+                Cell::from(format::truncate(&name, cw.repo)),
+                Cell::from(format::truncate(branch, BRANCH_W)),
+                Cell::from(format!("{emoji} {}", run.status)).style(style),
+                Cell::from(format::truncate(&run.workflow, cw.workflow)),
+                Cell::from(format::truncate(&run.title, cw.title)),
+                Cell::from(elapsed).style(style),
+            ])
+        }
+        DisplayRow::FailingSteps { steps } => Row::new(vec![
+            Cell::from(""),
+            Cell::from(""),
+            Cell::from(""),
+            Cell::from(""),
+            Cell::from(format!("  ↳ {}", format::truncate(steps, cw.title)))
+                .style(Style::default().fg(Color::Red)),
+            Cell::from(""),
+        ]),
+        DisplayRow::LastBuild {
+            repo,
+            branch,
+            build,
+            muted,
+        } => {
+            let style = status_style(&build.conclusion);
+            let emoji = status_emoji(&build.conclusion);
+            let age = build
+                .age_secs
+                .map(|s| format::age(s as u64))
+                .unwrap_or_default();
+            let name = format!("  {}{}", short_repo(repo), mute_indicator(*muted));
+            Row::new(vec![
+                Cell::from(format::truncate(&name, cw.repo)),
+                Cell::from(format::truncate(branch, BRANCH_W)),
+                Cell::from(format!("{emoji} {}", build.conclusion)).style(style),
+                Cell::from(format::truncate(&build.workflow, cw.workflow)),
+                Cell::from(format::truncate(&build.title, cw.title)),
+                Cell::from(age).style(style),
+            ])
+        }
+        DisplayRow::NeverRan {
+            repo,
+            branch,
+            muted,
+        } => {
+            let name = format!("  {}{}", short_repo(repo), mute_indicator(*muted));
+            Row::new(vec![
+                Cell::from(format::truncate(&name, cw.repo)),
+                Cell::from(format::truncate(branch, BRANCH_W)),
+                Cell::from("· idle").style(Style::default().fg(Color::DarkGray)),
+                Cell::from(""),
+                Cell::from(""),
+                Cell::from(""),
+            ])
+        }
+    }
+}
+
+fn render_footer(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &App) {
     let key_style = Style::default()
         .fg(Color::DarkGray)
         .add_modifier(Modifier::BOLD);
@@ -605,23 +830,26 @@ fn render(frame: &mut ratatui::Frame, app: &App) {
         ]))
         .style(Style::default().fg(Color::DarkGray)),
     };
-    frame.render_widget(footer, chunks[3]);
+    frame.render_widget(footer, area);
 }
 
-// -- HTTP --
+fn render(frame: &mut ratatui::Frame, app: &App) {
+    let area = frame.area();
+    let cw = ColWidths::from_terminal_width(area.width);
 
-async fn fetch_json<T: serde::de::DeserializeOwned>(
-    client: &reqwest::Client,
-    port: u16,
-    path: &str,
-) -> Result<T, String> {
-    let url = format!("http://127.0.0.1:{port}{path}");
-    let resp = client
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| format!("connect: {e}"))?;
-    resp.json::<T>().await.map_err(|e| format!("parse: {e}"))
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3), // header (2 info lines + separator)
+            Constraint::Length(1), // column headings
+            Constraint::Min(0),    // table body
+            Constraint::Length(1), // footer
+        ])
+        .split(area);
+
+    render_header(frame, chunks[0], app);
+    render_body(frame, chunks[1], chunks[2], app, &cw);
+    render_footer(frame, chunks[3], app);
 }
 
 // -- SSE background task --
@@ -703,86 +931,6 @@ async fn sse_task(client: reqwest::Client, port: u16, tx: mpsc::Sender<SseUpdate
 
 // -- Actions --
 
-async fn post_pause(client: &reqwest::Client, port: u16, pause: bool) -> Result<(), String> {
-    let url = format!("http://127.0.0.1:{port}/pause");
-    let resp = client
-        .post(&url)
-        .json(&serde_json::json!({ "pause": pause }))
-        .send()
-        .await
-        .map_err(|e| format!("pause: {e}"))?;
-    if !resp.status().is_success() {
-        return Err(format!("pause: HTTP {}", resp.status()));
-    }
-    Ok(())
-}
-
-async fn post_rerun(
-    client: &reqwest::Client,
-    port: u16,
-    repo: &str,
-    run_id: u64,
-) -> Result<(), String> {
-    let url = format!("http://127.0.0.1:{port}/rerun");
-    let resp = client
-        .post(&url)
-        .json(&serde_json::json!({ "repo": repo, "run_id": run_id }))
-        .send()
-        .await
-        .map_err(|e| format!("rerun: {e}"))?;
-    if !resp.status().is_success() {
-        return Err(format!("rerun: HTTP {}", resp.status()));
-    }
-    Ok(())
-}
-
-async fn post_watch(client: &reqwest::Client, port: u16, repo: &str) -> Result<(), String> {
-    let url = format!("http://127.0.0.1:{port}/watch");
-    let resp = client
-        .post(&url)
-        .json(&serde_json::json!({ "repos": [repo] }))
-        .send()
-        .await
-        .map_err(|e| format!("watch: {e}"))?;
-    if !resp.status().is_success() {
-        return Err(format!("watch: HTTP {}", resp.status()));
-    }
-    Ok(())
-}
-
-async fn post_unwatch(client: &reqwest::Client, port: u16, repo: &str) -> Result<(), String> {
-    let url = format!("http://127.0.0.1:{port}/unwatch");
-    let resp = client
-        .post(&url)
-        .json(&serde_json::json!({ "repos": [repo] }))
-        .send()
-        .await
-        .map_err(|e| format!("unwatch: {e}"))?;
-    if !resp.status().is_success() {
-        return Err(format!("unwatch: HTTP {}", resp.status()));
-    }
-    Ok(())
-}
-
-async fn post_notifications(
-    client: &reqwest::Client,
-    port: u16,
-    repo: &str,
-    action: &str,
-) -> Result<(), String> {
-    let url = format!("http://127.0.0.1:{port}/notifications");
-    let resp = client
-        .post(&url)
-        .json(&serde_json::json!({ "repo": repo, "action": action }))
-        .send()
-        .await
-        .map_err(|e| format!("notifications: {e}"))?;
-    if !resp.status().is_success() {
-        return Err(format!("notifications: HTTP {}", resp.status()));
-    }
-    Ok(())
-}
-
 fn open_url(repo: &str, run_id: u64) {
     let url = format!("https://github.com/{repo}/actions/runs/{run_id}");
     let cmd = if cfg!(target_os = "macos") {
@@ -816,8 +964,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|e| format!("Invalid port in {}: {e}", port_file.display()))?;
 
     // Initial fetch so there's something to display before SSE connects.
-    let client = reqwest::Client::new();
-    let initial = fetch_json::<StatusResponse>(&client, port, "/status")
+    let daemon = DaemonClient::new(port);
+    let initial = daemon
+        .get_json::<StatusResponse>("/status")
         .await
         .unwrap_or_else(|e| {
             eprintln!("Warning: could not fetch initial status: {e}");
@@ -826,7 +975,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 watches: vec![],
             }
         });
-    let initial_stats = fetch_json::<StatsResponse>(&client, port, "/stats")
+    let initial_stats = daemon
+        .get_json::<StatsResponse>("/stats")
         .await
         .unwrap_or_default();
 
@@ -850,7 +1000,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // SSE background task feeds events into this channel.
     let (sse_tx, mut sse_rx) = mpsc::channel::<SseUpdate>(64);
-    tokio::spawn(sse_task(client.clone(), port, sse_tx));
+    tokio::spawn(sse_task(daemon.inner().clone(), port, sse_tx));
 
     let mut keyboard = EventStream::new();
 
@@ -872,21 +1022,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             tokio::select! {
                 _ = elapsed_tick.tick() => {
-                    for watch in &mut app.status.watches {
-                        for run in &mut watch.active_runs {
-                            if let Some(e) = &mut run.elapsed_secs {
-                                *e += 1.0;
-                            }
-                        }
-                        if let Some(lb) = &mut watch.last_build
-                            && let Some(a) = &mut lb.age_secs
-                        {
-                            *a += 1.0;
-                        }
-                    }
+                    app.tick_timers();
                 }
                 _ = resync_tick.tick() => {
-                    app.resync(&client, port).await;
+                    app.resync(&daemon).await;
                 }
                 maybe_update = sse_rx.recv() => {
                     match maybe_update {
@@ -895,117 +1034,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         Some(SseUpdate::Connected) => {
                             app.sse_state = SseState::Connected;
-                            // Resync on connect to recover any events missed during
-                            // startup or reconnect.
-                            app.resync(&client, port).await;
+                            app.resync(&daemon).await;
                         }
                         Some(SseUpdate::Disconnected) => {
                             app.sse_state = SseState::Disconnected { since: Instant::now() };
                         }
-                        None => {} // sse_task exited
+                        None => {}
                     }
                 }
                 maybe_event = keyboard.next() => {
                     match maybe_event {
                         Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
-                            // Text input mode — capture characters or handle Enter/Esc.
-                            if let InputMode::TextInput { buffer, .. } = &mut app.input_mode {
-                                match key.code {
-                                    KeyCode::Esc => {
-                                        app.input_mode = InputMode::Normal;
-                                    }
-                                    KeyCode::Enter => {
-                                        let repo = buffer.trim().to_string();
-                                        app.input_mode = InputMode::Normal;
-                                        if !repo.is_empty() {
-                                            if let Err(e) = post_watch(&client, port, &repo).await {
-                                                app.flash = Some((e, Instant::now()));
-                                            } else {
-                                                app.flash = Some((format!("Watching {repo}"), Instant::now()));
-                                                app.resync(&client, port).await;
-                                            }
-                                        }
-                                    }
-                                    KeyCode::Backspace => { buffer.pop(); }
-                                    KeyCode::Char(c) => { buffer.push(c); }
-                                    _ => {}
-                                }
+                            if app.handle_text_input(key.code, &daemon).await {
                                 continue;
                             }
-
-                            // Normal mode keybindings.
-                            let flat = flatten_rows(&app.status.watches);
-                            let sel_count = flat.selectable.len();
-                            let selected = flat.selectable.get(app.selected)
-                                .map(|&idx| flat.rows[idx].repo_and_run_id());
-
-                            match key.code {
-                                KeyCode::Char('q') => break,
-                                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
-                                KeyCode::Up | KeyCode::Char('k') => {
-                                    app.selected = app.selected.saturating_sub(1);
-                                }
-                                KeyCode::Down | KeyCode::Char('j') => {
-                                    if sel_count > 0 {
-                                        app.selected = (app.selected + 1).min(sel_count - 1);
-                                    }
-                                }
-                                KeyCode::Char('a') => {
-                                    app.input_mode = InputMode::TextInput {
-                                        prompt: "Add repo (owner/repo): ".to_string(),
-                                        buffer: String::new(),
-                                    };
-                                }
-                                KeyCode::Char('d') => {
-                                    if let Some((repo, _, _)) = selected {
-                                        let repo = repo.to_string();
-                                        if let Err(e) = post_unwatch(&client, port, &repo).await {
-                                            app.flash = Some((e, Instant::now()));
-                                        } else {
-                                            app.flash = Some((format!("Removed {repo}"), Instant::now()));
-                                            app.resync(&client, port).await;
-                                        }
-                                    }
-                                }
-                                KeyCode::Char('n') => {
-                                    if let Some((repo, _, muted)) = selected {
-                                        let repo = repo.to_string();
-                                        let action = if muted { "unmute" } else { "mute" };
-                                        if let Err(e) = post_notifications(&client, port, &repo, action).await {
-                                            app.flash = Some((e, Instant::now()));
-                                        } else {
-                                            let msg = if muted { format!("Unmuted {repo}") } else { format!("Muted {repo}") };
-                                            app.flash = Some((msg, Instant::now()));
-                                            app.resync(&client, port).await;
-                                        }
-                                    }
-                                }
-                                KeyCode::Char('p') => {
-                                    let new_pause = !app.status.paused;
-                                    if let Err(e) = post_pause(&client, port, new_pause).await {
-                                        app.flash = Some((e, Instant::now()));
-                                    } else {
-                                        app.status.paused = new_pause;
-                                        let msg = if new_pause { "Paused" } else { "Resumed" };
-                                        app.flash = Some((msg.to_string(), Instant::now()));
-                                    }
-                                }
-                                KeyCode::Char('r') => {
-                                    if let Some((repo, Some(run_id), _)) = selected {
-                                        if let Err(e) = post_rerun(&client, port, repo, run_id).await {
-                                            app.flash = Some((e, Instant::now()));
-                                        } else {
-                                            app.flash = Some((format!("Rerun started: {run_id}"), Instant::now()));
-                                            app.resync(&client, port).await;
-                                        }
-                                    }
-                                }
-                                KeyCode::Char('o') => {
-                                    if let Some((repo, Some(run_id), _)) = selected {
-                                        open_url(repo, run_id);
-                                    }
-                                }
-                                _ => {}
+                            if app.handle_normal_key(key.code, key.modifiers, &daemon).await {
+                                break;
                             }
                         }
                         Some(Ok(Event::Resize(_, _))) => {} // triggers redraw at top of loop
