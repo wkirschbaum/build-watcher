@@ -307,9 +307,8 @@ pub async fn serve(
     let bound_port = listener.local_addr()?.port();
 
     let port_file = state_dir().join("port");
-    if let Err(e) = std::fs::write(&port_file, bound_port.to_string()) {
-        tracing::warn!("Failed to write port file {}: {e}", port_file.display());
-    }
+    std::fs::write(&port_file, bound_port.to_string())
+        .map_err(|e| format!("Failed to write port file {}: {e}", port_file.display()))?;
 
     if bound_port != port {
         tracing::warn!("Port {port} was occupied, using port {bound_port} instead");
