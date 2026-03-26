@@ -206,7 +206,7 @@ pub async fn save_watches(watches: &Watches) {
 const MAX_GH_FAILURES: u8 = 5;
 
 /// Runtime state per repo/branch: high-water mark + in-progress runs.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct WatchEntry {
     last_seen_run_id: u64,
     pub active_runs: HashMap<u64, ActiveRun>,

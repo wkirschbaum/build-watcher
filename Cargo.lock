@@ -144,13 +144,17 @@ dependencies = [
  "axum",
  "chrono",
  "futures-lite",
+ "http",
+ "http-body-util",
  "rmcp",
  "schemars",
  "serde",
  "serde_json",
  "thiserror",
  "tokio",
+ "tokio-stream",
  "tokio-util",
+ "tower",
  "tracing",
  "tracing-subscriber",
  "zbus",
@@ -1246,6 +1250,7 @@ dependencies = [
  "futures-core",
  "pin-project-lite",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]

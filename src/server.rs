@@ -1,6 +1,11 @@
+use std::convert::Infallible;
 use std::sync::Arc;
+use std::time::Duration;
 
 type AnyResult<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+use axum::extract::State;
+use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::routing::get;
 use rmcp::handler::server::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, Content, Implementation, ServerCapabilities, ServerInfo};
@@ -9,7 +14,9 @@ use rmcp::transport::streamable_http_server::{
 };
 use rmcp::{ErrorData as McpError, ServerHandler, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use tokio_stream::StreamExt as _;
+use tokio_stream::wrappers::BroadcastStream;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{
@@ -26,6 +33,136 @@ use crate::watcher::{
 
 pub const DEFAULT_PORT: u16 = 8417;
 
+// -- SSE / status endpoints --
+
+/// Shared state for the `/status` and `/events` HTTP routes.
+#[derive(Clone)]
+struct AppState {
+    watches: Watches,
+    pause: PauseState,
+    events: crate::events::EventBus,
+}
+
+/// A single active run as returned by `GET /status`.
+#[derive(Serialize)]
+struct ActiveRunView {
+    run_id: u64,
+    status: String,
+    workflow: String,
+    /// Human-readable title: plain commit title for pushes, "PR: …" for PRs.
+    title: String,
+    elapsed_secs: Option<f64>,
+}
+
+/// Summary of the last completed build as returned by `GET /status`.
+#[derive(Serialize)]
+struct LastBuildView {
+    run_id: u64,
+    conclusion: String,
+    workflow: String,
+    title: String,
+}
+
+/// One watched repo/branch as returned by `GET /status`.
+#[derive(Serialize)]
+struct WatchStatus {
+    repo: String,
+    branch: String,
+    active_runs: Vec<ActiveRunView>,
+    last_build: Option<LastBuildView>,
+}
+
+/// Full response body for `GET /status`.
+#[derive(Serialize)]
+struct StatusResponse {
+    paused: bool,
+    watches: Vec<WatchStatus>,
+}
+
+/// Build a snapshot of all current watches from already-locked state.
+///
+/// Pure function (no async, no locks) — callers acquire the locks and pass
+/// the data in. Both the `GET /status` HTTP handler and the `list_watches`
+/// MCP tool call this so the watch-enumeration logic lives in one place.
+fn build_watch_snapshot(
+    watches: &std::collections::HashMap<WatchKey, crate::watcher::WatchEntry>,
+    paused: bool,
+) -> StatusResponse {
+    let now = tokio::time::Instant::now();
+    let mut watch_list: Vec<WatchStatus> = watches
+        .iter()
+        .map(|(key, entry)| {
+            let mut active_runs: Vec<ActiveRunView> = entry
+                .active_runs
+                .iter()
+                .map(|(run_id, run)| {
+                    let elapsed_secs = now
+                        .checked_duration_since(run.started_at)
+                        .map(|d| d.as_secs_f64());
+                    ActiveRunView {
+                        run_id: *run_id,
+                        status: run.status.clone(),
+                        workflow: run.workflow.clone(),
+                        title: run.display_title(),
+                        elapsed_secs,
+                    }
+                })
+                .collect();
+            active_runs.sort_by_key(|r| r.run_id);
+
+            let last_build = entry.last_build.as_ref().map(|lb| LastBuildView {
+                run_id: lb.run_id,
+                conclusion: lb.conclusion.clone(),
+                workflow: lb.workflow.clone(),
+                title: lb.display_title(),
+            });
+
+            WatchStatus {
+                repo: key.repo.clone(),
+                branch: key.branch.clone(),
+                active_runs,
+                last_build,
+            }
+        })
+        .collect();
+    watch_list.sort_by(|a, b| a.repo.cmp(&b.repo).then(a.branch.cmp(&b.branch)));
+
+    StatusResponse {
+        paused,
+        watches: watch_list,
+    }
+}
+
+/// `GET /status` — JSON snapshot of all current watches and their build state.
+async fn status_handler(State(state): State<AppState>) -> axum::Json<StatusResponse> {
+    let paused = {
+        let p = state.pause.lock().await;
+        p.is_some_and(|deadline| tokio::time::Instant::now() < deadline)
+    };
+    let watches = state.watches.lock().await;
+    axum::Json(build_watch_snapshot(&watches, paused))
+}
+
+/// `GET /events` — SSE stream of `WatchEvent`s as they occur.
+///
+/// Each frame has an event type matching the variant name and a JSON data payload.
+/// A keepalive comment is sent every 30 seconds to detect dropped connections.
+async fn events_handler(State(state): State<AppState>) -> impl axum::response::IntoResponse {
+    let stream = BroadcastStream::new(state.events.subscribe())
+        .filter_map(|result| result.ok())
+        .map(|event| {
+            let event_type = match &event {
+                crate::events::WatchEvent::RunStarted(_) => "RunStarted",
+                crate::events::WatchEvent::RunCompleted { .. } => "RunCompleted",
+                crate::events::WatchEvent::StatusChanged { .. } => "StatusChanged",
+            };
+            let data = serde_json::to_string(&event).unwrap_or_default();
+            Ok::<_, Infallible>(Event::default().event(event_type).data(data))
+        });
+
+    Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(30)))
+}
+
 /// Bind to the preferred port, trying up to 9 consecutive ports on conflict.
 async fn bind_with_fallback(preferred: u16) -> AnyResult<tokio::net::TcpListener> {
     let last = preferred.saturating_add(9);
@@ -39,7 +176,7 @@ async fn bind_with_fallback(preferred: u16) -> AnyResult<tokio::net::TcpListener
     unreachable!("preferred..=last is never empty")
 }
 
-/// Build the axum router with the MCP `StreamableHttpService`.
+/// Build the axum router with the MCP `StreamableHttpService` and SSE/status routes.
 fn build_router(
     watches: Watches,
     config: SharedConfig,
@@ -55,6 +192,12 @@ fn build_router(
         sse_keep_alive: None,
         cancellation_token: ct.child_token(),
         ..Default::default()
+    };
+
+    let app_state = AppState {
+        watches: watches.clone(),
+        pause: pause.clone(),
+        events: handle.events.clone(),
     };
 
     let service: StreamableHttpService<BuildWatcher, LocalSessionManager> =
@@ -73,7 +216,11 @@ fn build_router(
             http_config,
         );
 
-    axum::Router::new().nest_service("/mcp", service)
+    axum::Router::new()
+        .route("/status", get(status_handler))
+        .route("/events", get(events_handler))
+        .with_state(app_state)
+        .nest_service("/mcp", service)
 }
 
 /// Run the MCP HTTP server with graceful shutdown.
@@ -491,53 +638,47 @@ impl BuildWatcher {
             p.is_some_and(|deadline| tokio::time::Instant::now() < deadline)
         };
 
+        let snapshot = build_watch_snapshot(&watches, paused);
+
         let mut lines: Vec<String> = Vec::new();
-        if paused {
+        if snapshot.paused {
             lines.push("⏸ Notifications paused\n".to_string());
         }
 
-        let mut watch_lines: Vec<String> = watches
+        let watch_lines: Vec<String> = snapshot
+            .watches
             .iter()
-            .map(|(key, entry)| {
-                let (repo, branch) = (&key.repo, &key.branch);
-                let last = entry
+            .map(|w| {
+                let last = w
                     .last_build
                     .as_ref()
-                    .map(|b| {
-                        format!(
-                            " (last: {} — {}: {})",
-                            b.conclusion,
-                            b.workflow,
-                            b.display_title()
-                        )
-                    })
+                    .map(|b| format!(" (last: {} — {}: {})", b.conclusion, b.workflow, b.title))
                     .unwrap_or_default();
 
-                if entry.active_runs.is_empty() {
-                    format!("- {repo} [{branch}] — idle{last}")
+                if w.active_runs.is_empty() {
+                    format!("- {} [{}] — idle{last}", w.repo, w.branch)
                 } else {
-                    let run_list: Vec<String> = entry
+                    let run_list: Vec<String> = w
                         .active_runs
-                        .values()
-                        .map(|active| {
-                            let time = format::duration(active.started_at.elapsed());
-                            format!(
-                                "{}: {} ({}, {time})",
-                                active.workflow,
-                                active.display_title(),
-                                active.status,
-                            )
+                        .iter()
+                        .map(|r| {
+                            let time = r
+                                .elapsed_secs
+                                .map(|s| format::duration(Duration::from_secs_f64(s)))
+                                .unwrap_or_default();
+                            format!("{}: {} ({}, {time})", r.workflow, r.title, r.status)
                         })
                         .collect();
                     format!(
-                        "- {repo} [{branch}] — {} active: {}{last}",
-                        entry.active_runs.len(),
+                        "- {} [{}] — {} active: {}{last}",
+                        w.repo,
+                        w.branch,
+                        w.active_runs.len(),
                         run_list.join(", ")
                     )
                 }
             })
             .collect();
-        watch_lines.sort();
         lines.extend(watch_lines);
 
         Ok(CallToolResult::success(vec![Content::text(
@@ -1386,5 +1527,192 @@ mod tests {
         assert_eq!(overrides.build_started, None); // unchanged
         assert_eq!(overrides.build_success, Some(NotificationLevel::Critical));
         assert_eq!(overrides.build_failure, None); // unchanged
+    }
+
+    // -- SSE / status endpoint tests --
+
+    use crate::events::{EventBus, RunSnapshot, WatchEvent};
+    use crate::watcher::{PauseState, WatchEntry, WatchKey, Watches};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    fn empty_state() -> (Watches, PauseState, EventBus) {
+        let watches = Arc::new(Mutex::new(HashMap::new()));
+        let pause: PauseState = Arc::new(Mutex::new(None));
+        let events = EventBus::new();
+        (watches, pause, events)
+    }
+
+    fn test_router(watches: Watches, pause: PauseState, events: EventBus) -> axum::Router {
+        let app_state = super::AppState {
+            watches,
+            pause,
+            events,
+        };
+        axum::Router::new()
+            .route("/status", axum::routing::get(super::status_handler))
+            .route("/events", axum::routing::get(super::events_handler))
+            .with_state(app_state)
+    }
+
+    async fn get_status_json(router: axum::Router) -> serde_json::Value {
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        let req = http::Request::get("/status")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    fn snap() -> RunSnapshot {
+        RunSnapshot {
+            repo: "alice/app".to_string(),
+            branch: "main".to_string(),
+            run_id: 42,
+            workflow: "CI".to_string(),
+            title: "Fix bug".to_string(),
+            event: "push".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn status_empty_watches() {
+        let (watches, pause, events) = empty_state();
+        let json = get_status_json(test_router(watches, pause, events)).await;
+        assert_eq!(json["paused"], false);
+        assert_eq!(json["watches"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn status_paused_flag() {
+        let (watches, pause, events) = empty_state();
+        // Set pause deadline far in the future.
+        *pause.lock().await =
+            Some(tokio::time::Instant::now() + std::time::Duration::from_secs(300));
+        let json = get_status_json(test_router(watches, pause, events)).await;
+        assert_eq!(json["paused"], true);
+    }
+
+    #[tokio::test]
+    async fn status_with_last_build() {
+        use crate::github::LastBuild;
+
+        let (watches, pause, events) = empty_state();
+        let key = WatchKey::new("alice/app", "main");
+        let mut entry = WatchEntry::default();
+        entry.last_build = Some(LastBuild {
+            run_id: 99,
+            conclusion: "success".to_string(),
+            workflow: "CI".to_string(),
+            title: "Initial commit".to_string(),
+            head_sha: "abc1234".to_string(),
+            event: "push".to_string(),
+        });
+        watches.lock().await.insert(key, entry);
+
+        let json = get_status_json(test_router(watches, pause, events)).await;
+        let watches_arr = &json["watches"];
+        assert_eq!(watches_arr.as_array().unwrap().len(), 1);
+        let w = &watches_arr[0];
+        assert_eq!(w["repo"], "alice/app");
+        assert_eq!(w["branch"], "main");
+        assert_eq!(w["active_runs"], serde_json::json!([]));
+        assert_eq!(w["last_build"]["run_id"], 99);
+        assert_eq!(w["last_build"]["conclusion"], "success");
+        assert_eq!(w["last_build"]["title"], "Initial commit");
+    }
+
+    #[tokio::test]
+    async fn status_watches_sorted() {
+        let (watches, pause, events) = empty_state();
+        {
+            let mut w = watches.lock().await;
+            w.insert(WatchKey::new("zoo/bar", "main"), WatchEntry::default());
+            w.insert(WatchKey::new("alice/app", "main"), WatchEntry::default());
+            w.insert(WatchKey::new("alice/app", "develop"), WatchEntry::default());
+        }
+        let json = get_status_json(test_router(watches, pause, events)).await;
+        let repos: Vec<&str> = json["watches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|w| w["repo"].as_str().unwrap())
+            .collect();
+        // alice/app entries come before zoo/bar
+        assert_eq!(repos[0], "alice/app");
+        assert_eq!(repos[1], "alice/app");
+        assert_eq!(repos[2], "zoo/bar");
+        // develop before main for alice/app
+        assert_eq!(json["watches"][0]["branch"], "develop");
+        assert_eq!(json["watches"][1]["branch"], "main");
+    }
+
+    #[tokio::test]
+    async fn events_returns_text_event_stream() {
+        use tower::ServiceExt;
+
+        let (watches, pause, events) = empty_state();
+        let router = test_router(watches, pause, events);
+        let req = http::Request::get("/events")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let content_type = resp.headers()["content-type"].to_str().unwrap();
+        assert!(
+            content_type.contains("text/event-stream"),
+            "got: {content_type}"
+        );
+    }
+
+    #[tokio::test]
+    async fn events_streams_run_started() {
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        let (watches, pause, events) = empty_state();
+        let router = test_router(watches, pause, events.clone());
+
+        // Make the request — the handler subscribes to the event bus synchronously
+        // before returning, so any events emitted after this point will be received.
+        let req = http::Request::get("/events")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), 200);
+
+        // Emit an event now that the SSE stream is subscribed.
+        events.emit(WatchEvent::RunStarted(snap()));
+
+        // Read body chunks until we find our SSE frame (with a timeout).
+        let mut body = resp.into_body();
+        let frame_text = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Some(Ok(frame)) = body.frame().await {
+                    if let Ok(data) = frame.into_data() {
+                        let text = String::from_utf8_lossy(&data).into_owned();
+                        if !text.trim().is_empty() {
+                            return text;
+                        }
+                    }
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for SSE frame");
+
+        assert!(
+            frame_text.contains("RunStarted"),
+            "expected 'RunStarted' in frame, got: {frame_text:?}"
+        );
+        assert!(
+            frame_text.contains("alice/app"),
+            "expected repo in frame, got: {frame_text:?}"
+        );
     }
 }

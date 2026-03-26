@@ -538,10 +538,8 @@ pub fn load_and_normalize() -> Config {
         cfg.default_branches = default_branches();
     }
 
-    if should_resave {
-        if let Err(e) = save_config(&cfg) {
-            tracing::error!("Failed to save config on startup: {e}");
-        }
+    if should_resave && let Err(e) = save_config(&cfg) {
+        tracing::error!("Failed to save config on startup: {e}");
     }
     cfg
 }
