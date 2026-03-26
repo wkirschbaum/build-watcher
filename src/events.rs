@@ -8,6 +8,7 @@ use tokio::time::Instant;
 use serde::Serialize;
 
 use crate::github::RunInfo;
+use crate::watcher::is_paused;
 use crate::{config, format, platform};
 
 const CHANNEL_CAPACITY: usize = 256;
@@ -21,6 +22,10 @@ pub struct RunSnapshot {
     pub workflow: String,
     pub title: String,
     pub event: String,
+    /// GitHub run status at the moment this snapshot was taken (e.g. `"queued"`, `"in_progress"`).
+    /// Allows TUI clients to populate `ActiveRunView.status` from a `RunStarted` event
+    /// without re-fetching `/status`.
+    pub status: String,
 }
 
 impl RunSnapshot {
@@ -32,6 +37,7 @@ impl RunSnapshot {
             workflow: run.workflow.clone(),
             title: run.title.clone(),
             event: run.event.clone(),
+            status: run.status.clone(),
         }
     }
 
@@ -168,11 +174,6 @@ fn effective_level(event: &WatchEvent, cfg: &config::Config) -> config::Notifica
     }
 }
 
-async fn is_paused(pause: &Arc<Mutex<Option<Instant>>>) -> bool {
-    let p = pause.lock().await;
-    p.is_some_and(|deadline| Instant::now() < deadline)
-}
-
 async fn handle_notification(
     event: WatchEvent,
     cfg: &config::Config,
@@ -245,6 +246,7 @@ mod tests {
             workflow: "CI".to_string(),
             title: "Fix login bug".to_string(),
             event: "push".to_string(),
+            status: "in_progress".to_string(),
         }
     }
 

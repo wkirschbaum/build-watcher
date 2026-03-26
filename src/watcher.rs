@@ -17,6 +17,12 @@ pub type Watches = Arc<Mutex<HashMap<WatchKey, WatchEntry>>>;
 pub type PauseState = Arc<Mutex<Option<Instant>>>;
 pub type RateLimitState = Arc<Mutex<Option<RateLimit>>>;
 
+/// Returns `true` if notifications are currently paused (deadline is in the future).
+pub(crate) async fn is_paused(pause: &PauseState) -> bool {
+    let p = pause.lock().await;
+    p.is_some_and(|deadline| Instant::now() < deadline)
+}
+
 /// Fastest permitted polling interval when active runs exist.
 pub(crate) const MIN_ACTIVE_SECS: u64 = 15;
 /// Fastest permitted polling interval when no active runs exist.

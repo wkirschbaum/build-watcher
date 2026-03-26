@@ -27,8 +27,8 @@ use crate::format;
 use crate::github::{validate_branch, validate_repo};
 use crate::watcher::{
     MIN_ACTIVE_SECS, MIN_IDLE_SECS, PauseState, RateLimitState, SharedConfig, WatchKey,
-    WatcherHandle, Watches, compute_intervals, count_api_calls, last_failed_build, save_watches,
-    start_watch,
+    WatcherHandle, Watches, compute_intervals, count_api_calls, is_paused, last_failed_build,
+    save_watches, start_watch,
 };
 
 pub const DEFAULT_PORT: u16 = 8417;
@@ -135,10 +135,7 @@ fn build_watch_snapshot(
 
 /// `GET /status` — JSON snapshot of all current watches and their build state.
 async fn status_handler(State(state): State<AppState>) -> axum::Json<StatusResponse> {
-    let paused = {
-        let p = state.pause.lock().await;
-        p.is_some_and(|deadline| tokio::time::Instant::now() < deadline)
-    };
+    let paused = is_paused(&state.pause).await;
     let watches = state.watches.lock().await;
     axum::Json(build_watch_snapshot(&watches, paused))
 }
@@ -626,18 +623,14 @@ impl BuildWatcher {
 
     #[tool(description = "List all currently watched builds and their status")]
     async fn list_watches(&self) -> Result<CallToolResult, McpError> {
-        let watches = self.watches.lock().await;
-        if watches.is_empty() {
+        if self.watches.lock().await.is_empty() {
             return Ok(CallToolResult::success(vec![Content::text(
                 "No active watches",
             )]));
         }
 
-        let paused = {
-            let p = self.pause.lock().await;
-            p.is_some_and(|deadline| tokio::time::Instant::now() < deadline)
-        };
-
+        let paused = is_paused(&self.pause).await;
+        let watches = self.watches.lock().await;
         let snapshot = build_watch_snapshot(&watches, paused);
 
         let mut lines: Vec<String> = Vec::new();
@@ -1577,6 +1570,7 @@ mod tests {
             workflow: "CI".to_string(),
             title: "Fix bug".to_string(),
             event: "push".to_string(),
+            status: "in_progress".to_string(),
         }
     }
 
