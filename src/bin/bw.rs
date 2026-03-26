@@ -28,6 +28,12 @@ use build_watcher::status::{
 
 // -- App state --
 
+/// Text input mode for interactive prompts (e.g. "Add repo: ").
+enum InputMode {
+    Normal,
+    TextInput { prompt: String, buffer: String },
+}
+
 struct App {
     status: StatusResponse,
     stats: StatsResponse,
@@ -40,6 +46,7 @@ struct App {
     selected: usize,
     /// Transient feedback message shown in the header (e.g. "Rerunning…").
     flash: Option<(String, Instant)>,
+    input_mode: InputMode,
 }
 
 impl App {
@@ -89,10 +96,14 @@ enum SseState {
 
 /// A flattened display row derived from the status snapshot.
 enum DisplayRow<'a> {
+    OrgHeader {
+        org: &'a str,
+    },
     ActiveRun {
         repo: &'a str,
         branch: &'a str,
         run: &'a ActiveRunView,
+        muted: bool,
     },
     FailingSteps {
         steps: &'a str,
@@ -101,10 +112,12 @@ enum DisplayRow<'a> {
         repo: &'a str,
         branch: &'a str,
         build: &'a LastBuildView,
+        muted: bool,
     },
     NeverRan {
         repo: &'a str,
         branch: &'a str,
+        muted: bool,
     },
 }
 
@@ -118,7 +131,16 @@ struct FlatRows<'a> {
 fn flatten_rows(watches: &[WatchStatus]) -> FlatRows<'_> {
     let mut rows = Vec::new();
     let mut selectable = Vec::new();
+    let mut current_org: Option<&str> = None;
+
     for w in watches {
+        // Insert org header when the org changes.
+        let org = w.repo.split('/').next().unwrap_or(&w.repo);
+        if current_org != Some(org) {
+            current_org = Some(org);
+            rows.push(DisplayRow::OrgHeader { org });
+        }
+
         if w.active_runs.is_empty() {
             match &w.last_build {
                 Some(b) => {
@@ -127,6 +149,7 @@ fn flatten_rows(watches: &[WatchStatus]) -> FlatRows<'_> {
                         repo: &w.repo,
                         branch: &w.branch,
                         build: b,
+                        muted: w.muted,
                     });
                     if b.conclusion != "success"
                         && let Some(steps) = &b.failing_steps
@@ -139,6 +162,7 @@ fn flatten_rows(watches: &[WatchStatus]) -> FlatRows<'_> {
                     rows.push(DisplayRow::NeverRan {
                         repo: &w.repo,
                         branch: &w.branch,
+                        muted: w.muted,
                     });
                 }
             }
@@ -149,6 +173,7 @@ fn flatten_rows(watches: &[WatchStatus]) -> FlatRows<'_> {
                     repo: &w.repo,
                     branch: &w.branch,
                     run,
+                    muted: w.muted,
                 });
             }
         }
@@ -157,15 +182,26 @@ fn flatten_rows(watches: &[WatchStatus]) -> FlatRows<'_> {
 }
 
 impl DisplayRow<'_> {
-    /// Returns `(repo, run_id)` for the selected row. Only valid for selectable rows.
-    fn repo_and_run_id(&self) -> (&str, Option<u64>) {
+    /// Returns `(repo, run_id, muted)` for the selected row. Only valid for selectable rows.
+    fn repo_and_run_id(&self) -> (&str, Option<u64>, bool) {
         match self {
-            DisplayRow::ActiveRun { repo, run, .. } => (repo, Some(run.run_id)),
-            DisplayRow::LastBuild { repo, build, .. } => (repo, Some(build.run_id)),
-            DisplayRow::NeverRan { repo, .. } => (repo, None),
-            DisplayRow::FailingSteps { .. } => unreachable!("FailingSteps is not selectable"),
+            DisplayRow::ActiveRun {
+                repo, run, muted, ..
+            } => (repo, Some(run.run_id), *muted),
+            DisplayRow::LastBuild {
+                repo, build, muted, ..
+            } => (repo, Some(build.run_id), *muted),
+            DisplayRow::NeverRan { repo, muted, .. } => (repo, None, *muted),
+            DisplayRow::OrgHeader { .. } | DisplayRow::FailingSteps { .. } => {
+                unreachable!("not selectable")
+            }
         }
     }
+}
+
+/// Extract just the repo name (after the '/') for display.
+fn short_repo(repo: &str) -> &str {
+    repo.rsplit_once('/').map_or(repo, |(_, name)| name)
 }
 
 // -- Event application --
@@ -428,6 +464,8 @@ fn render(frame: &mut ratatui::Frame, app: &App) {
         .unwrap_or(usize::MAX);
     let highlight_style = Style::default().bg(Color::DarkGray);
 
+    let mute_indicator = |muted: bool| -> &'static str { if muted { " 🔇" } else { "" } };
+
     let rows: Vec<Row> = flat
         .rows
         .iter()
@@ -435,15 +473,33 @@ fn render(frame: &mut ratatui::Frame, app: &App) {
         .map(|(i, dr)| {
             let is_selected = i == selected_display_idx;
             let row = match dr {
-                DisplayRow::ActiveRun { repo, branch, run } => {
+                DisplayRow::OrgHeader { org } => Row::new(vec![
+                    Cell::from((*org).to_string()).style(
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Cell::from(""),
+                    Cell::from(""),
+                    Cell::from(""),
+                    Cell::from(""),
+                    Cell::from(""),
+                ]),
+                DisplayRow::ActiveRun {
+                    repo,
+                    branch,
+                    run,
+                    muted,
+                } => {
                     let style = status_style(&run.status);
                     let emoji = status_emoji(&run.status);
                     let elapsed = run
                         .elapsed_secs
                         .map(|s| format::duration(Duration::from_secs_f64(s)))
                         .unwrap_or_default();
+                    let name = format!("  {}{}", short_repo(repo), mute_indicator(*muted));
                     Row::new(vec![
-                        Cell::from(format::truncate(repo, cw.repo)),
+                        Cell::from(format::truncate(&name, cw.repo)),
                         Cell::from(format::truncate(branch, BRANCH_W)),
                         Cell::from(format!("{emoji} {}", run.status)).style(style),
                         Cell::from(format::truncate(&run.workflow, cw.workflow)),
@@ -464,6 +520,7 @@ fn render(frame: &mut ratatui::Frame, app: &App) {
                     repo,
                     branch,
                     build,
+                    muted,
                 } => {
                     let style = status_style(&build.conclusion);
                     let emoji = status_emoji(&build.conclusion);
@@ -471,8 +528,9 @@ fn render(frame: &mut ratatui::Frame, app: &App) {
                         .age_secs
                         .map(|s| format::age(s as u64))
                         .unwrap_or_default();
+                    let name = format!("  {}{}", short_repo(repo), mute_indicator(*muted));
                     Row::new(vec![
-                        Cell::from(format::truncate(repo, cw.repo)),
+                        Cell::from(format::truncate(&name, cw.repo)),
                         Cell::from(format::truncate(branch, BRANCH_W)),
                         Cell::from(format!("{emoji} {}", build.conclusion)).style(style),
                         Cell::from(format::truncate(&build.workflow, cw.workflow)),
@@ -480,14 +538,21 @@ fn render(frame: &mut ratatui::Frame, app: &App) {
                         Cell::from(age).style(style),
                     ])
                 }
-                DisplayRow::NeverRan { repo, branch } => Row::new(vec![
-                    Cell::from(format::truncate(repo, cw.repo)),
-                    Cell::from(format::truncate(branch, BRANCH_W)),
-                    Cell::from("· idle").style(Style::default().fg(Color::DarkGray)),
-                    Cell::from(""),
-                    Cell::from(""),
-                    Cell::from(""),
-                ]),
+                DisplayRow::NeverRan {
+                    repo,
+                    branch,
+                    muted,
+                } => {
+                    let name = format!("  {}{}", short_repo(repo), mute_indicator(*muted));
+                    Row::new(vec![
+                        Cell::from(format::truncate(&name, cw.repo)),
+                        Cell::from(format::truncate(branch, BRANCH_W)),
+                        Cell::from("· idle").style(Style::default().fg(Color::DarkGray)),
+                        Cell::from(""),
+                        Cell::from(""),
+                        Cell::from(""),
+                    ])
+                }
             };
             if is_selected {
                 row.style(highlight_style)
@@ -510,19 +575,36 @@ fn render(frame: &mut ratatui::Frame, app: &App) {
     let key_style = Style::default()
         .fg(Color::DarkGray)
         .add_modifier(Modifier::BOLD);
-    let footer = Paragraph::new(Line::from(vec![
-        Span::styled("[↑↓]", key_style),
-        Span::raw(" select  "),
-        Span::styled("[r]", key_style),
-        Span::raw(" rerun  "),
-        Span::styled("[o]", key_style),
-        Span::raw(" open  "),
-        Span::styled("[p]", key_style),
-        Span::raw(" pause notifs  "),
-        Span::styled("[q]", key_style),
-        Span::raw(" quit"),
-    ]))
-    .style(Style::default().fg(Color::DarkGray));
+    let footer = match &app.input_mode {
+        InputMode::TextInput { prompt, buffer } => Paragraph::new(Line::from(vec![
+            Span::styled(prompt.as_str(), Style::default().fg(Color::Cyan)),
+            Span::raw(buffer.as_str()),
+            Span::styled("█", Style::default().fg(Color::Cyan)),
+            Span::styled(
+                "  [Enter] confirm  [Esc] cancel",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ])),
+        InputMode::Normal => Paragraph::new(Line::from(vec![
+            Span::styled("[↑↓]", key_style),
+            Span::raw(" select  "),
+            Span::styled("[a]", key_style),
+            Span::raw(" add  "),
+            Span::styled("[d]", key_style),
+            Span::raw(" remove  "),
+            Span::styled("[r]", key_style),
+            Span::raw(" rerun  "),
+            Span::styled("[o]", key_style),
+            Span::raw(" open  "),
+            Span::styled("[n]", key_style),
+            Span::raw(" mute  "),
+            Span::styled("[p]", key_style),
+            Span::raw(" pause  "),
+            Span::styled("[q]", key_style),
+            Span::raw(" quit"),
+        ]))
+        .style(Style::default().fg(Color::DarkGray)),
+    };
     frame.render_widget(footer, chunks[3]);
 }
 
@@ -654,6 +736,53 @@ async fn post_rerun(
     Ok(())
 }
 
+async fn post_watch(client: &reqwest::Client, port: u16, repo: &str) -> Result<(), String> {
+    let url = format!("http://127.0.0.1:{port}/watch");
+    let resp = client
+        .post(&url)
+        .json(&serde_json::json!({ "repos": [repo] }))
+        .send()
+        .await
+        .map_err(|e| format!("watch: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("watch: HTTP {}", resp.status()));
+    }
+    Ok(())
+}
+
+async fn post_unwatch(client: &reqwest::Client, port: u16, repo: &str) -> Result<(), String> {
+    let url = format!("http://127.0.0.1:{port}/unwatch");
+    let resp = client
+        .post(&url)
+        .json(&serde_json::json!({ "repos": [repo] }))
+        .send()
+        .await
+        .map_err(|e| format!("unwatch: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("unwatch: HTTP {}", resp.status()));
+    }
+    Ok(())
+}
+
+async fn post_notifications(
+    client: &reqwest::Client,
+    port: u16,
+    repo: &str,
+    action: &str,
+) -> Result<(), String> {
+    let url = format!("http://127.0.0.1:{port}/notifications");
+    let resp = client
+        .post(&url)
+        .json(&serde_json::json!({ "repo": repo, "action": action }))
+        .send()
+        .await
+        .map_err(|e| format!("notifications: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("notifications: HTTP {}", resp.status()));
+    }
+    Ok(())
+}
+
 fn open_url(repo: &str, run_id: u64) {
     let url = format!("https://github.com/{repo}/actions/runs/{run_id}");
     let cmd = if cfg!(target_os = "macos") {
@@ -709,6 +838,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         sse_state: SseState::Connecting,
         selected: 0,
         flash: None,
+        input_mode: InputMode::Normal,
     };
 
     // Terminal setup.
@@ -778,6 +908,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 maybe_event = keyboard.next() => {
                     match maybe_event {
                         Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
+                            // Text input mode — capture characters or handle Enter/Esc.
+                            if let InputMode::TextInput { buffer, .. } = &mut app.input_mode {
+                                match key.code {
+                                    KeyCode::Esc => {
+                                        app.input_mode = InputMode::Normal;
+                                    }
+                                    KeyCode::Enter => {
+                                        let repo = buffer.trim().to_string();
+                                        app.input_mode = InputMode::Normal;
+                                        if !repo.is_empty() {
+                                            if let Err(e) = post_watch(&client, port, &repo).await {
+                                                app.flash = Some((e, Instant::now()));
+                                            } else {
+                                                app.flash = Some((format!("Watching {repo}"), Instant::now()));
+                                                app.resync(&client, port).await;
+                                            }
+                                        }
+                                    }
+                                    KeyCode::Backspace => { buffer.pop(); }
+                                    KeyCode::Char(c) => { buffer.push(c); }
+                                    _ => {}
+                                }
+                                continue;
+                            }
+
+                            // Normal mode keybindings.
                             let flat = flatten_rows(&app.status.watches);
                             let sel_count = flat.selectable.len();
                             let selected = flat.selectable.get(app.selected)
@@ -794,6 +950,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         app.selected = (app.selected + 1).min(sel_count - 1);
                                     }
                                 }
+                                KeyCode::Char('a') => {
+                                    app.input_mode = InputMode::TextInput {
+                                        prompt: "Add repo (owner/repo): ".to_string(),
+                                        buffer: String::new(),
+                                    };
+                                }
+                                KeyCode::Char('d') => {
+                                    if let Some((repo, _, _)) = selected {
+                                        let repo = repo.to_string();
+                                        if let Err(e) = post_unwatch(&client, port, &repo).await {
+                                            app.flash = Some((e, Instant::now()));
+                                        } else {
+                                            app.flash = Some((format!("Removed {repo}"), Instant::now()));
+                                            app.resync(&client, port).await;
+                                        }
+                                    }
+                                }
+                                KeyCode::Char('n') => {
+                                    if let Some((repo, _, muted)) = selected {
+                                        let repo = repo.to_string();
+                                        let action = if muted { "unmute" } else { "mute" };
+                                        if let Err(e) = post_notifications(&client, port, &repo, action).await {
+                                            app.flash = Some((e, Instant::now()));
+                                        } else {
+                                            let msg = if muted { format!("Unmuted {repo}") } else { format!("Muted {repo}") };
+                                            app.flash = Some((msg, Instant::now()));
+                                            app.resync(&client, port).await;
+                                        }
+                                    }
+                                }
                                 KeyCode::Char('p') => {
                                     let new_pause = !app.status.paused;
                                     if let Err(e) = post_pause(&client, port, new_pause).await {
@@ -805,7 +991,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     }
                                 }
                                 KeyCode::Char('r') => {
-                                    if let Some((repo, Some(run_id))) = selected {
+                                    if let Some((repo, Some(run_id), _)) = selected {
                                         if let Err(e) = post_rerun(&client, port, repo, run_id).await {
                                             app.flash = Some((e, Instant::now()));
                                         } else {
@@ -815,7 +1001,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     }
                                 }
                                 KeyCode::Char('o') => {
-                                    if let Some((repo, Some(run_id))) = selected {
+                                    if let Some((repo, Some(run_id), _)) = selected {
                                         open_url(repo, run_id);
                                     }
                                 }
@@ -864,6 +1050,7 @@ mod tests {
             branch: branch.to_string(),
             active_runs: vec![],
             last_build: None,
+            muted: false,
         }
     }
 
@@ -934,6 +1121,7 @@ mod tests {
                 elapsed_secs: Some(30.0),
             }],
             last_build: None,
+            muted: false,
         }]);
 
         apply_event(
@@ -1004,6 +1192,7 @@ mod tests {
                 elapsed_secs: None,
             }],
             last_build: None,
+            muted: false,
         }]);
 
         apply_event(
@@ -1032,6 +1221,7 @@ mod tests {
                 elapsed_secs: None,
             }],
             last_build: None,
+            muted: false,
         }]);
 
         apply_event(
@@ -1076,9 +1266,13 @@ mod tests {
     fn flatten_rows_idle_watch() {
         let watches = vec![watch("alice/app", "main")];
         let flat = flatten_rows(&watches);
-        assert_eq!(flat.rows.len(), 1);
+        assert_eq!(flat.rows.len(), 2); // OrgHeader + NeverRan
         assert_eq!(flat.selectable.len(), 1);
-        assert!(matches!(flat.rows[0], DisplayRow::NeverRan { .. }));
+        assert!(matches!(
+            flat.rows[0],
+            DisplayRow::OrgHeader { org: "alice" }
+        ));
+        assert!(matches!(flat.rows[1], DisplayRow::NeverRan { .. }));
     }
 
     #[test]
@@ -1095,14 +1289,15 @@ mod tests {
                 failing_steps: Some("Build / tests".to_string()),
                 age_secs: Some(60.0),
             }),
+            muted: false,
         }];
         let flat = flatten_rows(&watches);
-        // LastBuild row + FailingSteps sub-row
-        assert_eq!(flat.rows.len(), 2);
+        // OrgHeader + LastBuild + FailingSteps
+        assert_eq!(flat.rows.len(), 3);
         // Only the LastBuild row is selectable
         assert_eq!(flat.selectable.len(), 1);
-        assert_eq!(flat.selectable[0], 0);
-        assert!(matches!(flat.rows[1], DisplayRow::FailingSteps { .. }));
+        assert_eq!(flat.selectable[0], 1); // index 1 (after OrgHeader)
+        assert!(matches!(flat.rows[2], DisplayRow::FailingSteps { .. }));
     }
 
     #[test]
@@ -1119,10 +1314,11 @@ mod tests {
                 failing_steps: None,
                 age_secs: Some(60.0),
             }),
+            muted: false,
         }];
         let flat = flatten_rows(&watches);
-        assert_eq!(flat.rows.len(), 1);
-        assert!(matches!(flat.rows[0], DisplayRow::LastBuild { .. }));
+        assert_eq!(flat.rows.len(), 2); // OrgHeader + LastBuild
+        assert!(matches!(flat.rows[1], DisplayRow::LastBuild { .. }));
     }
 
     // -- status_style / status_emoji --
@@ -1182,9 +1378,11 @@ mod tests {
                 elapsed_secs: Some(10.0),
             }],
             last_build: None,
+            muted: false,
         }];
         let flat = flatten_rows(&watches);
-        let (repo, run_id) = flat.rows[0].repo_and_run_id();
+        // First row is OrgHeader, second is the active run
+        let (repo, run_id, _muted) = flat.rows[1].repo_and_run_id();
         assert_eq!(repo, "alice/app");
         assert_eq!(run_id, Some(42));
     }

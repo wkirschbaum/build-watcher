@@ -38,6 +38,9 @@ pub struct WatchStatus {
     pub branch: String,
     pub active_runs: Vec<ActiveRunView>,
     pub last_build: Option<LastBuildView>,
+    /// Whether notifications are muted for this repo (all levels set to off).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub muted: bool,
 }
 
 /// Full response body for `GET /status`.

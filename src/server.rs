@@ -45,6 +45,8 @@ pub const DEFAULT_PORT: u16 = 8417;
 #[derive(Clone)]
 struct AppState {
     watches: Watches,
+    config: SharedConfig,
+    handle: WatcherHandle,
     pause: PauseState,
     events: EventBus,
     github: Arc<dyn build_watcher::github::GitHubClient>,
@@ -57,7 +59,11 @@ struct AppState {
 /// Pure function (no async, no locks) — callers acquire the locks and pass
 /// the data in. Both the `GET /status` HTTP handler and the `list_watches`
 /// MCP tool call this so the watch-enumeration logic lives in one place.
-fn build_watch_snapshot(watches: &HashMap<WatchKey, WatchEntry>, paused: bool) -> StatusResponse {
+fn build_watch_snapshot(
+    watches: &HashMap<WatchKey, WatchEntry>,
+    config: Option<&build_watcher::config::Config>,
+    paused: bool,
+) -> StatusResponse {
     let now = tokio::time::Instant::now();
     let mut watch_list: Vec<WatchStatus> = watches
         .iter()
@@ -96,11 +102,20 @@ fn build_watch_snapshot(watches: &HashMap<WatchKey, WatchEntry>, paused: bool) -
                 }
             });
 
+            let muted = config
+                .and_then(|cfg| cfg.repos.get(&key.repo))
+                .is_some_and(|rc| {
+                    rc.notifications.build_started == Some(NotificationLevel::Off)
+                        && rc.notifications.build_success == Some(NotificationLevel::Off)
+                        && rc.notifications.build_failure == Some(NotificationLevel::Off)
+                });
+
             WatchStatus {
                 repo: key.repo.clone(),
                 branch: key.branch.clone(),
                 active_runs,
                 last_build,
+                muted,
             }
         })
         .collect();
@@ -116,7 +131,8 @@ fn build_watch_snapshot(watches: &HashMap<WatchKey, WatchEntry>, paused: bool) -
 async fn status_handler(State(state): State<AppState>) -> axum::Json<StatusResponse> {
     let paused = is_paused(&state.pause).await;
     let watches = state.watches.lock().await;
-    axum::Json(build_watch_snapshot(&watches, paused))
+    let cfg = state.config.lock().await;
+    axum::Json(build_watch_snapshot(&watches, Some(&cfg), paused))
 }
 
 /// `GET /events` — SSE stream of `WatchEvent`s as they occur.
@@ -211,6 +227,195 @@ async fn rerun_handler(
     }
 }
 
+// -- Watch / unwatch / notifications REST endpoints --
+
+/// Shared logic for adding repos to watch — used by both the MCP tool and REST endpoint.
+async fn do_watch_builds(
+    watches: &Watches,
+    config: &SharedConfig,
+    handle: &WatcherHandle,
+    rate_limit: &RateLimitState,
+    repos: &[String],
+) -> Vec<String> {
+    let repo_branches: Vec<(String, Vec<String>)> = {
+        let cfg = config.lock().await;
+        repos
+            .iter()
+            .map(|repo| (repo.clone(), cfg.branches_for(repo).to_vec()))
+            .collect()
+    };
+
+    let mut results = Vec::new();
+    let mut started_repos: Vec<String> = Vec::new();
+    for (repo, branches) in &repo_branches {
+        let mut any_started = false;
+        for branch in branches {
+            match start_watch(watches, config, handle, rate_limit, repo, branch).await {
+                Ok(msg) => {
+                    any_started = true;
+                    results.push(msg);
+                }
+                Err(msg) => results.push(msg),
+            }
+        }
+        if any_started {
+            started_repos.push(repo.clone());
+        }
+    }
+
+    if !started_repos.is_empty() {
+        handle
+            .persistence
+            .save_watches(&collect_persisted(watches).await)
+            .await;
+        let snapshot = {
+            let mut cfg = config.lock().await;
+            cfg.add_repos(&started_repos);
+            cfg.clone()
+        };
+        if let Some(warning) = persist_config(&*handle.persistence, snapshot).await {
+            results.push(warning);
+        }
+    }
+
+    results
+}
+
+/// Shared logic for removing repos from watch — used by both the MCP tool and REST endpoint.
+async fn do_stop_watches(
+    watches: &Watches,
+    config: &SharedConfig,
+    handle: &WatcherHandle,
+    repos: &[String],
+) -> Vec<String> {
+    let removed_counts: Vec<(String, usize)> = {
+        let mut w = watches.lock().await;
+        repos
+            .iter()
+            .map(|repo| {
+                let keys: Vec<WatchKey> =
+                    w.keys().filter(|k| k.matches_repo(repo)).cloned().collect();
+                for key in &keys {
+                    w.remove(key);
+                }
+                (repo.clone(), keys.len())
+            })
+            .collect()
+    };
+    handle
+        .persistence
+        .save_watches(&collect_persisted(watches).await)
+        .await;
+
+    let (snapshot, mut results) = {
+        let mut cfg = config.lock().await;
+        let mut results = Vec::new();
+        for (repo, branch_count) in removed_counts {
+            let was_in_config = cfg.repos.contains_key(&repo);
+            cfg.repos.remove(&repo);
+            let msg = match (branch_count, was_in_config) {
+                (n, _) if n > 0 => format!("Stopped watching {repo} ({n} branches)"),
+                (_, true) => format!("{repo}: removed from config (was not actively polling)"),
+                _ => format!("{repo}: not found"),
+            };
+            results.push(msg);
+        }
+        (cfg.clone(), results)
+    };
+    if let Some(warning) = persist_config(&*handle.persistence, snapshot).await {
+        results.push(warning);
+    }
+
+    results
+}
+
+#[derive(Deserialize)]
+struct WatchRequest {
+    repos: Vec<String>,
+}
+
+/// `POST /watch` — Start watching one or more repos.
+async fn watch_handler(
+    State(state): State<AppState>,
+    axum::Json(body): axum::Json<WatchRequest>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    for repo in &body.repos {
+        if let Err(e) = validate_repo(repo) {
+            return axum::Json(serde_json::json!({ "error": e })).into_response();
+        }
+    }
+
+    let results = do_watch_builds(
+        &state.watches,
+        &state.config,
+        &state.handle,
+        &state.rate_limit,
+        &body.repos,
+    )
+    .await;
+    axum::Json(serde_json::json!({ "ok": true, "messages": results })).into_response()
+}
+
+/// `POST /unwatch` — Stop watching one or more repos.
+async fn unwatch_handler(
+    State(state): State<AppState>,
+    axum::Json(body): axum::Json<WatchRequest>,
+) -> axum::Json<serde_json::Value> {
+    let results = do_stop_watches(&state.watches, &state.config, &state.handle, &body.repos).await;
+    axum::Json(serde_json::json!({ "ok": true, "messages": results }))
+}
+
+#[derive(Deserialize)]
+struct NotificationsRequest {
+    repo: String,
+    /// "mute" sets all levels to off; "unmute" clears overrides (inherit global).
+    action: String,
+}
+
+/// `POST /notifications` — Mute or unmute per-repo notifications.
+async fn notifications_handler(
+    State(state): State<AppState>,
+    axum::Json(body): axum::Json<NotificationsRequest>,
+) -> axum::Json<serde_json::Value> {
+    let (snapshot, msg) = {
+        let mut cfg = state.config.lock().await;
+        let Some(rc) = cfg.repos.get_mut(&body.repo) else {
+            return axum::Json(
+                serde_json::json!({ "error": format!("{}: not being watched", body.repo) }),
+            );
+        };
+        let msg = match body.action.as_str() {
+            "mute" => {
+                rc.notifications = NotificationOverrides {
+                    build_started: Some(NotificationLevel::Off),
+                    build_success: Some(NotificationLevel::Off),
+                    build_failure: Some(NotificationLevel::Off),
+                };
+                format!("{}: notifications muted", body.repo)
+            }
+            "unmute" => {
+                rc.notifications = NotificationOverrides::default();
+                format!(
+                    "{}: notifications unmuted (using global defaults)",
+                    body.repo
+                )
+            }
+            other => {
+                return axum::Json(
+                    serde_json::json!({ "error": format!("unknown action: {other:?}") }),
+                );
+            }
+        };
+        (cfg.clone(), msg)
+    };
+    if let Some(warning) = persist_config(&*state.handle.persistence, snapshot).await {
+        return axum::Json(serde_json::json!({ "ok": true, "message": msg, "warning": warning }));
+    }
+    axum::Json(serde_json::json!({ "ok": true, "message": msg }))
+}
+
 /// Bind to the preferred port, trying up to 9 consecutive ports on conflict.
 async fn bind_with_fallback(preferred: u16) -> AnyResult<tokio::net::TcpListener> {
     let last = preferred.saturating_add(9);
@@ -244,6 +449,8 @@ fn build_router(
 
     let app_state = AppState {
         watches: watches.clone(),
+        config: config.clone(),
+        handle: handle.clone(),
         pause: pause.clone(),
         events: handle.events.clone(),
         github: handle.github.clone(),
@@ -273,6 +480,9 @@ fn build_router(
         .route("/events", get(events_handler))
         .route("/pause", axum::routing::post(pause_handler))
         .route("/rerun", axum::routing::post(rerun_handler))
+        .route("/watch", axum::routing::post(watch_handler))
+        .route("/unwatch", axum::routing::post(unwatch_handler))
+        .route("/notifications", axum::routing::post(notifications_handler))
         .with_state(app_state)
         .nest_service("/mcp", service)
 }
@@ -559,69 +769,20 @@ impl BuildWatcher {
         &self,
         Parameters(params): Parameters<WatchBuildsParams>,
     ) -> Result<CallToolResult, McpError> {
-        // Validate all repo names upfront
         for repo in &params.repos {
             if let Err(e) = validate_repo(repo) {
                 return Ok(CallToolResult::error(vec![Content::text(e)]));
             }
         }
 
-        // Read branch config without modifying it yet. We only add a repo to the
-        // persisted config after at least one branch successfully starts — this way a
-        // typo'd repo name (or a repo with no workflow runs) doesn't end up permanently
-        // in config, which would cause failed retries on every daemon restart.
-        let repo_branches: Vec<(String, Vec<String>)> = {
-            let config = self.config.lock().await;
-            params
-                .repos
-                .iter()
-                .map(|repo| (repo.clone(), config.branches_for(repo).to_vec()))
-                .collect()
-        };
-
-        let mut results = Vec::new();
-        let mut started_repos: Vec<String> = Vec::new();
-        for (repo, branches) in &repo_branches {
-            let mut any_started = false;
-            for branch in branches {
-                match start_watch(
-                    &self.watches,
-                    &self.config,
-                    &self.handle,
-                    &self.rate_limit,
-                    repo,
-                    branch,
-                )
-                .await
-                {
-                    Ok(msg) => {
-                        any_started = true;
-                        results.push(msg);
-                    }
-                    Err(msg) => results.push(msg),
-                }
-            }
-            if any_started {
-                started_repos.push(repo.clone());
-            }
-        }
-
-        // Persist only the repos that actually got a poller running. Repos whose
-        // every branch failed (e.g. no runs, bad name) are not saved.
-        if !started_repos.is_empty() {
-            self.handle
-                .persistence
-                .save_watches(&collect_persisted(&self.watches).await)
-                .await;
-            let snapshot = {
-                let mut config = self.config.lock().await;
-                config.add_repos(&started_repos);
-                config.clone()
-            };
-            if let Some(warning) = persist_config(&*self.handle.persistence, snapshot).await {
-                results.push(warning);
-            }
-        }
+        let results = do_watch_builds(
+            &self.watches,
+            &self.config,
+            &self.handle,
+            &self.rate_limit,
+            &params.repos,
+        )
+        .await;
 
         Ok(CallToolResult::success(vec![Content::text(
             results.join("\n\n"),
@@ -635,54 +796,8 @@ impl BuildWatcher {
         &self,
         Parameters(params): Parameters<StopWatchesParams>,
     ) -> Result<CallToolResult, McpError> {
-        // Phase 1: remove from the runtime watch map. The polling tasks detect the
-        // missing key on their next iteration and exit cleanly — no explicit
-        // cancellation is needed.
-        let removed_counts: Vec<(String, usize)> = {
-            let mut watches = self.watches.lock().await;
-            params
-                .repos
-                .iter()
-                .map(|repo| {
-                    let keys: Vec<WatchKey> = watches
-                        .keys()
-                        .filter(|k| k.matches_repo(repo))
-                        .cloned()
-                        .collect();
-                    for key in &keys {
-                        watches.remove(key);
-                    }
-                    (repo.clone(), keys.len())
-                })
-                .collect()
-        };
-        self.handle
-            .persistence
-            .save_watches(&collect_persisted(&self.watches).await)
-            .await;
-
-        // Phase 2: remove from config. We check both sources of truth here so the
-        // response message is accurate — a repo can be in config but have no active
-        // poller if a previous watch_builds call failed partway through.
-        let (snapshot, mut results) = {
-            let mut config = self.config.lock().await;
-            let mut results = Vec::new();
-            for (repo, branch_count) in removed_counts {
-                let was_in_config = config.repos.contains_key(&repo);
-                config.repos.remove(&repo);
-                let msg = match (branch_count, was_in_config) {
-                    (n, _) if n > 0 => format!("Stopped watching {repo} ({n} branches)"),
-                    (_, true) => format!("{repo}: removed from config (was not actively polling)"),
-                    _ => format!("{repo}: not found"),
-                };
-                results.push(msg);
-            }
-            (config.clone(), results)
-        };
-        if let Some(warning) = persist_config(&*self.handle.persistence, snapshot).await {
-            results.push(warning);
-        }
-
+        let results =
+            do_stop_watches(&self.watches, &self.config, &self.handle, &params.repos).await;
         Ok(CallToolResult::success(vec![Content::text(
             results.join("\n"),
         )]))
@@ -698,7 +813,7 @@ impl BuildWatcher {
 
         let paused = is_paused(&self.pause).await;
         let watches = self.watches.lock().await;
-        let snapshot = build_watch_snapshot(&watches, paused);
+        let snapshot = build_watch_snapshot(&watches, None, paused);
 
         let mut lines: Vec<String> = Vec::new();
         if snapshot.paused {
@@ -1669,9 +1784,21 @@ mod tests {
         }
     }
 
+    fn stub_handle() -> build_watcher::watcher::WatcherHandle {
+        build_watcher::watcher::WatcherHandle::new(
+            tokio_util::sync::CancellationToken::new(),
+            EventBus::new(),
+            Arc::new(StubGitHub),
+            Arc::new(build_watcher::persistence::NullPersistence),
+        )
+    }
+
     fn test_router(watches: Watches, pause: PauseState, events: EventBus) -> axum::Router {
+        let handle = stub_handle();
         let app_state = super::AppState {
             watches,
+            config: Arc::new(Mutex::new(build_watcher::config::Config::default())),
+            handle,
             pause,
             events,
             github: Arc::new(StubGitHub),
@@ -1784,8 +1911,11 @@ mod tests {
     }
 
     fn test_router_full(watches: Watches, pause: PauseState, events: EventBus) -> axum::Router {
+        let handle = stub_handle();
         let app_state = super::AppState {
             watches,
+            config: Arc::new(Mutex::new(build_watcher::config::Config::default())),
+            handle,
             pause,
             events,
             github: Arc::new(StubGitHub),
