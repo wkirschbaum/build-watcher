@@ -8,6 +8,12 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 /// - Adds `mcp__build-watcher__*` to the allow list in `~/.claude/settings.json`
 pub fn register(port: u16) -> Result<()> {
     let home = std::env::var("HOME")?;
+    let claude_dir = PathBuf::from(&home).join(".claude");
+
+    if !claude_dir.exists() {
+        println!("Claude Code config directory (~/.claude) not found — skipping MCP registration");
+        return Ok(());
+    }
 
     register_mcp_server(&home, port)?;
     register_permissions(&home)?;
