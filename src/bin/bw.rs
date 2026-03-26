@@ -1020,7 +1020,7 @@ fn render_display_row<'a>(
             Row::new(vec![
                 Cell::from(format::truncate(&name, cw.repo)),
                 Cell::from(format::truncate(branch, BRANCH_W)),
-                Cell::from(format!("{emoji} {}", run.status)).style(style),
+                Cell::from(format!("{emoji} {}", format::status(&run.status))).style(style),
                 Cell::from(format::truncate(&run.workflow, cw.workflow)),
                 Cell::from(format::truncate(&run.title, cw.title)),
                 Cell::from(elapsed).style(style),
@@ -1051,7 +1051,7 @@ fn render_display_row<'a>(
             Row::new(vec![
                 Cell::from(format::truncate(&name, cw.repo)),
                 Cell::from(format::truncate(branch, BRANCH_W)),
-                Cell::from(format!("{emoji} {}", build.conclusion)).style(style),
+                Cell::from(format!("{emoji} {}", format::status(&build.conclusion))).style(style),
                 Cell::from(format::truncate(&build.workflow, cw.workflow)),
                 Cell::from(format::truncate(&build.title, cw.title)),
                 Cell::from(age).style(style),

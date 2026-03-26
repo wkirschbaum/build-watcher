@@ -33,6 +33,19 @@ pub fn age(secs: u64) -> String {
     }
 }
 
+/// Format a GitHub Actions status or conclusion for display.
+///
+/// Converts snake_case API values (e.g. `"in_progress"`) to readable labels
+/// (e.g. `"in progress"`). Values that are already readable pass through unchanged.
+pub fn status(s: &str) -> &str {
+    match s {
+        "in_progress" => "in progress",
+        "timed_out" => "timed out",
+        "startup_failure" => "startup fail",
+        other => other,
+    }
+}
+
 /// Truncate a string to `max` characters, appending "…" if truncated.
 pub fn truncate(s: &str, max: usize) -> String {
     // Collect char boundary indices in a single pass.
@@ -73,6 +86,16 @@ mod tests {
         assert_eq!(age(300), "5m ago");
         assert_eq!(age(7200), "2h ago");
         assert_eq!(age(172800), "2d ago");
+    }
+
+    #[test]
+    fn status_formatting() {
+        assert_eq!(status("in_progress"), "in progress");
+        assert_eq!(status("timed_out"), "timed out");
+        assert_eq!(status("startup_failure"), "startup fail");
+        assert_eq!(status("success"), "success");
+        assert_eq!(status("failure"), "failure");
+        assert_eq!(status("queued"), "queued");
     }
 
     #[test]
