@@ -21,19 +21,20 @@ use tokio_stream::wrappers::BroadcastStream;
 use tokio_util::sync::CancellationToken;
 
 use build_watcher::config::{
-    NotificationLevel, NotificationOverrides, QuietHours, RepoConfig, config_dir,
-    save_config_async, state_dir, unix_now,
+    NotificationLevel, NotificationOverrides, QuietHours, RepoConfig, config_dir, state_dir,
+    unix_now,
 };
 use build_watcher::events::{EventBus, WatchEvent};
 use build_watcher::format;
 use build_watcher::github::{validate_branch, validate_repo};
+use build_watcher::persistence::Persistence;
 use build_watcher::status::{
     ActiveRunView, LastBuildView, StatsResponse, StatusResponse, WatchStatus,
 };
 use build_watcher::watcher::{
     MIN_ACTIVE_SECS, MIN_IDLE_SECS, PauseState, RateLimitState, SharedConfig, WatchEntry, WatchKey,
-    WatcherHandle, Watches, compute_intervals, count_api_calls, is_paused, last_failed_build,
-    save_watches, start_watch,
+    WatcherHandle, Watches, collect_persisted, compute_intervals, count_api_calls, is_paused,
+    last_failed_build, start_watch,
 };
 
 pub const DEFAULT_PORT: u16 = 8417;
@@ -325,15 +326,19 @@ pub async fn serve(
         .await?;
 
     handle.shutdown().await;
-    save_watches(&watches).await;
+    let persisted = collect_persisted(&watches).await;
+    handle.persistence.save_watches(&persisted).await;
     let _ = std::fs::remove_file(&port_file);
     tracing::info!("State saved, goodbye.");
 
     Ok(())
 }
 
-async fn persist_config(config: build_watcher::config::Config) -> Option<String> {
-    match save_config_async(&config).await {
+async fn persist_config(
+    persistence: &dyn Persistence,
+    config: build_watcher::config::Config,
+) -> Option<String> {
+    match persistence.save_config(&config).await {
         Ok(()) => None,
         Err(e) => {
             tracing::error!("Failed to save config: {e}");
@@ -604,13 +609,16 @@ impl BuildWatcher {
         // Persist only the repos that actually got a poller running. Repos whose
         // every branch failed (e.g. no runs, bad name) are not saved.
         if !started_repos.is_empty() {
-            save_watches(&self.watches).await;
+            self.handle
+                .persistence
+                .save_watches(&collect_persisted(&self.watches).await)
+                .await;
             let snapshot = {
                 let mut config = self.config.lock().await;
                 config.add_repos(&started_repos);
                 config.clone()
             };
-            if let Some(warning) = persist_config(snapshot).await {
+            if let Some(warning) = persist_config(&*self.handle.persistence, snapshot).await {
                 results.push(warning);
             }
         }
@@ -648,7 +656,10 @@ impl BuildWatcher {
                 })
                 .collect()
         };
-        save_watches(&self.watches).await;
+        self.handle
+            .persistence
+            .save_watches(&collect_persisted(&self.watches).await)
+            .await;
 
         // Phase 2: remove from config. We check both sources of truth here so the
         // response message is accurate — a repo can be in config but have no active
@@ -668,7 +679,7 @@ impl BuildWatcher {
             }
             (config.clone(), results)
         };
-        if let Some(warning) = persist_config(snapshot).await {
+        if let Some(warning) = persist_config(&*self.handle.persistence, snapshot).await {
             results.push(warning);
         }
 
@@ -756,7 +767,7 @@ impl BuildWatcher {
                     let msg = format!("Default branches set to {:?}", config.default_branches);
                     (config.clone(), msg)
                 };
-                if let Some(warning) = persist_config(snapshot).await {
+                if let Some(warning) = persist_config(&*self.handle.persistence, snapshot).await {
                     msg.push_str(&warning);
                 }
                 Ok(CallToolResult::success(vec![Content::text(msg)]))
@@ -785,7 +796,7 @@ impl BuildWatcher {
                     "Set {repo}: watching branches {:?}\nRestart watches with watch_builds to apply.",
                     params.branches,
                 );
-                if let Some(warning) = persist_config(snapshot).await {
+                if let Some(warning) = persist_config(&*self.handle.persistence, snapshot).await {
                     msg.push_str(&warning);
                 }
                 Ok(CallToolResult::success(vec![Content::text(msg)]))
@@ -954,7 +965,7 @@ impl BuildWatcher {
             }
             (config.clone(), msgs)
         };
-        if let Some(warning) = persist_config(snapshot).await {
+        if let Some(warning) = persist_config(&*self.handle.persistence, snapshot).await {
             msgs.push(warning);
         }
         Ok(CallToolResult::success(vec![Content::text(
@@ -1020,7 +1031,7 @@ impl BuildWatcher {
 
             (config.clone(), msgs)
         };
-        if let Some(warning) = persist_config(snapshot).await {
+        if let Some(warning) = persist_config(&*self.handle.persistence, snapshot).await {
             msgs.push(warning);
         }
 
@@ -1379,7 +1390,7 @@ impl BuildWatcher {
                 ));
             }
 
-            if let Some(warning) = persist_config(snapshot).await {
+            if let Some(warning) = persist_config(&*self.handle.persistence, snapshot).await {
                 msgs.push(warning);
             }
         }

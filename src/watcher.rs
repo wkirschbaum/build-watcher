@@ -8,9 +8,10 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
-use crate::config::{Config, load_json, save_json_async, state_dir};
+use crate::config::{Config, load_json, state_dir};
 use crate::events::{EventBus, RunSnapshot, WatchEvent};
 use crate::github::{GhError, GitHubClient, LastBuild, RateLimit, RunInfo};
+use crate::persistence::Persistence;
 
 pub type SharedConfig = Arc<Mutex<Config>>;
 pub type Watches = Arc<Mutex<HashMap<WatchKey, WatchEntry>>>;
@@ -178,13 +179,13 @@ impl<'de> Deserialize<'de> for WatchKey {
 // -- Watch state persistence --
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct PersistedWatch {
-    last_seen_run_id: u64,
+pub struct PersistedWatch {
+    pub(crate) last_seen_run_id: u64,
     #[serde(default)]
-    last_build: Option<LastBuild>,
+    pub(crate) last_build: Option<LastBuild>,
 }
 
-type PersistedWatches = HashMap<WatchKey, PersistedWatch>;
+pub(crate) type PersistedWatches = HashMap<WatchKey, PersistedWatch>;
 
 pub fn load_watches() -> HashMap<WatchKey, WatchEntry> {
     let persisted: PersistedWatches =
@@ -195,16 +196,12 @@ pub fn load_watches() -> HashMap<WatchKey, WatchEntry> {
         .collect()
 }
 
-pub async fn save_watches(watches: &Watches) {
-    let persisted: PersistedWatches = {
-        let w = watches.lock().await;
-        w.iter()
-            .map(|(k, v)| (k.clone(), v.to_persisted()))
-            .collect()
-    };
-    if let Err(e) = save_json_async(state_dir().join("watches.json"), persisted).await {
-        tracing::error!("Failed to save watches: {e}");
-    }
+/// Collect the persisted representation of all watches (acquires the lock).
+pub async fn collect_persisted(watches: &Watches) -> PersistedWatches {
+    let w = watches.lock().await;
+    w.iter()
+        .map(|(k, v)| (k.clone(), v.to_persisted()))
+        .collect()
 }
 
 // -- Watch entry --
@@ -223,7 +220,7 @@ pub struct WatchEntry {
 }
 
 impl WatchEntry {
-    fn from_persisted(p: PersistedWatch) -> Self {
+    pub(crate) fn from_persisted(p: PersistedWatch) -> Self {
         Self {
             last_seen_run_id: p.last_seen_run_id,
             active_runs: HashMap::new(),
@@ -233,7 +230,7 @@ impl WatchEntry {
         }
     }
 
-    fn to_persisted(&self) -> PersistedWatch {
+    pub(crate) fn to_persisted(&self) -> PersistedWatch {
         PersistedWatch {
             last_seen_run_id: self.last_seen_run_id,
             last_build: self.last_build.clone(),
@@ -320,15 +317,22 @@ pub struct WatcherHandle {
     pub cancel: CancellationToken,
     pub events: EventBus,
     pub github: Arc<dyn GitHubClient>,
+    pub persistence: Arc<dyn Persistence>,
 }
 
 impl WatcherHandle {
-    pub fn new(cancel: CancellationToken, events: EventBus, github: Arc<dyn GitHubClient>) -> Self {
+    pub fn new(
+        cancel: CancellationToken,
+        events: EventBus,
+        github: Arc<dyn GitHubClient>,
+        persistence: Arc<dyn Persistence>,
+    ) -> Self {
         Self {
             tracker: TaskTracker::new(),
             cancel,
             events,
             github,
+            persistence,
         }
     }
 
@@ -447,6 +451,7 @@ fn spawn_poller(
         token: handle.cancel.child_token(),
         events: handle.events.clone(),
         github: handle.github.clone(),
+        persistence: handle.persistence.clone(),
     };
     handle.tracker.spawn(poller.run());
 }
@@ -478,6 +483,7 @@ struct Poller {
     token: CancellationToken,
     events: EventBus,
     github: Arc<dyn GitHubClient>,
+    persistence: Arc<dyn Persistence>,
 }
 
 /// Snapshot of config values needed for a poll cycle.
@@ -685,7 +691,8 @@ impl Poller {
         }
 
         if changed {
-            save_watches(&self.watches).await;
+            let persisted = collect_persisted(&self.watches).await;
+            self.persistence.save_watches(&persisted).await;
         }
     }
 
@@ -771,7 +778,8 @@ impl Poller {
                 }
             }
         }
-        save_watches(&self.watches).await;
+        let persisted = collect_persisted(&self.watches).await;
+        self.persistence.save_watches(&persisted).await;
     }
 }
 
@@ -1518,6 +1526,7 @@ mod tests {
             CancellationToken::new(),
             crate::events::EventBus::new(),
             github,
+            Arc::new(crate::persistence::NullPersistence),
         )
     }
 
@@ -1536,6 +1545,7 @@ mod tests {
             token: handle.cancel.child_token(),
             events: handle.events.clone(),
             github: handle.github.clone(),
+            persistence: handle.persistence.clone(),
         }
     }
 

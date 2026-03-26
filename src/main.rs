@@ -8,6 +8,7 @@ use std::sync::Arc;
 use build_watcher::config;
 use build_watcher::events::EventBus;
 use build_watcher::github::{GhCliClient, GitHubClient};
+use build_watcher::persistence::FilePersistence;
 use build_watcher::watcher::{
     PauseState, RateLimitState, WatcherHandle, load_watches, startup_watches,
 };
@@ -48,7 +49,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let ct = CancellationToken::new();
     let gh: Arc<dyn GitHubClient> = Arc::new(GhCliClient);
-    let handle = WatcherHandle::new(ct.clone(), events, gh);
+    let persistence: Arc<dyn build_watcher::persistence::Persistence> = Arc::new(FilePersistence);
+    let handle = WatcherHandle::new(ct.clone(), events, gh, persistence);
     startup_watches(&watches, &config, &handle, &rate_limit).await;
 
     server::serve(watches, config, handle, pause, rate_limit, ct).await
