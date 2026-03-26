@@ -6,22 +6,13 @@ A top-like live terminal dashboard for build-watcher.
 
 ## Status
 
-### Daemon side — complete
+### Phase 1 — complete ✅
 
-| Item | Status |
-|------|--------|
-| `GET /status` JSON snapshot endpoint | ✅ Done |
-| `GET /events` SSE stream endpoint | ✅ Done |
-| `src/lib.rs` shared library crate | ✅ Done |
-| `[[bin]] bw` in Cargo.toml | ✅ Done |
-| `ActiveRunView` with `event` field | ✅ Done |
-| `LastBuildView` with `failing_steps` | ✅ Done |
-| `WatchEvent` derives `Deserialize` | ✅ Done |
-| Port discovery via state dir | ✅ Done |
+ratatui table, 1s polling, colour coding, `q` quit, `⏸ PAUSED` header indicator, failing-steps sub-row, column truncation.
 
-### `bw` binary — stub only
+### Phase 2 — complete ✅
 
-Port discovery + raw TCP `GET /status` + plain-text print. No TUI, no SSE, no live updates.
+SSE background task subscribes to `GET /events`; events applied in-place via `apply_event`. Reconnects with exponential backoff (1s → 2s → … → 30s), resetting after each successful connection. `/status` resync on every (re)connect and every 30 s as a fallback. Header shows `⚡ reconnecting (Xs)` when disconnected.
 
 ---
 

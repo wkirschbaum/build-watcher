@@ -1,6 +1,7 @@
 //! `bw` — live terminal dashboard for the build-watcher daemon.
 //!
-//! Phase 1: polls `GET /status` every second and renders a top-like table.
+//! Subscribes to `GET /events` (SSE) for real-time updates and resyncs
+//! from `GET /status` on connect and every 30 seconds as a fallback.
 
 use std::time::{Duration, Instant};
 
@@ -15,9 +16,11 @@ use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Cell, Paragraph, Row, Table};
+use tokio::sync::mpsc;
 use tokio_stream::StreamExt as _;
 
 use build_watcher::config::state_dir;
+use build_watcher::events::WatchEvent;
 use build_watcher::format;
 use build_watcher::status::{ActiveRunView, LastBuildView, StatusResponse, WatchStatus};
 
@@ -29,6 +32,7 @@ struct App {
     last_fetch: Instant,
     /// Error message from the most recent failed fetch, if any.
     fetch_error: Option<String>,
+    sse_state: SseState,
 }
 
 impl App {
@@ -39,6 +43,25 @@ impl App {
             .map(|w| w.active_runs.len())
             .sum()
     }
+}
+
+// -- SSE state --
+
+/// Message sent from the SSE background task to the main render loop.
+enum SseUpdate {
+    /// A watch event received from the stream.
+    Event(Box<WatchEvent>),
+    /// SSE stream successfully connected.
+    Connected,
+    /// SSE stream disconnected; task will retry with backoff.
+    Disconnected,
+}
+
+/// Tracks the SSE connection state for header display.
+enum SseState {
+    Connecting,
+    Connected,
+    Disconnected { since: Instant },
 }
 
 // -- Rows --
@@ -99,6 +122,76 @@ fn flatten_rows(watches: &[WatchStatus]) -> Vec<DisplayRow<'_>> {
     rows
 }
 
+// -- Event application --
+
+/// Apply a watch event to the local status snapshot.
+///
+/// Updates only watches that already exist in the snapshot; new watches
+/// appear on the next `/status` resync.
+fn apply_event(status: &mut StatusResponse, event: WatchEvent) {
+    match event {
+        WatchEvent::RunStarted(snap) => {
+            let Some(watch) = status
+                .watches
+                .iter_mut()
+                .find(|w| w.repo == snap.repo && w.branch == snap.branch)
+            else {
+                return;
+            };
+            if !watch.active_runs.iter().any(|r| r.run_id == snap.run_id) {
+                let title = snap.display_title();
+                watch.active_runs.push(ActiveRunView {
+                    run_id: snap.run_id,
+                    status: snap.status,
+                    workflow: snap.workflow,
+                    title,
+                    event: snap.event,
+                    elapsed_secs: Some(0.0),
+                });
+            }
+        }
+        WatchEvent::RunCompleted {
+            run,
+            conclusion,
+            failing_steps,
+            ..
+        } => {
+            let Some(watch) = status
+                .watches
+                .iter_mut()
+                .find(|w| w.repo == run.repo && w.branch == run.branch)
+            else {
+                return;
+            };
+            watch.active_runs.retain(|r| r.run_id != run.run_id);
+            let title = run.display_title();
+            watch.last_build = Some(LastBuildView {
+                run_id: run.run_id,
+                conclusion,
+                workflow: run.workflow,
+                title,
+                failing_steps,
+            });
+        }
+        WatchEvent::StatusChanged { run, to, .. } => {
+            let Some(watch) = status
+                .watches
+                .iter_mut()
+                .find(|w| w.repo == run.repo && w.branch == run.branch)
+            else {
+                return;
+            };
+            if let Some(active) = watch
+                .active_runs
+                .iter_mut()
+                .find(|r| r.run_id == run.run_id)
+            {
+                active.status = to;
+            }
+        }
+    }
+}
+
 // -- Rendering --
 
 fn status_style(conclusion_or_status: &str) -> Style {
@@ -153,6 +246,12 @@ fn render(frame: &mut ratatui::Frame, app: &App) {
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
+        ));
+    }
+    if let SseState::Disconnected { since } = &app.sse_state {
+        header_spans.push(Span::styled(
+            format!("  ⚡ reconnecting ({}s)", since.elapsed().as_secs()),
+            Style::default().fg(Color::Yellow),
         ));
     }
     if let Some(err) = &app.fetch_error {
@@ -277,6 +376,84 @@ async fn fetch_status(client: &reqwest::Client, port: u16) -> Result<StatusRespo
         .map_err(|e| format!("parse: {e}"))
 }
 
+// -- SSE background task --
+
+/// Connect to `GET /events` and forward parsed events to `tx` until the
+/// stream ends or the channel closes.
+///
+/// Sets `*connected` to `true` once the HTTP response is received so the
+/// caller can distinguish a connection failure from a mid-stream disconnect.
+async fn stream_sse(
+    client: &reqwest::Client,
+    port: u16,
+    tx: &mpsc::Sender<SseUpdate>,
+    connected: &mut bool,
+) -> bool {
+    let url = format!("http://127.0.0.1:{port}/events");
+    let response = match client.get(&url).send().await {
+        Ok(r) => r,
+        Err(_) => return false,
+    };
+
+    *connected = true;
+    if tx.send(SseUpdate::Connected).await.is_err() {
+        return true; // channel closed — main task exited
+    }
+
+    let mut stream = response.bytes_stream();
+    let mut buf = String::new();
+    let mut pending_data: Option<String> = None;
+
+    while let Some(chunk) = stream.next().await {
+        let bytes = match chunk {
+            Ok(b) => b,
+            Err(_) => return false,
+        };
+        buf.push_str(&String::from_utf8_lossy(&bytes));
+
+        loop {
+            let Some(pos) = buf.find('\n') else { break };
+            let line = buf[..pos].trim_end_matches('\r').to_string();
+            buf.drain(..=pos);
+
+            if line.is_empty() {
+                // End of SSE frame — dispatch accumulated data.
+                if let Some(data) = pending_data.take()
+                    && let Ok(event) = serde_json::from_str::<WatchEvent>(&data)
+                    && tx.send(SseUpdate::Event(Box::new(event))).await.is_err()
+                {
+                    return true;
+                }
+            } else if let Some(data) = line.strip_prefix("data: ") {
+                pending_data = Some(data.to_string());
+                // Lines starting with "event:", "id:", or ":" (comments) are ignored.
+            }
+        }
+    }
+
+    false // stream ended cleanly
+}
+
+/// SSE background task: connects, streams events, reconnects with exponential backoff.
+async fn sse_task(client: reqwest::Client, port: u16, tx: mpsc::Sender<SseUpdate>) {
+    let mut backoff_secs = 1u64;
+    loop {
+        let mut connected = false;
+        if stream_sse(&client, port, &tx, &mut connected).await {
+            break; // channel closed
+        }
+        if tx.send(SseUpdate::Disconnected).await.is_err() {
+            break;
+        }
+        if connected {
+            backoff_secs = 1; // successful connection — reset backoff
+        } else {
+            backoff_secs = (backoff_secs * 2).min(30);
+        }
+        tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+    }
+}
+
 // -- Entry point --
 
 #[tokio::main]
@@ -294,7 +471,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .parse()
         .map_err(|e| format!("Invalid port in {}: {e}", port_file.display()))?;
 
-    // Initial fetch.
+    // Initial fetch so there's something to display before SSE connects.
     let client = reqwest::Client::new();
     let initial = fetch_status(&client, port).await.unwrap_or_else(|e| {
         eprintln!("Warning: could not fetch initial status: {e}");
@@ -308,6 +485,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         status: initial,
         last_fetch: Instant::now(),
         fetch_error: None,
+        sse_state: SseState::Connecting,
     };
 
     // Terminal setup.
@@ -317,28 +495,72 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut events = EventStream::new();
-    let mut tick = tokio::time::interval(Duration::from_secs(1));
-    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // SSE background task feeds events into this channel.
+    let (sse_tx, mut sse_rx) = mpsc::channel::<SseUpdate>(64);
+    tokio::spawn(sse_task(client.clone(), port, sse_tx));
+
+    let mut keyboard = EventStream::new();
+
+    // 1-second tick to advance elapsed times locally between resyncs.
+    let mut elapsed_tick = tokio::time::interval(Duration::from_secs(1));
+    elapsed_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    // 30-second resync as a fallback guard against missed events.
+    // First tick is delayed so it doesn't duplicate the on-connect resync.
+    let mut resync_tick = tokio::time::interval_at(
+        tokio::time::Instant::now() + Duration::from_secs(30),
+        Duration::from_secs(30),
+    );
 
     let result = async {
         loop {
             terminal.draw(|f| render(f, &app))?;
 
             tokio::select! {
-                _ = tick.tick() => {
+                _ = elapsed_tick.tick() => {
+                    for watch in &mut app.status.watches {
+                        for run in &mut watch.active_runs {
+                            if let Some(e) = &mut run.elapsed_secs {
+                                *e += 1.0;
+                            }
+                        }
+                    }
+                }
+                _ = resync_tick.tick() => {
                     match fetch_status(&client, port).await {
                         Ok(status) => {
                             app.status = status;
                             app.last_fetch = Instant::now();
                             app.fetch_error = None;
                         }
-                        Err(e) => {
-                            app.fetch_error = Some(e);
-                        }
+                        Err(e) => app.fetch_error = Some(e),
                     }
                 }
-                maybe_event = events.next() => {
+                maybe_update = sse_rx.recv() => {
+                    match maybe_update {
+                        Some(SseUpdate::Event(event)) => {
+                            apply_event(&mut app.status, *event);
+                        }
+                        Some(SseUpdate::Connected) => {
+                            app.sse_state = SseState::Connected;
+                            // Resync on connect to recover any events missed during startup
+                            // or reconnect.
+                            match fetch_status(&client, port).await {
+                                Ok(status) => {
+                                    app.status = status;
+                                    app.last_fetch = Instant::now();
+                                    app.fetch_error = None;
+                                }
+                                Err(e) => app.fetch_error = Some(e),
+                            }
+                        }
+                        Some(SseUpdate::Disconnected) => {
+                            app.sse_state = SseState::Disconnected { since: Instant::now() };
+                        }
+                        None => {} // sse_task exited
+                    }
+                }
+                maybe_event = keyboard.next() => {
                     match maybe_event {
                         Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
                             if key.code == KeyCode::Char('q') {
