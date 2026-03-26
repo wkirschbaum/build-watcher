@@ -32,11 +32,13 @@ cargo clippy                # Lint
 - `src/main.rs` — Entry point, wires up config, watches, event bus, and server
 - `src/server.rs` — MCP tool handlers (`BuildWatcher` struct), axum router
 - `src/watcher.rs` — Watch lifecycle, `Poller` task, state persistence, rate limiting
-- `src/events.rs` — `EventBus` (broadcast channel), `WatchEvent` types, notification handler
+- `src/events.rs` — `EventBus` (broadcast channel), `WatchEvent` and `RunSnapshot` types (pure, no I/O)
 - `src/config.rs` — Config structs, crash-safe JSON persistence helpers
 - `src/github.rs` — `gh` CLI wrappers, `RunInfo`/`HistoryEntry` types, input validation
 - `src/format.rs` — Duration, age, and truncation formatting
 - `src/register.rs` — MCP server registration in `~/.claude.json` (invoked via `--register` flag)
+- `src/notification.rs` — Daemon-only notification handler; subscribes to the event bus and dispatches platform notifications
+- `src/bin/bw.rs` — `bw` CLI companion; reads the port file and queries `/status`
 - `src/platform/` — `Notifier` trait + backends (Linux: D-Bus via `zbus`; macOS: `terminal-notifier` → `osascript` fallback)
 
 ### How it works
@@ -51,6 +53,13 @@ The `BuildWatcher` struct implements 10 MCP tools. When a repo is watched, it sp
 - Actual port: `~/.local/state/build-watcher/port`
 
 **Safe JSON writes:** Config and state are written via draft → verify → rename with automatic backups to prevent corruption.
+
+**Crate layout:** `src/lib.rs` exports `config`, `events`, `format`, `github`, `watcher` as the `build_watcher` library crate. The `build-watcher` daemon binary and the `bw` CLI binary both depend on this lib. Daemon-only code (`platform`, `notification`, `server`, `register`) stays in `src/*.rs` alongside `main.rs`.
+
+## Design Principles
+
+- **Pure functions low, I/O high.** Business logic and data transformations should be pure functions with no I/O or side effects. I/O (file reads, network calls, OS notifications) belongs as high up the call stack as possible — at the boundary layers (`server.rs`, `notification.rs`, polling tasks), not buried in core types.
+- **Shared logic in the library crate.** If code is needed by both the daemon and the TUI/CLI, it belongs in `src/lib.rs` (and its sub-modules). Daemon-specific code (MCP server, platform notifications, service registration) stays binary-only.
 
 **Notification levels:** `off`, `low`, `normal`, `critical` — configurable globally, per repo, or per branch.
 

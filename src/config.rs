@@ -8,8 +8,6 @@ use serde::{Deserialize, Serialize};
 
 use chrono::Timelike;
 
-use crate::platform;
-
 /// Current Unix epoch in seconds.
 pub fn unix_now() -> u64 {
     std::time::SystemTime::now()
@@ -23,6 +21,39 @@ pub fn unix_now() -> u64 {
 static STATE_DIR: OnceLock<PathBuf> = OnceLock::new();
 static CONFIG_DIR: OnceLock<PathBuf> = OnceLock::new();
 
+fn home_dir() -> String {
+    std::env::var("HOME").unwrap_or_else(|_| {
+        tracing::warn!("HOME is not set; falling back to /tmp for state/config directories");
+        "/tmp".to_string()
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn default_state_dir() -> String {
+    format!("{}/.local/state/build-watcher", home_dir())
+}
+
+#[cfg(target_os = "linux")]
+fn default_config_dir() -> String {
+    format!("{}/.config/build-watcher", home_dir())
+}
+
+#[cfg(target_os = "macos")]
+fn default_state_dir() -> String {
+    format!(
+        "{}/Library/Application Support/build-watcher/state",
+        home_dir()
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn default_config_dir() -> String {
+    format!(
+        "{}/Library/Application Support/build-watcher/config",
+        home_dir()
+    )
+}
+
 fn init_dir(dir: &Path) {
     if let Err(e) = std::fs::create_dir_all(dir) {
         tracing::error!("Failed to create directory {}: {e}", dir.display());
@@ -31,9 +62,8 @@ fn init_dir(dir: &Path) {
 
 pub fn state_dir() -> &'static Path {
     STATE_DIR.get_or_init(|| {
-        let dir = PathBuf::from(
-            std::env::var("STATE_DIRECTORY").unwrap_or_else(|_| platform::default_state_dir()),
-        );
+        let dir =
+            PathBuf::from(std::env::var("STATE_DIRECTORY").unwrap_or_else(|_| default_state_dir()));
         init_dir(&dir);
         dir
     })
@@ -42,8 +72,7 @@ pub fn state_dir() -> &'static Path {
 pub fn config_dir() -> &'static Path {
     CONFIG_DIR.get_or_init(|| {
         let dir = PathBuf::from(
-            std::env::var("CONFIGURATION_DIRECTORY")
-                .unwrap_or_else(|_| platform::default_config_dir()),
+            std::env::var("CONFIGURATION_DIRECTORY").unwrap_or_else(|_| default_config_dir()),
         );
         init_dir(&dir);
         dir

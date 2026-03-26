@@ -19,13 +19,13 @@ use tokio_stream::StreamExt as _;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_util::sync::CancellationToken;
 
-use crate::config::{
+use build_watcher::config::{
     NotificationLevel, NotificationOverrides, QuietHours, RepoConfig, config_dir,
     save_config_async, state_dir,
 };
-use crate::format;
-use crate::github::{validate_branch, validate_repo};
-use crate::watcher::{
+use build_watcher::format;
+use build_watcher::github::{validate_branch, validate_repo};
+use build_watcher::watcher::{
     MIN_ACTIVE_SECS, MIN_IDLE_SECS, PauseState, RateLimitState, SharedConfig, WatchKey,
     WatcherHandle, Watches, compute_intervals, count_api_calls, is_paused, last_failed_build,
     save_watches, start_watch,
@@ -40,27 +40,32 @@ pub const DEFAULT_PORT: u16 = 8417;
 struct AppState {
     watches: Watches,
     pause: PauseState,
-    events: crate::events::EventBus,
+    events: build_watcher::events::EventBus,
 }
 
 /// A single active run as returned by `GET /status`.
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct ActiveRunView {
     run_id: u64,
     status: String,
     workflow: String,
     /// Human-readable title: plain commit title for pushes, "PR: …" for PRs.
     title: String,
+    /// GitHub event type (e.g. `"push"`, `"pull_request"`).
+    event: String,
     elapsed_secs: Option<f64>,
 }
 
 /// Summary of the last completed build as returned by `GET /status`.
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct LastBuildView {
     run_id: u64,
     conclusion: String,
     workflow: String,
     title: String,
+    /// Comma-separated list of step names that failed, if available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    failing_steps: Option<String>,
 }
 
 /// One watched repo/branch as returned by `GET /status`.
@@ -85,7 +90,7 @@ struct StatusResponse {
 /// the data in. Both the `GET /status` HTTP handler and the `list_watches`
 /// MCP tool call this so the watch-enumeration logic lives in one place.
 fn build_watch_snapshot(
-    watches: &std::collections::HashMap<WatchKey, crate::watcher::WatchEntry>,
+    watches: &std::collections::HashMap<WatchKey, build_watcher::watcher::WatchEntry>,
     paused: bool,
 ) -> StatusResponse {
     let now = tokio::time::Instant::now();
@@ -104,6 +109,7 @@ fn build_watch_snapshot(
                         status: run.status.clone(),
                         workflow: run.workflow.clone(),
                         title: run.display_title(),
+                        event: run.event.clone(),
                         elapsed_secs,
                     }
                 })
@@ -115,6 +121,7 @@ fn build_watch_snapshot(
                 conclusion: lb.conclusion.clone(),
                 workflow: lb.workflow.clone(),
                 title: lb.display_title(),
+                failing_steps: lb.failing_steps.clone(),
             });
 
             WatchStatus {
@@ -149,9 +156,9 @@ async fn events_handler(State(state): State<AppState>) -> impl axum::response::I
         .filter_map(|result| result.ok())
         .map(|event| {
             let event_type = match &event {
-                crate::events::WatchEvent::RunStarted(_) => "RunStarted",
-                crate::events::WatchEvent::RunCompleted { .. } => "RunCompleted",
-                crate::events::WatchEvent::StatusChanged { .. } => "StatusChanged",
+                build_watcher::events::WatchEvent::RunStarted(_) => "RunStarted",
+                build_watcher::events::WatchEvent::RunCompleted { .. } => "RunCompleted",
+                build_watcher::events::WatchEvent::StatusChanged { .. } => "StatusChanged",
             };
             let data = serde_json::to_string(&event).unwrap_or_default();
             Ok::<_, Infallible>(Event::default().event(event_type).data(data))
@@ -277,7 +284,7 @@ pub async fn serve(
     Ok(())
 }
 
-async fn persist_config(config: crate::config::Config) -> Option<String> {
+async fn persist_config(config: build_watcher::config::Config) -> Option<String> {
     match save_config_async(&config).await {
         Ok(()) => None,
         Err(e) => {
@@ -743,7 +750,7 @@ impl BuildWatcher {
     )]
     async fn get_stats(&self) -> Result<CallToolResult, McpError> {
         // Lock order: rate_limit → watches → pause → config (matches poller order).
-        let now = crate::config::unix_now();
+        let now = build_watcher::config::unix_now();
         let rl = self.rate_limit.lock().await;
         let (watches_snap, api_calls) = {
             let w = self.watches.lock().await;
@@ -1133,7 +1140,7 @@ impl BuildWatcher {
             ));
         }
 
-        let now = crate::config::unix_now();
+        let now = build_watcher::config::unix_now();
         for entry in &entries {
             let duration = entry
                 .duration_secs()
@@ -1368,7 +1375,7 @@ impl ServerHandler for BuildWatcher {
 
 /// Apply notification level params to a global `NotificationConfig` (sets values directly).
 fn apply_notification_levels(
-    notif: &mut crate::config::NotificationConfig,
+    notif: &mut build_watcher::config::NotificationConfig,
     params: &UpdateNotificationsParams,
 ) {
     if let Some(l) = params.build_started {
@@ -1431,7 +1438,7 @@ fn format_notification_overrides(overrides: &NotificationOverrides) -> String {
 #[cfg(test)]
 mod tests {
     use super::deserialize_string_or_vec;
-    use crate::config::{NotificationLevel, NotificationOverrides};
+    use build_watcher::config::{NotificationLevel, NotificationOverrides};
 
     fn deser(json: &str) -> Result<Vec<String>, serde_json::Error> {
         let mut de = serde_json::Deserializer::from_str(json);
@@ -1500,7 +1507,7 @@ mod tests {
 
     #[test]
     fn apply_notification_levels_selective() {
-        let mut notif = crate::config::NotificationConfig::default();
+        let mut notif = build_watcher::config::NotificationConfig::default();
         let params = notif_params(
             Some(NotificationLevel::Off),
             None,
@@ -1524,8 +1531,8 @@ mod tests {
 
     // -- SSE / status endpoint tests --
 
-    use crate::events::{EventBus, RunSnapshot, WatchEvent};
-    use crate::watcher::{PauseState, WatchEntry, WatchKey, Watches};
+    use build_watcher::events::{EventBus, RunSnapshot, WatchEvent};
+    use build_watcher::watcher::{PauseState, WatchEntry, WatchKey, Watches};
     use std::collections::HashMap;
     use std::sync::Arc;
     use tokio::sync::Mutex;
@@ -1594,18 +1601,19 @@ mod tests {
 
     #[tokio::test]
     async fn status_with_last_build() {
-        use crate::github::LastBuild;
+        use build_watcher::github::LastBuild;
 
         let (watches, pause, events) = empty_state();
         let key = WatchKey::new("alice/app", "main");
         let mut entry = WatchEntry::default();
         entry.last_build = Some(LastBuild {
             run_id: 99,
-            conclusion: "success".to_string(),
+            conclusion: "failure".to_string(),
             workflow: "CI".to_string(),
             title: "Initial commit".to_string(),
             head_sha: "abc1234".to_string(),
             event: "push".to_string(),
+            failing_steps: Some("Build / Run tests".to_string()),
         });
         watches.lock().await.insert(key, entry);
 
@@ -1617,8 +1625,9 @@ mod tests {
         assert_eq!(w["branch"], "main");
         assert_eq!(w["active_runs"], serde_json::json!([]));
         assert_eq!(w["last_build"]["run_id"], 99);
-        assert_eq!(w["last_build"]["conclusion"], "success");
+        assert_eq!(w["last_build"]["conclusion"], "failure");
         assert_eq!(w["last_build"]["title"], "Initial commit");
+        assert_eq!(w["last_build"]["failing_steps"], "Build / Run tests");
     }
 
     #[tokio::test]

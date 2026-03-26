@@ -11,8 +11,8 @@ use futures_lite::StreamExt;
 use zbus::Connection;
 use zbus::proxy;
 
-use crate::config::NotificationLevel;
 use crate::platform::{Notification, Notifier};
+use build_watcher::config::NotificationLevel;
 
 // -- D-Bus interface proxy --
 
@@ -248,16 +248,6 @@ fn spawn_action_listener(
 }
 
 // -- Platform API --
-
-pub fn default_state_dir() -> String {
-    let home = super::home_dir();
-    format!("{home}/.local/state/build-watcher")
-}
-
-pub fn default_config_dir() -> String {
-    let home = super::home_dir();
-    format!("{home}/.config/build-watcher")
-}
 
 pub async fn detect() -> Box<dyn Notifier> {
     match DbusNotifier::new().await {

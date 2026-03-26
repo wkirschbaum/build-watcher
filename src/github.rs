@@ -68,6 +68,10 @@ pub struct LastBuild {
     pub head_sha: String,
     #[serde(default)]
     pub event: String,
+    /// Failing step names from the build, if available (e.g. "Build / Run tests").
+    /// Populated when the run failed; `None` for successful builds or older persisted state.
+    #[serde(default)]
+    pub failing_steps: Option<String>,
 }
 
 impl LastBuild {
@@ -162,6 +166,7 @@ impl RunInfo {
             title: self.title.clone(),
             head_sha: self.head_sha.clone(),
             event: self.event.clone(),
+            failing_steps: None,
         }
     }
 }

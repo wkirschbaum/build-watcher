@@ -2,8 +2,8 @@ use std::future::Future;
 use std::pin::Pin;
 use std::process::{Command, Stdio};
 
-use crate::config::NotificationLevel;
 use crate::platform::{Notification, Notifier};
+use build_watcher::config::NotificationLevel;
 
 // -- Shared helpers --
 
@@ -105,16 +105,6 @@ impl Notifier for AppleScriptNotifier {
 }
 
 // -- Platform API --
-
-pub fn default_state_dir() -> String {
-    let home = super::home_dir();
-    format!("{home}/Library/Application Support/build-watcher/state")
-}
-
-pub fn default_config_dir() -> String {
-    let home = super::home_dir();
-    format!("{home}/Library/Application Support/build-watcher/config")
-}
 
 pub async fn detect() -> Box<dyn Notifier> {
     if TerminalNotifier::is_available() {

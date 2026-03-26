@@ -31,6 +31,7 @@ pkill -f "$BINARY_PATH" 2>/dev/null || true
 sleep 0.5
 
 cp "$SCRIPT_DIR/target/release/$BINARY_NAME" "$INSTALL_DIR/$BINARY_NAME"
+cp "$SCRIPT_DIR/target/release/bw" "$INSTALL_DIR/bw"
 
 # -- Seed config file if missing --
 
@@ -104,7 +105,8 @@ echo "==> Configuring Claude Code MCP server..."
 echo ""
 echo "Done! build-watcher is installed and running."
 echo ""
-echo "  Binary:   $INSTALL_DIR/$BINARY_NAME"
+echo "  Daemon:   $INSTALL_DIR/$BINARY_NAME"
+echo "  CLI:      $INSTALL_DIR/bw"
 echo "  MCP:      http://127.0.0.1:$PORT/mcp"
 echo "  Config:   $CONFIG_FILE"
 echo "  State:    ~/.local/state/build-watcher/watches.json"

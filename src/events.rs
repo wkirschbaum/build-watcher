@@ -1,20 +1,13 @@
-use std::fmt::Write as _;
-use std::sync::Arc;
-use std::time::Duration;
+use tokio::sync::broadcast;
 
-use tokio::sync::{Mutex, broadcast};
-use tokio::time::Instant;
-
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::github::RunInfo;
-use crate::watcher::is_paused;
-use crate::{config, format, platform};
 
 const CHANNEL_CAPACITY: usize = 256;
 
 /// Snapshot of a run's identity, carried by events.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunSnapshot {
     pub repo: String,
     pub branch: String,
@@ -52,13 +45,13 @@ impl RunSnapshot {
         crate::github::display_title(&self.event, &self.title)
     }
 
-    fn notification_group(&self) -> String {
+    pub fn notification_group(&self) -> String {
         format!("{}#{}#{}", self.repo, self.branch, self.workflow)
     }
 }
 
 /// Events emitted by the watcher polling loop.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum WatchEvent {
     /// A new build was detected.
     RunStarted(RunSnapshot),
@@ -67,28 +60,18 @@ pub enum WatchEvent {
     RunCompleted {
         run: RunSnapshot,
         conclusion: String,
-        #[serde(serialize_with = "serialize_elapsed")]
-        elapsed: Option<Duration>,
+        /// Elapsed seconds from when the poller first saw the run until completion.
+        /// `None` for runs that were already completed when first detected.
+        elapsed: Option<f64>,
         failing_steps: Option<String>,
     },
 
     /// A build's status changed (e.g. queued -> `in_progress`).
-    #[allow(dead_code)] // fields carried for Debug logging
     StatusChanged {
         run: RunSnapshot,
         from: String,
         to: String,
     },
-}
-
-fn serialize_elapsed<S: serde::Serializer>(
-    elapsed: &Option<Duration>,
-    serializer: S,
-) -> Result<S::Ok, S::Error> {
-    match elapsed {
-        Some(d) => serializer.serialize_some(&d.as_secs_f64()),
-        None => serializer.serialize_none(),
-    }
 }
 
 /// Broadcast bus for watch events. Cloning shares the same underlying channel.
@@ -112,131 +95,15 @@ impl EventBus {
     }
 }
 
-// -- Notification handler --
-
-/// Listens for watch events and dispatches desktop notifications.
-pub async fn run_notification_handler(
-    mut rx: broadcast::Receiver<WatchEvent>,
-    config: Arc<Mutex<config::Config>>,
-    pause: Arc<Mutex<Option<Instant>>>,
-) {
-    loop {
-        match rx.recv().await {
-            Ok(event) => {
-                // Check pause state before acquiring the config lock to
-                // avoid holding two locks simultaneously.
-                let paused = is_paused(&pause).await;
-
-                // Extract what we need from config and drop the lock before
-                // dispatching the notification (which performs async I/O).
-                let cfg_snapshot = {
-                    let cfg = config.lock().await;
-                    let level = effective_level(&event, &cfg);
-                    let suppressed = level == config::NotificationLevel::Off
-                        || (level != config::NotificationLevel::Critical
-                            && (paused || cfg.is_in_quiet_hours()));
-                    if suppressed {
-                        None
-                    } else {
-                        Some((cfg.clone(), level))
-                    }
-                };
-                if let Some((cfg, level)) = &cfg_snapshot {
-                    handle_notification(event, cfg, *level).await;
-                }
-            }
-            Err(broadcast::error::RecvError::Lagged(n)) => {
-                tracing::warn!("Notification handler dropped {n} events");
-            }
-            Err(broadcast::error::RecvError::Closed) => {
-                tracing::debug!("Event bus closed, notification handler exiting");
-                break;
-            }
-        }
-    }
-}
-
-/// Determine the effective notification level for an event without sending it.
-fn effective_level(event: &WatchEvent, cfg: &config::Config) -> config::NotificationLevel {
-    match event {
-        WatchEvent::RunStarted(run) => cfg.notifications_for(&run.repo, &run.branch).build_started,
-        WatchEvent::RunCompleted {
-            run, conclusion, ..
-        } => {
-            let notif = cfg.notifications_for(&run.repo, &run.branch);
-            if conclusion == "success" {
-                notif.build_success
-            } else {
-                notif.build_failure
-            }
-        }
-        WatchEvent::StatusChanged { .. } => config::NotificationLevel::Off,
-    }
-}
-
-async fn handle_notification(
-    event: WatchEvent,
-    cfg: &config::Config,
-    level: config::NotificationLevel,
-) {
-    match event {
-        WatchEvent::RunStarted(run) => {
-            let repo_label = cfg.short_repo(&run.repo);
-            platform::send(platform::Notification {
-                title: format!("🔨 started: {} | {}", repo_label, run.workflow),
-                body: format!("[{}] {}", run.branch, run.display_title()),
-                level,
-                url: Some(run.url()),
-                group: run.notification_group(),
-                app_name: run.repo,
-                rerun_run_id: None,
-            })
-            .await;
-        }
-        WatchEvent::RunCompleted {
-            run,
-            conclusion,
-            elapsed,
-            failing_steps,
-        } => {
-            let succeeded = conclusion == "success";
-            let repo_label = cfg.short_repo(&run.repo);
-
-            let (emoji, status) = if succeeded {
-                ("✅", "succeeded")
-            } else {
-                ("❌", "failed")
-            };
-            let mut body = format!("[{}] {}", run.branch, run.display_title());
-            if let Some(d) = elapsed {
-                let _ = write!(body, " in {}", format::duration(d));
-            }
-            if let Some(steps) = &failing_steps {
-                let _ = write!(body, "\nFailed: {steps}");
-            }
-
-            let rerun_run_id = if !succeeded { Some(run.run_id) } else { None };
-            platform::send(platform::Notification {
-                title: format!("{emoji} {status}: {} | {}", repo_label, run.workflow),
-                body,
-                level,
-                url: Some(run.url()),
-                group: run.notification_group(),
-                app_name: run.repo,
-                rerun_run_id,
-            })
-            .await;
-        }
-        WatchEvent::StatusChanged { .. } => {
-            // No desktop notification for status changes
-        }
+impl Default for EventBus {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use config::NotificationLevel::*;
 
     fn snap() -> RunSnapshot {
         RunSnapshot {
@@ -272,25 +139,6 @@ mod tests {
     }
 
     #[test]
-    fn effective_level_by_event_type() {
-        let cfg = config::Config::default();
-
-        assert_eq!(
-            effective_level(&WatchEvent::RunStarted(snap()), &cfg),
-            Normal
-        );
-        assert_eq!(effective_level(&completed("success"), &cfg), Normal);
-        assert_eq!(effective_level(&completed("failure"), &cfg), Critical);
-
-        let status = WatchEvent::StatusChanged {
-            run: snap(),
-            from: "queued".to_string(),
-            to: "in_progress".to_string(),
-        };
-        assert_eq!(effective_level(&status, &cfg), Off);
-    }
-
-    #[test]
     fn from_run_info_copies_fields() {
         let run = crate::github::RunInfo {
             id: 99,
@@ -308,22 +156,58 @@ mod tests {
         assert_eq!(s.workflow, "Deploy");
         assert_eq!(s.title, "Update deps");
         assert_eq!(s.event, "pull_request");
+        assert_eq!(s.status, "in_progress");
     }
 
     #[test]
-    fn serialize_elapsed_formats() {
-        // Some(duration) → float seconds
+    fn elapsed_serializes_as_float() {
         let json = serde_json::to_value(completed("success")).unwrap();
         assert_eq!(json["RunCompleted"]["elapsed"], serde_json::Value::Null);
 
         let event = WatchEvent::RunCompleted {
             run: snap(),
             conclusion: "success".to_string(),
-            elapsed: Some(Duration::from_secs_f64(134.5)),
+            elapsed: Some(134.5),
             failing_steps: None,
         };
         let json = serde_json::to_value(&event).unwrap();
         assert_eq!(json["RunCompleted"]["elapsed"], 134.5);
+    }
+
+    #[test]
+    fn elapsed_round_trips_through_json() {
+        let event = WatchEvent::RunCompleted {
+            run: snap(),
+            conclusion: "failure".to_string(),
+            elapsed: Some(42.0),
+            failing_steps: Some("Build / Run tests".to_string()),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let decoded: WatchEvent = serde_json::from_str(&json).unwrap();
+        match decoded {
+            WatchEvent::RunCompleted {
+                elapsed,
+                failing_steps,
+                conclusion,
+                ..
+            } => {
+                assert_eq!(elapsed, Some(42.0));
+                assert_eq!(failing_steps.as_deref(), Some("Build / Run tests"));
+                assert_eq!(conclusion, "failure");
+            }
+            other => panic!("expected RunCompleted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_started_round_trips_through_json() {
+        let event = WatchEvent::RunStarted(snap());
+        let json = serde_json::to_string(&event).unwrap();
+        let decoded: WatchEvent = serde_json::from_str(&json).unwrap();
+        match decoded {
+            WatchEvent::RunStarted(s) => assert_eq!(s.repo, "alice/app"),
+            other => panic!("expected RunStarted, got {other:?}"),
+        }
     }
 
     #[test]

@@ -25,8 +25,9 @@ else
   fi
 fi
 
-echo "==> Removing binary..."
+echo "==> Removing binaries..."
 rm -f "$INSTALL_DIR/$BINARY_NAME"
+rm -f "$INSTALL_DIR/bw"
 
 echo "==> Removing desktop entry..."
 DESKTOP_FILE="$HOME/.local/share/applications/$BINARY_NAME.desktop"

@@ -18,18 +18,18 @@ pub type PauseState = Arc<Mutex<Option<Instant>>>;
 pub type RateLimitState = Arc<Mutex<Option<RateLimit>>>;
 
 /// Returns `true` if notifications are currently paused (deadline is in the future).
-pub(crate) async fn is_paused(pause: &PauseState) -> bool {
+pub async fn is_paused(pause: &PauseState) -> bool {
     let p = pause.lock().await;
     p.is_some_and(|deadline| Instant::now() < deadline)
 }
 
 /// Fastest permitted polling interval when active runs exist.
-pub(crate) const MIN_ACTIVE_SECS: u64 = 15;
+pub const MIN_ACTIVE_SECS: u64 = 15;
 /// Fastest permitted polling interval when no active runs exist.
-pub(crate) const MIN_IDLE_SECS: u64 = 60;
+pub const MIN_IDLE_SECS: u64 = 60;
 /// Fallback intervals used before the first rate-limit fetch succeeds.
-pub(crate) const FALLBACK_ACTIVE_SECS: u64 = 30;
-pub(crate) const FALLBACK_IDLE_SECS: u64 = 120;
+pub const FALLBACK_ACTIVE_SECS: u64 = 30;
+pub const FALLBACK_IDLE_SECS: u64 = 120;
 /// How often each poller refreshes the shared rate limit state.
 const RATE_LIMIT_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
@@ -38,7 +38,7 @@ const RATE_LIMIT_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 /// Each watch makes 1 `gh run list` call per idle cycle to check for new runs.
 /// Each active run adds 1 `gh run view` call per active cycle.
 /// This gives the rate limiter an accurate picture of actual API consumption.
-pub(crate) fn count_api_calls(watches: &HashMap<WatchKey, WatchEntry>) -> u64 {
+pub fn count_api_calls(watches: &HashMap<WatchKey, WatchEntry>) -> u64 {
     let base_calls = watches.len() as u64; // 1 gh run list per watch
     let active_run_calls: u64 = watches.values().map(|e| e.active_runs.len() as u64).sum();
     base_calls + active_run_calls
@@ -63,7 +63,7 @@ pub(crate) fn count_api_calls(watches: &HashMap<WatchKey, WatchEntry>) -> u64 {
 /// Above 50%, floor intervals scale as `MIN_*_SECS × (isqrt(calls))`
 /// — square-root growth keeps latency low for typical setups (≤10 watches)
 /// while gently slowing things down as the call count grows.
-pub(crate) fn compute_intervals(
+pub fn compute_intervals(
     rate_limit: Option<&RateLimit>,
     api_calls_per_cycle: u64,
     now: u64,
@@ -241,13 +241,19 @@ impl WatchEntry {
         !self.active_runs.is_empty()
     }
 
-    fn record_completion(&mut self, run: &RunInfo) -> Option<Duration> {
+    fn record_completion(
+        &mut self,
+        run: &RunInfo,
+        failing_steps: Option<String>,
+    ) -> Option<Duration> {
         let elapsed = self
             .active_runs
             .remove(&run.id)
             .map(|a| a.started_at.elapsed());
         self.failure_counts.remove(&run.id);
-        self.last_build = Some(run.to_last_build());
+        let mut last_build = run.to_last_build();
+        last_build.failing_steps = failing_steps;
+        self.last_build = Some(last_build);
         elapsed
     }
 
@@ -628,7 +634,7 @@ impl Poller {
                     let w = self.watches.lock().await;
                     w.get(&self.key)
                         .and_then(|e| e.active_runs.get(&run_id))
-                        .map(|a| a.started_at.elapsed())
+                        .map(|a| a.started_at.elapsed().as_secs_f64())
                 };
 
                 let failing_steps = if run.succeeded() {
@@ -642,7 +648,7 @@ impl Poller {
                         run: RunSnapshot::from_run_info(&run, repo, branch),
                         conclusion: run.conclusion.clone(),
                         elapsed,
-                        failing_steps,
+                        failing_steps: failing_steps.clone(),
                     });
                 }
 
@@ -654,7 +660,7 @@ impl Poller {
 
                 let mut w = self.watches.lock().await;
                 if let Some(entry) = w.get_mut(&self.key) {
-                    entry.record_completion(&run);
+                    entry.record_completion(&run, failing_steps);
                 }
                 changed = true;
             } else {
@@ -707,6 +713,10 @@ impl Poller {
             return;
         }
 
+        // Collect failing_steps for any already-completed runs so we can
+        // backfill last_build after incorporate_new_runs sets it.
+        let mut failing_steps_by_id: HashMap<u64, Option<String>> = HashMap::new();
+
         for run in &new_runs {
             tracing::info!(
                 key = %self.key, run_id = run.id,
@@ -726,8 +736,9 @@ impl Poller {
                     run: snapshot,
                     conclusion: run.conclusion.clone(),
                     elapsed: None,
-                    failing_steps,
+                    failing_steps: failing_steps.clone(),
                 });
+                failing_steps_by_id.insert(run.id, failing_steps);
                 tracing::info!(
                     key = %self.key, run_id = run.id,
                     sha = run.short_sha(), conclusion = %run.conclusion,
@@ -742,6 +753,12 @@ impl Poller {
                 // Incorporate only filtered runs for active tracking, but bump
                 // high-water mark from all unseen runs to avoid re-checking.
                 entry.incorporate_new_runs(&new_runs);
+                // Backfill failing_steps for whichever run became last_build.
+                if let Some(ref mut lb) = entry.last_build
+                    && let Some(steps) = failing_steps_by_id.get(&lb.run_id)
+                {
+                    lb.failing_steps = steps.clone();
+                }
                 if let Some(max_id) = unseen.iter().map(|r| r.id).max() {
                     entry.last_seen_run_id = entry.last_seen_run_id.max(max_id);
                 }
@@ -967,7 +984,7 @@ mod tests {
         let mut entry = make_entry();
         let run = make_run(101, "completed", "success");
 
-        entry.record_completion(&run);
+        entry.record_completion(&run, None);
 
         assert!(!entry.active_runs.contains_key(&101));
         assert!(entry.active_runs.contains_key(&102));
@@ -977,12 +994,23 @@ mod tests {
     }
 
     #[test]
+    fn record_completion_stores_failing_steps() {
+        let mut entry = make_entry();
+        let run = make_run(101, "completed", "failure");
+
+        entry.record_completion(&run, Some("Build / Run tests".to_string()));
+
+        let lb = entry.last_build.unwrap();
+        assert_eq!(lb.failing_steps.as_deref(), Some("Build / Run tests"));
+    }
+
+    #[test]
     fn record_completion_clears_failure_count() {
         let mut entry = make_entry();
         entry.failure_counts.insert(101, 3);
         let run = make_run(101, "completed", "failure");
 
-        entry.record_completion(&run);
+        entry.record_completion(&run, None);
 
         assert!(!entry.failure_counts.contains_key(&101));
     }
@@ -1126,7 +1154,7 @@ mod tests {
     fn persisted_roundtrip_preserves_fields() {
         let mut entry = make_entry();
         let run = make_run(101, "completed", "success");
-        entry.record_completion(&run);
+        entry.record_completion(&run, None);
 
         let persisted = entry.to_persisted();
         let restored = WatchEntry::from_persisted(persisted);
@@ -1200,7 +1228,7 @@ mod tests {
         let mut watches = HashMap::new();
         let mut entry = make_entry();
         let run = make_run(200, "completed", "failure");
-        entry.record_completion(&run);
+        entry.record_completion(&run, None);
         watches.insert(WatchKey::new("alice/app", "main"), entry);
 
         let result = last_failed_build(&watches, "alice/app");
@@ -1216,7 +1244,7 @@ mod tests {
         let mut watches = HashMap::new();
         let mut entry = make_entry();
         let run = make_run(200, "completed", "success");
-        entry.record_completion(&run);
+        entry.record_completion(&run, None);
         watches.insert(WatchKey::new("alice/app", "main"), entry);
 
         assert!(last_failed_build(&watches, "alice/app").is_none());
@@ -1228,12 +1256,12 @@ mod tests {
 
         let mut entry1 = make_entry();
         let run1 = make_run(100, "completed", "failure");
-        entry1.record_completion(&run1);
+        entry1.record_completion(&run1, None);
         watches.insert(WatchKey::new("alice/app", "main"), entry1);
 
         let mut entry2 = make_entry();
         let run2 = make_run(200, "completed", "failure");
-        entry2.record_completion(&run2);
+        entry2.record_completion(&run2, None);
         watches.insert(WatchKey::new("alice/app", "develop"), entry2);
 
         let (_, build) = last_failed_build(&watches, "alice/app").unwrap();
@@ -1245,7 +1273,7 @@ mod tests {
         let mut watches = HashMap::new();
         let mut entry = make_entry();
         let run = make_run(200, "completed", "failure");
-        entry.record_completion(&run);
+        entry.record_completion(&run, None);
         watches.insert(WatchKey::new("bob/other", "main"), entry);
 
         assert!(last_failed_build(&watches, "alice/app").is_none());
