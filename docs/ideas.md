@@ -4,9 +4,6 @@ Personal desktop tool — all features should improve the local daily experience
 
 ## High Impact, Low Effort
 
-### Sortable columns in TUI
-Allow cycling sort order via keybinding (e.g. `s` to cycle: repo → status → age → workflow). Store `sort_key: SortColumn` and `sort_ascending: bool` in `App`. Apply sorting after `flatten_rows` — sort the selectable rows within each org group, keeping `OrgHeader` and `FailingSteps` rows pinned. Display the current sort column/direction indicator in the column header (e.g. `REPO ▲`). Default sort: repo name ascending (current behavior).
-
 ### Auto-watch from git remote
 Detect `origin` remote of the current working directory and auto-suggest watching it via MCP. Saves the manual `owner/repo` lookup.
 

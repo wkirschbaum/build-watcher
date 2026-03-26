@@ -136,6 +136,31 @@ enum InputMode {
     },
 }
 
+/// Column used for sorting the watch list.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SortColumn {
+    Repo,
+    Branch,
+    Status,
+    Workflow,
+    Age,
+}
+
+impl SortColumn {
+    const ALL: [SortColumn; 5] = [
+        SortColumn::Repo,
+        SortColumn::Branch,
+        SortColumn::Status,
+        SortColumn::Workflow,
+        SortColumn::Age,
+    ];
+
+    fn next(self) -> Self {
+        let idx = Self::ALL.iter().position(|&c| c == self).unwrap_or(0);
+        Self::ALL[(idx + 1) % Self::ALL.len()]
+    }
+}
+
 struct App {
     status: StatusResponse,
     stats: StatsResponse,
@@ -151,6 +176,8 @@ struct App {
     input_mode: InputMode,
     /// Sender for background task results back to the main loop.
     bg_tx: mpsc::Sender<SseUpdate>,
+    sort_column: SortColumn,
+    sort_ascending: bool,
 }
 
 impl App {
@@ -392,6 +419,14 @@ impl App {
                     open_url(repo, run_id);
                 }
             }
+            KeyCode::Char('s') => {
+                if self.sort_ascending {
+                    self.sort_ascending = false;
+                } else {
+                    self.sort_column = self.sort_column.next();
+                    self.sort_ascending = true;
+                }
+            }
             _ => {}
         }
         false
@@ -523,6 +558,70 @@ impl DisplayRow<'_> {
                 unreachable!("not selectable")
             }
         }
+    }
+}
+
+/// Sort watches by the selected column. Returns a new sorted vec.
+fn sorted_watches(
+    watches: &[WatchStatus],
+    column: SortColumn,
+    ascending: bool,
+) -> Vec<WatchStatus> {
+    let mut sorted = watches.to_vec();
+    sorted.sort_by(|a, b| {
+        let cmp = match column {
+            SortColumn::Repo => a.repo.cmp(&b.repo).then(a.branch.cmp(&b.branch)),
+            SortColumn::Branch => a.branch.cmp(&b.branch).then(a.repo.cmp(&b.repo)),
+            SortColumn::Status => {
+                let sa = watch_sort_status(a);
+                let sb = watch_sort_status(b);
+                sa.cmp(&sb)
+            }
+            SortColumn::Workflow => {
+                let wa = watch_sort_workflow(a);
+                let wb = watch_sort_workflow(b);
+                wa.cmp(wb)
+            }
+            SortColumn::Age => {
+                let aa = watch_sort_age(a);
+                let ab = watch_sort_age(b);
+                aa.partial_cmp(&ab).unwrap_or(std::cmp::Ordering::Equal)
+            }
+        };
+        if ascending { cmp } else { cmp.reverse() }
+    });
+    sorted
+}
+
+/// Sort key for status: active runs first (by status), then completed (by conclusion).
+fn watch_sort_status(w: &WatchStatus) -> (u8, String) {
+    if let Some(run) = w.active_runs.first() {
+        (0, run.status.clone())
+    } else if let Some(b) = &w.last_build {
+        (1, b.conclusion.clone())
+    } else {
+        (2, String::new())
+    }
+}
+
+fn watch_sort_workflow(w: &WatchStatus) -> &str {
+    if let Some(run) = w.active_runs.first() {
+        &run.workflow
+    } else if let Some(b) = &w.last_build {
+        &b.workflow
+    } else {
+        ""
+    }
+}
+
+/// Sort key for age: active runs by elapsed (smallest first), then completed by age.
+fn watch_sort_age(w: &WatchStatus) -> f64 {
+    if let Some(run) = w.active_runs.first() {
+        run.elapsed_secs.unwrap_or(f64::MAX)
+    } else if let Some(b) = &w.last_build {
+        b.age_secs.unwrap_or(f64::MAX)
+    } else {
+        f64::MAX
     }
 }
 
@@ -768,16 +867,28 @@ fn render_body(
     let header_style = Style::default()
         .fg(Color::DarkGray)
         .add_modifier(Modifier::BOLD);
+    let active_style = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
+    let arrow = if app.sort_ascending { " ▲" } else { " ▼" };
+    let hdr = |label: &str, col: SortColumn| -> Cell<'_> {
+        if app.sort_column == col {
+            Cell::from(format!("{label}{arrow}")).style(active_style)
+        } else {
+            Cell::from(label.to_string()).style(header_style)
+        }
+    };
     let col_header = Row::new(vec![
-        Cell::from("REPO").style(header_style),
-        Cell::from("BRANCH").style(header_style),
-        Cell::from("STATUS").style(header_style),
-        Cell::from("WORKFLOW").style(header_style),
+        hdr("REPO", SortColumn::Repo),
+        hdr("BRANCH", SortColumn::Branch),
+        hdr("STATUS", SortColumn::Status),
+        hdr("WORKFLOW", SortColumn::Workflow),
         Cell::from("TITLE").style(header_style),
-        Cell::from("ELAPSED / AGE").style(header_style),
+        hdr("ELAPSED / AGE", SortColumn::Age),
     ]);
 
-    let flat = flatten_rows(&app.status.watches);
+    let sorted = sorted_watches(&app.status.watches, app.sort_column, app.sort_ascending);
+    let flat = flatten_rows(&sorted);
     let selected_display_idx = flat
         .selectable
         .get(app.selected)
@@ -930,6 +1041,8 @@ fn render_footer(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
             Span::raw(" mute  "),
             Span::styled("[p]", key_style),
             Span::raw(" pause  "),
+            Span::styled("[s]", key_style),
+            Span::raw(" sort  "),
             Span::styled("[q]", key_style),
             Span::raw(" quit"),
         ]))
@@ -1095,6 +1208,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         flash: None,
         input_mode: InputMode::Normal,
         bg_tx: mpsc::channel(1).0, // placeholder, replaced below
+        sort_column: SortColumn::Repo,
+        sort_ascending: true,
     };
 
     // Terminal setup.
