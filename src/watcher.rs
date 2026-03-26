@@ -218,6 +218,8 @@ pub struct WatchEntry {
     pub active_runs: HashMap<u64, ActiveRun>,
     failure_counts: HashMap<u64, u8>,
     pub last_build: Option<LastBuild>,
+    /// When the last build completed (not persisted — `None` after daemon restart).
+    pub completed_at: Option<Instant>,
 }
 
 impl WatchEntry {
@@ -227,6 +229,7 @@ impl WatchEntry {
             active_runs: HashMap::new(),
             failure_counts: HashMap::new(),
             last_build: p.last_build,
+            completed_at: None,
         }
     }
 
@@ -254,6 +257,7 @@ impl WatchEntry {
         let mut last_build = run.to_last_build();
         last_build.failing_steps = failing_steps;
         self.last_build = Some(last_build);
+        self.completed_at = Some(Instant::now());
         elapsed
     }
 
@@ -298,6 +302,7 @@ impl WatchEntry {
         for run in new_runs.iter().rev() {
             if run.is_completed() {
                 self.last_build = Some(run.to_last_build());
+                self.completed_at = Some(Instant::now());
             } else {
                 self.active_runs
                     .insert(run.id, ActiveRun::from_run(run, Instant::now()));
@@ -409,6 +414,7 @@ pub async fn start_watch(
         active_runs: active,
         failure_counts: HashMap::new(),
         last_build: last_completed.map(|r| (*r).to_last_build()),
+        completed_at: last_completed.map(|_| Instant::now()),
     };
 
     {
@@ -957,6 +963,7 @@ mod tests {
             ]),
             failure_counts: HashMap::new(),
             last_build: None,
+            completed_at: None,
         }
     }
 
@@ -1376,12 +1383,14 @@ mod tests {
             active_runs,
             failure_counts: HashMap::new(),
             last_build: None,
+            completed_at: None,
         };
         let entry2 = WatchEntry {
             last_seen_run_id: 100,
             active_runs: HashMap::new(),
             failure_counts: HashMap::new(),
             last_build: None,
+            completed_at: None,
         };
         watches.insert(WatchKey::new("owner/repo1", "main"), entry1);
         watches.insert(WatchKey::new("owner/repo2", "main"), entry2);
@@ -1575,6 +1584,7 @@ mod tests {
                     active_runs: HashMap::new(),
                     failure_counts: HashMap::new(),
                     last_build: None,
+                    completed_at: None,
                 },
             );
         }
@@ -1637,6 +1647,7 @@ mod tests {
                     active_runs: HashMap::new(),
                     failure_counts: HashMap::new(),
                     last_build: None,
+                    completed_at: None,
                 },
             );
         }
@@ -1683,6 +1694,7 @@ mod tests {
                 active_runs: HashMap::new(),
                 failure_counts: HashMap::new(),
                 last_build: None,
+                completed_at: None,
             };
             entry.active_runs.insert(101, make_active("in_progress"));
             w.insert(key.clone(), entry);
@@ -1730,6 +1742,7 @@ mod tests {
                 active_runs: HashMap::new(),
                 failure_counts: HashMap::new(),
                 last_build: None,
+                completed_at: None,
             };
             entry.active_runs.insert(101, make_active("queued"));
             w.insert(key.clone(), entry);
@@ -1774,6 +1787,7 @@ mod tests {
                 active_runs: HashMap::new(),
                 failure_counts: HashMap::new(),
                 last_build: None,
+                completed_at: None,
             };
             entry.active_runs.insert(101, make_active("in_progress"));
             w.insert(key.clone(), entry);
@@ -1825,6 +1839,7 @@ mod tests {
                     active_runs: HashMap::new(),
                     failure_counts: HashMap::new(),
                     last_build: None,
+                    completed_at: None,
                 },
             );
         }

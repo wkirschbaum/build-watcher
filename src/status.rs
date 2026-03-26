@@ -26,6 +26,9 @@ pub struct LastBuildView {
     /// Comma-separated list of step names that failed, if available.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failing_steps: Option<String>,
+    /// Seconds since the build completed (not available after daemon restart).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub age_secs: Option<f64>,
 }
 
 /// One watched repo/branch as returned by `GET /status`.

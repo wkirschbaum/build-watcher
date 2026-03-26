@@ -14,6 +14,10 @@ ratatui table, 1s polling, colour coding, `q` quit, `⏸ PAUSED` header indicato
 
 SSE background task subscribes to `GET /events`; events applied in-place via `apply_event`. Reconnects with exponential backoff (1s → 2s → … → 30s), resetting after each successful connection. `/status` resync on every (re)connect and every 30 s as a fallback. Header shows `⚡ reconnecting (Xs)` when disconnected.
 
+### Phase 4 — complete ✅
+
+Completed build age ("3m ago", "2h ago") with local ticking, responsive column widths scaling to terminal width, terminal resize handling.
+
 ---
 
 ## Dependencies to add

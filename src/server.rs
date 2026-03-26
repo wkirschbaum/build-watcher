@@ -75,12 +75,19 @@ fn build_watch_snapshot(watches: &HashMap<WatchKey, WatchEntry>, paused: bool) -
                 .collect();
             active_runs.sort_by_key(|r| r.run_id);
 
-            let last_build = entry.last_build.as_ref().map(|lb| LastBuildView {
-                run_id: lb.run_id,
-                conclusion: lb.conclusion.clone(),
-                workflow: lb.workflow.clone(),
-                title: lb.display_title(),
-                failing_steps: lb.failing_steps.clone(),
+            let last_build = entry.last_build.as_ref().map(|lb| {
+                let age_secs = entry
+                    .completed_at
+                    .and_then(|t| now.checked_duration_since(t))
+                    .map(|d| d.as_secs_f64());
+                LastBuildView {
+                    run_id: lb.run_id,
+                    conclusion: lb.conclusion.clone(),
+                    workflow: lb.workflow.clone(),
+                    title: lb.display_title(),
+                    failing_steps: lb.failing_steps.clone(),
+                    age_secs,
+                }
             });
 
             WatchStatus {

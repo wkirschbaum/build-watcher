@@ -43,6 +43,17 @@ impl App {
             .map(|w| w.active_runs.len())
             .sum()
     }
+
+    async fn resync(&mut self, client: &reqwest::Client, port: u16) {
+        match fetch_status(client, port).await {
+            Ok(status) => {
+                self.status = status;
+                self.last_fetch = Instant::now();
+                self.fetch_error = None;
+            }
+            Err(e) => self.fetch_error = Some(e),
+        }
+    }
 }
 
 // -- SSE state --
@@ -171,6 +182,7 @@ fn apply_event(status: &mut StatusResponse, event: WatchEvent) {
                 workflow: run.workflow,
                 title,
                 failing_steps,
+                age_secs: Some(0.0),
             });
         }
         WatchEvent::StatusChanged { run, to, .. } => {
@@ -217,8 +229,54 @@ fn status_emoji(conclusion_or_status: &str) -> &'static str {
     }
 }
 
+// -- Responsive column layout --
+
+const COL_SPACING: u16 = 1;
+const NUM_GAPS: usize = 5; // 6 columns → 5 gaps
+
+// Fixed column widths (content is bounded, no truncation needed).
+const BRANCH_W: usize = 12;
+const STATUS_W: usize = 18;
+const AGE_W: usize = 14;
+const FIXED_W: usize = BRANCH_W + STATUS_W + AGE_W + NUM_GAPS * COL_SPACING as usize;
+
+/// Variable column widths computed from terminal width.
+struct ColWidths {
+    repo: usize,
+    workflow: usize,
+    title: usize,
+}
+
+impl ColWidths {
+    fn from_terminal_width(w: u16) -> Self {
+        // Remaining space split among repo, workflow, title (30% / 25% / 45%).
+        let remaining = (w as usize).saturating_sub(FIXED_W);
+        let repo = (remaining * 30 / 100).max(10);
+        let workflow = (remaining * 25 / 100).max(8);
+        let title = remaining.saturating_sub(repo + workflow).max(8);
+
+        Self {
+            repo,
+            workflow,
+            title,
+        }
+    }
+
+    fn constraints(&self) -> [Constraint; 6] {
+        [
+            Constraint::Length(self.repo as u16),
+            Constraint::Length(BRANCH_W as u16),
+            Constraint::Length(STATUS_W as u16),
+            Constraint::Length(self.workflow as u16),
+            Constraint::Min(self.title as u16),
+            Constraint::Length(AGE_W as u16),
+        ]
+    }
+}
+
 fn render(frame: &mut ratatui::Frame, app: &App) {
     let area = frame.area();
+    let cw = ColWidths::from_terminal_width(area.width);
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -289,11 +347,11 @@ fn render(frame: &mut ratatui::Frame, app: &App) {
                     .map(|s| format::duration(Duration::from_secs_f64(s)))
                     .unwrap_or_default();
                 Row::new(vec![
-                    Cell::from(format::truncate(repo, 24)),
-                    Cell::from(format::truncate(branch, 12)),
+                    Cell::from(format::truncate(repo, cw.repo)),
+                    Cell::from(format::truncate(branch, BRANCH_W)),
                     Cell::from(format!("{emoji} {}", run.status)).style(style),
-                    Cell::from(format::truncate(&run.workflow, 20)),
-                    Cell::from(format::truncate(&run.title, 30)),
+                    Cell::from(format::truncate(&run.workflow, cw.workflow)),
+                    Cell::from(format::truncate(&run.title, cw.title)),
                     Cell::from(elapsed).style(style),
                 ])
             }
@@ -302,7 +360,7 @@ fn render(frame: &mut ratatui::Frame, app: &App) {
                 Cell::from(""),
                 Cell::from(""),
                 Cell::from(""),
-                Cell::from(format!("  ↳ {}", format::truncate(steps, 50)))
+                Cell::from(format!("  ↳ {}", format::truncate(steps, cw.title)))
                     .style(Style::default().fg(Color::Red)),
                 Cell::from(""),
             ]),
@@ -313,18 +371,22 @@ fn render(frame: &mut ratatui::Frame, app: &App) {
             } => {
                 let style = status_style(&build.conclusion);
                 let emoji = status_emoji(&build.conclusion);
+                let age = build
+                    .age_secs
+                    .map(|s| format::age(s as u64))
+                    .unwrap_or_default();
                 Row::new(vec![
-                    Cell::from(format::truncate(repo, 24)),
-                    Cell::from(format::truncate(branch, 12)),
+                    Cell::from(format::truncate(repo, cw.repo)),
+                    Cell::from(format::truncate(branch, BRANCH_W)),
                     Cell::from(format!("{emoji} {}", build.conclusion)).style(style),
-                    Cell::from(format::truncate(&build.workflow, 20)),
-                    Cell::from(format::truncate(&build.title, 30)),
-                    Cell::from("").style(style),
+                    Cell::from(format::truncate(&build.workflow, cw.workflow)),
+                    Cell::from(format::truncate(&build.title, cw.title)),
+                    Cell::from(age).style(style),
                 ])
             }
             DisplayRow::NeverRan { repo, branch } => Row::new(vec![
-                Cell::from(format::truncate(repo, 24)),
-                Cell::from(format::truncate(branch, 12)),
+                Cell::from(format::truncate(repo, cw.repo)),
+                Cell::from(format::truncate(branch, BRANCH_W)),
                 Cell::from("· idle").style(Style::default().fg(Color::DarkGray)),
                 Cell::from(""),
                 Cell::from(""),
@@ -333,24 +395,17 @@ fn render(frame: &mut ratatui::Frame, app: &App) {
         })
         .collect();
 
-    let widths = [
-        Constraint::Length(25),
-        Constraint::Length(13),
-        Constraint::Length(18),
-        Constraint::Length(21),
-        Constraint::Min(20),
-        Constraint::Length(14),
-    ];
+    let widths = cw.constraints();
 
     // Render headings row as a table so columns align with the body.
     let heading_table = Table::new(vec![col_header], widths)
         .block(Block::default())
-        .column_spacing(1);
+        .column_spacing(COL_SPACING);
     frame.render_widget(heading_table, chunks[1]);
 
     let body_table = Table::new(rows, widths)
         .block(Block::default())
-        .column_spacing(1);
+        .column_spacing(COL_SPACING);
     frame.render_widget(body_table, chunks[2]);
 
     // -- Footer --
@@ -511,6 +566,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tokio::time::Instant::now() + Duration::from_secs(30),
         Duration::from_secs(30),
     );
+    resync_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     let result = async {
         loop {
@@ -524,17 +580,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 *e += 1.0;
                             }
                         }
+                        if let Some(lb) = &mut watch.last_build
+                            && let Some(a) = &mut lb.age_secs
+                        {
+                            *a += 1.0;
+                        }
                     }
                 }
                 _ = resync_tick.tick() => {
-                    match fetch_status(&client, port).await {
-                        Ok(status) => {
-                            app.status = status;
-                            app.last_fetch = Instant::now();
-                            app.fetch_error = None;
-                        }
-                        Err(e) => app.fetch_error = Some(e),
-                    }
+                    app.resync(&client, port).await;
                 }
                 maybe_update = sse_rx.recv() => {
                     match maybe_update {
@@ -543,16 +597,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         Some(SseUpdate::Connected) => {
                             app.sse_state = SseState::Connected;
-                            // Resync on connect to recover any events missed during startup
-                            // or reconnect.
-                            match fetch_status(&client, port).await {
-                                Ok(status) => {
-                                    app.status = status;
-                                    app.last_fetch = Instant::now();
-                                    app.fetch_error = None;
-                                }
-                                Err(e) => app.fetch_error = Some(e),
-                            }
+                            // Resync on connect to recover any events missed during
+                            // startup or reconnect.
+                            app.resync(&client, port).await;
                         }
                         Some(SseUpdate::Disconnected) => {
                             app.sse_state = SseState::Disconnected { since: Instant::now() };
@@ -567,6 +614,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 break;
                             }
                         }
+                        Some(Ok(Event::Resize(_, _))) => {} // triggers redraw at top of loop
                         Some(Err(e)) => return Err(e.into()),
                         _ => {}
                     }
@@ -582,4 +630,249 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     terminal.backend_mut().execute(LeaveAlternateScreen)?;
 
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use build_watcher::events::{RunSnapshot, WatchEvent};
+    use build_watcher::status::{ActiveRunView, StatusResponse, WatchStatus};
+
+    fn snap(repo: &str, branch: &str, run_id: u64) -> RunSnapshot {
+        RunSnapshot {
+            repo: repo.to_string(),
+            branch: branch.to_string(),
+            run_id,
+            workflow: "CI".to_string(),
+            title: "Fix bug".to_string(),
+            event: "push".to_string(),
+            status: "queued".to_string(),
+        }
+    }
+
+    fn watch(repo: &str, branch: &str) -> WatchStatus {
+        WatchStatus {
+            repo: repo.to_string(),
+            branch: branch.to_string(),
+            active_runs: vec![],
+            last_build: None,
+        }
+    }
+
+    fn status_with(watches: Vec<WatchStatus>) -> StatusResponse {
+        StatusResponse {
+            paused: false,
+            watches,
+        }
+    }
+
+    // -- RunStarted --
+
+    #[test]
+    fn run_started_inserts_active_run() {
+        let mut status = status_with(vec![watch("alice/app", "main")]);
+        apply_event(
+            &mut status,
+            WatchEvent::RunStarted(snap("alice/app", "main", 1)),
+        );
+
+        let runs = &status.watches[0].active_runs;
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].run_id, 1);
+        assert_eq!(runs[0].status, "queued");
+        assert_eq!(runs[0].workflow, "CI");
+        assert_eq!(runs[0].elapsed_secs, Some(0.0));
+    }
+
+    #[test]
+    fn run_started_dedup_same_run_id() {
+        let mut status = status_with(vec![watch("alice/app", "main")]);
+        apply_event(
+            &mut status,
+            WatchEvent::RunStarted(snap("alice/app", "main", 42)),
+        );
+        apply_event(
+            &mut status,
+            WatchEvent::RunStarted(snap("alice/app", "main", 42)),
+        );
+
+        assert_eq!(status.watches[0].active_runs.len(), 1);
+    }
+
+    #[test]
+    fn run_started_ignores_unknown_watch() {
+        let mut status = status_with(vec![watch("alice/app", "main")]);
+        apply_event(
+            &mut status,
+            WatchEvent::RunStarted(snap("alice/app", "release", 1)),
+        );
+
+        assert!(status.watches[0].active_runs.is_empty());
+    }
+
+    // -- RunCompleted --
+
+    #[test]
+    fn run_completed_removes_active_run_and_updates_last_build() {
+        let mut status = status_with(vec![WatchStatus {
+            repo: "alice/app".to_string(),
+            branch: "main".to_string(),
+            active_runs: vec![ActiveRunView {
+                run_id: 7,
+                status: "in_progress".to_string(),
+                workflow: "CI".to_string(),
+                title: "Fix bug".to_string(),
+                event: "push".to_string(),
+                elapsed_secs: Some(30.0),
+            }],
+            last_build: None,
+        }]);
+
+        apply_event(
+            &mut status,
+            WatchEvent::RunCompleted {
+                run: snap("alice/app", "main", 7),
+                conclusion: "success".to_string(),
+                elapsed: Some(35.0),
+                failing_steps: None,
+            },
+        );
+
+        assert!(status.watches[0].active_runs.is_empty());
+        let lb = status.watches[0].last_build.as_ref().unwrap();
+        assert_eq!(lb.run_id, 7);
+        assert_eq!(lb.conclusion, "success");
+        assert_eq!(lb.workflow, "CI");
+        assert!(lb.failing_steps.is_none());
+        assert_eq!(lb.age_secs, Some(0.0));
+    }
+
+    #[test]
+    fn run_completed_sets_failing_steps() {
+        let mut status = status_with(vec![watch("alice/app", "main")]);
+        apply_event(
+            &mut status,
+            WatchEvent::RunCompleted {
+                run: snap("alice/app", "main", 5),
+                conclusion: "failure".to_string(),
+                elapsed: None,
+                failing_steps: Some("Build / tests".to_string()),
+            },
+        );
+
+        let lb = status.watches[0].last_build.as_ref().unwrap();
+        assert_eq!(lb.failing_steps.as_deref(), Some("Build / tests"));
+    }
+
+    #[test]
+    fn run_completed_ignores_unknown_watch() {
+        let mut status = status_with(vec![watch("alice/app", "main")]);
+        apply_event(
+            &mut status,
+            WatchEvent::RunCompleted {
+                run: snap("other/repo", "main", 1),
+                conclusion: "success".to_string(),
+                elapsed: None,
+                failing_steps: None,
+            },
+        );
+
+        assert!(status.watches[0].last_build.is_none());
+    }
+
+    // -- StatusChanged --
+
+    #[test]
+    fn status_changed_updates_active_run_status() {
+        let mut status = status_with(vec![WatchStatus {
+            repo: "alice/app".to_string(),
+            branch: "main".to_string(),
+            active_runs: vec![ActiveRunView {
+                run_id: 3,
+                status: "queued".to_string(),
+                workflow: "CI".to_string(),
+                title: "Fix bug".to_string(),
+                event: "push".to_string(),
+                elapsed_secs: None,
+            }],
+            last_build: None,
+        }]);
+
+        apply_event(
+            &mut status,
+            WatchEvent::StatusChanged {
+                run: snap("alice/app", "main", 3),
+                from: "queued".to_string(),
+                to: "in_progress".to_string(),
+            },
+        );
+
+        assert_eq!(status.watches[0].active_runs[0].status, "in_progress");
+    }
+
+    #[test]
+    fn status_changed_ignores_unknown_run_id() {
+        let mut status = status_with(vec![WatchStatus {
+            repo: "alice/app".to_string(),
+            branch: "main".to_string(),
+            active_runs: vec![ActiveRunView {
+                run_id: 3,
+                status: "queued".to_string(),
+                workflow: "CI".to_string(),
+                title: "Fix bug".to_string(),
+                event: "push".to_string(),
+                elapsed_secs: None,
+            }],
+            last_build: None,
+        }]);
+
+        apply_event(
+            &mut status,
+            WatchEvent::StatusChanged {
+                run: snap("alice/app", "main", 999),
+                from: "queued".to_string(),
+                to: "in_progress".to_string(),
+            },
+        );
+
+        assert_eq!(status.watches[0].active_runs[0].status, "queued");
+    }
+
+    #[test]
+    fn status_changed_ignores_unknown_watch() {
+        let mut status = status_with(vec![watch("alice/app", "main")]);
+        apply_event(
+            &mut status,
+            WatchEvent::StatusChanged {
+                run: snap("other/repo", "main", 1),
+                from: "queued".to_string(),
+                to: "in_progress".to_string(),
+            },
+        );
+        // No panic, no state change.
+        assert!(status.watches[0].active_runs.is_empty());
+    }
+
+    // -- LastBuildView title --
+
+    #[test]
+    fn run_completed_sets_display_title_for_pr() {
+        let mut pr_snap = snap("alice/app", "main", 10);
+        pr_snap.event = "pull_request".to_string();
+        pr_snap.title = "Add feature".to_string();
+
+        let mut status = status_with(vec![watch("alice/app", "main")]);
+        apply_event(
+            &mut status,
+            WatchEvent::RunCompleted {
+                run: pr_snap,
+                conclusion: "success".to_string(),
+                elapsed: None,
+                failing_steps: None,
+            },
+        );
+
+        let lb = status.watches[0].last_build.as_ref().unwrap();
+        assert_eq!(lb.title, "PR: Add feature");
+    }
 }
