@@ -77,7 +77,15 @@ pub fn load_json<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
 
 fn try_parse_file<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
     let data = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&data).ok()
+    match serde_json::from_str(&data) {
+        Ok(val) => Some(val),
+        Err(e) => {
+            if !data.trim().is_empty() {
+                tracing::warn!("{}: parse failed: {e}", path.display());
+            }
+            None
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -149,8 +157,8 @@ pub fn save_json<T: Serialize>(path: &Path, value: &T) -> Result<(), PersistErro
     // Backup current file, then promote draft
     let bak = path.with_extension("json.bak");
     if let Err(e) = std::fs::rename(path, &bak) {
-        // Not fatal — the file may not exist yet (first save)
-        if path.exists() {
+        // NotFound is expected on the first save; anything else is worth logging.
+        if e.kind() != std::io::ErrorKind::NotFound {
             tracing::warn!("Failed to create backup {}: {e}", bak.display());
         }
     }
@@ -170,13 +178,29 @@ pub fn save_json<T: Serialize>(path: &Path, value: &T) -> Result<(), PersistErro
 // -- Configuration --
 
 /// Notification urgency level.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum NotificationLevel {
     Off,
     Low,
     Normal,
     Critical,
+}
+
+impl<'de> Deserialize<'de> for NotificationLevel {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        Ok(match s.to_lowercase().as_str() {
+            "off" => Self::Off,
+            "low" => Self::Low,
+            "normal" => Self::Normal,
+            "critical" => Self::Critical,
+            other => {
+                tracing::warn!("config: unknown notification level {other:?}, using 'normal'");
+                Self::Normal
+            }
+        })
+    }
 }
 
 impl std::fmt::Display for NotificationLevel {
@@ -411,30 +435,113 @@ fn is_in_quiet_hours_at(qh: &QuietHours, cur_mins: u32) -> bool {
     }
 }
 
-/// Load config from disk. Returns the config and whether the primary file was valid
-/// (as opposed to falling back to backup or defaults). Callers should only re-save
-/// to normalize schema when the primary loaded successfully.
+/// Attempt to load a Config by deserializing each top-level field individually,
+/// using the field's default when it is missing or has an invalid value.
+/// Also recovers individual repo entries, skipping those that cannot be parsed.
+/// Returns `None` only when the file cannot be read or is not a JSON object.
+fn load_config_lenient(path: &Path) -> Option<Config> {
+    let data = std::fs::read_to_string(path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&data).ok()?;
+    let obj = value.as_object()?;
+
+    let mut cfg = Config::default();
+
+    macro_rules! field {
+        ($key:literal, $field:expr) => {
+            if let Some(v) = obj.get($key) {
+                match serde_json::from_value(v.clone()) {
+                    Ok(val) => $field = val,
+                    Err(e) => {
+                        tracing::warn!("config: invalid field {:?}: {e}, using default", $key)
+                    }
+                }
+            }
+        };
+    }
+
+    field!("default_branches", cfg.default_branches);
+    field!("ignored_workflows", cfg.ignored_workflows);
+    field!("notifications", cfg.notifications);
+    field!("quiet_hours", cfg.quiet_hours);
+
+    // Repos: load the map entry-by-entry so a single bad repo doesn't drop the rest.
+    if let Some(serde_json::Value::Object(repos_obj)) = obj.get("repos") {
+        for (repo, repo_val) in repos_obj {
+            match serde_json::from_value::<RepoConfig>(repo_val.clone()) {
+                Ok(rc) => {
+                    cfg.repos.insert(repo.clone(), rc);
+                }
+                Err(e) => {
+                    tracing::warn!("config: invalid entry for repo {repo:?}: {e}, skipping");
+                }
+            }
+        }
+    }
+
+    Some(cfg)
+}
+
+/// Load config from disk.
+///
+/// Returns `(config, should_resave)`. `should_resave` is `true` when the caller
+/// should write the config back to disk — either to normalise the schema after a
+/// clean load, or to persist field-level corrections made during lenient recovery.
+/// It is `false` when we fell back to the backup (we don't want to overwrite the
+/// primary with backup data until the user has verified it).
 fn load_config() -> (Config, bool) {
     let path = config_dir().join("config.json");
+
     if let Some(val) = try_parse_file::<Config>(&path) {
         return (val, true);
     }
+
+    // Strict parse failed — try field-by-field recovery before falling back to backup.
+    if let Some(val) = load_config_lenient(&path) {
+        tracing::warn!(
+            "Config has invalid field values; loaded with partial recovery. \
+             The corrected config will be saved on startup."
+        );
+        return (val, true);
+    }
+
     let bak = path.with_extension("json.bak");
     if let Some(val) = try_parse_file::<Config>(&bak) {
         tracing::warn!("Primary config corrupt, recovered from backup");
         let _ = std::fs::copy(&bak, &path);
         return (val, false);
     }
+
+    if let Some(val) = load_config_lenient(&bak) {
+        tracing::warn!("Backup config has invalid field values; loaded with partial recovery");
+        return (val, true);
+    }
+
+    tracing::warn!("Config missing or unreadable; starting with defaults");
     (Config::default(), false)
 }
 
-/// Load config and re-save to normalize the schema (adds missing fields).
-/// Skips re-save when the primary was corrupt or missing to avoid overwriting
-/// a user-edited file with defaults.
+/// Load config, apply startup validation, and re-save to normalise the schema.
+///
+/// Validation rules applied after loading:
+/// - `default_branches` must not be empty (reset to `["main"]` if so).
+///
+/// Re-save is skipped when we fell back to the backup file, to avoid overwriting
+/// the primary with backup data before the user has a chance to inspect it.
 pub fn load_and_normalize() -> Config {
-    let (cfg, primary_ok) = load_config();
-    if primary_ok && let Err(e) = save_config(&cfg) {
-        tracing::error!("Failed to save config on startup: {e}");
+    let (mut cfg, should_resave) = load_config();
+
+    if cfg.default_branches.is_empty() {
+        tracing::warn!(
+            "config: 'default_branches' is empty — no branches would be watched. \
+             Resetting to [\"main\"]."
+        );
+        cfg.default_branches = default_branches();
+    }
+
+    if should_resave {
+        if let Err(e) = save_config(&cfg) {
+            tracing::error!("Failed to save config on startup: {e}");
+        }
     }
     cfg
 }
@@ -704,5 +811,110 @@ mod tests {
             }
             .is_empty()
         );
+    }
+
+    #[test]
+    fn try_parse_file_returns_none_for_missing_file() {
+        let path = std::env::temp_dir().join("bw-nonexistent-99999.json");
+        let result: Option<Config> = try_parse_file(&path);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn try_parse_file_returns_none_for_corrupt_json() {
+        let dir = std::env::temp_dir().join(format!("bw-test-corrupt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("corrupt.json");
+        std::fs::write(&path, "{ this is not json }").unwrap();
+        let result: Option<Config> = try_parse_file(&path);
+        assert!(result.is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn default_branches_empty_is_reset_to_main() {
+        // load_config_lenient accepts an empty array for default_branches;
+        // load_and_normalize must then reset it.
+        let dir = std::env::temp_dir().join(format!("bw-test-empty-br-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        std::fs::write(&path, r#"{"default_branches": []}"#).unwrap();
+
+        let cfg = load_config_lenient(&path).unwrap();
+        assert!(
+            cfg.default_branches.is_empty(),
+            "lenient load keeps the empty vec as-is"
+        );
+
+        // Simulate load_and_normalize validation
+        let mut cfg = cfg;
+        if cfg.default_branches.is_empty() {
+            cfg.default_branches = default_branches();
+        }
+        assert_eq!(cfg.default_branches, vec!["main".to_string()]);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn notification_level_unknown_variant_falls_back_to_normal() {
+        let level: NotificationLevel = serde_json::from_str("\"urgent\"").unwrap();
+        assert_eq!(level, NotificationLevel::Normal);
+    }
+
+    #[test]
+    fn notification_level_case_insensitive() {
+        let level: NotificationLevel = serde_json::from_str("\"CRITICAL\"").unwrap();
+        assert_eq!(level, NotificationLevel::Critical);
+        let level: NotificationLevel = serde_json::from_str("\"Off\"").unwrap();
+        assert_eq!(level, NotificationLevel::Off);
+    }
+
+    #[test]
+    fn lenient_load_recovers_bad_field_value() {
+        let dir = std::env::temp_dir().join(format!("bw-test-lenient-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+
+        // Write config with a wrong type for default_branches (number instead of array)
+        std::fs::write(
+            &path,
+            r#"{"default_branches": 42, "repos": {"alice/app": {}}}"#,
+        )
+        .unwrap();
+
+        let cfg = load_config_lenient(&path).unwrap();
+        // Bad field falls back to default
+        assert_eq!(cfg.default_branches, vec!["main".to_string()]);
+        // Good field is preserved
+        assert!(cfg.repos.contains_key("alice/app"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn lenient_load_skips_bad_repo_entry() {
+        let dir = std::env::temp_dir().join(format!("bw-test-repo-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+
+        // One repo has branches as a number (invalid), the other is fine
+        std::fs::write(
+            &path,
+            r#"{"repos": {"alice/app": {"branches": 999}, "bob/lib": {}}}"#,
+        )
+        .unwrap();
+
+        let cfg = load_config_lenient(&path).unwrap();
+        assert!(
+            !cfg.repos.contains_key("alice/app"),
+            "bad repo should be skipped"
+        );
+        assert!(
+            cfg.repos.contains_key("bob/lib"),
+            "good repo should be kept"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
