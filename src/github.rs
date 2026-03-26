@@ -682,6 +682,19 @@ mod tests {
         assert_eq!(bad.duration_secs(), None);
     }
 
+    #[test]
+    fn history_entry_age_secs() {
+        let entry = make_history("push", "2024-01-01T10:00:00Z", "2024-01-01T10:05:30Z");
+        let created_epoch = parse_iso_epoch("2024-01-01T10:00:00Z").unwrap();
+        // 5 minutes after created_at
+        assert_eq!(entry.age_secs(created_epoch + 300), Some(300));
+        // now before created_at saturates to 0
+        assert_eq!(entry.age_secs(created_epoch - 100), Some(0));
+        // invalid timestamp returns None
+        let bad = make_history("push", "invalid", "");
+        assert_eq!(bad.age_secs(created_epoch), None);
+    }
+
     fn job(name: &str, conclusion: &str, steps: Vec<(&str, &str)>) -> GhJob {
         GhJob {
             name: name.to_string(),

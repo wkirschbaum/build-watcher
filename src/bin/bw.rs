@@ -1063,6 +1063,132 @@ mod tests {
 
     // -- LastBuildView title --
 
+    // -- flatten_rows --
+
+    #[test]
+    fn flatten_rows_empty() {
+        let flat = flatten_rows(&[]);
+        assert!(flat.rows.is_empty());
+        assert!(flat.selectable.is_empty());
+    }
+
+    #[test]
+    fn flatten_rows_idle_watch() {
+        let watches = vec![watch("alice/app", "main")];
+        let flat = flatten_rows(&watches);
+        assert_eq!(flat.rows.len(), 1);
+        assert_eq!(flat.selectable.len(), 1);
+        assert!(matches!(flat.rows[0], DisplayRow::NeverRan { .. }));
+    }
+
+    #[test]
+    fn flatten_rows_with_failing_steps_not_selectable() {
+        let watches = vec![WatchStatus {
+            repo: "alice/app".to_string(),
+            branch: "main".to_string(),
+            active_runs: vec![],
+            last_build: Some(LastBuildView {
+                run_id: 1,
+                conclusion: "failure".to_string(),
+                workflow: "CI".to_string(),
+                title: "Fix".to_string(),
+                failing_steps: Some("Build / tests".to_string()),
+                age_secs: Some(60.0),
+            }),
+        }];
+        let flat = flatten_rows(&watches);
+        // LastBuild row + FailingSteps sub-row
+        assert_eq!(flat.rows.len(), 2);
+        // Only the LastBuild row is selectable
+        assert_eq!(flat.selectable.len(), 1);
+        assert_eq!(flat.selectable[0], 0);
+        assert!(matches!(flat.rows[1], DisplayRow::FailingSteps { .. }));
+    }
+
+    #[test]
+    fn flatten_rows_success_no_failing_steps_row() {
+        let watches = vec![WatchStatus {
+            repo: "alice/app".to_string(),
+            branch: "main".to_string(),
+            active_runs: vec![],
+            last_build: Some(LastBuildView {
+                run_id: 1,
+                conclusion: "success".to_string(),
+                workflow: "CI".to_string(),
+                title: "Fix".to_string(),
+                failing_steps: None,
+                age_secs: Some(60.0),
+            }),
+        }];
+        let flat = flatten_rows(&watches);
+        assert_eq!(flat.rows.len(), 1);
+        assert!(matches!(flat.rows[0], DisplayRow::LastBuild { .. }));
+    }
+
+    // -- status_style / status_emoji --
+
+    #[test]
+    fn status_style_colors() {
+        assert_eq!(status_style("success").fg, Some(Color::Green));
+        assert_eq!(status_style("failure").fg, Some(Color::Red));
+        assert_eq!(status_style("cancelled").fg, Some(Color::Red));
+        assert_eq!(status_style("in_progress").fg, Some(Color::Yellow));
+        assert_eq!(status_style("queued").fg, Some(Color::Yellow));
+        assert_eq!(status_style("unknown").fg, None);
+    }
+
+    #[test]
+    fn status_emoji_variants() {
+        assert_eq!(status_emoji("success"), "✅");
+        assert_eq!(status_emoji("failure"), "❌");
+        assert_eq!(status_emoji("in_progress"), "⏳");
+        assert_eq!(status_emoji("queued"), "⏸");
+        assert_eq!(status_emoji("something_else"), "·");
+    }
+
+    // -- ColWidths --
+
+    #[test]
+    fn col_widths_minimum_values() {
+        // Very narrow terminal — should not panic and should use minimums
+        let cw = ColWidths::from_terminal_width(20);
+        assert!(cw.repo >= 10);
+        assert!(cw.workflow >= 8);
+        assert!(cw.title >= 8);
+    }
+
+    #[test]
+    fn col_widths_wide_terminal() {
+        let cw = ColWidths::from_terminal_width(200);
+        // Should get reasonable proportions
+        assert!(cw.repo > 10);
+        assert!(cw.workflow > 8);
+        assert!(cw.title > cw.workflow); // title gets 45% vs workflow 25%
+    }
+
+    // -- DisplayRow::repo_and_run_id --
+
+    #[test]
+    fn display_row_repo_and_run_id() {
+        let watches = vec![WatchStatus {
+            repo: "alice/app".to_string(),
+            branch: "main".to_string(),
+            active_runs: vec![ActiveRunView {
+                run_id: 42,
+                status: "in_progress".to_string(),
+                workflow: "CI".to_string(),
+                title: "Fix".to_string(),
+                event: "push".to_string(),
+                elapsed_secs: Some(10.0),
+            }],
+            last_build: None,
+        }];
+        let flat = flatten_rows(&watches);
+        let (repo, run_id) = flat.rows[0].repo_and_run_id();
+        assert_eq!(repo, "alice/app");
+        assert_eq!(run_id, Some(42));
+    }
+
     #[test]
     fn run_completed_sets_display_title_for_pr() {
         let mut pr_snap = snap("alice/app", "main", 10);

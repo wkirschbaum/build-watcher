@@ -985,7 +985,49 @@ mod tests {
         assert_eq!(legacy.branch, "main");
     }
 
+    #[test]
+    fn watch_key_serde_roundtrip() {
+        let key = WatchKey::new("alice/app", "feature/xyz");
+        let json = serde_json::to_string(&key).unwrap();
+        assert_eq!(json, "\"alice/app#feature/xyz\"");
+        let parsed: WatchKey = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, key);
+    }
+
+    #[test]
+    fn active_run_display_title() {
+        let push = make_active("in_progress");
+        assert_eq!(push.display_title(), "Test PR");
+
+        let mut pr = make_active("queued");
+        pr.event = "pull_request".to_string();
+        assert_eq!(pr.display_title(), "PR: Test PR");
+    }
+
     // -- WatchEntry state machine tests --
+
+    #[test]
+    fn record_completion_returns_elapsed() {
+        let mut entry = make_entry();
+        let run = make_run(101, "completed", "success");
+
+        let elapsed = entry.record_completion(&run, None);
+
+        // Active run was present, so elapsed should be Some
+        assert!(elapsed.is_some());
+        // Should be very small since we just created it
+        assert!(elapsed.unwrap() < std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    fn record_completion_returns_none_for_unknown_run() {
+        let mut entry = make_entry();
+        let run = make_run(999, "completed", "success");
+
+        let elapsed = entry.record_completion(&run, None);
+
+        assert!(elapsed.is_none());
+    }
 
     #[test]
     fn record_completion_removes_run_and_sets_last_build() {

@@ -901,6 +901,21 @@ mod tests {
     }
 
     #[test]
+    fn notification_level_display_roundtrip() {
+        for level in [
+            NotificationLevel::Off,
+            NotificationLevel::Low,
+            NotificationLevel::Normal,
+            NotificationLevel::Critical,
+        ] {
+            let s = level.to_string();
+            let parsed: NotificationLevel =
+                serde_json::from_value(serde_json::Value::String(s)).unwrap();
+            assert_eq!(parsed, level);
+        }
+    }
+
+    #[test]
     fn lenient_load_recovers_bad_field_value() {
         let dir = std::env::temp_dir().join(format!("bw-test-lenient-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();

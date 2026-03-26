@@ -1499,6 +1499,25 @@ mod tests {
         assert!(deser(r#""not json""#).is_err());
     }
 
+    fn deser_opt(json: &str) -> Result<Option<Vec<String>>, serde_json::Error> {
+        let mut de = serde_json::Deserializer::from_str(json);
+        super::deserialize_opt_string_or_vec(&mut de)
+    }
+
+    #[test]
+    fn deserialize_opt_string_or_vec_variants() {
+        assert_eq!(
+            deser_opt(r#"["a","b"]"#).unwrap(),
+            Some(vec!["a".to_string(), "b".to_string()])
+        );
+        assert_eq!(
+            deser_opt(r#""[\"x\"]""#).unwrap(),
+            Some(vec!["x".to_string()])
+        );
+        assert_eq!(deser_opt("null").unwrap(), None);
+        assert!(deser_opt(r#""not json""#).is_err());
+    }
+
     #[test]
     fn hhmm_validation() {
         assert!(super::validate_hhmm("00:00").is_ok());
@@ -1751,6 +1770,106 @@ mod tests {
         // develop before main for alice/app
         assert_eq!(json["watches"][0]["branch"], "develop");
         assert_eq!(json["watches"][1]["branch"], "main");
+    }
+
+    fn test_router_full(watches: Watches, pause: PauseState, events: EventBus) -> axum::Router {
+        let app_state = super::AppState {
+            watches,
+            pause,
+            events,
+            github: Arc::new(StubGitHub),
+            rate_limit: Arc::new(Mutex::new(None)),
+            started_at: std::time::Instant::now(),
+        };
+        axum::Router::new()
+            .route("/status", axum::routing::get(super::status_handler))
+            .route("/stats", axum::routing::get(super::stats_handler))
+            .route("/pause", axum::routing::post(super::pause_handler))
+            .route("/events", axum::routing::get(super::events_handler))
+            .with_state(app_state)
+    }
+
+    #[tokio::test]
+    async fn stats_returns_uptime_and_intervals() {
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        let (watches, pause, events) = empty_state();
+        let router = test_router_full(watches, pause, events);
+        let req = http::Request::get("/stats")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        // Uptime should be very small (just started)
+        assert!(json["uptime_secs"].as_u64().unwrap() < 5);
+        // Without rate limit data, should use fallback intervals
+        assert_eq!(json["active_poll_secs"], 30);
+        assert_eq!(json["idle_poll_secs"], 120);
+        assert!(json["rate_remaining"].is_null());
+    }
+
+    #[tokio::test]
+    async fn pause_toggle() {
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        let (watches, pause, events) = empty_state();
+
+        // Pause
+        let router = test_router_full(watches.clone(), pause.clone(), events.clone());
+        let req = http::Request::post("/pause")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(r#"{"pause":true}"#))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["paused"], true);
+
+        // Resume
+        let router = test_router_full(watches.clone(), pause.clone(), events.clone());
+        let req = http::Request::post("/pause")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(r#"{"pause":false}"#))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["paused"], false);
+    }
+
+    #[tokio::test]
+    async fn status_with_active_runs() {
+        use build_watcher::watcher::ActiveRun;
+        use tokio::time::Instant;
+
+        let (watches, pause, events) = empty_state();
+        let key = WatchKey::new("alice/app", "main");
+        let mut entry = WatchEntry::default();
+        entry.active_runs.insert(
+            42,
+            ActiveRun {
+                status: "in_progress".to_string(),
+                started_at: Instant::now(),
+                workflow: "CI".to_string(),
+                title: "Fix bug".to_string(),
+                event: "push".to_string(),
+            },
+        );
+        watches.lock().await.insert(key, entry);
+
+        let json = get_status_json(test_router(watches, pause, events)).await;
+        let runs = &json["watches"][0]["active_runs"];
+        assert_eq!(runs.as_array().unwrap().len(), 1);
+        assert_eq!(runs[0]["run_id"], 42);
+        assert_eq!(runs[0]["status"], "in_progress");
+        assert_eq!(runs[0]["workflow"], "CI");
+        assert!(runs[0]["elapsed_secs"].as_f64().is_some());
     }
 
     #[tokio::test]
