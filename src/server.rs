@@ -805,14 +805,13 @@ impl BuildWatcher {
 
     #[tool(description = "List all currently watched builds and their status")]
     async fn list_watches(&self) -> Result<CallToolResult, McpError> {
-        if self.watches.lock().await.is_empty() {
+        let paused = is_paused(&self.pause).await;
+        let watches = self.watches.lock().await;
+        if watches.is_empty() {
             return Ok(CallToolResult::success(vec![Content::text(
                 "No active watches",
             )]));
         }
-
-        let paused = is_paused(&self.pause).await;
-        let watches = self.watches.lock().await;
         let snapshot = build_watch_snapshot(&watches, None, paused);
 
         let mut lines: Vec<String> = Vec::new();

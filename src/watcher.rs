@@ -608,16 +608,17 @@ impl Poller {
 
     /// Remove this watch and its config entry when the repo no longer exists.
     async fn remove_dead_watch(&self, repo: &str) {
-        {
+        let persisted = {
             let mut w = self.watches.lock().await;
             let keys: Vec<WatchKey> = w.keys().filter(|k| k.matches_repo(repo)).cloned().collect();
             for key in &keys {
                 w.remove(key);
             }
-        }
-        self.persistence
-            .save_watches(&collect_persisted(&self.watches).await)
-            .await;
+            w.iter()
+                .map(|(k, v)| (k.clone(), v.to_persisted()))
+                .collect()
+        };
+        self.persistence.save_watches(&persisted).await;
 
         let snapshot = {
             let mut cfg = self.config.lock().await;
