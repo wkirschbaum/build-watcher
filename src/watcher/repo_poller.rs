@@ -394,18 +394,21 @@ impl RepoPoller {
         for key in &branches {
             let branch_runs = runs_for_branch(&all_runs, &key.branch);
 
-            let last_seen = {
+            let (last_seen, active_ids) = {
                 let w = self.watches.lock().await;
                 match w.get(key) {
-                    Some(entry) => entry.last_seen_run_id,
+                    Some(entry) => {
+                        let ids: Vec<u64> = entry.active_runs.keys().copied().collect();
+                        (entry.last_seen_run_id, ids)
+                    }
                     None => continue,
                 }
             };
 
-            // unseen = all runs newer than high-water mark for this branch
+            // unseen = runs newer than high-water mark AND not already tracked as active
             let unseen: Vec<&RunInfo> = branch_runs
                 .iter()
-                .filter(|r| r.id > last_seen)
+                .filter(|r| r.id > last_seen && !active_ids.contains(&r.id))
                 .copied()
                 .collect();
             let unseen_as_owned: Vec<RunInfo> = unseen.iter().map(|r| (*r).clone()).collect();
@@ -418,20 +421,21 @@ impl RepoPoller {
             let mut failing_steps_by_id: HashMap<u64, Option<String>> = HashMap::new();
 
             for run in &new_runs {
-                tracing::info!(
-                    key = %key, run_id = run.id,
-                    sha = run.short_sha(), workflow = %run.workflow, title = %run.title,
-                    "New build detected"
-                );
                 let snapshot = RunSnapshot::from_run_info(run, &self.repo, &key.branch);
-                self.events.emit(WatchEvent::RunStarted(snapshot.clone()));
 
                 if run.is_completed() {
+                    // Run completed before we saw it — emit only RunCompleted,
+                    // not a spurious RunStarted that would cause a double notification.
                     let failing_steps = if run.succeeded() {
                         None
                     } else {
                         self.github.failing_steps(&self.repo, run.id).await
                     };
+                    tracing::info!(
+                        key = %key, run_id = run.id,
+                        sha = run.short_sha(), conclusion = %run.conclusion,
+                        "Build already completed"
+                    );
                     self.events.emit(WatchEvent::RunCompleted {
                         run: snapshot,
                         conclusion: run.conclusion.clone(),
@@ -439,11 +443,13 @@ impl RepoPoller {
                         failing_steps: failing_steps.clone(),
                     });
                     failing_steps_by_id.insert(run.id, failing_steps);
+                } else {
                     tracing::info!(
                         key = %key, run_id = run.id,
-                        sha = run.short_sha(), conclusion = %run.conclusion,
-                        "Build already completed"
+                        sha = run.short_sha(), workflow = %run.workflow, title = %run.title,
+                        "New build detected"
                     );
+                    self.events.emit(WatchEvent::RunStarted(snapshot));
                 }
             }
 

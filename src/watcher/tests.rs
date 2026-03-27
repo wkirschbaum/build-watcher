@@ -8,6 +8,7 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
+use crate::events::WatchEvent;
 use crate::github::{GhError, RunInfo};
 
 use super::repo_poller::RepoPoller;
@@ -704,15 +705,22 @@ async fn check_for_new_runs_detects_new_builds() {
     assert_eq!(entry.last_build.as_ref().unwrap().run_id, 102);
     drop(w);
 
-    // Verify events: RunStarted for 101 and 102, RunCompleted for 102
+    // Verify events: RunStarted for 101 (in_progress), RunCompleted for 102 (already done).
+    // No RunStarted for 102 — it was already completed when discovered.
     let mut events = vec![];
     while let Ok(e) = rx.try_recv() {
         events.push(e);
     }
+    assert_eq!(events.len(), 2, "expected 2 events, got {events:?}");
     assert!(
-        events.len() >= 3,
-        "expected ≥3 events, got {}",
-        events.len()
+        matches!(&events[0], WatchEvent::RunStarted(s) if s.run_id == 101),
+        "expected RunStarted(101), got {:?}",
+        events[0]
+    );
+    assert!(
+        matches!(&events[1], WatchEvent::RunCompleted { run, .. } if run.run_id == 102),
+        "expected RunCompleted(102), got {:?}",
+        events[1]
     );
 
     handle.cancel.cancel();
@@ -902,6 +910,69 @@ async fn poll_active_runs_fetches_failing_steps() {
 }
 
 // -- Startup recovery --
+
+#[tokio::test]
+async fn check_for_new_runs_skips_already_active() {
+    let key = WatchKey::new("alice/app", "main");
+    // Run 101 is in_progress and already tracked as active.
+    // A stale last_seen_run_id (100) should NOT cause 101 to be re-emitted.
+    let runs = vec![
+        make_run(100, "completed", "success"),
+        make_run(101, "in_progress", ""),
+    ];
+    let gh = MockGitHub::with_runs(runs);
+    let watches: Watches = Arc::new(Mutex::new(HashMap::new()));
+    let config: SharedConfig = Arc::new(Mutex::new(Config::default()));
+    let rate_limit: RateLimitState = Arc::new(Mutex::new(None));
+    let handle = mock_handle(gh);
+
+    // Seed: last_seen=100, run 101 already in active_runs (e.g. from recovery).
+    {
+        let mut w = watches.lock().await;
+        w.insert(
+            key.clone(),
+            WatchEntry {
+                last_seen_run_id: 100,
+                active_runs: HashMap::from([(101, make_active("in_progress"))]),
+                failure_counts: HashMap::new(),
+                last_build: None,
+            },
+        );
+    }
+
+    let mut rx = handle.events.subscribe();
+    let poller = make_repo_poller("alice/app", &watches, &config, &rate_limit, &handle);
+    poller.check_for_new_runs_repo_wide().await;
+
+    // No events should be emitted — run 101 was already being tracked.
+    let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+    assert!(
+        events.is_empty(),
+        "expected no events for already-active run, got {} events",
+        events.len()
+    );
+
+    handle.cancel.cancel();
+}
+
+#[tokio::test]
+async fn record_completion_bumps_last_seen() {
+    let mut entry = WatchEntry {
+        last_seen_run_id: 50,
+        active_runs: HashMap::from([(100, make_active("in_progress"))]),
+        failure_counts: HashMap::new(),
+        last_build: None,
+    };
+    let run = make_run(100, "completed", "success");
+    entry.record_completion(&run, None, 999);
+
+    assert_eq!(
+        entry.last_seen_run_id, 100,
+        "record_completion should bump last_seen_run_id"
+    );
+    assert!(entry.active_runs.is_empty());
+    assert!(entry.last_build.is_some());
+}
 
 #[tokio::test]
 async fn recover_existing_watches_recovers_active_runs() {

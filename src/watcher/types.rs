@@ -168,6 +168,9 @@ impl WatchEntry {
             .remove(&run.id)
             .map(|a| a.started_at.elapsed());
         self.failure_counts.remove(&run.id);
+        // Bump high-water mark so check_for_new_runs doesn't re-discover
+        // this run as "new" after it completes.
+        self.last_seen_run_id = self.last_seen_run_id.max(run.id);
         let mut last_build = run.to_last_build();
         last_build.failing_steps = failing_steps;
         last_build.completed_at = Some(now_unix);
