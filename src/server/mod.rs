@@ -17,10 +17,11 @@ use tokio_util::sync::CancellationToken;
 
 use build_watcher::config::{NotificationLevel, state_dir, unix_now};
 use build_watcher::events::EventBus;
+use build_watcher::history::SharedHistory;
 use build_watcher::status::{ActiveRunView, LastBuildView, StatusResponse, WatchStatus};
 use build_watcher::watcher::{
-    PauseState, RateLimitState, SharedConfig, SharedHistory, WatchEntry, WatchKey, WatcherHandle,
-    Watches, collect_persisted,
+    PauseState, RateLimitState, SharedConfig, WatchEntry, WatchKey, WatcherHandle, Watches,
+    collect_persisted,
 };
 
 pub use mcp::BuildWatcher;
@@ -192,6 +193,7 @@ fn build_router(
             axum::routing::get(rest::get_defaults_handler).post(rest::set_defaults_handler),
         )
         .route("/history", get(rest::history_handler))
+        .route("/history/all", get(rest::history_all_handler))
         .route("/shutdown", axum::routing::post(rest::shutdown_handler))
         .with_state(app_state)
         .nest_service("/mcp", service)
@@ -253,9 +255,13 @@ pub async fn serve(
 
     handle.shutdown().await;
     let persisted = collect_persisted(&watches).await;
-    handle.persistence.save_watches(&persisted).await;
+    if let Err(e) = handle.persistence.save_watches(&persisted).await {
+        tracing::error!(error = %e, "Failed to save watches on shutdown");
+    }
     let hist = handle.history.lock().await.clone();
-    handle.persistence.save_history(&hist).await;
+    if let Err(e) = handle.persistence.save_history(&hist).await {
+        tracing::error!(error = %e, "Failed to save history on shutdown");
+    }
     let _ = std::fs::remove_file(&port_file);
     tracing::info!("State saved, goodbye.");
 

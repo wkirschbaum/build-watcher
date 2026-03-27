@@ -1,3 +1,5 @@
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use tokio::sync::broadcast;
 
 use serde::{Deserialize, Serialize};
@@ -75,20 +77,33 @@ pub enum WatchEvent {
 #[derive(Clone)]
 pub struct EventBus {
     tx: broadcast::Sender<WatchEvent>,
+    dropped: Arc<AtomicU64>,
 }
+
+use std::sync::Arc;
 
 impl EventBus {
     pub fn new() -> Self {
         let (tx, _) = broadcast::channel(CHANNEL_CAPACITY);
-        Self { tx }
+        Self {
+            tx,
+            dropped: Arc::new(AtomicU64::new(0)),
+        }
     }
 
     pub fn emit(&self, event: WatchEvent) {
-        let _ = self.tx.send(event);
+        if self.tx.send(event).is_err() {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<WatchEvent> {
         self.tx.subscribe()
+    }
+
+    /// Number of events emitted when no subscribers were listening.
+    pub fn dropped_count(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
     }
 }
 
@@ -218,5 +233,27 @@ mod tests {
             Ok(WatchEvent::RunStarted(s)) => assert_eq!(s.repo, "alice/app"),
             other => panic!("expected RunStarted, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn dropped_count_increments_without_subscribers() {
+        let bus = EventBus::new();
+        assert_eq!(bus.dropped_count(), 0);
+
+        // No subscribers — emit should count as dropped.
+        bus.emit(WatchEvent::RunStarted(snap()));
+        assert_eq!(bus.dropped_count(), 1);
+
+        bus.emit(WatchEvent::RunStarted(snap()));
+        assert_eq!(bus.dropped_count(), 2);
+    }
+
+    #[test]
+    fn dropped_count_zero_with_subscriber() {
+        let bus = EventBus::new();
+        let _rx = bus.subscribe();
+
+        bus.emit(WatchEvent::RunStarted(snap()));
+        assert_eq!(bus.dropped_count(), 0);
     }
 }

@@ -43,6 +43,22 @@ pub fn history_for(
     entries
 }
 
+/// Returns all builds across all repos/branches, sorted newest-first, limited to `limit`.
+pub fn history_all(history: &BuildHistory, limit: usize) -> Vec<(String, String, LastBuild)> {
+    let mut entries: Vec<(String, String, LastBuild)> = history
+        .iter()
+        .flat_map(|(key, builds)| {
+            builds
+                .iter()
+                .map(move |b| (key.repo.clone(), key.branch.clone(), b.clone()))
+        })
+        .collect();
+
+    entries.sort_by(|a, b| b.2.completed_at.cmp(&a.2.completed_at));
+    entries.truncate(limit);
+    entries
+}
+
 /// Persist `history` to disk, pruning each key to at most MAX_HISTORY entries on save.
 pub async fn save_history(history: &BuildHistory) {
     let pruned: BuildHistory = history

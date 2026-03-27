@@ -48,8 +48,8 @@ struct DbusProps {
     urgency: u8,
 }
 
-fn dbus_props(level: NotificationLevel) -> DbusProps {
-    match level {
+fn dbus_props(level: NotificationLevel) -> Option<DbusProps> {
+    Some(match level {
         NotificationLevel::Low => DbusProps {
             icon: "emblem-synchronizing",
             category: "transfer",
@@ -68,8 +68,8 @@ fn dbus_props(level: NotificationLevel) -> DbusProps {
             expire_ms: 0,
             urgency: 2,
         },
-        NotificationLevel::Off => unreachable!("Off is filtered before send()"),
-    }
+        NotificationLevel::Off => return None,
+    })
 }
 
 // -- D-Bus notifier --
@@ -101,7 +101,9 @@ impl Notifier for DbusNotifier {
     }
 
     fn send(&self, n: &Notification) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
-        let props = dbus_props(n.level);
+        let Some(props) = dbus_props(n.level) else {
+            return Box::pin(async {});
+        };
 
         let replaces_id = self
             .ids
@@ -231,8 +233,25 @@ pub async fn detect() -> Box<dyn Notifier> {
     match DbusNotifier::new().await {
         Ok(n) => Box::new(n),
         Err(e) => {
-            panic!("D-Bus session bus unavailable: {e}");
+            tracing::warn!("D-Bus session bus unavailable: {e}; notifications disabled");
+            Box::new(FallbackNotifier)
         }
+    }
+}
+
+/// Silent fallback when D-Bus is unavailable (headless, SSH, etc.).
+struct FallbackNotifier;
+
+impl Notifier for FallbackNotifier {
+    fn name(&self) -> &'static str {
+        "fallback(none)"
+    }
+
+    fn send(&self, n: &Notification) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        let title = n.title.clone();
+        Box::pin(async move {
+            tracing::debug!(title = %title, "Notification suppressed (no D-Bus)");
+        })
     }
 }
 
@@ -242,22 +261,24 @@ mod tests {
 
     #[test]
     fn dbus_props_by_level() {
-        let low = dbus_props(NotificationLevel::Low);
+        let low = dbus_props(NotificationLevel::Low).unwrap();
         assert_eq!(
             (low.icon, low.urgency, low.expire_ms),
             ("emblem-synchronizing", 0, 4000)
         );
 
-        let normal = dbus_props(NotificationLevel::Normal);
+        let normal = dbus_props(NotificationLevel::Normal).unwrap();
         assert_eq!(
             (normal.icon, normal.urgency, normal.expire_ms),
             ("emblem-ok", 1, 8000)
         );
 
-        let critical = dbus_props(NotificationLevel::Critical);
+        let critical = dbus_props(NotificationLevel::Critical).unwrap();
         assert_eq!(
             (critical.icon, critical.urgency, critical.expire_ms),
             ("dialog-error", 2, 0)
         );
+
+        assert!(dbus_props(NotificationLevel::Off).is_none());
     }
 }

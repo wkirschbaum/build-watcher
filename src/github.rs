@@ -523,6 +523,18 @@ pub fn validate_repo(repo: &str) -> Result<(), String> {
     Ok(())
 }
 
+// -- GitHub URLs --
+
+/// URL for a specific workflow run.
+pub fn run_url(repo: &str, run_id: u64) -> String {
+    format!("https://github.com/{repo}/actions/runs/{run_id}")
+}
+
+/// URL for a repository.
+pub fn repo_url(repo: &str) -> String {
+    format!("https://github.com/{repo}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -806,16 +818,4 @@ mod tests {
     fn extract_failing_steps_empty_jobs() {
         assert_eq!(extract_failing_steps(&[]), None);
     }
-}
-
-// -- GitHub URLs --
-
-/// URL for a specific workflow run.
-pub fn run_url(repo: &str, run_id: u64) -> String {
-    format!("https://github.com/{repo}/actions/runs/{run_id}")
-}
-
-/// URL for a repository.
-pub fn repo_url(repo: &str) -> String {
-    format!("https://github.com/{repo}")
 }

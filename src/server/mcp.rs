@@ -306,6 +306,11 @@ impl BuildWatcher {
             ));
         }
 
+        let dropped = self.handle.events.dropped_count();
+        if dropped > 0 {
+            lines.push(format!("  Dropped events   : {dropped}"));
+        }
+
         lines.push(String::new());
         lines.push(format!(
             "Config file : {}",

@@ -450,11 +450,11 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ignored_workflows: Vec<String>,
     #[serde(default)]
+    pub poll_aggression: PollAggression,
+    #[serde(default)]
     pub notifications: NotificationConfig,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quiet_hours: Option<QuietHours>,
-    #[serde(default)]
-    pub poll_aggression: PollAggression,
     #[serde(default)]
     pub repos: HashMap<String, RepoConfig>,
 }

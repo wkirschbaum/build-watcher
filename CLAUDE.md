@@ -30,16 +30,33 @@ cargo clippy                # Lint
 ### Key files
 
 - `src/main.rs` — Entry point, wires up config, watches, event bus, and server
-- `src/server.rs` — MCP tool handlers (`BuildWatcher` struct), axum router, REST endpoints (`/status`, `/stats`, `/events`, `/pause`, `/rerun`)
-- `src/watcher.rs` — Watch lifecycle, `Poller` task, state persistence, rate limiting
+- `src/server/` — Server module directory:
+  - `mod.rs` — App state, axum router setup, snapshot building
+  - `mcp.rs` — MCP tool handlers (`BuildWatcher` struct)
+  - `rest.rs` — REST/SSE endpoints (`/status`, `/stats`, `/events`, `/pause`, `/rerun`)
+  - `actions.rs` — MCP tool action implementations
+  - `schema.rs` — JSON schema definitions for tool parameters
+- `src/watcher/` — Watch lifecycle module directory:
+  - `mod.rs` — Type aliases (`Watches`, `SharedConfig`, etc.), `is_paused()`, `count_api_calls()`, `filter_runs()`, re-exports
+  - `types.rs` — `WatchKey`, `ActiveRun`, `WatchEntry`, `PersistedWatch`, persistence helpers, `last_failed_build()`
+  - `poller.rs` — `Poller` async task, poll loop, active run tracking, new run detection
+  - `startup.rs` — `WatcherHandle`, `start_watch()`, `startup_watches()`, recovery logic
+  - `tests.rs` — Mock GitHub client, unit and integration tests
 - `src/events.rs` — `EventBus` (broadcast channel), `WatchEvent` and `RunSnapshot` types (pure, no I/O)
 - `src/config.rs` — Config structs, crash-safe JSON persistence helpers
-- `src/github.rs` — `gh` CLI wrappers, `RunInfo`/`HistoryEntry` types, input validation
+- `src/github.rs` — `gh` CLI wrappers, `RunInfo`/`HistoryEntry` types, input validation, GitHub URL helpers
 - `src/format.rs` — Duration, age, and truncation formatting
+- `src/rate_limiter.rs` — API rate-limit budget computation and poll interval scaling
+- `src/history.rs` — Build history management (per repo/branch, capped ring buffer)
+- `src/persistence.rs` — `Persistence` trait abstraction (file I/O vs. null for tests)
 - `src/register.rs` — MCP server registration in `~/.claude.json` (invoked via `--register` flag)
 - `src/notification.rs` — Daemon-only notification handler; subscribes to the event bus and dispatches platform notifications
 - `src/status.rs` — Shared HTTP response types (`StatusResponse`, `StatsResponse`) used by both daemon and TUI
-- `src/bin/bw.rs` — `bw` TUI dashboard; SSE real-time updates, row selection, rerun/open/pause actions
+- `src/bin/bw/` — `bw` TUI dashboard module directory:
+  - `main.rs` — Entry point, terminal setup, event loop
+  - `app.rs` — App state, input handling, event application
+  - `client.rs` — HTTP client for daemon communication, SSE streaming
+  - `render.rs` — TUI rendering, display rows, sorting, grouping
 - `src/platform/` — `Notifier` trait + backends (Linux: D-Bus via `zbus`; macOS: `terminal-notifier` → `osascript` fallback)
 
 ### How it works
@@ -55,7 +72,7 @@ The `BuildWatcher` struct implements 10 MCP tools. When a repo is watched, it sp
 
 **Safe JSON writes:** Config and state are written via draft → verify → rename with automatic backups to prevent corruption.
 
-**Crate layout:** `src/lib.rs` exports `config`, `events`, `format`, `github`, `watcher` as the `build_watcher` library crate. The `build-watcher` daemon binary and the `bw` CLI binary both depend on this lib. Daemon-only code (`platform`, `notification`, `server`, `register`) stays in `src/*.rs` alongside `main.rs`.
+**Crate layout:** `src/lib.rs` exports `config`, `events`, `format`, `github`, `history`, `persistence`, `rate_limiter`, `status`, `watcher` as the `build_watcher` library crate. The `build-watcher` daemon binary and the `bw` CLI binary both depend on this lib. Daemon-only code (`platform/`, `notification.rs`, `server/`, `register.rs`) stays alongside `main.rs`.
 
 ## Design Principles
 

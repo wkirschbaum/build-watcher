@@ -10,9 +10,12 @@ use crate::watcher::{PersistedWatch, WatchKey};
 /// `FilePersistence` writes to disk; `NullPersistence` is a no-op for tests.
 #[async_trait]
 pub trait Persistence: Send + Sync {
-    async fn save_watches(&self, watches: &HashMap<WatchKey, PersistedWatch>);
+    async fn save_watches(
+        &self,
+        watches: &HashMap<WatchKey, PersistedWatch>,
+    ) -> Result<(), PersistError>;
     async fn save_config(&self, config: &Config) -> Result<(), PersistError>;
-    async fn save_history(&self, history: &BuildHistory);
+    async fn save_history(&self, history: &BuildHistory) -> Result<(), PersistError>;
 }
 
 /// Real persistence — writes JSON to the state/config directories.
@@ -20,26 +23,25 @@ pub struct FilePersistence;
 
 #[async_trait]
 impl Persistence for FilePersistence {
-    async fn save_watches(&self, watches: &HashMap<WatchKey, PersistedWatch>) {
+    async fn save_watches(
+        &self,
+        watches: &HashMap<WatchKey, PersistedWatch>,
+    ) -> Result<(), PersistError> {
         let path = config::state_dir().join("watches.json");
-        if let Err(e) = config::save_json_async(path, watches.clone()).await {
-            tracing::error!("Failed to save watches: {e}");
-        }
+        config::save_json_async(path, watches.clone()).await
     }
 
     async fn save_config(&self, config: &Config) -> Result<(), PersistError> {
         config::save_config_async(config).await
     }
 
-    async fn save_history(&self, history: &BuildHistory) {
+    async fn save_history(&self, history: &BuildHistory) -> Result<(), PersistError> {
         let pruned: BuildHistory = history
             .iter()
             .map(|(k, v)| (k.clone(), v.iter().take(MAX_HISTORY).cloned().collect()))
             .collect();
         let path = config::state_dir().join("history.json");
-        if let Err(e) = config::save_json_async(path, pruned).await {
-            tracing::error!("Failed to save history: {e}");
-        }
+        config::save_json_async(path, pruned).await
     }
 }
 
@@ -48,9 +50,16 @@ pub struct NullPersistence;
 
 #[async_trait]
 impl Persistence for NullPersistence {
-    async fn save_watches(&self, _watches: &HashMap<WatchKey, PersistedWatch>) {}
+    async fn save_watches(
+        &self,
+        _watches: &HashMap<WatchKey, PersistedWatch>,
+    ) -> Result<(), PersistError> {
+        Ok(())
+    }
     async fn save_config(&self, _config: &Config) -> Result<(), PersistError> {
         Ok(())
     }
-    async fn save_history(&self, _history: &BuildHistory) {}
+    async fn save_history(&self, _history: &BuildHistory) -> Result<(), PersistError> {
+        Ok(())
+    }
 }

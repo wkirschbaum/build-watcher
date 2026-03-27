@@ -41,12 +41,17 @@ pub(crate) async fn do_watch_builds(
     }
 
     if !started_repos.is_empty() {
-        handle
+        if let Err(e) = handle
             .persistence
             .save_watches(&collect_persisted(watches).await)
-            .await;
+            .await
+        {
+            tracing::error!(error = %e, "Failed to persist watches");
+        }
         let hist = handle.history.lock().await.clone();
-        handle.persistence.save_history(&hist).await;
+        if let Err(e) = handle.persistence.save_history(&hist).await {
+            tracing::error!(error = %e, "Failed to persist history");
+        }
         let snapshot = {
             let mut cfg = config.lock().await;
             cfg.add_repos(&started_repos);
@@ -81,10 +86,13 @@ pub(crate) async fn do_stop_watches(
             })
             .collect()
     };
-    handle
+    if let Err(e) = handle
         .persistence
         .save_watches(&collect_persisted(watches).await)
-        .await;
+        .await
+    {
+        tracing::error!(error = %e, "Failed to persist watches");
+    }
 
     let (snapshot, mut results) = {
         let mut cfg = config.lock().await;
@@ -160,10 +168,13 @@ pub(crate) async fn do_configure_branches(
         let rc = cfg.repos.entry(repo.to_string()).or_default();
         rc.branches = new_branches;
     }
-    handle
+    if let Err(e) = handle
         .persistence
         .save_watches(&collect_persisted(watches).await)
-        .await;
+        .await
+    {
+        tracing::error!(error = %e, "Failed to persist watches");
+    }
     let snapshot = config.lock().await.clone();
     if let Some(warning) = persist_config(&*handle.persistence, snapshot).await {
         results.push(warning);

@@ -14,7 +14,7 @@ path = "src/main.rs"
 
 [[bin]]
 name = "bw"
-path = "src/bin/bw.rs"
+path = "src/bin/bw/main.rs"
 
 [dependencies]
 rmcp = { version = "1", features = ["server", "transport-io", "transport-streamable-http-server", "macros"] }

@@ -250,7 +250,7 @@ mod tests {
     #[test]
     fn min_floors_never_violated() {
         // Even with a tiny budget, floors hold.
-        let rl = make_rl(1, 5000, 3600); // nearly exhausted
+        let _rl = make_rl(1, 5000, 3600); // nearly exhausted
         // Low: target=500. last=1, elapsed=3600 → own=3600 >> 500 → budget=0 → wait 3600.
         // Floor: max(15, 3600) = 3600 and max(60, 3600) = 3600. No floor violation.
         // Verify floors hold in free zone:

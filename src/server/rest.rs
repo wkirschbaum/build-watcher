@@ -13,7 +13,7 @@ use build_watcher::config::{
 };
 use build_watcher::events::WatchEvent;
 use build_watcher::github::{validate_branch, validate_repo};
-use build_watcher::history::history_for;
+use build_watcher::history::{history_all, history_for};
 use build_watcher::rate_limiter::compute_intervals;
 use build_watcher::status::{HistoryEntryView, StatsResponse};
 use build_watcher::watcher::{count_api_calls, is_paused};
@@ -82,6 +82,7 @@ pub(crate) async fn stats_handler(State(state): State<AppState>) -> axum::Json<S
         rate_remaining,
         rate_limit,
         rate_reset_mins,
+        dropped_events: state.events.dropped_count(),
     })
 }
 
@@ -427,24 +428,55 @@ pub(crate) async fn history_handler(
     drop(hist);
     let views: Vec<HistoryEntryView> = entries
         .into_iter()
-        .map(|(br, lb)| {
-            let title = lb.display_title();
-            let age_secs = lb.completed_at.map(|t| now.saturating_sub(t));
-            HistoryEntryView {
-                id: lb.run_id,
-                conclusion: lb.conclusion,
-                workflow: lb.workflow,
-                title,
-                branch: br,
-                event: lb.event,
-                created_at: String::new(),
-                updated_at: String::new(),
-                duration_secs: lb.duration_secs,
-                age_secs,
-            }
-        })
+        .map(|(br, lb)| to_history_view(String::new(), br, lb, now))
         .collect();
     axum::Json(views).into_response()
+}
+
+#[derive(Deserialize)]
+pub(crate) struct LimitQuery {
+    #[serde(default)]
+    limit: Option<u32>,
+}
+
+/// `GET /history/all` — Recent builds across all repos, ungrouped, newest-first.
+pub(crate) async fn history_all_handler(
+    State(state): State<AppState>,
+    Query(q): Query<LimitQuery>,
+) -> axum::response::Response {
+    let limit = q.limit.unwrap_or(20).min(50) as usize;
+    let now = unix_now();
+    let hist = state.history.lock().await;
+    let entries = history_all(&hist, limit);
+    drop(hist);
+    let views: Vec<HistoryEntryView> = entries
+        .into_iter()
+        .map(|(repo, branch, lb)| to_history_view(repo, branch, lb, now))
+        .collect();
+    axum::Json(views).into_response()
+}
+
+fn to_history_view(
+    repo: String,
+    branch: String,
+    lb: build_watcher::github::LastBuild,
+    now: u64,
+) -> HistoryEntryView {
+    let title = lb.display_title();
+    let age_secs = lb.completed_at.map(|t| now.saturating_sub(t));
+    HistoryEntryView {
+        id: lb.run_id,
+        conclusion: lb.conclusion,
+        workflow: lb.workflow,
+        title,
+        repo,
+        branch,
+        event: lb.event,
+        created_at: String::new(),
+        updated_at: String::new(),
+        duration_secs: lb.duration_secs,
+        age_secs,
+    }
 }
 
 #[cfg(test)]
@@ -801,12 +833,12 @@ mod tests {
         let mut body = resp.into_body();
         let frame_text = tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
-                if let Some(Ok(frame)) = body.frame().await {
-                    if let Ok(data) = frame.into_data() {
-                        let text = String::from_utf8_lossy(&data).into_owned();
-                        if !text.trim().is_empty() {
-                            return text;
-                        }
+                if let Some(Ok(frame)) = body.frame().await
+                    && let Ok(data) = frame.into_data()
+                {
+                    let text = String::from_utf8_lossy(&data).into_owned();
+                    if !text.trim().is_empty() {
+                        return text;
                     }
                 }
             }

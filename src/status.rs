@@ -57,6 +57,9 @@ pub struct HistoryEntryView {
     pub conclusion: String,
     pub workflow: String,
     pub title: String,
+    /// Repo in `owner/name` format (populated by `/history/all`, empty for per-repo `/history`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub repo: String,
     pub branch: String,
     pub event: String,
     pub created_at: String,
@@ -79,4 +82,7 @@ pub struct StatsResponse {
     pub rate_remaining: Option<u64>,
     pub rate_limit: Option<u64>,
     pub rate_reset_mins: Option<u64>,
+    /// Events emitted when no subscribers were listening.
+    #[serde(default)]
+    pub dropped_events: u64,
 }
