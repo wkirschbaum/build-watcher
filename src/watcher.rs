@@ -8,7 +8,7 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
-use crate::config::{Config, load_json, state_dir};
+use crate::config::{Config, load_json, state_dir, unix_now};
 use crate::events::{EventBus, RunSnapshot, WatchEvent};
 use crate::github::{GhError, GitHubClient, LastBuild, RateLimit, RunInfo};
 use crate::persistence::Persistence;
@@ -24,13 +24,10 @@ pub async fn is_paused(pause: &PauseState) -> bool {
     p.is_some_and(|deadline| Instant::now() < deadline)
 }
 
-/// Fastest permitted polling interval when active runs exist.
-pub const MIN_ACTIVE_SECS: u64 = 15;
-/// Fastest permitted polling interval when no active runs exist.
-pub const MIN_IDLE_SECS: u64 = 60;
-/// Fallback intervals used before the first rate-limit fetch succeeds.
-pub const FALLBACK_ACTIVE_SECS: u64 = 30;
-pub const FALLBACK_IDLE_SECS: u64 = 120;
+// Re-export rate-limiter constants so existing callers in server/ don't break.
+pub use crate::rate_limiter::{
+    FALLBACK_ACTIVE_SECS, FALLBACK_IDLE_SECS, MIN_ACTIVE_SECS, MIN_IDLE_SECS,
+};
 /// How often each poller refreshes the shared rate limit state.
 const RATE_LIMIT_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
@@ -45,56 +42,8 @@ pub fn count_api_calls(watches: &HashMap<WatchKey, WatchEntry>) -> u64 {
     base_calls + active_run_calls
 }
 
-/// Compute dynamic polling intervals based on the current GitHub rate limit.
-///
-/// `api_calls_per_cycle` is the total expected GitHub API calls per poll cycle
-/// across all watches (from `count_api_calls`). This accounts for both the
-/// base `gh run list` call per watch and the `gh run view` call per active run.
-///
-/// Strategy:
-/// - No data yet → conservative fallback.
-/// - More than 50% of the limit remains → floor speed scaled by call count.
-/// - Below 50% → throttle: spread the remaining budget evenly across the
-///   seconds until the window resets, then floor at MIN values.
-///
-/// The 50% threshold gives a comfortable safety margin: it lets polling run
-/// at full speed for the first half of the window, then gradually backs off
-/// so the remaining budget lasts exactly to the reset.
-///
-/// Above 50%, floor intervals scale as `MIN_*_SECS × (isqrt(calls))`
-/// — square-root growth keeps latency low for typical setups (≤10 watches)
-/// while gently slowing things down as the call count grows.
-pub fn compute_intervals(
-    rate_limit: Option<&RateLimit>,
-    api_calls_per_cycle: u64,
-    now: u64,
-) -> (u64, u64) {
-    let calls = api_calls_per_cycle.max(1);
-    let Some(rl) = rate_limit else {
-        return (FALLBACK_ACTIVE_SECS, FALLBACK_IDLE_SECS);
-    };
-
-    // Above 50%: scale floor intervals by sqrt(calls).
-    // 1 call → ×1, 2–3 → ×1, 4–8 → ×2, 9–15 → ×3, 16–24 → ×4, …
-    if rl.remaining * 2 > rl.limit {
-        let scale = (calls as f64).sqrt() as u64;
-        let scale = scale.max(1);
-        return (MIN_ACTIVE_SECS * scale, MIN_IDLE_SECS * scale);
-    }
-
-    let seconds_until_reset = rl.reset.saturating_sub(now).max(1);
-
-    // Spread remaining budget evenly: min_interval = calls * secs / remaining.
-    // checked_div handles remaining == 0 by waiting out the full reset window.
-    let rate_limited_secs = (calls * seconds_until_reset)
-        .checked_div(rl.remaining)
-        .unwrap_or(seconds_until_reset);
-
-    (
-        MIN_ACTIVE_SECS.max(rate_limited_secs),
-        MIN_IDLE_SECS.max(rate_limited_secs),
-    )
-}
+// Re-export for callers that previously imported compute_intervals from watcher.
+pub use crate::rate_limiter::compute_intervals;
 
 /// Runtime state for an in-progress run, including when we first saw it.
 #[derive(Debug, Clone)]
@@ -148,7 +97,13 @@ impl WatchKey {
     fn parse(s: &str) -> Self {
         match s.rsplit_once('#') {
             Some((repo, branch)) => Self::new(repo, branch),
-            None => Self::new(s, FALLBACK_BRANCH),
+            None => {
+                tracing::warn!(
+                    key = s,
+                    "Watch key missing #branch separator, falling back to '{FALLBACK_BRANCH}'"
+                );
+                Self::new(s, FALLBACK_BRANCH)
+            }
         }
     }
 
@@ -215,8 +170,6 @@ pub struct WatchEntry {
     pub active_runs: HashMap<u64, ActiveRun>,
     failure_counts: HashMap<u64, u8>,
     pub last_build: Option<LastBuild>,
-    /// When the last build completed (not persisted — `None` after daemon restart).
-    pub completed_at: Option<Instant>,
 }
 
 impl WatchEntry {
@@ -226,7 +179,6 @@ impl WatchEntry {
             active_runs: HashMap::new(),
             failure_counts: HashMap::new(),
             last_build: p.last_build,
-            completed_at: None,
         }
     }
 
@@ -245,6 +197,7 @@ impl WatchEntry {
         &mut self,
         run: &RunInfo,
         failing_steps: Option<String>,
+        now_unix: u64,
     ) -> Option<Duration> {
         let elapsed = self
             .active_runs
@@ -253,8 +206,8 @@ impl WatchEntry {
         self.failure_counts.remove(&run.id);
         let mut last_build = run.to_last_build();
         last_build.failing_steps = failing_steps;
+        last_build.completed_at = Some(now_unix);
         self.last_build = Some(last_build);
-        self.completed_at = Some(Instant::now());
         elapsed
     }
 
@@ -292,17 +245,18 @@ impl WatchEntry {
 
     /// Incorporate newly discovered runs. Iterate oldest-first so the newest completed
     /// run ends up as `last_build`.
-    fn incorporate_new_runs(&mut self, new_runs: &[&RunInfo]) {
+    fn incorporate_new_runs(&mut self, new_runs: &[&RunInfo], now: Instant, now_unix: u64) {
         if let Some(max_id) = new_runs.iter().map(|r| r.id).max() {
             self.last_seen_run_id = max_id;
         }
         for run in new_runs.iter().rev() {
             if run.is_completed() {
-                self.last_build = Some(run.to_last_build());
-                self.completed_at = Some(Instant::now());
+                let mut lb = run.to_last_build();
+                lb.completed_at = Some(now_unix);
+                self.last_build = Some(lb);
             } else {
                 self.active_runs
-                    .insert(run.id, ActiveRun::from_run(run, Instant::now()));
+                    .insert(run.id, ActiveRun::from_run(run, now));
             }
         }
     }
@@ -413,12 +367,16 @@ pub async fn start_watch(
         )
     };
 
+    let last_build = last_completed.map(|r| {
+        let mut lb = (*r).to_last_build();
+        lb.completed_at = Some(unix_now());
+        lb
+    });
     let entry = WatchEntry {
         last_seen_run_id: max_id,
         active_runs: active,
         failure_counts: HashMap::new(),
-        last_build: last_completed.map(|r| (*r).to_last_build()),
-        completed_at: last_completed.map(|_| now),
+        last_build,
     };
 
     {
@@ -452,6 +410,7 @@ fn spawn_poller(
         events: handle.events.clone(),
         github: handle.github.clone(),
         persistence: handle.persistence.clone(),
+        last_active_secs: 0,
     };
     handle.tracker.spawn(poller.run());
 }
@@ -484,6 +443,9 @@ struct Poller {
     events: EventBus,
     github: Arc<dyn GitHubClient>,
     persistence: Arc<dyn Persistence>,
+    /// Last computed active poll interval, used to back-project our own API call count.
+    /// Zero on the first cycle (conservative: all of `rl.used` attributed to external).
+    last_active_secs: u64,
 }
 
 /// Snapshot of config values needed for a poll cycle.
@@ -522,7 +484,7 @@ impl Poller {
     /// - No active runs: check for new runs every `idle_secs` (slow, ~60s)
     /// New-run checks always happen at least every `idle_secs`, even during active polling.
     #[tracing::instrument(skip_all, fields(key = %self.key))]
-    async fn run(self) {
+    async fn run(mut self) {
         let repo = self.key.repo.clone();
         let branch = self.key.branch.clone();
         let mut last_new_run_check: Option<Instant> = None;
@@ -553,6 +515,7 @@ impl Poller {
             };
 
             let pcfg = self.read_config(&repo).await;
+            self.last_active_secs = pcfg.active_secs;
             let delay = if has_active {
                 pcfg.active_secs
             } else {
@@ -595,9 +558,14 @@ impl Poller {
             let w = self.watches.lock().await;
             count_api_calls(&w)
         };
-        let (active_secs, idle_secs) =
-            compute_intervals(rate_limit.as_ref(), api_calls, crate::config::unix_now());
         let cfg = self.config.lock().await;
+        let (active_secs, idle_secs) = compute_intervals(
+            rate_limit.as_ref(),
+            api_calls,
+            crate::config::unix_now(),
+            cfg.poll_aggression,
+            self.last_active_secs,
+        );
         PollConfig {
             active_secs,
             idle_secs,
@@ -697,7 +665,7 @@ impl Poller {
 
                 let mut w = self.watches.lock().await;
                 if let Some(entry) = w.get_mut(&self.key) {
-                    entry.record_completion(&run, failing_steps);
+                    entry.record_completion(&run, failing_steps, unix_now());
                 }
                 changed = true;
             } else {
@@ -795,7 +763,7 @@ impl Poller {
             if let Some(entry) = w.get_mut(&self.key) {
                 // Incorporate only filtered runs for active tracking, but bump
                 // high-water mark from all unseen runs to avoid re-checking.
-                entry.incorporate_new_runs(&new_runs);
+                entry.incorporate_new_runs(&new_runs, Instant::now(), unix_now());
                 // Backfill failing_steps for whichever run became last_build.
                 if let Some(ref mut lb) = entry.last_build
                     && let Some(steps) = failing_steps_by_id.get(&lb.run_id)
@@ -1000,7 +968,6 @@ mod tests {
             ]),
             failure_counts: HashMap::new(),
             last_build: None,
-            completed_at: None,
         }
     }
 
@@ -1048,7 +1015,7 @@ mod tests {
         let mut entry = make_entry();
         let run = make_run(101, "completed", "success");
 
-        let elapsed = entry.record_completion(&run, None);
+        let elapsed = entry.record_completion(&run, None, 0);
 
         // Active run was present, so elapsed should be Some
         assert!(elapsed.is_some());
@@ -1061,7 +1028,7 @@ mod tests {
         let mut entry = make_entry();
         let run = make_run(999, "completed", "success");
 
-        let elapsed = entry.record_completion(&run, None);
+        let elapsed = entry.record_completion(&run, None, 0);
 
         assert!(elapsed.is_none());
     }
@@ -1071,7 +1038,7 @@ mod tests {
         let mut entry = make_entry();
         let run = make_run(101, "completed", "success");
 
-        entry.record_completion(&run, None);
+        entry.record_completion(&run, None, 0);
 
         assert!(!entry.active_runs.contains_key(&101));
         assert!(entry.active_runs.contains_key(&102));
@@ -1085,7 +1052,7 @@ mod tests {
         let mut entry = make_entry();
         let run = make_run(101, "completed", "failure");
 
-        entry.record_completion(&run, Some("Build / Run tests".to_string()));
+        entry.record_completion(&run, Some("Build / Run tests".to_string()), 0);
 
         let lb = entry.last_build.unwrap();
         assert_eq!(lb.failing_steps.as_deref(), Some("Build / Run tests"));
@@ -1097,7 +1064,7 @@ mod tests {
         entry.failure_counts.insert(101, 3);
         let run = make_run(101, "completed", "failure");
 
-        entry.record_completion(&run, None);
+        entry.record_completion(&run, None, 0);
 
         assert!(!entry.failure_counts.contains_key(&101));
     }
@@ -1178,7 +1145,7 @@ mod tests {
         let run = make_run(200, "in_progress", "");
         let new_runs: Vec<&RunInfo> = vec![&run];
 
-        entry.incorporate_new_runs(&new_runs);
+        entry.incorporate_new_runs(&new_runs, Instant::now(), 0);
 
         assert_eq!(entry.last_seen_run_id, 200);
         assert_eq!(entry.active_runs[&200].status, "in_progress");
@@ -1191,7 +1158,7 @@ mod tests {
         let run = make_run(200, "completed", "success");
         let new_runs: Vec<&RunInfo> = vec![&run];
 
-        entry.incorporate_new_runs(&new_runs);
+        entry.incorporate_new_runs(&new_runs, Instant::now(), 0);
 
         assert_eq!(entry.last_seen_run_id, 200);
         assert!(!entry.active_runs.contains_key(&200));
@@ -1205,7 +1172,7 @@ mod tests {
         let new = make_run(201, "completed", "success");
         let new_runs: Vec<&RunInfo> = vec![&new, &old];
 
-        entry.incorporate_new_runs(&new_runs);
+        entry.incorporate_new_runs(&new_runs, Instant::now(), 0);
 
         assert_eq!(entry.last_seen_run_id, 201);
         let lb = entry.last_build.unwrap();
@@ -1220,7 +1187,7 @@ mod tests {
         let active = make_run(201, "in_progress", "");
         let new_runs: Vec<&RunInfo> = vec![&active, &completed];
 
-        entry.incorporate_new_runs(&new_runs);
+        entry.incorporate_new_runs(&new_runs, Instant::now(), 0);
 
         assert_eq!(entry.last_seen_run_id, 201);
         assert_eq!(entry.active_runs[&201].status, "in_progress");
@@ -1241,7 +1208,7 @@ mod tests {
     fn persisted_roundtrip_preserves_fields() {
         let mut entry = make_entry();
         let run = make_run(101, "completed", "success");
-        entry.record_completion(&run, None);
+        entry.record_completion(&run, None, 0);
 
         let persisted = entry.to_persisted();
         let restored = WatchEntry::from_persisted(persisted);
@@ -1315,7 +1282,7 @@ mod tests {
         let mut watches = HashMap::new();
         let mut entry = make_entry();
         let run = make_run(200, "completed", "failure");
-        entry.record_completion(&run, None);
+        entry.record_completion(&run, None, 0);
         watches.insert(WatchKey::new("alice/app", "main"), entry);
 
         let result = last_failed_build(&watches, "alice/app");
@@ -1331,7 +1298,7 @@ mod tests {
         let mut watches = HashMap::new();
         let mut entry = make_entry();
         let run = make_run(200, "completed", "success");
-        entry.record_completion(&run, None);
+        entry.record_completion(&run, None, 0);
         watches.insert(WatchKey::new("alice/app", "main"), entry);
 
         assert!(last_failed_build(&watches, "alice/app").is_none());
@@ -1343,12 +1310,12 @@ mod tests {
 
         let mut entry1 = make_entry();
         let run1 = make_run(100, "completed", "failure");
-        entry1.record_completion(&run1, None);
+        entry1.record_completion(&run1, None, 0);
         watches.insert(WatchKey::new("alice/app", "main"), entry1);
 
         let mut entry2 = make_entry();
         let run2 = make_run(200, "completed", "failure");
-        entry2.record_completion(&run2, None);
+        entry2.record_completion(&run2, None, 0);
         watches.insert(WatchKey::new("alice/app", "develop"), entry2);
 
         let (_, build) = last_failed_build(&watches, "alice/app").unwrap();
@@ -1360,94 +1327,13 @@ mod tests {
         let mut watches = HashMap::new();
         let mut entry = make_entry();
         let run = make_run(200, "completed", "failure");
-        entry.record_completion(&run, None);
+        entry.record_completion(&run, None, 0);
         watches.insert(WatchKey::new("bob/other", "main"), entry);
 
         assert!(last_failed_build(&watches, "alice/app").is_none());
     }
 
-    // -- compute_intervals --
-
-    const T: u64 = 1_000_000; // fixed "now" for deterministic tests
-
-    fn make_rate_limit(remaining: u64, limit: u64, secs_until_reset: u64) -> RateLimit {
-        RateLimit {
-            limit,
-            remaining,
-            reset: T + secs_until_reset,
-            used: limit.saturating_sub(remaining),
-        }
-    }
-
-    #[test]
-    fn compute_intervals_no_data_returns_fallback() {
-        let (active, idle) = compute_intervals(None, 1, T);
-        assert_eq!(active, FALLBACK_ACTIVE_SECS);
-        assert_eq!(idle, FALLBACK_IDLE_SECS);
-    }
-
-    #[test]
-    fn compute_intervals_above_threshold_scales_with_call_count() {
-        let rl = make_rate_limit(3000, 5000, 3600); // 60% remaining — above 50%
-
-        // 1 api call: sqrt(1) = 1 → bare floor
-        let (active, idle) = compute_intervals(Some(&rl), 1, T);
-        assert_eq!(active, MIN_ACTIVE_SECS);
-        assert_eq!(idle, MIN_IDLE_SECS);
-
-        // 3 api calls: sqrt(3) = 1 → ×1
-        let (active, idle) = compute_intervals(Some(&rl), 3, T);
-        assert_eq!(active, MIN_ACTIVE_SECS);
-        assert_eq!(idle, MIN_IDLE_SECS);
-
-        // 6 api calls: sqrt(6) = 2 → ×2
-        let (active, idle) = compute_intervals(Some(&rl), 6, T);
-        assert_eq!(active, MIN_ACTIVE_SECS * 2);
-        assert_eq!(idle, MIN_IDLE_SECS * 2);
-
-        // 10 api calls: sqrt(10) = 3 → ×3
-        let (active, idle) = compute_intervals(Some(&rl), 10, T);
-        assert_eq!(active, MIN_ACTIVE_SECS * 3);
-        assert_eq!(idle, MIN_IDLE_SECS * 3);
-    }
-
-    #[test]
-    fn compute_intervals_below_threshold_throttles() {
-        // At 50%: floors dominate for 1 call
-        let rl50 = make_rate_limit(2500, 5000, 3600);
-        assert_eq!(compute_intervals(Some(&rl50), 1, T), (15, 60));
-
-        // At 10%: still floors for 1 call (rate_limited = 3600/500 = 7s < floors)
-        let rl10 = make_rate_limit(500, 5000, 3600);
-        assert_eq!(compute_intervals(Some(&rl10), 1, T), (15, 60));
-    }
-
-    #[test]
-    fn compute_intervals_scales_with_call_count() {
-        // 500/5000 remaining, 10 api calls (e.g. 5 watches + 5 active runs), 3600s
-        // rate_limited = (10 * 3600) / 500 = 72s
-        let rl = make_rate_limit(500, 5000, 3600);
-        let (active, idle) = compute_intervals(Some(&rl), 10, T);
-        assert_eq!(active, 72);
-        assert_eq!(idle, 72);
-    }
-
-    #[test]
-    fn compute_intervals_zero_remaining_waits_for_reset() {
-        let rl = make_rate_limit(0, 5000, 3600);
-        let (active, idle) = compute_intervals(Some(&rl), 1, T);
-        assert_eq!(active, 3600);
-        assert_eq!(idle, 3600);
-    }
-
-    #[test]
-    fn compute_intervals_zero_calls_treated_as_one() {
-        let rl = make_rate_limit(500, 5000, 3600);
-        let (a0, i0) = compute_intervals(Some(&rl), 0, T);
-        let (a1, i1) = compute_intervals(Some(&rl), 1, T);
-        assert_eq!(a0, a1);
-        assert_eq!(i0, i1);
-    }
+    // -- count_api_calls --
 
     #[test]
     fn count_api_calls_reflects_active_runs() {
@@ -1462,14 +1348,12 @@ mod tests {
             active_runs,
             failure_counts: HashMap::new(),
             last_build: None,
-            completed_at: None,
         };
         let entry2 = WatchEntry {
             last_seen_run_id: 100,
             active_runs: HashMap::new(),
             failure_counts: HashMap::new(),
             last_build: None,
-            completed_at: None,
         };
         watches.insert(WatchKey::new("owner/repo1", "main"), entry1);
         watches.insert(WatchKey::new("owner/repo2", "main"), entry2);
@@ -1575,6 +1459,7 @@ mod tests {
             events: handle.events.clone(),
             github: handle.github.clone(),
             persistence: handle.persistence.clone(),
+            last_active_secs: 0,
         }
     }
 
@@ -1665,7 +1550,6 @@ mod tests {
                     active_runs: HashMap::new(),
                     failure_counts: HashMap::new(),
                     last_build: None,
-                    completed_at: None,
                 },
             );
         }
@@ -1728,7 +1612,6 @@ mod tests {
                     active_runs: HashMap::new(),
                     failure_counts: HashMap::new(),
                     last_build: None,
-                    completed_at: None,
                 },
             );
         }
@@ -1775,7 +1658,6 @@ mod tests {
                 active_runs: HashMap::new(),
                 failure_counts: HashMap::new(),
                 last_build: None,
-                completed_at: None,
             };
             entry.active_runs.insert(101, make_active("in_progress"));
             w.insert(key.clone(), entry);
@@ -1823,7 +1705,6 @@ mod tests {
                 active_runs: HashMap::new(),
                 failure_counts: HashMap::new(),
                 last_build: None,
-                completed_at: None,
             };
             entry.active_runs.insert(101, make_active("queued"));
             w.insert(key.clone(), entry);
@@ -1868,7 +1749,6 @@ mod tests {
                 active_runs: HashMap::new(),
                 failure_counts: HashMap::new(),
                 last_build: None,
-                completed_at: None,
             };
             entry.active_runs.insert(101, make_active("in_progress"));
             w.insert(key.clone(), entry);
@@ -1920,7 +1800,6 @@ mod tests {
                     active_runs: HashMap::new(),
                     failure_counts: HashMap::new(),
                     last_build: None,
-                    completed_at: None,
                 },
             );
         }

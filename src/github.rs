@@ -84,6 +84,9 @@ pub struct LastBuild {
     /// Populated when the run failed; `None` for successful builds or older persisted state.
     #[serde(default)]
     pub failing_steps: Option<String>,
+    /// Unix timestamp (seconds) when this build completed. Persisted so age survives restarts.
+    #[serde(default)]
+    pub completed_at: Option<u64>,
 }
 
 impl LastBuild {
@@ -167,7 +170,7 @@ impl RunInfo {
     }
 
     pub fn url(&self, repo: &str) -> String {
-        format!("https://github.com/{repo}/actions/runs/{}", self.id)
+        run_url(repo, self.id)
     }
 
     pub fn to_last_build(&self) -> LastBuild {
@@ -179,6 +182,7 @@ impl RunInfo {
             head_sha: self.head_sha.clone(),
             event: self.event.clone(),
             failing_steps: None,
+            completed_at: None,
         }
     }
 }

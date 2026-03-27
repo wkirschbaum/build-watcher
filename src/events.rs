@@ -35,10 +35,7 @@ impl RunSnapshot {
     }
 
     pub fn url(&self) -> String {
-        format!(
-            "https://github.com/{}/actions/runs/{}",
-            self.repo, self.run_id
-        )
+        crate::github::run_url(&self.repo, self.run_id)
     }
 
     pub fn display_title(&self) -> String {

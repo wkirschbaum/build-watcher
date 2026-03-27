@@ -73,6 +73,9 @@ pub struct StatsResponse {
     pub uptime_secs: u64,
     pub active_poll_secs: u64,
     pub idle_poll_secs: u64,
+    /// Current poll aggression level: "low", "medium", or "high".
+    #[serde(default)]
+    pub poll_aggression: String,
     pub rate_remaining: Option<u64>,
     pub rate_limit: Option<u64>,
     pub rate_reset_mins: Option<u64>,

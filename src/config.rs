@@ -262,6 +262,76 @@ impl NotificationLevel {
     }
 }
 
+// -- Poll aggression --
+
+/// Controls how aggressively the poller consumes the GitHub API rate-limit budget.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum PollAggression {
+    /// Target ≤10% of the rate-limit per reset window.
+    Low,
+    /// Target ≤25% of the rate-limit per reset window (default).
+    #[default]
+    Medium,
+    /// Target ≤50% of the rate-limit per reset window.
+    High,
+}
+
+impl<'de> Deserialize<'de> for PollAggression {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        Ok(match s.to_lowercase().as_str() {
+            "low" => Self::Low,
+            "medium" => Self::Medium,
+            "high" => Self::High,
+            other => {
+                tracing::warn!("config: unknown poll_aggression {other:?}, using 'medium'");
+                Self::Medium
+            }
+        })
+    }
+}
+
+impl std::fmt::Display for PollAggression {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Low => write!(f, "low"),
+            Self::Medium => write!(f, "medium"),
+            Self::High => write!(f, "high"),
+        }
+    }
+}
+
+impl PollAggression {
+    const ALL: &[Self] = &[Self::Low, Self::Medium, Self::High];
+
+    /// Advance to the next level, wrapping around.
+    pub fn next(self) -> Self {
+        let idx = Self::ALL.iter().position(|&v| v == self).unwrap_or(1);
+        Self::ALL[(idx + 1) % Self::ALL.len()]
+    }
+
+    /// Retreat to the previous level, wrapping around.
+    pub fn prev(self) -> Self {
+        let idx = Self::ALL.iter().position(|&v| v == self).unwrap_or(1);
+        Self::ALL[(idx + Self::ALL.len() - 1) % Self::ALL.len()]
+    }
+
+    /// The fraction of the GitHub rate-limit budget this level targets per window.
+    pub fn target_fraction(self) -> f64 {
+        match self {
+            Self::Low => 0.10,
+            Self::Medium => 0.25,
+            Self::High => 0.50,
+        }
+    }
+
+    /// The number of API calls this level allows per rate-limit window.
+    pub fn target_calls(self, limit: u64) -> u64 {
+        (self.target_fraction() * limit as f64) as u64
+    }
+}
+
 /// Per-event notification levels.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(clippy::struct_field_names)] // `build_` prefix is intentional domain naming
@@ -290,6 +360,29 @@ impl NotificationOverrides {
     pub fn is_empty(&self) -> bool {
         self.build_started.is_none() && self.build_success.is_none() && self.build_failure.is_none()
     }
+}
+
+/// Which level of the config hierarchy provided a notification level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotificationSource {
+    Global,
+    Repo,
+    Branch,
+}
+
+/// A resolved notification level together with its origin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExplainedNotification {
+    pub level: NotificationLevel,
+    pub source: NotificationSource,
+}
+
+/// Fully resolved notification config with provenance for each field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExplainedNotificationConfig {
+    pub build_started: ExplainedNotification,
+    pub build_success: ExplainedNotification,
+    pub build_failure: ExplainedNotification,
 }
 
 fn default_normal() -> NotificationLevel {
@@ -343,8 +436,15 @@ pub struct RepoConfig {
     pub branch_notifications: HashMap<String, BranchConfig>,
 }
 
+/// Current schema version. Bump when making breaking changes to the config format.
+pub const CURRENT_SCHEMA_VERSION: u32 = 1;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
+    /// Schema version for forward-compatible migrations. Old files without this
+    /// field deserialize as 0; `load_and_normalize` migrates them to `CURRENT_SCHEMA_VERSION`.
+    #[serde(default)]
+    pub schema_version: u32,
     #[serde(default = "default_branches")]
     pub default_branches: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -353,6 +453,8 @@ pub struct Config {
     pub notifications: NotificationConfig,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quiet_hours: Option<QuietHours>,
+    #[serde(default)]
+    pub poll_aggression: PollAggression,
     #[serde(default)]
     pub repos: HashMap<String, RepoConfig>,
 }
@@ -364,10 +466,12 @@ fn default_branches() -> Vec<String> {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            schema_version: CURRENT_SCHEMA_VERSION,
             default_branches: default_branches(),
             ignored_workflows: Vec::new(),
             notifications: NotificationConfig::default(),
             quiet_hours: None,
+            poll_aggression: PollAggression::default(),
             repos: HashMap::new(),
         }
     }
@@ -394,6 +498,47 @@ impl Config {
         };
 
         NotificationConfig {
+            build_started: resolve(|o| o.build_started, global.build_started),
+            build_success: resolve(|o| o.build_success, global.build_success),
+            build_failure: resolve(|o| o.build_failure, global.build_failure),
+        }
+    }
+
+    /// Like `notifications_for`, but also reports which config level provided each value.
+    pub fn notifications_for_explained(
+        &self,
+        repo: &str,
+        branch: &str,
+    ) -> ExplainedNotificationConfig {
+        let global = &self.notifications;
+        let repo_cfg = self.repos.get(repo);
+        let repo_notif = repo_cfg.map(|r| &r.notifications);
+        let branch_notif = repo_cfg
+            .and_then(|r| r.branch_notifications.get(branch))
+            .map(|b| &b.notifications);
+
+        let resolve = |get_field: fn(&NotificationOverrides) -> Option<NotificationLevel>,
+                       global_val: NotificationLevel|
+         -> ExplainedNotification {
+            if let Some(level) = branch_notif.and_then(get_field) {
+                ExplainedNotification {
+                    level,
+                    source: NotificationSource::Branch,
+                }
+            } else if let Some(level) = repo_notif.and_then(get_field) {
+                ExplainedNotification {
+                    level,
+                    source: NotificationSource::Repo,
+                }
+            } else {
+                ExplainedNotification {
+                    level: global_val,
+                    source: NotificationSource::Global,
+                }
+            }
+        };
+
+        ExplainedNotificationConfig {
             build_started: resolve(|o| o.build_started, global.build_started),
             build_success: resolve(|o| o.build_success, global.build_success),
             build_failure: resolve(|o| o.build_failure, global.build_failure),
@@ -577,6 +722,18 @@ fn load_config() -> (Config, bool) {
 /// the primary with backup data before the user has a chance to inspect it.
 pub fn load_and_normalize() -> Config {
     let (mut cfg, should_resave) = load_config();
+    let mut needs_save = should_resave;
+
+    // Migrate from v0 (files saved before schema_version existed).
+    if cfg.schema_version < CURRENT_SCHEMA_VERSION {
+        tracing::info!(
+            from = cfg.schema_version,
+            to = CURRENT_SCHEMA_VERSION,
+            "Migrating config schema"
+        );
+        cfg.schema_version = CURRENT_SCHEMA_VERSION;
+        needs_save = true;
+    }
 
     if cfg.default_branches.is_empty() {
         tracing::warn!(
@@ -586,7 +743,7 @@ pub fn load_and_normalize() -> Config {
         cfg.default_branches = default_branches();
     }
 
-    if should_resave && let Err(e) = save_config(&cfg) {
+    if needs_save && let Err(e) = save_config(&cfg) {
         tracing::error!("Failed to save config on startup: {e}");
     }
     cfg
@@ -704,6 +861,39 @@ mod tests {
         assert_eq!(n.build_started, NotificationLevel::Off); // from branch
         assert_eq!(n.build_success, NotificationLevel::Critical); // from branch
         assert_eq!(n.build_failure, NotificationLevel::Low); // from repo (branch is None)
+    }
+
+    #[test]
+    fn notifications_for_explained_tracks_sources() {
+        let mut config = Config::default();
+        let mut branch_notifications = HashMap::new();
+        branch_notifications.insert(
+            "release".to_string(),
+            BranchConfig {
+                notifications: NotificationOverrides {
+                    build_started: Some(NotificationLevel::Off),
+                    ..Default::default()
+                },
+            },
+        );
+        config.repos.insert(
+            "alice/app".to_string(),
+            RepoConfig {
+                notifications: NotificationOverrides {
+                    build_failure: Some(NotificationLevel::Low),
+                    ..Default::default()
+                },
+                branch_notifications,
+                ..Default::default()
+            },
+        );
+        let e = config.notifications_for_explained("alice/app", "release");
+        assert_eq!(e.build_started.level, NotificationLevel::Off);
+        assert_eq!(e.build_started.source, NotificationSource::Branch);
+        assert_eq!(e.build_success.level, NotificationLevel::Normal);
+        assert_eq!(e.build_success.source, NotificationSource::Global);
+        assert_eq!(e.build_failure.level, NotificationLevel::Low);
+        assert_eq!(e.build_failure.source, NotificationSource::Repo);
     }
 
     #[test]
@@ -977,5 +1167,20 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn schema_version_defaults_to_zero_for_old_configs() {
+        let cfg: Config = serde_json::from_str(r#"{"default_branches": ["main"]}"#).unwrap();
+        assert_eq!(cfg.schema_version, 0);
+    }
+
+    #[test]
+    fn schema_version_round_trips() {
+        let cfg = Config::default();
+        assert_eq!(cfg.schema_version, CURRENT_SCHEMA_VERSION);
+        let json = serde_json::to_string(&cfg).unwrap();
+        let loaded: Config = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.schema_version, CURRENT_SCHEMA_VERSION);
     }
 }

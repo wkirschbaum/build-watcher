@@ -24,9 +24,9 @@ pub async fn run_notification_handler(
                 // avoid holding two locks simultaneously.
                 let paused = is_paused(&pause).await;
 
-                // Extract what we need from config and drop the lock before
-                // dispatching the notification (which performs async I/O).
-                let cfg_snapshot = {
+                // Extract only what we need from config (level + repo label)
+                // and drop the lock before dispatching (which performs async I/O).
+                let dispatch = {
                     let cfg = config.lock().await;
                     let level = effective_level(&event, &cfg);
                     let suppressed = level == NotificationLevel::Off
@@ -35,11 +35,14 @@ pub async fn run_notification_handler(
                     if suppressed {
                         None
                     } else {
-                        Some((cfg.clone(), level))
+                        let repo_label = event_repo(&event)
+                            .map(|r| cfg.short_repo(r).to_string())
+                            .unwrap_or_default();
+                        Some((repo_label, level))
                     }
                 };
-                if let Some((cfg, level)) = &cfg_snapshot {
-                    handle_notification(event, cfg, *level).await;
+                if let Some((repo_label, level)) = &dispatch {
+                    handle_notification(event, repo_label, *level).await;
                 }
             }
             Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -50,6 +53,15 @@ pub async fn run_notification_handler(
                 break;
             }
         }
+    }
+}
+
+/// Extract the repo name from an event, if applicable.
+fn event_repo(event: &WatchEvent) -> Option<&str> {
+    match event {
+        WatchEvent::RunStarted(run) => Some(&run.repo),
+        WatchEvent::RunCompleted { run, .. } => Some(&run.repo),
+        WatchEvent::StatusChanged { .. } => None,
     }
 }
 
@@ -71,10 +83,9 @@ pub(crate) fn effective_level(event: &WatchEvent, cfg: &config::Config) -> Notif
     }
 }
 
-async fn handle_notification(event: WatchEvent, cfg: &config::Config, level: NotificationLevel) {
+async fn handle_notification(event: WatchEvent, repo_label: &str, level: NotificationLevel) {
     match event {
         WatchEvent::RunStarted(run) => {
-            let repo_label = cfg.short_repo(&run.repo);
             platform::send(platform::Notification {
                 title: format!("🔨 started: {} | {}", repo_label, run.workflow),
                 body: format!("[{}] {}", run.branch, run.display_title()),
@@ -92,7 +103,6 @@ async fn handle_notification(event: WatchEvent, cfg: &config::Config, level: Not
             failing_steps,
         } => {
             let succeeded = conclusion == "success";
-            let repo_label = cfg.short_repo(&run.repo);
 
             let (emoji, status) = if succeeded {
                 ("✅", "succeeded")
