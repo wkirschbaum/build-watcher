@@ -5,10 +5,6 @@ use crate::github::RateLimit;
 pub const MIN_ACTIVE_SECS: u64 = 15;
 /// Fastest permitted polling interval when no active runs exist.
 pub const MIN_IDLE_SECS: u64 = 30;
-/// Fallback active interval (Medium) before the first rate-limit fetch succeeds.
-pub const FALLBACK_ACTIVE_SECS: u64 = 30;
-/// Fallback idle interval (Medium) before the first rate-limit fetch succeeds.
-pub const FALLBACK_IDLE_SECS: u64 = 60;
 
 /// Assumed GitHub rate-limit window in seconds.
 const WINDOW_SECS: u64 = 3600;
@@ -101,11 +97,10 @@ pub fn compute_intervals(
 }
 
 fn fallback_intervals(aggression: PollAggression) -> (u64, u64) {
-    match aggression {
-        PollAggression::Low => (45, 120),
-        PollAggression::Medium => (FALLBACK_ACTIVE_SECS, FALLBACK_IDLE_SECS),
-        PollAggression::High => (MIN_ACTIVE_SECS, MIN_IDLE_SECS),
-    }
+    let m = aggression.interval_multiplier();
+    let active = ((MIN_ACTIVE_SECS as f64) * m) as u64;
+    let idle = ((MIN_IDLE_SECS as f64) * m) as u64;
+    (active.max(MIN_ACTIVE_SECS), idle.max(MIN_IDLE_SECS))
 }
 
 #[cfg(test)]
@@ -130,15 +125,15 @@ mod tests {
     fn fallback_by_aggression() {
         assert_eq!(
             compute_intervals(None, 1, T, PollAggression::Low, 0),
-            (45, 120)
+            (105, 210) // 15×7, 30×7
         );
         assert_eq!(
             compute_intervals(None, 1, T, PollAggression::Medium, 0),
-            (FALLBACK_ACTIVE_SECS, FALLBACK_IDLE_SECS)
+            (30, 60) // 15×2, 30×2
         );
         assert_eq!(
             compute_intervals(None, 1, T, PollAggression::High, 0),
-            (MIN_ACTIVE_SECS, MIN_IDLE_SECS)
+            (MIN_ACTIVE_SECS, MIN_IDLE_SECS) // 15×1, 30×1
         );
     }
 
@@ -146,7 +141,7 @@ mod tests {
 
     #[test]
     fn free_zone_high_aggression_at_floor() {
-        // High aggression (mult=1.0): target = 50% of 5000 = 2500. own_calls=0 → free zone → floor.
+        // High aggression (mult=1.0): target = 70% of 5000 = 3500. own_calls=0 → free zone → floor.
         let rl = make_rl(5000, 5000, 3600);
         let (active, idle) = compute_intervals(Some(&rl), 1, T, PollAggression::High, 0);
         assert_eq!(active, MIN_ACTIVE_SECS);
@@ -155,20 +150,20 @@ mod tests {
 
     #[test]
     fn free_zone_medium_aggression_scaled() {
-        // Medium aggression (mult=1.5): free zone → floor × 1.5.
+        // Medium aggression (mult=2.0): free zone → floor × 2.
         let rl = make_rl(5000, 5000, 3600);
         let (active, idle) = compute_intervals(Some(&rl), 1, T, PollAggression::Medium, 0);
-        assert_eq!(active, (MIN_ACTIVE_SECS as f64 * 1.5) as u64); // 22
-        assert_eq!(idle, (MIN_IDLE_SECS as f64 * 1.5) as u64); // 45
+        assert_eq!(active, (MIN_ACTIVE_SECS as f64 * 2.0) as u64); // 30
+        assert_eq!(idle, (MIN_IDLE_SECS as f64 * 2.0) as u64); // 60
     }
 
     #[test]
     fn free_zone_low_aggression_scaled() {
-        // Low aggression (mult=3.0): free zone → floor × 3.
+        // Low aggression (mult=7.0): free zone → floor × 7.
         let rl = make_rl(5000, 5000, 3600);
         let (active, idle) = compute_intervals(Some(&rl), 1, T, PollAggression::Low, 0);
-        assert_eq!(active, MIN_ACTIVE_SECS * 3); // 45
-        assert_eq!(idle, MIN_IDLE_SECS * 3); // 90
+        assert_eq!(active, MIN_ACTIVE_SECS * 7); // 105
+        assert_eq!(idle, MIN_IDLE_SECS * 7); // 210
     }
 
     #[test]
@@ -182,8 +177,8 @@ mod tests {
 
     #[test]
     fn free_zone_while_own_calls_under_half_target() {
-        // High: target = 2500. If we're 1800s into a 3600s window polling at 30s
-        // intervals with 1 call/cycle → own_calls = 1800/30 * 1 = 60. 60*2=120 < 2500 → free.
+        // High: target = 3500. If we're 1800s into a 3600s window polling at 30s
+        // intervals with 1 call/cycle → own_calls = 1800/30 * 1 = 60. 60*2=120 < 3500 → free.
         let rl = make_rl(4000, 5000, 1800);
         let last = 30;
         let (active, idle) = compute_intervals(Some(&rl), 1, T, PollAggression::High, last);
@@ -226,22 +221,22 @@ mod tests {
 
     #[test]
     fn external_usage_reduces_available_budget() {
-        // High: target = 50% of 5000 = 2500. Window half elapsed (1800s left).
-        // Own: last=60, elapsed=1800, 1 call → own = 30. 30*2=60 < 2500 → free zone.
+        // High: target = 70% of 5000 = 3500. Window half elapsed (1800s left).
+        // Own: last=60, elapsed=1800, 1 call → own = 30. 30*2=60 < 3500 → free zone.
         // Now add heavy external usage so remaining is very low:
         // remaining=100, used=4900. external_used = 4900 - 30 = 4870.
         // projected_ext = 4870 / 1800 * 1800 = 4870 → available = 100 - 4870 = 0 (saturating).
-        // effective_budget = min(0, 2500-30) = 0 → wait.
-        // But own_calls*2 < target_calls → would normally be free zone. Check: 30*2=60 < 2500 yes.
+        // effective_budget = min(0, 3500-30) = 0 → wait.
+        // But own_calls*2 < target_calls → would normally be free zone. Check: 30*2=60 < 3500 yes.
         // The free-zone check doesn't verify available_to_us, so let me re-read the algorithm...
         // Actually in the free zone we return immediately without checking effective_budget.
         // So this test should be in throttle zone. Let me push own_calls past the threshold.
-        // High: target=2500. Need own_calls*2 >= 2500 → own_calls >= 1250.
-        // last=1, elapsed=1800 → own = 1800. 1800*2=3600 >= 2500 → throttle.
+        // High: target=3500. Need own_calls*2 >= 3500 → own_calls >= 1750.
+        // last=1, elapsed=1800 → own = 1800. 1800*2=3600 >= 3500 → throttle.
         let rl = make_rl(100, 5000, 1800); // remaining=100, used=4900
         // own = 1800/1 * 1 = 1800. external_used = 4900 - 1800 = 3100.
         // projected_ext = 3100 / 1800 * 1800 = 3100. available = 100 - 3100 = 0 (saturating).
-        // our_remaining_quota = 2500 - 1800 = 700. effective_budget = min(0, 700) = 0 → wait.
+        // our_remaining_quota = 3500 - 1800 = 1700. effective_budget = min(0, 1700) = 0 → wait.
         let (active, idle) = compute_intervals(Some(&rl), 1, T, PollAggression::High, 1);
         assert_eq!(active, 1800);
         assert_eq!(idle, 1800);
