@@ -484,8 +484,8 @@ const NUM_GAPS: usize = 5; // 6 columns → 5 gaps
 
 // Fixed column widths (content is bounded, no truncation needed).
 const BRANCH_W: usize = 12;
-const STATUS_W: usize = 18;
-const AGE_W: usize = 14;
+const STATUS_W: usize = 15;
+const AGE_W: usize = 10;
 const FIXED_W: usize = BRANCH_W + STATUS_W + AGE_W + NUM_GAPS * COL_SPACING as usize;
 
 /// Variable column widths computed from terminal width.
@@ -497,9 +497,9 @@ pub(crate) struct ColWidths {
 
 impl ColWidths {
     pub(crate) fn from_terminal_width(w: u16) -> Self {
-        // Remaining space split among repo, workflow, title (30% / 25% / 45%).
+        // Remaining space split among repo, workflow, title (20% / 25% / 55%).
         let remaining = (w as usize).saturating_sub(FIXED_W);
-        let repo = (remaining * 30 / 100).max(10);
+        let repo = (remaining * 20 / 100).max(10);
         let workflow = (remaining * 25 / 100).max(8);
         let title = remaining.saturating_sub(repo + workflow).max(8);
 
@@ -625,11 +625,12 @@ pub(crate) fn render_header(frame: &mut ratatui::Frame, area: ratatui::layout::R
     frame.render_widget(Paragraph::new(vec![line1, line2, line3]), area);
 }
 
-pub(crate) fn render_body(
+pub(crate) fn render_body<'a>(
     frame: &mut ratatui::Frame,
     heading_area: ratatui::layout::Rect,
     body_area: ratatui::layout::Rect,
     app: &App,
+    flat: &FlatRows<'a>,
     cw: &ColWidths,
 ) {
     let header_style = Style::default()
@@ -655,13 +656,6 @@ pub(crate) fn render_body(
         hdr("ELAPSED / AGE", SortColumn::Age),
     ]);
 
-    let sorted = sorted_watches(
-        &app.status.watches,
-        app.sort_column,
-        app.sort_ascending,
-        app.group_by,
-    );
-    let flat = flatten_rows(&sorted, app.group_by, &app.collapsed);
     let selected_display_idx = flat
         .selectable
         .get(app.selected)
@@ -748,7 +742,7 @@ fn render_display_row<'a>(
             muted,
             newest_age,
         } => {
-            let arrow = if *collapsed { "▶" } else { "▼" };
+            let arrow = if *collapsed { "›" } else { "⌄" };
             let name = format!("{arrow} {}{}", short_repo(repo), mute_indicator(*muted));
             let count_label = if *branch_count == 1 {
                 "1 branch".to_string()
@@ -979,16 +973,15 @@ pub(crate) fn render(frame: &mut ratatui::Frame, app: &App) {
     let area = frame.area();
     let cw = ColWidths::from_terminal_width(area.width);
 
-    // Count rows in the main table to give it an exact height.
+    // Sort and flatten watches once for the entire render pass.
     let sorted = sorted_watches(
         &app.status.watches,
         app.sort_column,
         app.sort_ascending,
         app.group_by,
     );
-    let table_rows = flatten_rows(&sorted, app.group_by, &app.collapsed)
-        .rows
-        .len() as u16;
+    let flat = flatten_rows(&sorted, app.group_by, &app.collapsed);
+    let table_rows = flat.rows.len() as u16;
 
     let recent_count = app.recent_history.len();
     let recent_height = recent_count.min(10) as u16;
@@ -1022,7 +1015,7 @@ pub(crate) fn render(frame: &mut ratatui::Frame, app: &App) {
     };
 
     render_header(frame, chunks[0], app);
-    render_body(frame, chunks[1], chunks[2], app, &cw);
+    render_body(frame, chunks[1], chunks[2], app, &flat, &cw);
     if show_recent {
         render_recent_panel(frame, chunks[4], chunks[5], app, &cw);
         render_footer(frame, chunks[7], app);

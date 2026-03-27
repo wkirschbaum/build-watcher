@@ -16,6 +16,20 @@ pub trait Persistence: Send + Sync {
     ) -> Result<(), PersistError>;
     async fn save_config(&self, config: &Config) -> Result<(), PersistError>;
     async fn save_history(&self, history: &BuildHistory) -> Result<(), PersistError>;
+
+    /// Save both watches and history together. Logs errors without failing.
+    async fn save_state(
+        &self,
+        watches: &HashMap<WatchKey, PersistedWatch>,
+        history: &BuildHistory,
+    ) {
+        if let Err(e) = self.save_watches(watches).await {
+            tracing::error!(error = %e, "Failed to persist watches");
+        }
+        if let Err(e) = self.save_history(history).await {
+            tracing::error!(error = %e, "Failed to persist history");
+        }
+    }
 }
 
 /// Real persistence — writes JSON to the state/config directories.

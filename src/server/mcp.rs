@@ -5,7 +5,7 @@ use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, Content, Implementation, ServerCapabilities, ServerInfo};
 use rmcp::{ErrorData as McpError, ServerHandler, tool, tool_handler, tool_router};
 
-use build_watcher::config::{PollAggression, QuietHours, config_dir, unix_now};
+use build_watcher::config::{PollAggression, config_dir, unix_now};
 use build_watcher::format;
 use build_watcher::github::{validate_branch, validate_repo};
 use build_watcher::history::history_for;
@@ -16,8 +16,8 @@ use build_watcher::watcher::{
 };
 
 use super::actions::{
-    apply_notification_levels, apply_notification_overrides, do_configure_branches,
-    do_stop_watches, do_watch_builds, persist_config, validate_hhmm,
+    apply_notification_levels, apply_notification_overrides, apply_pause, apply_quiet_hours,
+    do_configure_branches, do_stop_watches, do_watch_builds, persist_config, validate_hhmm,
 };
 use super::build_watch_snapshot;
 use super::schema::{
@@ -689,34 +689,7 @@ impl BuildWatcher {
 
         // Pause / resume
         if let Some(pause) = params.pause {
-            let mut p = self.pause.lock().await;
-            if pause {
-                let msg = match params.pause_minutes {
-                    Some(mins) if mins > 0 => {
-                        *p = Some(
-                            tokio::time::Instant::now() + std::time::Duration::from_secs(mins * 60),
-                        );
-                        format!("Notifications paused for {mins} minutes")
-                    }
-                    _ => {
-                        const INDEFINITE: u64 = u32::MAX as u64;
-                        *p = Some(
-                            tokio::time::Instant::now()
-                                + std::time::Duration::from_secs(INDEFINITE),
-                        );
-                        "Notifications paused indefinitely".to_string()
-                    }
-                };
-                msgs.push(msg);
-            } else {
-                let was_paused = p.is_some_and(|d| tokio::time::Instant::now() < d);
-                *p = None;
-                msgs.push(if was_paused {
-                    "Notifications resumed".to_string()
-                } else {
-                    "Notifications were not paused".to_string()
-                });
-            }
+            msgs.push(apply_pause(&self.pause, pause, params.pause_minutes).await);
         }
 
         // Quiet hours + notification levels (both touch config)
@@ -725,18 +698,12 @@ impl BuildWatcher {
                 let mut config = self.config.lock().await;
 
                 // Quiet hours
-                if params.quiet_clear == Some(true) {
-                    config.quiet_hours = None;
-                    msgs.push("Quiet hours cleared".to_string());
-                } else if has_quiet {
-                    let start = params.quiet_start.as_deref().unwrap_or("22:00").to_string();
-                    let end = params.quiet_end.as_deref().unwrap_or("06:00").to_string();
-                    config.quiet_hours = Some(QuietHours {
-                        start: start.clone(),
-                        end: end.clone(),
-                    });
-                    msgs.push(format!("Quiet hours set: {start}–{end} (local time)"));
-                }
+                msgs.extend(apply_quiet_hours(
+                    &mut config,
+                    params.quiet_start.as_deref(),
+                    params.quiet_end.as_deref(),
+                    params.quiet_clear == Some(true),
+                ));
 
                 // Notification levels
                 let (scope, effective) = if has_levels {

@@ -375,29 +375,6 @@ impl NotificationOverrides {
     }
 }
 
-/// Which level of the config hierarchy provided a notification level.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NotificationSource {
-    Global,
-    Repo,
-    Branch,
-}
-
-/// A resolved notification level together with its origin.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ExplainedNotification {
-    pub level: NotificationLevel,
-    pub source: NotificationSource,
-}
-
-/// Fully resolved notification config with provenance for each field.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ExplainedNotificationConfig {
-    pub build_started: ExplainedNotification,
-    pub build_success: ExplainedNotification,
-    pub build_failure: ExplainedNotification,
-}
-
 fn default_normal() -> NotificationLevel {
     NotificationLevel::Normal
 }
@@ -511,47 +488,6 @@ impl Config {
         };
 
         NotificationConfig {
-            build_started: resolve(|o| o.build_started, global.build_started),
-            build_success: resolve(|o| o.build_success, global.build_success),
-            build_failure: resolve(|o| o.build_failure, global.build_failure),
-        }
-    }
-
-    /// Like `notifications_for`, but also reports which config level provided each value.
-    pub fn notifications_for_explained(
-        &self,
-        repo: &str,
-        branch: &str,
-    ) -> ExplainedNotificationConfig {
-        let global = &self.notifications;
-        let repo_cfg = self.repos.get(repo);
-        let repo_notif = repo_cfg.map(|r| &r.notifications);
-        let branch_notif = repo_cfg
-            .and_then(|r| r.branch_notifications.get(branch))
-            .map(|b| &b.notifications);
-
-        let resolve = |get_field: fn(&NotificationOverrides) -> Option<NotificationLevel>,
-                       global_val: NotificationLevel|
-         -> ExplainedNotification {
-            if let Some(level) = branch_notif.and_then(get_field) {
-                ExplainedNotification {
-                    level,
-                    source: NotificationSource::Branch,
-                }
-            } else if let Some(level) = repo_notif.and_then(get_field) {
-                ExplainedNotification {
-                    level,
-                    source: NotificationSource::Repo,
-                }
-            } else {
-                ExplainedNotification {
-                    level: global_val,
-                    source: NotificationSource::Global,
-                }
-            }
-        };
-
-        ExplainedNotificationConfig {
             build_started: resolve(|o| o.build_started, global.build_started),
             build_success: resolve(|o| o.build_success, global.build_success),
             build_failure: resolve(|o| o.build_failure, global.build_failure),
@@ -896,39 +832,6 @@ mod tests {
         assert_eq!(n.build_started, NotificationLevel::Off); // from branch
         assert_eq!(n.build_success, NotificationLevel::Critical); // from branch
         assert_eq!(n.build_failure, NotificationLevel::Low); // from repo (branch is None)
-    }
-
-    #[test]
-    fn notifications_for_explained_tracks_sources() {
-        let mut config = Config::default();
-        let mut branch_notifications = HashMap::new();
-        branch_notifications.insert(
-            "release".to_string(),
-            BranchConfig {
-                notifications: NotificationOverrides {
-                    build_started: Some(NotificationLevel::Off),
-                    ..Default::default()
-                },
-            },
-        );
-        config.repos.insert(
-            "alice/app".to_string(),
-            RepoConfig {
-                notifications: NotificationOverrides {
-                    build_failure: Some(NotificationLevel::Low),
-                    ..Default::default()
-                },
-                branch_notifications,
-                ..Default::default()
-            },
-        );
-        let e = config.notifications_for_explained("alice/app", "release");
-        assert_eq!(e.build_started.level, NotificationLevel::Off);
-        assert_eq!(e.build_started.source, NotificationSource::Branch);
-        assert_eq!(e.build_success.level, NotificationLevel::Normal);
-        assert_eq!(e.build_success.source, NotificationSource::Global);
-        assert_eq!(e.build_failure.level, NotificationLevel::Low);
-        assert_eq!(e.build_failure.source, NotificationSource::Repo);
     }
 
     #[test]

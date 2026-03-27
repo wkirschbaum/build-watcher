@@ -258,13 +258,8 @@ pub async fn serve(
 
     handle.shutdown().await;
     let persisted = collect_persisted(&watches).await;
-    if let Err(e) = handle.persistence.save_watches(&persisted).await {
-        tracing::error!(error = %e, "Failed to save watches on shutdown");
-    }
     let hist = handle.history.lock().await.clone();
-    if let Err(e) = handle.persistence.save_history(&hist).await {
-        tracing::error!(error = %e, "Failed to save history on shutdown");
-    }
+    handle.persistence.save_state(&persisted, &hist).await;
     let _ = std::fs::remove_file(&port_file);
     tracing::info!("State saved, goodbye.");
 

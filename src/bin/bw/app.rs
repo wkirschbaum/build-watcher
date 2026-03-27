@@ -92,8 +92,9 @@ macro_rules! impl_cycle {
 }
 
 /// How to group rows in the watch list.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum GroupBy {
+    #[default]
     Org,
     Branch,
     Workflow,
@@ -131,8 +132,9 @@ impl GroupBy {
 }
 
 /// Column used for sorting the watch list.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum SortColumn {
+    #[default]
     Repo,
     Branch,
     Status,
@@ -151,20 +153,28 @@ impl_cycle!(
     ]
 );
 
-/// Persisted TUI preferences (sort/group state).
+fn default_true() -> bool {
+    true
+}
+
+/// Persisted TUI preferences (sort/group/collapse state).
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(default)]
 pub(crate) struct TuiPrefs {
     pub(crate) sort_column: SortColumn,
+    #[serde(default = "default_true")]
     pub(crate) sort_ascending: bool,
     pub(crate) group_by: GroupBy,
+    pub(crate) collapsed: HashSet<String>,
 }
 
 impl Default for TuiPrefs {
     fn default() -> Self {
         Self {
-            sort_column: SortColumn::Repo,
+            sort_column: SortColumn::default(),
             sort_ascending: true,
-            group_by: GroupBy::Org,
+            group_by: GroupBy::default(),
+            collapsed: HashSet::new(),
         }
     }
 }
@@ -181,9 +191,15 @@ impl TuiPrefs {
             .unwrap_or_default()
     }
 
+    /// Atomic write: serialize → write to .tmp → rename over target.
     pub(crate) fn save(&self) {
-        if let Ok(json) = serde_json::to_string_pretty(self) {
-            let _ = std::fs::write(Self::path(), json);
+        let path = Self::path();
+        let tmp = path.with_extension("json.tmp");
+        let Ok(json) = serde_json::to_string_pretty(self) else {
+            return;
+        };
+        if std::fs::write(&tmp, &json).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
         }
     }
 }
@@ -249,10 +265,14 @@ impl App {
     }
 
     fn save_prefs(&self) {
+        // Only persist collapsed repos that are still being watched.
+        let watched: HashSet<String> = self.status.watches.iter().map(|w| w.repo.clone()).collect();
+        let collapsed = self.collapsed.intersection(&watched).cloned().collect();
         TuiPrefs {
             sort_column: self.sort_column,
             sort_ascending: self.sort_ascending,
             group_by: self.group_by,
+            collapsed,
         }
         .save();
     }
@@ -623,6 +643,7 @@ impl App {
                     } else {
                         self.collapsed.insert(repo);
                     }
+                    self.save_prefs();
                 }
             }
             KeyCode::Left if !is_repo_row => {
@@ -637,6 +658,7 @@ impl App {
                     }) {
                         self.selected = pos;
                     }
+                    self.save_prefs();
                 }
             }
             KeyCode::Tab | KeyCode::Char('e') => {
@@ -647,6 +669,7 @@ impl App {
                     } else {
                         self.collapsed.insert(repo);
                     }
+                    self.save_prefs();
                 }
             }
             KeyCode::BackTab | KeyCode::Char('E') => {
@@ -658,6 +681,7 @@ impl App {
                 } else {
                     self.collapsed.clear();
                 }
+                self.save_prefs();
             }
             KeyCode::Char('a') => {
                 self.input_mode = InputMode::TextInput {

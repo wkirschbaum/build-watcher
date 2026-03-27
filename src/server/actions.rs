@@ -41,17 +41,9 @@ pub(crate) async fn do_watch_builds(
     }
 
     if !started_repos.is_empty() {
-        if let Err(e) = handle
-            .persistence
-            .save_watches(&collect_persisted(watches).await)
-            .await
-        {
-            tracing::error!(error = %e, "Failed to persist watches");
-        }
+        let persisted = collect_persisted(watches).await;
         let hist = handle.history.lock().await.clone();
-        if let Err(e) = handle.persistence.save_history(&hist).await {
-            tracing::error!(error = %e, "Failed to persist history");
-        }
+        handle.persistence.save_state(&persisted, &hist).await;
         let snapshot = {
             let mut cfg = config.lock().await;
             cfg.add_repos(&started_repos);
@@ -168,11 +160,8 @@ pub(crate) async fn do_configure_branches(
         let rc = cfg.repos.entry(repo.to_string()).or_default();
         rc.branches = new_branches;
     }
-    if let Err(e) = handle
-        .persistence
-        .save_watches(&collect_persisted(watches).await)
-        .await
-    {
+    let persisted = collect_persisted(watches).await;
+    if let Err(e) = handle.persistence.save_watches(&persisted).await {
         tracing::error!(error = %e, "Failed to persist watches");
     }
     let snapshot = config.lock().await.clone();
@@ -321,6 +310,59 @@ pub(crate) fn do_notification_action(
 }
 
 /// Validate a time string in HH:MM (24-hour) format.
+/// Apply pause/resume to the pause state. Returns a human-readable message.
+pub(crate) async fn apply_pause(
+    pause: &build_watcher::watcher::PauseState,
+    do_pause: bool,
+    minutes: Option<u64>,
+) -> String {
+    let mut p = pause.lock().await;
+    if do_pause {
+        match minutes {
+            Some(mins) if mins > 0 => {
+                *p = Some(tokio::time::Instant::now() + std::time::Duration::from_secs(mins * 60));
+                format!("Notifications paused for {mins} minutes")
+            }
+            _ => {
+                const INDEFINITE: u64 = u32::MAX as u64;
+                *p = Some(tokio::time::Instant::now() + std::time::Duration::from_secs(INDEFINITE));
+                "Notifications paused indefinitely".to_string()
+            }
+        }
+    } else {
+        let was_paused = p.is_some_and(|d| tokio::time::Instant::now() < d);
+        *p = None;
+        if was_paused {
+            "Notifications resumed".to_string()
+        } else {
+            "Notifications were not paused".to_string()
+        }
+    }
+}
+
+/// Apply quiet hours changes to config. Returns messages describing what changed.
+pub(crate) fn apply_quiet_hours(
+    config: &mut build_watcher::config::Config,
+    quiet_start: Option<&str>,
+    quiet_end: Option<&str>,
+    quiet_clear: bool,
+) -> Vec<String> {
+    let mut msgs = Vec::new();
+    if quiet_clear {
+        config.quiet_hours = None;
+        msgs.push("Quiet hours cleared".to_string());
+    } else if quiet_start.is_some() || quiet_end.is_some() {
+        let start = quiet_start.unwrap_or("22:00").to_string();
+        let end = quiet_end.unwrap_or("06:00").to_string();
+        config.quiet_hours = Some(build_watcher::config::QuietHours {
+            start: start.clone(),
+            end: end.clone(),
+        });
+        msgs.push(format!("Quiet hours set: {start}–{end} (local time)"));
+    }
+    msgs
+}
+
 pub(crate) fn validate_hhmm(s: &str) -> Result<(), String> {
     let Some((h, m)) = s.split_once(':') else {
         return Err(format!("{s:?} is not HH:MM format (e.g. \"22:00\")"));

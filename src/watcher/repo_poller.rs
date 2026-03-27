@@ -93,12 +93,12 @@ impl RepoPoller {
             let w = self.watches.lock().await;
             super::count_api_calls(&w)
         };
-        let cfg = self.config.lock().await;
+        let aggression = self.config.lock().await.poll_aggression;
         compute_intervals(
             rate_limit.as_ref(),
             api_calls,
             unix_now(),
-            cfg.poll_aggression,
+            aggression,
             self.last_active_secs,
         )
     }
@@ -259,6 +259,8 @@ impl RepoPoller {
             }
         }
 
+        let found_in_batch = found_runs.len();
+
         // Fallback: individually check missing runs, capped to avoid rate-limit exhaustion.
         if missing_runs.len() > MAX_FALLBACK_CALLS {
             tracing::warn!(
@@ -268,23 +270,27 @@ impl RepoPoller {
                 "Too many runs missing from batch, capping fallback calls"
             );
         }
+        let mut fallback_errors: Vec<(u64, WatchKey, crate::github::GhError)> = Vec::new();
         for (run_id, key) in missing_runs.iter().take(MAX_FALLBACK_CALLS) {
             if self.token.is_cancelled() {
                 return;
             }
             match self.github.run_status(&self.repo, *run_id).await {
-                Ok(run) => {
-                    found_runs.push((run, key.clone()));
-                    let mut w = self.watches.lock().await;
-                    if let Some(entry) = w.get_mut(key) {
-                        entry.clear_failure_count(*run_id);
-                    }
+                Ok(run) => found_runs.push((run, key.clone())),
+                Err(e) => fallback_errors.push((*run_id, key.clone(), e)),
+            }
+        }
+        // Apply all fallback results in a single lock acquisition.
+        {
+            let mut w = self.watches.lock().await;
+            for (run, key) in &found_runs[found_in_batch..] {
+                if let Some(entry) = w.get_mut(key) {
+                    entry.clear_failure_count(run.id);
                 }
-                Err(e) => {
-                    let mut w = self.watches.lock().await;
-                    if let Some(entry) = w.get_mut(key) {
-                        entry.record_failure(*run_id, &e);
-                    }
+            }
+            for (run_id, key, e) in &fallback_errors {
+                if let Some(entry) = w.get_mut(key) {
+                    entry.record_failure(*run_id, e);
                 }
             }
         }
@@ -310,14 +316,12 @@ impl RepoPoller {
                     self.github.failing_steps(&self.repo, run.id).await
                 };
 
-                if self.has_any_watches().await {
-                    self.events.emit(WatchEvent::RunCompleted {
-                        run: RunSnapshot::from_run_info(run, &self.repo, &key.branch),
-                        conclusion: run.conclusion.clone(),
-                        elapsed,
-                        failing_steps: failing_steps.clone(),
-                    });
-                }
+                self.events.emit(WatchEvent::RunCompleted {
+                    run: RunSnapshot::from_run_info(run, &self.repo, &key.branch),
+                    conclusion: run.conclusion.clone(),
+                    elapsed,
+                    failing_steps: failing_steps.clone(),
+                });
 
                 tracing::info!(
                     key = %key, run_id = run.id,
@@ -355,13 +359,8 @@ impl RepoPoller {
 
         if changed {
             let persisted = collect_persisted(&self.watches).await;
-            if let Err(e) = self.persistence.save_watches(&persisted).await {
-                tracing::error!(repo = %self.repo, error = %e, "Failed to persist watches");
-            }
             let hist = self.history.lock().await.clone();
-            if let Err(e) = self.persistence.save_history(&hist).await {
-                tracing::error!(repo = %self.repo, error = %e, "Failed to persist history");
-            }
+            self.persistence.save_state(&persisted, &hist).await;
         }
     }
 
@@ -413,10 +412,6 @@ impl RepoPoller {
             let new_runs = filter_runs(&unseen_as_owned, &bpcfg.workflows, &bpcfg.ignored);
             if new_runs.is_empty() && unseen.is_empty() {
                 continue;
-            }
-
-            if !self.has_any_watches().await {
-                return;
             }
 
             // Collect failing_steps for already-completed runs.
@@ -490,13 +485,8 @@ impl RepoPoller {
 
         if any_changed {
             let persisted = collect_persisted(&self.watches).await;
-            if let Err(e) = self.persistence.save_watches(&persisted).await {
-                tracing::error!(repo = %self.repo, error = %e, "Failed to persist watches");
-            }
             let hist = self.history.lock().await.clone();
-            if let Err(e) = self.persistence.save_history(&hist).await {
-                tracing::error!(repo = %self.repo, error = %e, "Failed to persist history");
-            }
+            self.persistence.save_state(&persisted, &hist).await;
         }
     }
 }
