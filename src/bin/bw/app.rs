@@ -7,7 +7,7 @@ use crossterm::event::{KeyCode, KeyModifiers};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
-use build_watcher::config::{NotificationLevel, state_dir};
+use build_watcher::config::{NOTIFICATION_EVENT_COUNT, NotificationLevel, state_dir};
 use build_watcher::events::WatchEvent;
 use build_watcher::github::{repo_url, run_url, validate_branch, validate_repo};
 use build_watcher::status::{
@@ -400,10 +400,11 @@ impl App {
                         self.input_mode = InputMode::Normal;
                     }
                     KeyCode::Tab | KeyCode::Down => {
-                        *active = (*active + 1) % 3;
+                        *active = (*active + 1) % NOTIFICATION_EVENT_COUNT;
                     }
                     KeyCode::BackTab | KeyCode::Up => {
-                        *active = (*active + 2) % 3;
+                        *active =
+                            (*active + NOTIFICATION_EVENT_COUNT - 1) % NOTIFICATION_EVENT_COUNT;
                     }
                     KeyCode::Right | KeyCode::Char(' ') => {
                         levels[*active] = levels[*active].next();
@@ -506,6 +507,36 @@ impl App {
             d.set_defaults(Some(branches), Some(workflows), aggression)
                 .await
                 .map(|()| "Config saved".to_string())
+        });
+    }
+
+    /// Open the build history popup for a repo, optionally scoped to a branch.
+    fn open_history(&mut self, daemon: &DaemonClient, repo: &str, branch: Option<&str>) {
+        let d = daemon.clone();
+        let repo = repo.to_string();
+        let branch_owned = branch.map(|b| b.to_string());
+        let tx = self.bg_tx.clone();
+        self.set_flash("Loading history…");
+        tokio::spawn(async move {
+            match d.get_history(&repo, branch_owned.as_deref(), 20).await {
+                Ok(entries) => {
+                    let _ = tx
+                        .send(SseUpdate::EnterHistory {
+                            repo,
+                            branch: branch_owned,
+                            entries,
+                        })
+                        .await;
+                }
+                Err(e) => {
+                    let _ = tx
+                        .send(SseUpdate::BackgroundResult {
+                            flash: e,
+                            resync: false,
+                        })
+                        .await;
+                }
+            }
         });
     }
 
@@ -755,107 +786,15 @@ impl App {
                     open_browser(&repo_url(repo));
                 }
             }
-            KeyCode::Char('h') => {
+            KeyCode::Char('h') | KeyCode::Char('H') => {
                 if let Some((repo, branch, _, _)) = selected {
-                    let d = daemon.clone();
-                    let repo = repo.to_string();
-                    let tx = self.bg_tx.clone();
-                    self.set_flash("Loading history…");
-                    if is_repo_row {
-                        // Repo row: show all-branch history
-                        tokio::spawn(async move {
-                            match d.get_history(&repo, None, 20).await {
-                                Ok(entries) => {
-                                    let _ = tx
-                                        .send(SseUpdate::EnterHistory {
-                                            repo,
-                                            branch: None,
-                                            entries,
-                                        })
-                                        .await;
-                                }
-                                Err(e) => {
-                                    let _ = tx
-                                        .send(SseUpdate::BackgroundResult {
-                                            flash: e,
-                                            resync: false,
-                                        })
-                                        .await;
-                                }
-                            }
-                        });
-                    } else {
-                        let branch = branch.to_string();
-                        tokio::spawn(async move {
-                            match d.get_history(&repo, Some(&branch), 20).await {
-                                Ok(entries) => {
-                                    let _ = tx
-                                        .send(SseUpdate::EnterHistory {
-                                            repo,
-                                            branch: Some(branch),
-                                            entries,
-                                        })
-                                        .await;
-                                }
-                                Err(e) => {
-                                    let _ = tx
-                                        .send(SseUpdate::BackgroundResult {
-                                            flash: e,
-                                            resync: false,
-                                        })
-                                        .await;
-                                }
-                            }
-                        });
-                    }
+                    // h on branch row = branch-scoped; h on repo row or H = all branches
+                    let all_branches = code == KeyCode::Char('H') || is_repo_row;
+                    self.open_history(daemon, repo, if all_branches { None } else { Some(branch) });
                 }
             }
-            KeyCode::Char('H') => {
-                if let Some((repo, _, _, _)) = selected {
-                    let d = daemon.clone();
-                    let repo = repo.to_string();
-                    let tx = self.bg_tx.clone();
-                    self.set_flash("Loading history…");
-                    tokio::spawn(async move {
-                        match d.get_history(&repo, None, 20).await {
-                            Ok(entries) => {
-                                let _ = tx
-                                    .send(SseUpdate::EnterHistory {
-                                        repo,
-                                        branch: None,
-                                        entries,
-                                    })
-                                    .await;
-                            }
-                            Err(e) => {
-                                let _ = tx
-                                    .send(SseUpdate::BackgroundResult {
-                                        flash: e,
-                                        resync: false,
-                                    })
-                                    .await;
-                            }
-                        }
-                    });
-                }
-            }
-            KeyCode::Char('s') => {
-                if self.sort_ascending {
-                    self.sort_ascending = false;
-                } else {
-                    self.sort_column = self.sort_column.next();
-                    self.sort_ascending = true;
-                }
-                self.save_prefs();
-            }
-            KeyCode::Char('S') => {
-                if !self.sort_ascending {
-                    self.sort_ascending = true;
-                } else {
-                    self.sort_column = self.sort_column.prev();
-                    self.sort_ascending = false;
-                }
-                self.save_prefs();
+            KeyCode::Char('s') | KeyCode::Char('S') => {
+                self.cycle_sort(code == KeyCode::Char('S'));
             }
             KeyCode::Char('g') => {
                 self.group_by = self.group_by.next();
@@ -866,49 +805,70 @@ impl App {
                 self.save_prefs();
             }
             KeyCode::Char('C') => {
-                let d = daemon.clone();
-                let tx = self.bg_tx.clone();
-                self.set_flash("Loading config…");
-                tokio::spawn(async move {
-                    match d.get_defaults().await {
-                        Ok(defaults) => {
-                            let _ = tx
-                                .send(SseUpdate::EnterForm {
-                                    title: "Config".to_string(),
-                                    fields: vec![
-                                        FormField {
-                                            label: "Default branches".to_string(),
-                                            buffer: defaults.default_branches.join(", "),
-                                            options: vec![],
-                                        },
-                                        FormField {
-                                            label: "Ignored workflows".to_string(),
-                                            buffer: defaults.ignored_workflows.join(", "),
-                                            options: vec![],
-                                        },
-                                        FormField {
-                                            label: "Poll aggression".to_string(),
-                                            buffer: defaults.poll_aggression,
-                                            options: vec!["low", "medium", "high"],
-                                        },
-                                    ],
-                                })
-                                .await;
-                        }
-                        Err(e) => {
-                            let _ = tx
-                                .send(SseUpdate::BackgroundResult {
-                                    flash: e,
-                                    resync: false,
-                                })
-                                .await;
-                        }
-                    }
-                });
+                self.open_config_form(daemon);
             }
             _ => {}
         }
         QuitAction::None
+    }
+
+    fn cycle_sort(&mut self, reverse: bool) {
+        if reverse {
+            if !self.sort_ascending {
+                self.sort_ascending = true;
+            } else {
+                self.sort_column = self.sort_column.prev();
+                self.sort_ascending = false;
+            }
+        } else if self.sort_ascending {
+            self.sort_ascending = false;
+        } else {
+            self.sort_column = self.sort_column.next();
+            self.sort_ascending = true;
+        }
+        self.save_prefs();
+    }
+
+    fn open_config_form(&mut self, daemon: &DaemonClient) {
+        let d = daemon.clone();
+        let tx = self.bg_tx.clone();
+        self.set_flash("Loading config…");
+        tokio::spawn(async move {
+            match d.get_defaults().await {
+                Ok(defaults) => {
+                    let _ = tx
+                        .send(SseUpdate::EnterForm {
+                            title: "Config".to_string(),
+                            fields: vec![
+                                FormField {
+                                    label: "Default branches".to_string(),
+                                    buffer: defaults.default_branches.join(", "),
+                                    options: vec![],
+                                },
+                                FormField {
+                                    label: "Ignored workflows".to_string(),
+                                    buffer: defaults.ignored_workflows.join(", "),
+                                    options: vec![],
+                                },
+                                FormField {
+                                    label: "Poll aggression".to_string(),
+                                    buffer: defaults.poll_aggression,
+                                    options: vec!["low", "medium", "high"],
+                                },
+                            ],
+                        })
+                        .await;
+                }
+                Err(e) => {
+                    let _ = tx
+                        .send(SseUpdate::BackgroundResult {
+                            flash: e,
+                            resync: false,
+                        })
+                        .await;
+                }
+            }
+        });
     }
 }
 

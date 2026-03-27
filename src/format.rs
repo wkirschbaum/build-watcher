@@ -1,5 +1,9 @@
 use std::time::Duration;
 
+const SECS_PER_MINUTE: u64 = 60;
+const SECS_PER_HOUR: u64 = 3600;
+const SECS_PER_DAY: u64 = 86400;
+
 /// Format a Duration as "Xs", "Xm", or "Xm Ys".
 pub fn duration(d: Duration) -> String {
     seconds(d.as_secs())
@@ -7,11 +11,11 @@ pub fn duration(d: Duration) -> String {
 
 /// Format seconds as "Xs", "Xm", or "Xm Ys".
 pub fn seconds(secs: u64) -> String {
-    if secs < 60 {
+    if secs < SECS_PER_MINUTE {
         format!("{secs}s")
     } else {
-        let m = secs / 60;
-        let s = secs % 60;
+        let m = secs / SECS_PER_MINUTE;
+        let s = secs % SECS_PER_MINUTE;
         if s == 0 {
             format!("{m}m")
         } else {
@@ -22,14 +26,14 @@ pub fn seconds(secs: u64) -> String {
 
 /// Format seconds as a human-readable "X ago" string.
 pub fn age(secs: u64) -> String {
-    if secs < 60 {
+    if secs < SECS_PER_MINUTE {
         "just now".to_string()
-    } else if secs < 3600 {
-        format!("{}m ago", secs / 60)
-    } else if secs < 86400 {
-        format!("{}h ago", secs / 3600)
+    } else if secs < SECS_PER_HOUR {
+        format!("{}m ago", secs / SECS_PER_MINUTE)
+    } else if secs < SECS_PER_DAY {
+        format!("{}h ago", secs / SECS_PER_HOUR)
     } else {
-        format!("{}d ago", secs / 86400)
+        format!("{}d ago", secs / SECS_PER_DAY)
     }
 }
 

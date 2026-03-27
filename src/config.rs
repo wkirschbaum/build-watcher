@@ -219,6 +219,9 @@ pub enum NotificationLevel {
     Critical,
 }
 
+/// Number of per-event notification types (started, success, failure).
+pub const NOTIFICATION_EVENT_COUNT: usize = 3;
+
 impl<'de> Deserialize<'de> for NotificationLevel {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let s = String::deserialize(deserializer)?;
@@ -329,6 +332,16 @@ impl PollAggression {
     /// The number of API calls this level allows per rate-limit window.
     pub fn target_calls(self, limit: u64) -> u64 {
         (self.target_fraction() * limit as f64) as u64
+    }
+
+    /// Multiplier applied to poll intervals in the free zone.
+    /// High = 1.0 (floor speed), Medium = 1.5×, Low = 3×.
+    pub fn interval_multiplier(self) -> f64 {
+        match self {
+            Self::High => 1.0,
+            Self::Medium => 1.5,
+            Self::Low => 3.0,
+        }
     }
 }
 
@@ -741,6 +754,28 @@ pub fn load_and_normalize() -> Config {
              Resetting to [\"main\"]."
         );
         cfg.default_branches = default_branches();
+    }
+
+    // Validate repo and branch names loaded from config.
+    for branch in &cfg.default_branches {
+        if let Err(e) = crate::github::validate_branch(branch) {
+            tracing::warn!("config: invalid default branch: {e}");
+        }
+    }
+    let repo_names: Vec<String> = cfg.repos.keys().cloned().collect();
+    for repo in &repo_names {
+        if let Err(e) = crate::github::validate_repo(repo) {
+            tracing::warn!("config: invalid repo name: {e}");
+            cfg.repos.remove(repo);
+            needs_save = true;
+        } else {
+            let rc = &cfg.repos[repo];
+            for branch in &rc.branches {
+                if let Err(e) = crate::github::validate_branch(branch) {
+                    tracing::warn!("config: {repo}: invalid branch: {e}");
+                }
+            }
+        }
     }
 
     if needs_save && let Err(e) = save_config(&cfg) {

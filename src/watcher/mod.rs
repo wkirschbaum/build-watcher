@@ -38,17 +38,15 @@ pub async fn is_paused(pause: &PauseState) -> bool {
 /// - 1 `in_progress_runs_for_repo` call per repo that has any active runs (batch status check)
 /// - Occasional fallback `run_status` calls are unpredictable and not budgeted.
 pub fn count_api_calls(watches: &HashMap<WatchKey, WatchEntry>) -> u64 {
-    let unique_repos: HashSet<&str> = watches.keys().map(|k| k.repo.as_str()).collect();
-    let base_calls = unique_repos.len() as u64;
-    let repos_with_active = unique_repos
-        .iter()
-        .filter(|repo| {
-            watches
-                .iter()
-                .any(|(k, e)| k.repo == **repo && e.has_active_runs())
-        })
-        .count() as u64;
-    base_calls + repos_with_active
+    let mut all_repos = HashSet::new();
+    let mut repos_with_active = HashSet::new();
+    for (k, e) in watches {
+        all_repos.insert(k.repo.as_str());
+        if e.has_active_runs() {
+            repos_with_active.insert(k.repo.as_str());
+        }
+    }
+    all_repos.len() as u64 + repos_with_active.len() as u64
 }
 
 /// Filter runs by branch name. Used to fan out repo-wide results to per-branch watchers.

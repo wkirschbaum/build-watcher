@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::{Mutex, Notify, Semaphore};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
@@ -222,6 +222,9 @@ pub async fn startup_watches(
     start_new_config_watches(watches, config, handle, rate_limit, &snapshot).await;
 }
 
+/// Maximum concurrent GitHub API requests during startup recovery.
+const MAX_CONCURRENT_RECOVERY: usize = 10;
+
 /// Resume persisted watches and recover any in-progress runs from GitHub.
 pub(super) async fn recover_existing_watches(
     watches: &Watches,
@@ -230,12 +233,15 @@ pub(super) async fn recover_existing_watches(
     rate_limit: &RateLimitState,
     snapshot: &[WatchKey],
 ) {
+    let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_RECOVERY));
     let mut set = tokio::task::JoinSet::new();
     for key in snapshot {
         tracing::info!(key = %key, "Resuming watch");
         let key = key.clone();
         let gh = handle.github.clone();
+        let sem = semaphore.clone();
         set.spawn(async move {
+            let _permit = sem.acquire().await;
             let result = gh.recent_runs(&key.repo, &key.branch).await;
             (key, result)
         });

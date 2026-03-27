@@ -5,6 +5,12 @@ use serde::{Deserialize, Serialize};
 const GH_TIMEOUT: Duration = Duration::from_secs(30);
 const GH_JSON_FIELDS: &str =
     "databaseId,status,conclusion,displayTitle,workflowName,headSha,event,headBranch";
+/// Default limit for `recent_runs` (per-branch).
+const DEFAULT_BRANCH_LIMIT: u32 = 10;
+/// Upper limit for `in_progress_runs_for_repo`.
+const IN_PROGRESS_LIMIT: u32 = 100;
+/// Default limit for `recent_runs_for_repo` (new-run detection).
+pub const DEFAULT_REPO_LIMIT: u32 = 20;
 
 /// Truncates a hex SHA to 7 characters. Returns the full string if shorter.
 pub fn short_sha(sha: &str) -> &str {
@@ -136,22 +142,31 @@ pub struct RunInfo {
 }
 
 impl RunInfo {
-    fn from_gh_json(raw: GhRunJson) -> Option<Self> {
-        Some(Self {
-            id: raw.database_id?,
+    fn from_gh_json(raw: GhRunJson, repo: &str) -> Result<Self, GhError> {
+        let id = raw.database_id.ok_or_else(|| GhError::MissingFields {
+            repo: repo.to_string(),
+        })?;
+        Ok(Self {
+            id,
             status: if raw.status.is_empty() {
-                "unknown".to_string()
+                return Err(GhError::MissingFields {
+                    repo: repo.to_string(),
+                });
             } else {
                 raw.status
             },
             conclusion: raw.conclusion,
             title: if raw.display_title.is_empty() {
-                "unknown".to_string()
+                return Err(GhError::MissingFields {
+                    repo: repo.to_string(),
+                });
             } else {
                 raw.display_title
             },
             workflow: if raw.workflow_name.is_empty() {
-                "unknown".to_string()
+                return Err(GhError::MissingFields {
+                    repo: repo.to_string(),
+                });
             } else {
                 raw.workflow_name
             },
@@ -226,86 +241,47 @@ pub trait GitHubClient: Send + Sync + 'static {
 /// Real GitHub client that shells out to the `gh` CLI.
 pub struct GhCliClient;
 
+/// Shared helper for `gh run list` with variable filters.
+/// Parses the JSON response into `Vec<RunInfo>`, skipping entries with missing fields.
+async fn gh_run_list(repo: &str, limit: u32, extra_args: &[&str]) -> Result<Vec<RunInfo>, GhError> {
+    let limit_str = limit.to_string();
+    let mut args = vec![
+        "run",
+        "list",
+        "--repo",
+        repo,
+        "--limit",
+        &limit_str,
+        "--json",
+        GH_JSON_FIELDS,
+    ];
+    args.extend_from_slice(extra_args);
+    let stdout = gh_exec(repo, &args).await?;
+    let raw: Vec<GhRunJson> = serde_json::from_slice(&stdout).map_err(|e| GhError::Parse {
+        repo: repo.to_string(),
+        source: e,
+    })?;
+    Ok(raw
+        .into_iter()
+        .filter_map(|r| RunInfo::from_gh_json(r, repo).ok())
+        .collect())
+}
+
 #[async_trait::async_trait]
 impl GitHubClient for GhCliClient {
     #[tracing::instrument(skip_all, fields(%repo, %branch))]
     async fn recent_runs(&self, repo: &str, branch: &str) -> Result<Vec<RunInfo>, GhError> {
-        let stdout = gh_exec(
-            repo,
-            &[
-                "run",
-                "list",
-                "--repo",
-                repo,
-                "--branch",
-                branch,
-                "--limit",
-                "10",
-                "--json",
-                GH_JSON_FIELDS,
-            ],
-        )
-        .await?;
-
-        let raw: Vec<GhRunJson> = serde_json::from_slice(&stdout).map_err(|e| GhError::Parse {
-            repo: repo.to_string(),
-            source: e,
-        })?;
-
-        Ok(raw.into_iter().filter_map(RunInfo::from_gh_json).collect())
+        gh_run_list(repo, DEFAULT_BRANCH_LIMIT, &["--branch", branch]).await
     }
 
     #[tracing::instrument(skip_all, fields(%repo, %limit))]
     async fn recent_runs_for_repo(&self, repo: &str, limit: u32) -> Result<Vec<RunInfo>, GhError> {
-        let limit_str = limit.to_string();
-        let stdout = gh_exec(
-            repo,
-            &[
-                "run",
-                "list",
-                "--repo",
-                repo,
-                "--limit",
-                &limit_str,
-                "--json",
-                GH_JSON_FIELDS,
-            ],
-        )
-        .await?;
-
-        let raw: Vec<GhRunJson> = serde_json::from_slice(&stdout).map_err(|e| GhError::Parse {
-            repo: repo.to_string(),
-            source: e,
-        })?;
-
-        Ok(raw.into_iter().filter_map(RunInfo::from_gh_json).collect())
+        gh_run_list(repo, limit, &[]).await
     }
 
     #[tracing::instrument(skip_all, fields(%repo))]
     async fn in_progress_runs_for_repo(&self, repo: &str) -> Result<Vec<RunInfo>, GhError> {
-        let stdout = gh_exec(
-            repo,
-            &[
-                "run",
-                "list",
-                "--repo",
-                repo,
-                "--status",
-                "in_progress",
-                "--limit",
-                "100",
-                "--json",
-                GH_JSON_FIELDS,
-            ],
-        )
-        .await?;
-
-        let raw: Vec<GhRunJson> = serde_json::from_slice(&stdout).map_err(|e| GhError::Parse {
-            repo: repo.to_string(),
-            source: e,
-        })?;
-
-        Ok(raw.into_iter().filter_map(RunInfo::from_gh_json).collect())
+        gh_run_list(repo, IN_PROGRESS_LIMIT, &["--status", "in_progress"]).await
     }
 
     #[tracing::instrument(skip_all, fields(%repo, %run_id))]
@@ -330,22 +306,31 @@ impl GitHubClient for GhCliClient {
             source: e,
         })?;
 
-        RunInfo::from_gh_json(raw).ok_or_else(|| GhError::MissingFields {
-            repo: repo.to_string(),
-        })
+        RunInfo::from_gh_json(raw, repo)
     }
 
     async fn failing_steps(&self, repo: &str, run_id: u64) -> Option<String> {
         let id_str = run_id.to_string();
-        let stdout = gh_exec(
+        let stdout = match gh_exec(
             repo,
             &["run", "view", &id_str, "--repo", repo, "--json", "jobs"],
         )
         .await
-        .ok()?;
+        {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::debug!(%repo, %run_id, error = %e, "Failed to fetch failing steps");
+                return None;
+            }
+        };
 
-        let resp: GhJobsResponse = serde_json::from_slice(&stdout).ok()?;
-        extract_failing_steps(&resp.jobs)
+        match serde_json::from_slice::<GhJobsResponse>(&stdout) {
+            Ok(resp) => extract_failing_steps(&resp.jobs),
+            Err(e) => {
+                tracing::debug!(%repo, %run_id, error = %e, "Failed to parse jobs response");
+                None
+            }
+        }
     }
 
     async fn run_rerun(
@@ -476,32 +461,33 @@ fn parse_iso_epoch(s: &str) -> Option<u64> {
 const GH_HISTORY_FIELDS: &str =
     "databaseId,conclusion,displayTitle,workflowName,headBranch,event,createdAt,updatedAt";
 
+/// Raw JSON shape for history entries (superset of `GhRunJson` with timestamps).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GhHistoryJson {
+    database_id: Option<u64>,
+    #[serde(default)]
+    conclusion: String,
+    #[serde(default)]
+    display_title: String,
+    #[serde(default)]
+    workflow_name: String,
+    #[serde(default)]
+    head_branch: String,
+    #[serde(default)]
+    event: String,
+    #[serde(default)]
+    created_at: String,
+    #[serde(default)]
+    updated_at: String,
+}
+
 /// Fetch recent build history for a repo, optionally filtered by branch.
 async fn gh_run_list_history_impl(
     repo: &str,
     branch: Option<&str>,
     limit: u32,
 ) -> Result<Vec<HistoryEntry>, GhError> {
-    #[derive(Debug, Deserialize)]
-    #[serde(rename_all = "camelCase")]
-    struct GhHistoryJson {
-        database_id: Option<u64>,
-        #[serde(default)]
-        conclusion: String,
-        #[serde(default)]
-        display_title: String,
-        #[serde(default)]
-        workflow_name: String,
-        #[serde(default)]
-        head_branch: String,
-        #[serde(default)]
-        event: String,
-        #[serde(default)]
-        created_at: String,
-        #[serde(default)]
-        updated_at: String,
-    }
-
     let limit_str = limit.to_string();
     let mut args = vec![
         "run",
@@ -617,7 +603,7 @@ mod tests {
 
     fn run_from_value(v: &serde_json::Value) -> Option<RunInfo> {
         let raw: GhRunJson = serde_json::from_value(v.clone()).ok()?;
-        RunInfo::from_gh_json(raw)
+        RunInfo::from_gh_json(raw, "test/repo").ok()
     }
 
     #[test]
@@ -675,16 +661,14 @@ mod tests {
     }
 
     #[test]
-    fn defaults_for_missing_optional_fields() {
+    fn missing_required_fields_returns_none() {
+        // Missing status, title, workflow → from_gh_json returns Err
         let v = json!({ "databaseId": 1 });
-        let run = run_from_value(&v).unwrap();
-        assert_eq!(run.status, "unknown");
-        assert_eq!(run.title, "unknown");
-        assert_eq!(run.workflow, "unknown");
-        assert_eq!(run.conclusion, "");
-        assert_eq!(run.head_sha, "");
-        assert_eq!(run.event, "");
-        assert_eq!(run.head_branch, "");
+        assert!(run_from_value(&v).is_none());
+
+        // Missing just title
+        let v = json!({ "databaseId": 1, "status": "completed", "workflowName": "CI" });
+        assert!(run_from_value(&v).is_none());
     }
 
     #[test]

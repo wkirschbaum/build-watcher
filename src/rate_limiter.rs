@@ -4,11 +4,11 @@ use crate::github::RateLimit;
 /// Fastest permitted polling interval when active runs exist.
 pub const MIN_ACTIVE_SECS: u64 = 15;
 /// Fastest permitted polling interval when no active runs exist.
-pub const MIN_IDLE_SECS: u64 = 60;
+pub const MIN_IDLE_SECS: u64 = 30;
 /// Fallback active interval (Medium) before the first rate-limit fetch succeeds.
 pub const FALLBACK_ACTIVE_SECS: u64 = 30;
 /// Fallback idle interval (Medium) before the first rate-limit fetch succeeds.
-pub const FALLBACK_IDLE_SECS: u64 = 120;
+pub const FALLBACK_IDLE_SECS: u64 = 60;
 
 /// Assumed GitHub rate-limit window in seconds.
 const WINDOW_SECS: u64 = 3600;
@@ -69,10 +69,14 @@ pub fn compute_intervals(
         0
     };
 
-    // Free zone: own usage is under half the target → poll at floor speed.
+    // Free zone: own usage is under half the target → poll near floor speed,
+    // scaled by aggression level so the setting actually affects polling rate.
     if own_calls_so_far * 2 < target_calls {
         let scale = (calls as f64).sqrt() as u64;
-        return (MIN_ACTIVE_SECS * scale.max(1), MIN_IDLE_SECS * scale.max(1));
+        let aggression_mult = aggression.interval_multiplier();
+        let active = ((MIN_ACTIVE_SECS * scale.max(1)) as f64 * aggression_mult) as u64;
+        let idle = ((MIN_IDLE_SECS * scale.max(1)) as f64 * aggression_mult) as u64;
+        return (active.max(MIN_ACTIVE_SECS), idle.max(MIN_IDLE_SECS));
     }
 
     // Throttle zone: project external usage forward and compute effective budget.
@@ -98,7 +102,7 @@ pub fn compute_intervals(
 
 fn fallback_intervals(aggression: PollAggression) -> (u64, u64) {
     match aggression {
-        PollAggression::Low => (60, 300),
+        PollAggression::Low => (45, 120),
         PollAggression::Medium => (FALLBACK_ACTIVE_SECS, FALLBACK_IDLE_SECS),
         PollAggression::High => (MIN_ACTIVE_SECS, MIN_IDLE_SECS),
     }
@@ -126,7 +130,7 @@ mod tests {
     fn fallback_by_aggression() {
         assert_eq!(
             compute_intervals(None, 1, T, PollAggression::Low, 0),
-            (60, 300)
+            (45, 120)
         );
         assert_eq!(
             compute_intervals(None, 1, T, PollAggression::Medium, 0),
@@ -141,32 +145,48 @@ mod tests {
     // -- Free zone --
 
     #[test]
-    fn free_zone_floor_speed_single_call() {
-        // Medium: target = 25% of 5000 = 1250. With own_calls_so_far = 0 (first call),
-        // 0 * 2 < 1250 → free zone → bare floor.
-        let rl = make_rl(5000, 5000, 3600); // fresh window
-        let (active, idle) = compute_intervals(Some(&rl), 1, T, PollAggression::Medium, 0);
+    fn free_zone_high_aggression_at_floor() {
+        // High aggression (mult=1.0): target = 50% of 5000 = 2500. own_calls=0 → free zone → floor.
+        let rl = make_rl(5000, 5000, 3600);
+        let (active, idle) = compute_intervals(Some(&rl), 1, T, PollAggression::High, 0);
         assert_eq!(active, MIN_ACTIVE_SECS);
         assert_eq!(idle, MIN_IDLE_SECS);
     }
 
     #[test]
-    fn free_zone_sqrt_scaling() {
-        // Medium, fresh window, 6 calls → sqrt(6) = 2 → ×2
+    fn free_zone_medium_aggression_scaled() {
+        // Medium aggression (mult=1.5): free zone → floor × 1.5.
         let rl = make_rl(5000, 5000, 3600);
-        let (active, idle) = compute_intervals(Some(&rl), 6, T, PollAggression::Medium, 0);
+        let (active, idle) = compute_intervals(Some(&rl), 1, T, PollAggression::Medium, 0);
+        assert_eq!(active, (MIN_ACTIVE_SECS as f64 * 1.5) as u64); // 22
+        assert_eq!(idle, (MIN_IDLE_SECS as f64 * 1.5) as u64); // 45
+    }
+
+    #[test]
+    fn free_zone_low_aggression_scaled() {
+        // Low aggression (mult=3.0): free zone → floor × 3.
+        let rl = make_rl(5000, 5000, 3600);
+        let (active, idle) = compute_intervals(Some(&rl), 1, T, PollAggression::Low, 0);
+        assert_eq!(active, MIN_ACTIVE_SECS * 3); // 45
+        assert_eq!(idle, MIN_IDLE_SECS * 3); // 90
+    }
+
+    #[test]
+    fn free_zone_sqrt_scaling() {
+        // High aggression, fresh window, 6 calls → sqrt(6) = 2 → ×2 (mult=1.0)
+        let rl = make_rl(5000, 5000, 3600);
+        let (active, idle) = compute_intervals(Some(&rl), 6, T, PollAggression::High, 0);
         assert_eq!(active, MIN_ACTIVE_SECS * 2);
         assert_eq!(idle, MIN_IDLE_SECS * 2);
     }
 
     #[test]
     fn free_zone_while_own_calls_under_half_target() {
-        // Medium: target = 1250. If we're 1800s into a 3600s window polling at 30s
-        // intervals with 1 call/cycle → own_calls = 1800/30 * 1 = 60. 60*2=120 < 1250 → free.
-        let rl = make_rl(4000, 5000, 1800); // 1800s left
-        // now = T, window_start = T + 1800 - 3600 = T - 1800, elapsed = 1800s
+        // High: target = 2500. If we're 1800s into a 3600s window polling at 30s
+        // intervals with 1 call/cycle → own_calls = 1800/30 * 1 = 60. 60*2=120 < 2500 → free.
+        let rl = make_rl(4000, 5000, 1800);
         let last = 30;
-        let (active, idle) = compute_intervals(Some(&rl), 1, T, PollAggression::Medium, last);
+        let (active, idle) = compute_intervals(Some(&rl), 1, T, PollAggression::High, last);
         assert_eq!(active, MIN_ACTIVE_SECS);
         assert_eq!(idle, MIN_IDLE_SECS);
     }
@@ -189,7 +209,7 @@ mod tests {
         // rate_limited = 1 * 1800 / 40 = 45s.
         let (active, idle) = compute_intervals(Some(&rl), 1, T, PollAggression::Low, 30);
         assert_eq!(active, 45);
-        assert_eq!(idle, 60); // floor applies: 45 < 60
+        assert_eq!(idle, 45); // 45 > MIN_IDLE_SECS (30)
     }
 
     #[test]
@@ -230,10 +250,10 @@ mod tests {
     #[test]
     fn first_call_attributes_all_used_to_external() {
         // last_active_secs = 0 → own_calls = 0 → free zone (own*2 < target).
-        // Medium: target=1250. Even with lots of rl.used, we're in free zone.
+        // High: target=2500. Even with lots of rl.used, we're in free zone.
         let rl = make_rl(1000, 5000, 3600); // used=4000
-        let (active, idle) = compute_intervals(Some(&rl), 1, T, PollAggression::Medium, 0);
-        // own=0, 0*2=0 < 1250 → free zone → floor
+        let (active, idle) = compute_intervals(Some(&rl), 1, T, PollAggression::High, 0);
+        // own=0, 0*2=0 < 2500 → free zone → floor (High mult=1.0)
         assert_eq!(active, MIN_ACTIVE_SECS);
         assert_eq!(idle, MIN_IDLE_SECS);
     }
@@ -241,8 +261,8 @@ mod tests {
     #[test]
     fn zero_calls_treated_as_one() {
         let rl = make_rl(5000, 5000, 3600);
-        let (a0, i0) = compute_intervals(Some(&rl), 0, T, PollAggression::Medium, 0);
-        let (a1, i1) = compute_intervals(Some(&rl), 1, T, PollAggression::Medium, 0);
+        let (a0, i0) = compute_intervals(Some(&rl), 0, T, PollAggression::High, 0);
+        let (a1, i1) = compute_intervals(Some(&rl), 1, T, PollAggression::High, 0);
         assert_eq!(a0, a1);
         assert_eq!(i0, i1);
     }
@@ -262,15 +282,23 @@ mod tests {
 
     #[test]
     fn low_aggression_is_more_conservative_than_medium() {
-        // Low: target=500. Medium: target=1250. 1800s left, last=4s, 1 call/cycle.
-        // elapsed=1800, own = 1800/4 = 450.
-        // Low:    450*2=900 >= 500  → throttle. remaining_quota=50. interval=1800/50=36s.
-        // Medium: 450*2=900 < 1250  → free zone → MIN_ACTIVE_SECS=15.
-        // external_used = 1000-450 = 550. projected_ext = 550/1800*1800 = 550. available = 3450.
-        // effective_budget (Low) = min(3450, 50) = 50 → rate_limited = 36 > 15 → active=36.
-        let rl = make_rl(4000, 5000, 1800);
-        let (low_a, _) = compute_intervals(Some(&rl), 1, T, PollAggression::Low, 4);
-        let (med_a, _) = compute_intervals(Some(&rl), 1, T, PollAggression::Medium, 4);
+        // Both in free zone with fresh window — Low mult=3.0, Medium mult=1.5.
+        let rl = make_rl(5000, 5000, 3600);
+        let (low_a, low_i) = compute_intervals(Some(&rl), 1, T, PollAggression::Low, 0);
+        let (med_a, med_i) = compute_intervals(Some(&rl), 1, T, PollAggression::Medium, 0);
+        let (high_a, high_i) = compute_intervals(Some(&rl), 1, T, PollAggression::High, 0);
         assert!(low_a > med_a, "Low should be more conservative than Medium");
+        assert!(
+            med_a > high_a,
+            "Medium should be more conservative than High"
+        );
+        assert!(
+            low_i > med_i,
+            "Low idle should be more conservative than Medium"
+        );
+        assert!(
+            med_i > high_i,
+            "Medium idle should be more conservative than High"
+        );
     }
 }

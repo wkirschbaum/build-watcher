@@ -8,7 +8,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::unix_now;
 use crate::events::{EventBus, RunSnapshot, WatchEvent};
-use crate::github::{GitHubClient, LastBuild, RunInfo};
+use crate::github::{DEFAULT_REPO_LIMIT, GitHubClient, LastBuild, RunInfo};
 use crate::history::push_build;
 use crate::persistence::Persistence;
 use crate::rate_limiter::compute_intervals;
@@ -20,6 +20,8 @@ use super::{
 
 /// How often each poller refreshes the shared rate limit state.
 const RATE_LIMIT_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+/// Maximum individual `run_status` fallback calls when the batch endpoint misses runs.
+const MAX_FALLBACK_CALLS: usize = 10;
 
 /// Reason a `cancellable_sleep` call returned.
 enum WakeReason {
@@ -162,8 +164,15 @@ impl RepoPoller {
                 self.poll_active_runs_batch().await;
             }
 
-            let due =
-                last_new_run_check.is_none_or(|t| t.elapsed() >= Duration::from_secs(idle_secs));
+            // Check for new runs at idle_secs intervals (or active_secs when builds are running,
+            // so new pushes during active builds are detected promptly).
+            let new_run_interval = if has_active {
+                active_secs.max(idle_secs / 2)
+            } else {
+                idle_secs
+            };
+            let due = last_new_run_check
+                .is_none_or(|t| t.elapsed() >= Duration::from_secs(new_run_interval));
             if due {
                 self.check_for_new_runs_repo_wide().await;
                 last_new_run_check = Some(Instant::now());
@@ -202,7 +211,8 @@ impl RepoPoller {
     }
 
     /// Batch-check all active runs for this repo using a single API call.
-    /// Falls back to individual `run_status` for runs missing from the batch response.
+    /// Falls back to individual `run_status` for runs missing from the batch response,
+    /// capped at `MAX_FALLBACK_CALLS` to avoid rate-limit exhaustion.
     pub(super) async fn poll_active_runs_batch(&self) {
         // Collect all (run_id, WatchKey) pairs for active runs in this repo.
         let active_run_keys: Vec<(u64, WatchKey)> = {
@@ -227,45 +237,70 @@ impl RepoPoller {
         };
         let batch_by_id: HashMap<u64, &RunInfo> = batch_runs.iter().map(|r| (r.id, r)).collect();
 
-        let mut changed = false;
+        // Separate runs found in batch vs missing (need fallback).
+        let mut found_runs: Vec<(RunInfo, WatchKey)> = Vec::new();
+        let mut missing_runs: Vec<(u64, WatchKey)> = Vec::new();
 
         for (run_id, key) in &active_run_keys {
+            if let Some(&run) = batch_by_id.get(run_id) {
+                found_runs.push((run.clone(), key.clone()));
+            } else {
+                missing_runs.push((*run_id, key.clone()));
+            }
+        }
+
+        // Clear failure counts for found runs in a single lock acquisition.
+        {
+            let mut w = self.watches.lock().await;
+            for (run, key) in &found_runs {
+                if let Some(entry) = w.get_mut(key) {
+                    entry.clear_failure_count(run.id);
+                }
+            }
+        }
+
+        // Fallback: individually check missing runs, capped to avoid rate-limit exhaustion.
+        if missing_runs.len() > MAX_FALLBACK_CALLS {
+            tracing::warn!(
+                repo = %self.repo,
+                missing = missing_runs.len(),
+                cap = MAX_FALLBACK_CALLS,
+                "Too many runs missing from batch, capping fallback calls"
+            );
+        }
+        for (run_id, key) in missing_runs.iter().take(MAX_FALLBACK_CALLS) {
             if self.token.is_cancelled() {
                 return;
             }
+            match self.github.run_status(&self.repo, *run_id).await {
+                Ok(run) => {
+                    found_runs.push((run, key.clone()));
+                    let mut w = self.watches.lock().await;
+                    if let Some(entry) = w.get_mut(key) {
+                        entry.clear_failure_count(*run_id);
+                    }
+                }
+                Err(e) => {
+                    let mut w = self.watches.lock().await;
+                    if let Some(entry) = w.get_mut(key) {
+                        entry.record_failure(*run_id, &e);
+                    }
+                }
+            }
+        }
 
-            let run = if let Some(&run) = batch_by_id.get(run_id) {
-                // Found in batch response — still in progress (or status changed).
-                let mut w = self.watches.lock().await;
-                if let Some(entry) = w.get_mut(key) {
-                    entry.clear_failure_count(*run_id);
-                }
-                run.clone()
-            } else {
-                // Not in batch — likely just completed. Fall back to individual check.
-                match self.github.run_status(&self.repo, *run_id).await {
-                    Ok(run) => {
-                        let mut w = self.watches.lock().await;
-                        if let Some(entry) = w.get_mut(key) {
-                            entry.clear_failure_count(*run_id);
-                        }
-                        run
-                    }
-                    Err(e) => {
-                        let mut w = self.watches.lock().await;
-                        if let Some(entry) = w.get_mut(key) {
-                            changed |= entry.record_failure(*run_id, &e);
-                        }
-                        continue;
-                    }
-                }
-            };
+        // Process all resolved runs.
+        let mut changed = false;
+        for (run, key) in &found_runs {
+            if self.token.is_cancelled() {
+                return;
+            }
 
             if run.is_completed() {
                 let elapsed = {
                     let w = self.watches.lock().await;
                     w.get(key)
-                        .and_then(|e| e.active_runs.get(run_id))
+                        .and_then(|e| e.active_runs.get(&run.id))
                         .map(|a| a.started_at.elapsed().as_secs_f64())
                 };
 
@@ -277,7 +312,7 @@ impl RepoPoller {
 
                 if self.has_any_watches().await {
                     self.events.emit(WatchEvent::RunCompleted {
-                        run: RunSnapshot::from_run_info(&run, &self.repo, &key.branch),
+                        run: RunSnapshot::from_run_info(run, &self.repo, &key.branch),
                         conclusion: run.conclusion.clone(),
                         elapsed,
                         failing_steps: failing_steps.clone(),
@@ -285,7 +320,7 @@ impl RepoPoller {
                 }
 
                 tracing::info!(
-                    key = %key, run_id,
+                    key = %key, run_id = run.id,
                     sha = run.short_sha(), conclusion = %run.conclusion,
                     "Build completed"
                 );
@@ -293,7 +328,7 @@ impl RepoPoller {
                 let new_build = {
                     let mut w = self.watches.lock().await;
                     if let Some(entry) = w.get_mut(key) {
-                        entry.record_completion(&run, failing_steps, unix_now());
+                        entry.record_completion(run, failing_steps, unix_now());
                         entry.last_build.clone()
                     } else {
                         None
@@ -307,10 +342,10 @@ impl RepoPoller {
             } else {
                 let mut w = self.watches.lock().await;
                 if let Some(entry) = w.get_mut(key)
-                    && let Some(old_status) = entry.update_status(*run_id, &run.status)
+                    && let Some(old_status) = entry.update_status(run.id, &run.status)
                 {
                     self.events.emit(WatchEvent::StatusChanged {
-                        run: RunSnapshot::from_run_info(&run, &self.repo, &key.branch),
+                        run: RunSnapshot::from_run_info(run, &self.repo, &key.branch),
                         from: old_status,
                         to: run.status.clone(),
                     });
@@ -337,7 +372,11 @@ impl RepoPoller {
             return;
         }
 
-        let all_runs = match self.github.recent_runs_for_repo(&self.repo, 20).await {
+        let all_runs = match self
+            .github
+            .recent_runs_for_repo(&self.repo, DEFAULT_REPO_LIMIT)
+            .await
+        {
             Ok(r) => r,
             Err(e) if e.is_repo_not_found() => {
                 tracing::warn!(repo = %self.repo, error = %e, "Repo not found, removing watches");

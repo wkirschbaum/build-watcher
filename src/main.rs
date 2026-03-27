@@ -55,5 +55,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let handle = WatcherHandle::new(ct.clone(), events, gh, persistence, history);
     startup_watches(&watches, &config, &handle, &rate_limit).await;
 
-    server::serve(watches, config, handle, pause, rate_limit, ct).await
+    server::serve(watches, config, handle, pause, rate_limit, ct)
+        .await
+        .map_err(|e| e.into())
 }

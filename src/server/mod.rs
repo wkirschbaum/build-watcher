@@ -6,9 +6,15 @@ mod schema;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-type AnyResult<T> = std::result::Result<T, Box<dyn std::error::Error>>;
-
 use axum::response::IntoResponse as _;
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ServerError {
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("{0}")]
+    Other(String),
+}
 use axum::routing::get;
 use rmcp::transport::streamable_http_server::{
     StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
@@ -16,8 +22,6 @@ use rmcp::transport::streamable_http_server::{
 use tokio_util::sync::CancellationToken;
 
 use build_watcher::config::{NotificationLevel, state_dir, unix_now};
-use build_watcher::events::EventBus;
-use build_watcher::history::SharedHistory;
 use build_watcher::status::{ActiveRunView, LastBuildView, StatusResponse, WatchStatus};
 use build_watcher::watcher::{
     PauseState, RateLimitState, SharedConfig, WatchEntry, WatchKey, WatcherHandle, Watches,
@@ -35,10 +39,7 @@ pub(crate) struct AppState {
     pub config: SharedConfig,
     pub handle: WatcherHandle,
     pub pause: PauseState,
-    pub events: EventBus,
-    pub github: Arc<dyn build_watcher::github::GitHubClient>,
     pub rate_limit: RateLimitState,
-    pub history: SharedHistory,
     pub started_at: std::time::Instant,
 }
 
@@ -117,7 +118,7 @@ pub(crate) fn json_error(msg: impl std::fmt::Display) -> axum::response::Respons
 }
 
 /// Bind to the preferred port, trying up to 9 consecutive ports on conflict.
-async fn bind_with_fallback(preferred: u16) -> AnyResult<tokio::net::TcpListener> {
+async fn bind_with_fallback(preferred: u16) -> Result<tokio::net::TcpListener, ServerError> {
     let last = preferred.saturating_add(9);
     for port in preferred..=last {
         match tokio::net::TcpListener::bind(format!("127.0.0.1:{port}")).await {
@@ -152,10 +153,7 @@ fn build_router(
         config: config.clone(),
         handle: handle.clone(),
         pause: pause.clone(),
-        events: handle.events.clone(),
-        github: handle.github.clone(),
         rate_limit: rate_limit.clone(),
-        history: handle.history.clone(),
         started_at,
     };
 
@@ -210,7 +208,7 @@ pub async fn serve(
     pause: PauseState,
     rate_limit: RateLimitState,
     ct: CancellationToken,
-) -> AnyResult<()> {
+) -> Result<(), ServerError> {
     let started_at = std::time::Instant::now();
     let port: u16 = std::env::var("BUILD_WATCHER_PORT")
         .ok()
@@ -230,8 +228,12 @@ pub async fn serve(
     let bound_port = listener.local_addr()?.port();
 
     let port_file = state_dir().join("port");
-    std::fs::write(&port_file, bound_port.to_string())
-        .map_err(|e| format!("Failed to write port file {}: {e}", port_file.display()))?;
+    std::fs::write(&port_file, bound_port.to_string()).map_err(|e| {
+        ServerError::Other(format!(
+            "Failed to write port file {}: {e}",
+            port_file.display()
+        ))
+    })?;
 
     if bound_port != port {
         tracing::warn!("Port {port} was occupied, using port {bound_port} instead");
@@ -251,7 +253,8 @@ pub async fn serve(
             }
             ct.cancel();
         })
-        .await?;
+        .await
+        .map_err(ServerError::Io)?;
 
     handle.shutdown().await;
     let persisted = collect_persisted(&watches).await;

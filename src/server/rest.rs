@@ -8,9 +8,7 @@ use serde::{Deserialize, Serialize};
 use tokio_stream::StreamExt as _;
 use tokio_stream::wrappers::BroadcastStream;
 
-use build_watcher::config::{
-    NotificationConfig, NotificationLevel, NotificationOverrides, PollAggression, unix_now,
-};
+use build_watcher::config::{NotificationConfig, NotificationLevel, PollAggression, unix_now};
 use build_watcher::events::WatchEvent;
 use build_watcher::github::{validate_branch, validate_repo};
 use build_watcher::history::{history_all, history_for};
@@ -19,9 +17,7 @@ use build_watcher::status::{HistoryEntryView, StatsResponse};
 use build_watcher::watcher::{count_api_calls, is_paused};
 
 use super::AppState;
-use super::actions::{
-    apply_level_overrides, do_configure_branches, do_stop_watches, do_watch_builds, persist_config,
-};
+use super::actions::{do_configure_branches, do_stop_watches, do_watch_builds, persist_config};
 use super::{build_watch_snapshot, json_error};
 
 /// `GET /status` — JSON snapshot of all current watches and their build state.
@@ -42,7 +38,7 @@ pub(crate) async fn status_handler(
 pub(crate) async fn events_handler(
     State(state): State<AppState>,
 ) -> impl axum::response::IntoResponse {
-    let stream = BroadcastStream::new(state.events.subscribe())
+    let stream = BroadcastStream::new(state.handle.events.subscribe())
         .filter_map(|result| result.ok())
         .map(|event| {
             let event_type = match &event {
@@ -50,7 +46,17 @@ pub(crate) async fn events_handler(
                 WatchEvent::RunCompleted { .. } => "RunCompleted",
                 WatchEvent::StatusChanged { .. } => "StatusChanged",
             };
-            let data = serde_json::to_string(&event).unwrap_or_default();
+            let data = match serde_json::to_string(&event) {
+                Ok(d) => d,
+                Err(e) => {
+                    tracing::error!("Failed to serialize SSE event: {e}");
+                    return Ok::<_, Infallible>(
+                        Event::default()
+                            .event("error")
+                            .data(format!("serialization error: {e}")),
+                    );
+                }
+            };
             Ok::<_, Infallible>(Event::default().event(event_type).data(data))
         });
 
@@ -82,7 +88,7 @@ pub(crate) async fn stats_handler(State(state): State<AppState>) -> axum::Json<S
         rate_remaining,
         rate_limit,
         rate_reset_mins,
-        dropped_events: state.events.dropped_count(),
+        dropped_events: state.handle.events.dropped_count(),
     })
 }
 
@@ -122,7 +128,12 @@ pub(crate) async fn rerun_handler(
 ) -> axum::response::Response {
     use axum::http::StatusCode;
 
-    match state.github.run_rerun(&body.repo, body.run_id, false).await {
+    match state
+        .handle
+        .github
+        .run_rerun(&body.repo, body.run_id, false)
+        .await
+    {
         Ok(_) => axum::Json(serde_json::json!({ "ok": true })).into_response(),
         Err(e) => (
             StatusCode::BAD_GATEWAY,
@@ -241,74 +252,21 @@ pub(crate) async fn notifications_handler(
     State(state): State<AppState>,
     axum::Json(body): axum::Json<NotificationsRequest>,
 ) -> axum::response::Response {
-    use build_watcher::config::BranchConfig;
+    use super::actions::do_notification_action;
 
     let (snapshot, msg) = {
         let mut cfg = state.config.lock().await;
-        let Some(rc) = cfg.repos.get_mut(&body.repo) else {
-            return json_error(format!("{}: not being watched", body.repo));
-        };
-        let all_off = NotificationOverrides {
-            build_started: Some(NotificationLevel::Off),
-            build_success: Some(NotificationLevel::Off),
-            build_failure: Some(NotificationLevel::Off),
-        };
-        let target_label = if let Some(b) = &body.branch {
-            format!("{}/{}", body.repo, b)
-        } else {
-            body.repo.clone()
-        };
-        let msg = match (body.action.as_str(), &body.branch) {
-            ("mute", Some(branch)) => {
-                rc.branch_notifications
-                    .entry(branch.clone())
-                    .or_default()
-                    .notifications = all_off;
-                format!("{target_label}: notifications muted")
-            }
-            ("unmute", Some(branch)) => {
-                if let Some(bc) = rc.branch_notifications.get_mut(branch) {
-                    bc.notifications = NotificationOverrides::default();
-                    if bc == &BranchConfig::default() {
-                        rc.branch_notifications.remove(branch);
-                    }
-                }
-                format!("{target_label}: notifications unmuted (using repo/global defaults)")
-            }
-            ("mute", None) => {
-                rc.notifications = all_off;
-                format!("{target_label}: notifications muted")
-            }
-            ("unmute", None) => {
-                rc.notifications = NotificationOverrides::default();
-                format!("{target_label}: notifications unmuted (using global defaults)")
-            }
-            ("set_levels", Some(branch)) => {
-                let overrides = &mut rc
-                    .branch_notifications
-                    .entry(branch.clone())
-                    .or_default()
-                    .notifications;
-                apply_level_overrides(
-                    overrides,
-                    body.build_started,
-                    body.build_success,
-                    body.build_failure,
-                );
-                format!("{target_label}: notification levels updated")
-            }
-            ("set_levels", None) => {
-                apply_level_overrides(
-                    &mut rc.notifications,
-                    body.build_started,
-                    body.build_success,
-                    body.build_failure,
-                );
-                format!("{target_label}: notification levels updated")
-            }
-            (other, _) => {
-                return json_error(format!("unknown action: {other:?}"));
-            }
+        let msg = match do_notification_action(
+            &mut cfg,
+            &body.repo,
+            body.branch.as_deref(),
+            &body.action,
+            body.build_started,
+            body.build_success,
+            body.build_failure,
+        ) {
+            Ok(m) => m,
+            Err(e) => return json_error(e),
         };
         (cfg.clone(), msg)
     };
@@ -423,7 +381,7 @@ pub(crate) async fn history_handler(
     let limit = q.limit.unwrap_or(15).min(50) as usize;
     let branch = q.branch.as_deref();
     let now = unix_now();
-    let hist = state.history.lock().await;
+    let hist = state.handle.history.lock().await;
     let entries = history_for(&hist, &q.repo, branch, limit);
     drop(hist);
     let views: Vec<HistoryEntryView> = entries
@@ -446,7 +404,7 @@ pub(crate) async fn history_all_handler(
 ) -> axum::response::Response {
     let limit = q.limit.unwrap_or(20).min(50) as usize;
     let now = unix_now();
-    let hist = state.history.lock().await;
+    let hist = state.handle.history.lock().await;
     let entries = history_all(&hist, limit);
     drop(hist);
     let views: Vec<HistoryEntryView> = entries
@@ -483,6 +441,7 @@ fn to_history_view(
 mod tests {
     use build_watcher::config::NotificationLevel;
     use build_watcher::events::{EventBus, RunSnapshot, WatchEvent};
+    use build_watcher::rate_limiter::{FALLBACK_ACTIVE_SECS, FALLBACK_IDLE_SECS};
     use build_watcher::watcher::{PauseState, WatchEntry, WatchKey, Watches};
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -567,17 +526,21 @@ mod tests {
         )
     }
 
-    fn test_router(watches: Watches, pause: PauseState, events: EventBus) -> axum::Router {
-        let handle = stub_handle();
+    fn test_router(watches: Watches, pause: PauseState, _events: EventBus) -> axum::Router {
+        test_router_with_handle(watches, pause, stub_handle())
+    }
+
+    fn test_router_with_handle(
+        watches: Watches,
+        pause: PauseState,
+        handle: build_watcher::watcher::WatcherHandle,
+    ) -> axum::Router {
         let app_state = super::super::AppState {
             watches,
             config: Arc::new(Mutex::new(build_watcher::config::Config::default())),
             handle,
             pause,
-            events,
-            github: Arc::new(StubGitHub),
             rate_limit: Arc::new(Mutex::new(None)),
-            history: Arc::new(Mutex::new(HashMap::new())),
             started_at: std::time::Instant::now(),
         };
         axum::Router::new()
@@ -589,17 +552,14 @@ mod tests {
     fn notifications_test_router(
         config: Arc<Mutex<build_watcher::config::Config>>,
     ) -> axum::Router {
-        let (watches, pause, events) = empty_state();
+        let (watches, pause, _events) = empty_state();
         let handle = stub_handle();
         let app_state = super::super::AppState {
             watches,
             config,
             handle,
             pause,
-            events,
-            github: Arc::new(StubGitHub),
             rate_limit: Arc::new(Mutex::new(None)),
-            history: Arc::new(Mutex::new(HashMap::new())),
             started_at: std::time::Instant::now(),
         };
         axum::Router::new()
@@ -709,17 +669,14 @@ mod tests {
         assert_eq!(json["watches"][1]["branch"], "main");
     }
 
-    fn test_router_full(watches: Watches, pause: PauseState, events: EventBus) -> axum::Router {
+    fn test_router_full(watches: Watches, pause: PauseState, _events: EventBus) -> axum::Router {
         let handle = stub_handle();
         let app_state = super::super::AppState {
             watches,
             config: Arc::new(Mutex::new(build_watcher::config::Config::default())),
             handle,
             pause,
-            events,
-            github: Arc::new(StubGitHub),
             rate_limit: Arc::new(Mutex::new(None)),
-            history: Arc::new(Mutex::new(HashMap::new())),
             started_at: std::time::Instant::now(),
         };
         axum::Router::new()
@@ -745,8 +702,8 @@ mod tests {
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert!(json["uptime_secs"].as_u64().unwrap() < 5);
-        assert_eq!(json["active_poll_secs"], 30);
-        assert_eq!(json["idle_poll_secs"], 120);
+        assert_eq!(json["active_poll_secs"], FALLBACK_ACTIVE_SECS);
+        assert_eq!(json["idle_poll_secs"], FALLBACK_IDLE_SECS);
         assert!(json["rate_remaining"].is_null());
     }
 
@@ -832,8 +789,10 @@ mod tests {
         use http_body_util::BodyExt;
         use tower::ServiceExt;
 
-        let (watches, pause, events) = empty_state();
-        let router = test_router(watches, pause, events.clone());
+        let (watches, pause, _events) = empty_state();
+        let handle = stub_handle();
+        let events = handle.events.clone();
+        let router = test_router_with_handle(watches, pause, handle);
 
         let req = http::Request::get("/events")
             .body(axum::body::Body::empty())

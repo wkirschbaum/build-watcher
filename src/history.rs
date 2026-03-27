@@ -59,14 +59,18 @@ pub fn history_all(history: &BuildHistory, limit: usize) -> Vec<(String, String,
     entries
 }
 
-/// Persist `history` to disk, pruning each key to at most MAX_HISTORY entries on save.
-pub async fn save_history(history: &BuildHistory) {
-    let pruned: BuildHistory = history
+/// Return a copy of `history` with each key pruned to at most MAX_HISTORY entries.
+pub fn pruned(history: &BuildHistory) -> BuildHistory {
+    history
         .iter()
         .map(|(k, v)| (k.clone(), v.iter().take(MAX_HISTORY).cloned().collect()))
-        .collect();
+        .collect()
+}
+
+/// Persist `history` to disk, pruning each key to at most MAX_HISTORY entries on save.
+pub async fn save_history(history: &BuildHistory) {
     let path = state_dir().join("history.json");
-    if let Err(e) = save_json_async(path, pruned).await {
+    if let Err(e) = save_json_async(path, pruned(history)).await {
         tracing::error!("Failed to save history: {e}");
     }
 }

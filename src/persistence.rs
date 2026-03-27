@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 
 use crate::config::{self, Config, PersistError};
-use crate::history::{BuildHistory, MAX_HISTORY};
+use crate::history::BuildHistory;
 use crate::watcher::{PersistedWatch, WatchKey};
 
 /// Abstraction over state/config persistence.
@@ -36,12 +36,8 @@ impl Persistence for FilePersistence {
     }
 
     async fn save_history(&self, history: &BuildHistory) -> Result<(), PersistError> {
-        let pruned: BuildHistory = history
-            .iter()
-            .map(|(k, v)| (k.clone(), v.iter().take(MAX_HISTORY).cloned().collect()))
-            .collect();
         let path = config::state_dir().join("history.json");
-        config::save_json_async(path, pruned).await
+        config::save_json_async(path, crate::history::pruned(history)).await
     }
 }
 

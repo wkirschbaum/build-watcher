@@ -247,6 +247,79 @@ pub(crate) fn apply_notification_overrides(
     );
 }
 
+/// Mute, unmute, or set per-event notification levels for a repo/branch.
+///
+/// Used by both the REST `POST /notifications` and the TUI daemon client.
+/// The `action` string is one of `"mute"`, `"unmute"`, or `"set_levels"`.
+pub(crate) fn do_notification_action(
+    config: &mut build_watcher::config::Config,
+    repo: &str,
+    branch: Option<&str>,
+    action: &str,
+    started: Option<NotificationLevel>,
+    success: Option<NotificationLevel>,
+    failure: Option<NotificationLevel>,
+) -> Result<String, String> {
+    use build_watcher::config::BranchConfig;
+
+    let Some(rc) = config.repos.get_mut(repo) else {
+        return Err(format!("{repo}: not being watched"));
+    };
+    let all_off = NotificationOverrides {
+        build_started: Some(NotificationLevel::Off),
+        build_success: Some(NotificationLevel::Off),
+        build_failure: Some(NotificationLevel::Off),
+    };
+    let target_label = match branch {
+        Some(b) => format!("{repo}/{b}"),
+        None => repo.to_string(),
+    };
+    match (action, branch) {
+        ("mute", Some(branch)) => {
+            rc.branch_notifications
+                .entry(branch.to_string())
+                .or_default()
+                .notifications = all_off;
+            Ok(format!("{target_label}: notifications muted"))
+        }
+        ("unmute", Some(branch)) => {
+            if let Some(bc) = rc.branch_notifications.get_mut(branch) {
+                bc.notifications = NotificationOverrides::default();
+                if bc == &BranchConfig::default() {
+                    rc.branch_notifications.remove(branch);
+                }
+            }
+            Ok(format!(
+                "{target_label}: notifications unmuted (using repo/global defaults)"
+            ))
+        }
+        ("mute", None) => {
+            rc.notifications = all_off;
+            Ok(format!("{target_label}: notifications muted"))
+        }
+        ("unmute", None) => {
+            rc.notifications = NotificationOverrides::default();
+            Ok(format!(
+                "{target_label}: notifications unmuted (using global defaults)"
+            ))
+        }
+        ("set_levels", Some(branch)) => {
+            let overrides = &mut rc
+                .branch_notifications
+                .entry(branch.to_string())
+                .or_default()
+                .notifications;
+            apply_level_overrides(overrides, started, success, failure);
+            Ok(format!("{target_label}: notification levels updated"))
+        }
+        ("set_levels", None) => {
+            apply_level_overrides(&mut rc.notifications, started, success, failure);
+            Ok(format!("{target_label}: notification levels updated"))
+        }
+        (other, _) => Err(format!("unknown action: {other:?}")),
+    }
+}
+
 /// Validate a time string in HH:MM (24-hour) format.
 pub(crate) fn validate_hhmm(s: &str) -> Result<(), String> {
     let Some((h, m)) = s.split_once(':') else {
