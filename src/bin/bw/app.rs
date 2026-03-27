@@ -516,7 +516,7 @@ impl App {
 
         let d = daemon.clone();
         self.input_mode = InputMode::Normal;
-        self.spawn_action("Saving config…", false, async move {
+        self.spawn_action("Saving config…", true, async move {
             d.set_defaults(Some(branches), Some(workflows), aggression)
                 .await
                 .map(|()| "Config saved".to_string())
