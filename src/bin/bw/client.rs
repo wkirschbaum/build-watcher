@@ -1,6 +1,7 @@
 use std::time::Duration;
 
-use build_watcher::config::{NotificationConfig, NotificationLevel, state_dir};
+use build_watcher::config::{NotificationConfig, NotificationLevel};
+use build_watcher::dirs::state_dir;
 use build_watcher::events::WatchEvent;
 use build_watcher::status::HistoryEntryView;
 use tokio::sync::mpsc;

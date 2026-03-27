@@ -1,4 +1,5 @@
 pub mod config;
+pub mod dirs;
 pub mod events;
 pub mod format;
 pub mod github;

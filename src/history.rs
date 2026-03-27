@@ -3,8 +3,9 @@ use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
-use crate::config::{load_json, state_dir};
+use crate::dirs::state_dir;
 use crate::github::LastBuild;
+use crate::persistence::load_json;
 use crate::watcher::WatchKey;
 
 pub const MAX_HISTORY: usize = 20;

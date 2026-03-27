@@ -1,5 +1,4 @@
-use build_watcher::config::{NotificationLevel, NotificationOverrides};
-use build_watcher::persistence::Persistence;
+use build_watcher::config::{self, NotificationLevel, NotificationOverrides};
 use build_watcher::watcher::{
     RateLimitState, SharedConfig, WatcherHandle, Watches, collect_persisted, start_watch,
 };
@@ -49,7 +48,7 @@ pub(crate) async fn do_watch_builds(
             cfg.add_repos(&started_repos);
             cfg.clone()
         };
-        if let Some(warning) = persist_config(&*handle.persistence, snapshot).await {
+        if let Some(warning) = persist_config(snapshot).await {
             results.push(warning);
         }
     }
@@ -101,7 +100,7 @@ pub(crate) async fn do_stop_watches(
         }
         (cfg.clone(), results)
     };
-    if let Some(warning) = persist_config(&*handle.persistence, snapshot).await {
+    if let Some(warning) = persist_config(snapshot).await {
         results.push(warning);
     }
 
@@ -165,18 +164,15 @@ pub(crate) async fn do_configure_branches(
         tracing::error!(error = %e, "Failed to persist watches");
     }
     let snapshot = config.lock().await.clone();
-    if let Some(warning) = persist_config(&*handle.persistence, snapshot).await {
+    if let Some(warning) = persist_config(snapshot).await {
         results.push(warning);
     }
 
     results
 }
 
-pub(crate) async fn persist_config(
-    persistence: &dyn Persistence,
-    config: build_watcher::config::Config,
-) -> Option<String> {
-    match persistence.save_config(&config).await {
+pub(crate) async fn persist_config(cfg: build_watcher::config::Config) -> Option<String> {
+    match config::save_config_async(&cfg).await {
         Ok(()) => None,
         Err(e) => {
             tracing::error!("Failed to save config: {e}");

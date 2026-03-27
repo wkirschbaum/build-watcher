@@ -7,9 +7,11 @@ use crossterm::event::{KeyCode, KeyModifiers};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
-use build_watcher::config::{self, NOTIFICATION_EVENT_COUNT, NotificationLevel, state_dir};
+use build_watcher::config::{NOTIFICATION_EVENT_COUNT, NotificationLevel};
+use build_watcher::dirs::state_dir;
 use build_watcher::events::WatchEvent;
 use build_watcher::github::{repo_url, run_url, validate_branch, validate_repo};
+use build_watcher::persistence::{load_json, save_json};
 use build_watcher::status::{
     ActiveRunView, HistoryEntryView, LastBuildView, StatsResponse, StatusResponse, WatchStatus,
 };
@@ -180,11 +182,11 @@ impl TuiPrefs {
     }
 
     pub(crate) fn load() -> Self {
-        config::load_json(&Self::path()).unwrap_or_default()
+        load_json(&Self::path()).unwrap_or_default()
     }
 
     pub(crate) fn save(&self) {
-        if let Err(e) = config::save_json(&Self::path(), self) {
+        if let Err(e) = save_json(&Self::path(), self) {
             tracing::warn!("Failed to save TUI preferences: {e}");
         }
     }
@@ -670,11 +672,23 @@ impl App {
                 }
             }
             KeyCode::BackTab | KeyCode::Char('E') => {
-                // Expand all if any collapsed, collapse all if all expanded
-                let all_repos: HashSet<String> =
-                    self.status.watches.iter().map(|w| w.repo.clone()).collect();
+                // Expand all if any collapsed, collapse all if all expanded.
+                // Only multi-branch repos are collapsible; single-branch repos
+                // are always inlined and unaffected by collapsed state.
+                let multi_branch_repos: HashSet<String> = {
+                    let mut counts: std::collections::HashMap<&str, usize> =
+                        std::collections::HashMap::new();
+                    for w in &self.status.watches {
+                        *counts.entry(w.repo.as_str()).or_insert(0) += 1;
+                    }
+                    counts
+                        .into_iter()
+                        .filter(|(_, n)| *n > 1)
+                        .map(|(repo, _)| repo.to_string())
+                        .collect()
+                };
                 if self.collapsed.is_empty() {
-                    self.collapsed = all_repos;
+                    self.collapsed = multi_branch_repos;
                 } else {
                     self.collapsed.clear();
                 }
@@ -1684,8 +1698,8 @@ mod tests {
             group_by: GroupBy::Status,
             collapsed: HashSet::from(["alice/app".to_string(), "bob/lib".to_string()]),
         };
-        config::save_json(&path, &prefs).unwrap();
-        let loaded: TuiPrefs = config::load_json(&path).unwrap();
+        save_json(&path, &prefs).unwrap();
+        let loaded: TuiPrefs = load_json(&path).unwrap();
         assert_eq!(loaded.sort_column, SortColumn::Workflow);
         assert!(!loaded.sort_ascending);
         assert_eq!(loaded.group_by, GroupBy::Status);
@@ -1698,7 +1712,7 @@ mod tests {
     fn tui_prefs_corrupt_file_returns_defaults() {
         let path = temp_prefs_path("corrupt");
         std::fs::write(&path, "not json at all {{{").unwrap();
-        let loaded: Option<TuiPrefs> = config::load_json(&path);
+        let loaded: Option<TuiPrefs> = load_json(&path);
         assert!(loaded.is_none());
         // Callers use unwrap_or_default:
         let prefs = loaded.unwrap_or_default();
@@ -1715,7 +1729,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("tui-prefs.json");
         // Don't create the file
-        let loaded: Option<TuiPrefs> = config::load_json(&path);
+        let loaded: Option<TuiPrefs> = load_json(&path);
         assert!(loaded.is_none());
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1729,7 +1743,7 @@ mod tests {
             r#"{"sort_column":"Branch","sort_ascending":false,"group_by":"Workflow"}"#,
         )
         .unwrap();
-        let loaded: TuiPrefs = config::load_json(&path).unwrap();
+        let loaded: TuiPrefs = load_json(&path).unwrap();
         assert_eq!(loaded.sort_column, SortColumn::Branch);
         assert!(!loaded.sort_ascending);
         assert_eq!(loaded.group_by, GroupBy::Workflow);
@@ -1742,7 +1756,7 @@ mod tests {
         let path = temp_prefs_path("partial");
         // Only sort_column present — everything else should get defaults.
         std::fs::write(&path, r#"{"sort_column":"Age"}"#).unwrap();
-        let loaded: TuiPrefs = config::load_json(&path).unwrap();
+        let loaded: TuiPrefs = load_json(&path).unwrap();
         assert_eq!(loaded.sort_column, SortColumn::Age);
         assert!(loaded.sort_ascending); // default: true
         assert_eq!(loaded.group_by, GroupBy::Org); // default
@@ -1759,7 +1773,7 @@ mod tests {
             r#"{"sort_column":"NonExistent","sort_ascending":true,"group_by":"Org"}"#,
         )
         .unwrap();
-        let loaded: Option<TuiPrefs> = config::load_json(&path);
+        let loaded: Option<TuiPrefs> = load_json(&path);
         assert!(loaded.is_none());
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
@@ -1777,7 +1791,7 @@ mod tests {
         // Write valid backup, corrupt primary.
         std::fs::write(&bak, serde_json::to_string(&prefs).unwrap()).unwrap();
         std::fs::write(&path, "corrupt!!!").unwrap();
-        let loaded: TuiPrefs = config::load_json(&path).unwrap();
+        let loaded: TuiPrefs = load_json(&path).unwrap();
         assert_eq!(loaded.sort_column, SortColumn::Status);
         assert!(!loaded.sort_ascending);
         assert_eq!(loaded.group_by, GroupBy::Branch);

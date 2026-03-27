@@ -270,7 +270,7 @@ pub(crate) async fn notifications_handler(
         };
         (cfg.clone(), msg)
     };
-    if let Some(warning) = persist_config(&*state.handle.persistence, snapshot).await {
+    if let Some(warning) = persist_config(snapshot).await {
         return axum::Json(serde_json::json!({ "ok": true, "message": msg, "warning": warning }))
             .into_response();
     }
@@ -346,7 +346,7 @@ pub(crate) async fn set_defaults_handler(
         (cfg.clone(), messages)
     };
     state.handle.config_changed.notify_waiters();
-    if let Some(warning) = persist_config(&*state.handle.persistence, snapshot).await {
+    if let Some(warning) = persist_config(snapshot).await {
         return axum::Json(
             serde_json::json!({ "ok": true, "messages": messages, "warning": warning }),
         )
@@ -441,7 +441,7 @@ fn to_history_view(
 mod tests {
     use build_watcher::config::NotificationLevel;
     use build_watcher::events::{EventBus, RunSnapshot, WatchEvent};
-    use build_watcher::rate_limiter::{FALLBACK_ACTIVE_SECS, FALLBACK_IDLE_SECS};
+    use build_watcher::rate_limiter::MIN_ACTIVE_SECS;
     use build_watcher::watcher::{PauseState, WatchEntry, WatchKey, Watches};
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -702,8 +702,9 @@ mod tests {
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert!(json["uptime_secs"].as_u64().unwrap() < 5);
-        assert_eq!(json["active_poll_secs"], FALLBACK_ACTIVE_SECS);
-        assert_eq!(json["idle_poll_secs"], FALLBACK_IDLE_SECS);
+        // Default aggression is Medium (mult=2.0): fallback = (15×2, 30×2) = (30, 60)
+        assert_eq!(json["active_poll_secs"], MIN_ACTIVE_SECS * 2);
+        assert_eq!(json["idle_poll_secs"], 60u64);
         assert!(json["rate_remaining"].is_null());
     }
 

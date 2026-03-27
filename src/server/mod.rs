@@ -21,7 +21,8 @@ use rmcp::transport::streamable_http_server::{
 };
 use tokio_util::sync::CancellationToken;
 
-use build_watcher::config::{NotificationLevel, state_dir, unix_now};
+use build_watcher::config::{NotificationLevel, unix_now};
+use build_watcher::dirs::state_dir;
 use build_watcher::status::{ActiveRunView, LastBuildView, StatusResponse, WatchStatus};
 use build_watcher::watcher::{
     PauseState, RateLimitState, SharedConfig, WatchEntry, WatchKey, WatcherHandle, Watches,

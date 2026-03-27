@@ -4,8 +4,9 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tokio::time::Instant;
 
-use crate::config::{load_json, state_dir};
+use crate::dirs::state_dir;
 use crate::github::{GhError, LastBuild, RunInfo};
+use crate::persistence::load_json;
 
 use super::Watches;
 

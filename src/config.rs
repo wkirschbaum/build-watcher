@@ -1,12 +1,13 @@
 use std::collections::HashMap;
-use std::io::Write;
-use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::path::Path;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use chrono::Timelike;
+
+use crate::dirs::config_dir;
+use crate::persistence::{PersistError, save_json, save_json_async, try_parse_file};
 
 /// Current Unix epoch in seconds.
 pub fn unix_now() -> u64 {
@@ -14,197 +15,6 @@ pub fn unix_now() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .expect("system clock before Unix epoch")
         .as_secs()
-}
-
-// -- Directories (computed once) --
-
-static STATE_DIR: OnceLock<PathBuf> = OnceLock::new();
-static CONFIG_DIR: OnceLock<PathBuf> = OnceLock::new();
-
-fn home_dir() -> String {
-    std::env::var("HOME").unwrap_or_else(|_| {
-        tracing::warn!("HOME is not set; falling back to /tmp for state/config directories");
-        "/tmp".to_string()
-    })
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-compile_error!("Unsupported platform: only Linux and macOS are supported");
-
-#[cfg(target_os = "linux")]
-fn default_state_dir() -> String {
-    format!("{}/.local/state/build-watcher", home_dir())
-}
-
-#[cfg(target_os = "linux")]
-fn default_config_dir() -> String {
-    format!("{}/.config/build-watcher", home_dir())
-}
-
-#[cfg(target_os = "macos")]
-fn default_state_dir() -> String {
-    format!(
-        "{}/Library/Application Support/build-watcher/state",
-        home_dir()
-    )
-}
-
-#[cfg(target_os = "macos")]
-fn default_config_dir() -> String {
-    format!(
-        "{}/Library/Application Support/build-watcher/config",
-        home_dir()
-    )
-}
-
-fn init_dir(dir: &Path) {
-    if let Err(e) = std::fs::create_dir_all(dir) {
-        tracing::error!("Failed to create directory {}: {e}", dir.display());
-    }
-}
-
-pub fn state_dir() -> &'static Path {
-    STATE_DIR.get_or_init(|| {
-        let dir =
-            PathBuf::from(std::env::var("STATE_DIRECTORY").unwrap_or_else(|_| default_state_dir()));
-        init_dir(&dir);
-        dir
-    })
-}
-
-pub fn config_dir() -> &'static Path {
-    CONFIG_DIR.get_or_init(|| {
-        let dir = PathBuf::from(
-            std::env::var("CONFIGURATION_DIRECTORY").unwrap_or_else(|_| default_config_dir()),
-        );
-        init_dir(&dir);
-        dir
-    })
-}
-
-// -- Safe JSON persistence --
-//
-// Crash-safe write sequence:
-// 1. Serialize → write to .draft → fsync  (crash here: .draft lost, primary intact)
-// 2. Parse .draft back to verify           (crash here: .draft orphaned, primary intact)
-// 3. Rename primary → .bak                 (crash here: .bak exists, load recovers from it)
-// 4. Rename .draft → primary               (crash here: primary missing, load recovers from .bak)
-//
-// On load, we transparently fall back to .bak if the primary is missing or corrupt.
-
-pub fn load_json<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
-    if let Some(val) = try_parse_file::<T>(path) {
-        return Some(val);
-    }
-
-    let bak = path.with_extension("json.bak");
-    if let Some(val) = try_parse_file::<T>(&bak) {
-        tracing::warn!("Primary {} corrupt, recovered from backup", path.display());
-        let _ = std::fs::copy(&bak, path);
-        return Some(val);
-    }
-
-    None
-}
-
-fn try_parse_file<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
-    let data = std::fs::read_to_string(path).ok()?;
-    match serde_json::from_str(&data) {
-        Ok(val) => Some(val),
-        Err(e) => {
-            if !data.trim().is_empty() {
-                tracing::warn!("{}: parse failed: {e}", path.display());
-            }
-            None
-        }
-    }
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum PersistError {
-    #[error("failed to serialize: {0}")]
-    Serialize(#[from] serde_json::Error),
-    #[error("failed to write {path}: {source}")]
-    Write {
-        path: PathBuf,
-        source: std::io::Error,
-    },
-    #[error("draft verification failed for {0}")]
-    Verify(PathBuf),
-    #[error("failed to rename {from} to {to}: {source}")]
-    Rename {
-        from: PathBuf,
-        to: PathBuf,
-        source: std::io::Error,
-    },
-}
-
-/// Async wrapper around `save_json` that runs the blocking I/O on a dedicated thread.
-pub async fn save_json_async<T: Serialize + Send + 'static>(
-    path: PathBuf,
-    value: T,
-) -> Result<(), PersistError> {
-    match tokio::task::spawn_blocking(move || save_json(&path, &value)).await {
-        Ok(result) => result,
-        Err(e) => {
-            tracing::error!("save_json_async: blocking task panicked: {e}");
-            Err(PersistError::Serialize(serde_json::Error::io(
-                std::io::Error::other("blocking task panicked"),
-            )))
-        }
-    }
-}
-
-pub fn save_json<T: Serialize>(path: &Path, value: &T) -> Result<(), PersistError> {
-    let data = serde_json::to_string_pretty(value)?;
-
-    let draft = path.with_extension("json.draft");
-
-    // Write and fsync the draft file
-    {
-        let mut file = std::fs::File::create(&draft).map_err(|e| PersistError::Write {
-            path: draft.clone(),
-            source: e,
-        })?;
-        file.write_all(data.as_bytes())
-            .map_err(|e| PersistError::Write {
-                path: draft.clone(),
-                source: e,
-            })?;
-        file.sync_all().map_err(|e| PersistError::Write {
-            path: draft.clone(),
-            source: e,
-        })?;
-    }
-
-    // Verify the draft parses back as valid JSON before committing
-    match std::fs::read_to_string(&draft) {
-        Ok(readback) if serde_json::from_str::<serde_json::Value>(&readback).is_ok() => {}
-        _ => {
-            let _ = std::fs::remove_file(&draft);
-            return Err(PersistError::Verify(draft));
-        }
-    }
-
-    // Backup current file, then promote draft
-    let bak = path.with_extension("json.bak");
-    if let Err(e) = std::fs::rename(path, &bak) {
-        // NotFound is expected on the first save; anything else is worth logging.
-        if e.kind() != std::io::ErrorKind::NotFound {
-            tracing::warn!("Failed to create backup {}: {e}", bak.display());
-        }
-    }
-    if let Err(e) = std::fs::rename(&draft, path) {
-        // Try to restore backup
-        let _ = std::fs::rename(&bak, path);
-        return Err(PersistError::Rename {
-            from: draft,
-            to: path.to_path_buf(),
-            source: e,
-        });
-    }
-
-    Ok(())
 }
 
 // -- Configuration --
@@ -324,8 +134,8 @@ impl PollAggression {
     pub fn target_fraction(self) -> f64 {
         match self {
             Self::Low => 0.10,
-            Self::Medium => 0.25,
-            Self::High => 0.50,
+            Self::Medium => 0.30,
+            Self::High => 0.70,
         }
     }
 
@@ -335,12 +145,12 @@ impl PollAggression {
     }
 
     /// Multiplier applied to poll intervals in the free zone.
-    /// High = 1.0 (floor speed), Medium = 1.5×, Low = 3×.
+    /// High = 1.0 (floor speed), Medium = 2×, Low = 7×.
     pub fn interval_multiplier(self) -> f64 {
         match self {
             Self::High => 1.0,
-            Self::Medium => 1.5,
-            Self::Low => 3.0,
+            Self::Medium => 2.0,
+            Self::Low => 7.0,
         }
     }
 }
@@ -731,6 +541,7 @@ pub async fn save_config_async(config: &Config) -> Result<(), PersistError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::persistence::{load_json, save_json};
 
     fn qh(start: &str, end: &str) -> QuietHours {
         QuietHours {

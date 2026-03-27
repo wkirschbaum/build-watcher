@@ -5,7 +5,8 @@ use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, Content, Implementation, ServerCapabilities, ServerInfo};
 use rmcp::{ErrorData as McpError, ServerHandler, tool, tool_handler, tool_router};
 
-use build_watcher::config::{PollAggression, config_dir, unix_now};
+use build_watcher::config::{PollAggression, unix_now};
+use build_watcher::dirs::config_dir;
 use build_watcher::format;
 use build_watcher::github::{validate_branch, validate_repo};
 use build_watcher::history::history_for;
@@ -182,7 +183,7 @@ impl BuildWatcher {
                     let msg = format!("Default branches set to {:?}", config.default_branches);
                     (config.clone(), msg)
                 };
-                if let Some(warning) = persist_config(&*self.handle.persistence, snapshot).await {
+                if let Some(warning) = persist_config(snapshot).await {
                     msg.push_str(&warning);
                 }
                 Ok(CallToolResult::success(vec![Content::text(msg)]))
@@ -371,7 +372,7 @@ impl BuildWatcher {
             }
             (config.clone(), msgs)
         };
-        if let Some(warning) = persist_config(&*self.handle.persistence, snapshot).await {
+        if let Some(warning) = persist_config(snapshot).await {
             msgs.push(warning);
         }
         Ok(CallToolResult::success(vec![Content::text(
@@ -437,7 +438,7 @@ impl BuildWatcher {
 
             (config.clone(), msgs)
         };
-        if let Some(warning) = persist_config(&*self.handle.persistence, snapshot).await {
+        if let Some(warning) = persist_config(snapshot).await {
             msgs.push(warning);
         }
 
@@ -758,7 +759,7 @@ impl BuildWatcher {
                 ));
             }
 
-            if let Some(warning) = persist_config(&*self.handle.persistence, snapshot).await {
+            if let Some(warning) = persist_config(snapshot).await {
                 msgs.push(warning);
             }
         }
@@ -792,7 +793,7 @@ impl BuildWatcher {
             cfg.clone()
         };
         self.handle.config_changed.notify_waiters();
-        if let Some(w) = persist_config(&*self.handle.persistence, snapshot).await {
+        if let Some(w) = persist_config(snapshot).await {
             return Ok(CallToolResult::success(vec![Content::text(w)]));
         }
         Ok(CallToolResult::success(vec![Content::text(format!(

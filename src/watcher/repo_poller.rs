@@ -205,7 +205,7 @@ impl RepoPoller {
             cfg.repos.remove(&self.repo);
             cfg.clone()
         };
-        if let Err(e) = self.persistence.save_config(&snapshot).await {
+        if let Err(e) = crate::config::save_config_async(&snapshot).await {
             tracing::error!(error = %e, "Failed to save config after removing dead repo");
         }
     }
