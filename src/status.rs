@@ -50,6 +50,23 @@ pub struct StatusResponse {
     pub watches: Vec<WatchStatus>,
 }
 
+/// A single build history entry as returned by `GET /history`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HistoryEntryView {
+    pub id: u64,
+    pub conclusion: String,
+    pub workflow: String,
+    pub title: String,
+    pub branch: String,
+    pub event: String,
+    pub created_at: String,
+    pub updated_at: String,
+    /// Duration in seconds (`updated_at - created_at`), if timestamps are valid.
+    pub duration_secs: Option<u64>,
+    /// Seconds since `created_at`, computed at serialization time.
+    pub age_secs: Option<u64>,
+}
+
 /// Daemon stats returned by `GET /stats`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct StatsResponse {

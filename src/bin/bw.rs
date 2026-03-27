@@ -25,7 +25,7 @@ use build_watcher::events::WatchEvent;
 use build_watcher::format;
 use build_watcher::github::{repo_url, run_url, validate_branch, validate_repo};
 use build_watcher::status::{
-    ActiveRunView, LastBuildView, StatsResponse, StatusResponse, WatchStatus,
+    ActiveRunView, HistoryEntryView, LastBuildView, StatsResponse, StatusResponse, WatchStatus,
 };
 
 // -- Daemon client --
@@ -176,6 +176,34 @@ impl DaemonClient {
         .await
     }
 
+    async fn get_history(
+        &self,
+        repo: &str,
+        branch: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<HistoryEntryView>, String> {
+        let mut url = format!(
+            "http://127.0.0.1:{}/history?repo={}&limit={}",
+            self.port, repo, limit
+        );
+        if let Some(b) = branch {
+            url.push_str(&format!("&branch={}", b));
+        }
+        let resp = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        if !resp.status().is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format!("history: {body}"));
+        }
+        resp.json::<Vec<HistoryEntryView>>()
+            .await
+            .map_err(|e| e.to_string())
+    }
+
     /// Inner client ref for the SSE background task (which needs `bytes_stream`).
     fn inner(&self) -> &reqwest::Client {
         &self.client
@@ -232,6 +260,13 @@ enum InputMode {
         levels: [NotificationLevel; 3],
         /// Active row index (0..3).
         active: usize,
+    },
+    /// Build history overlay popup (opened with `h`/`H`).
+    History {
+        repo: String,
+        branch: Option<String>,
+        entries: Vec<HistoryEntryView>,
+        selected: usize,
     },
 }
 
@@ -479,6 +514,34 @@ impl App {
                 }
                 true
             }
+            InputMode::History {
+                repo,
+                entries,
+                selected,
+                ..
+            } => {
+                match code {
+                    KeyCode::Esc => {
+                        self.input_mode = InputMode::Normal;
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        *selected = selected.saturating_sub(1);
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        if !entries.is_empty() {
+                            *selected = (*selected + 1).min(entries.len() - 1);
+                        }
+                    }
+                    KeyCode::Char('o') => {
+                        if let Some(entry) = entries.get(*selected) {
+                            let url = run_url(repo, entry.id);
+                            open_browser(&url);
+                        }
+                    }
+                    _ => {}
+                }
+                true
+            }
         }
     }
 
@@ -698,6 +761,65 @@ impl App {
                     open_browser(&repo_url(repo));
                 }
             }
+            KeyCode::Char('h') => {
+                if let Some((repo, branch, _, _)) = selected {
+                    let d = daemon.clone();
+                    let repo = repo.to_string();
+                    let branch = branch.to_string();
+                    let tx = self.bg_tx.clone();
+                    self.set_flash("Loading history…");
+                    tokio::spawn(async move {
+                        match d.get_history(&repo, Some(&branch), 20).await {
+                            Ok(entries) => {
+                                let _ = tx
+                                    .send(SseUpdate::EnterHistory {
+                                        repo,
+                                        branch: Some(branch),
+                                        entries,
+                                    })
+                                    .await;
+                            }
+                            Err(e) => {
+                                let _ = tx
+                                    .send(SseUpdate::BackgroundResult {
+                                        flash: e,
+                                        resync: false,
+                                    })
+                                    .await;
+                            }
+                        }
+                    });
+                }
+            }
+            KeyCode::Char('H') => {
+                if let Some((repo, _, _, _)) = selected {
+                    let d = daemon.clone();
+                    let repo = repo.to_string();
+                    let tx = self.bg_tx.clone();
+                    self.set_flash("Loading history…");
+                    tokio::spawn(async move {
+                        match d.get_history(&repo, None, 20).await {
+                            Ok(entries) => {
+                                let _ = tx
+                                    .send(SseUpdate::EnterHistory {
+                                        repo,
+                                        branch: None,
+                                        entries,
+                                    })
+                                    .await;
+                            }
+                            Err(e) => {
+                                let _ = tx
+                                    .send(SseUpdate::BackgroundResult {
+                                        flash: e,
+                                        resync: false,
+                                    })
+                                    .await;
+                            }
+                        }
+                    });
+                }
+            }
             KeyCode::Char('s') => {
                 if self.sort_ascending {
                     self.sort_ascending = false;
@@ -782,6 +904,12 @@ enum SseUpdate {
         repo: String,
         branch: String,
         levels: [NotificationLevel; 3],
+    },
+    /// Open the build history popup.
+    EnterHistory {
+        repo: String,
+        branch: Option<String>,
+        entries: Vec<HistoryEntryView>,
     },
 }
 
@@ -1474,7 +1602,9 @@ fn render_footer(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
                 Style::default().fg(Color::DarkGray),
             ),
         ])),
-        InputMode::Form { .. } | InputMode::NotificationPicker { .. } => Paragraph::new(""),
+        InputMode::Form { .. }
+        | InputMode::NotificationPicker { .. }
+        | InputMode::History { .. } => Paragraph::new(""),
         InputMode::Normal => Paragraph::new(Line::from(vec![
             Span::styled("[↑↓]", key_style),
             Span::raw(" select  "),
@@ -1494,6 +1624,8 @@ fn render_footer(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &
             Span::raw(" sort  "),
             Span::styled("[g/G]", key_style),
             Span::raw(" group  "),
+            Span::styled("[h/H]", key_style),
+            Span::raw(" history  "),
             Span::styled("[C]", key_style),
             Span::raw(" config  "),
             Span::styled("[q]", key_style),
@@ -1543,6 +1675,17 @@ fn render(frame: &mut ratatui::Frame, app: &App) {
     } = &app.input_mode
     {
         render_notification_picker_popup(frame, repo, branch, levels, *active);
+    }
+
+    // Overlay the history popup if active.
+    if let InputMode::History {
+        repo,
+        branch,
+        entries,
+        selected,
+    } = &app.input_mode
+    {
+        render_history_popup(frame, repo, branch.as_deref(), entries, *selected);
     }
 }
 
@@ -1730,6 +1873,160 @@ fn render_notification_picker_popup(
         Span::styled(" cancel", Style::default().fg(Color::DarkGray)),
     ]);
     frame.render_widget(Paragraph::new(hint), rows[5]);
+}
+
+fn render_history_popup(
+    frame: &mut ratatui::Frame,
+    repo: &str,
+    branch: Option<&str>,
+    entries: &[HistoryEntryView],
+    selected: usize,
+) {
+    let area = frame.area();
+    // 1 header row + data rows + 1 blank + 1 hint + 2 borders, capped to terminal height
+    let data_rows = entries.len().max(1) as u16;
+    let popup_height = (data_rows + 5).min(area.height.saturating_sub(4));
+    let visible_rows = popup_height.saturating_sub(5) as usize; // rows available for data
+
+    let popup = centered_rect(85, popup_height, area);
+    frame.render_widget(Clear, popup);
+
+    let title = match branch {
+        Some(b) => format!(" History: {repo} @ {b} "),
+        None => format!(" History: {repo} "),
+    };
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    // Layout: header row + data rows (fill remaining) + blank + hint
+    let inner_height = inner.height as usize;
+    let mut constraints = vec![Constraint::Length(1)]; // column header
+    for _ in 0..inner_height.saturating_sub(3) {
+        constraints.push(Constraint::Length(1));
+    }
+    constraints.push(Constraint::Length(1)); // blank
+    constraints.push(Constraint::Length(1)); // hint
+
+    let rows_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
+        .split(inner);
+
+    // Column header
+    let header_style = Style::default()
+        .fg(Color::DarkGray)
+        .add_modifier(Modifier::BOLD);
+    let header_row = if branch.is_none() {
+        "  STATUS        BRANCH    WORKFLOW       TITLE                           DURATION  AGE"
+    } else {
+        "  STATUS        WORKFLOW       TITLE                                     DURATION  AGE"
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(header_row, header_style))),
+        rows_layout[0],
+    );
+
+    // Scroll offset: keep selected centered
+    let offset = if visible_rows == 0 {
+        0
+    } else {
+        selected.saturating_sub(visible_rows / 2)
+    };
+
+    if entries.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "  No history found.",
+                Style::default().fg(Color::DarkGray),
+            ))),
+            rows_layout[1],
+        );
+    } else {
+        for (slot, entry) in entries.iter().skip(offset).enumerate() {
+            let layout_idx = slot + 1; // offset by header row
+            if layout_idx >= rows_layout.len().saturating_sub(2) {
+                break; // stop before blank + hint rows
+            }
+            let is_selected = offset + slot == selected;
+            let base_style = if is_selected {
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Reset)
+            };
+            let status_style = if is_selected {
+                base_style
+            } else {
+                status_style(&entry.conclusion)
+            };
+            let arrow = if is_selected { "▸ " } else { "  " };
+            let emoji = status_emoji(&entry.conclusion);
+            let status_str = format::status(&entry.conclusion);
+            let duration = entry
+                .duration_secs
+                .map(|s| format::seconds(s))
+                .unwrap_or_else(|| "—".to_string());
+            let age = entry
+                .age_secs
+                .map(|s| format::age(s))
+                .unwrap_or_else(|| "—".to_string());
+            let title_str = format::truncate(&entry.title, 32);
+            let workflow_str = format::truncate(&entry.workflow, 14);
+
+            let line = if branch.is_none() {
+                let branch_str = format::truncate(&entry.branch, 9);
+                Line::from(vec![
+                    Span::styled(format!("{arrow}{emoji} {status_str:<11}"), status_style),
+                    Span::styled(format!("{branch_str:<10}",), base_style),
+                    Span::styled(format!("{workflow_str:<15}"), base_style),
+                    Span::styled(format!("{title_str:<33}"), base_style),
+                    Span::styled(format!("{duration:<10}"), base_style),
+                    Span::styled(age, base_style),
+                ])
+            } else {
+                Line::from(vec![
+                    Span::styled(format!("{arrow}{emoji} {status_str:<11}"), status_style),
+                    Span::styled(format!("{workflow_str:<15}"), base_style),
+                    Span::styled(format!("{title_str:<37}"), base_style),
+                    Span::styled(format!("{duration:<10}"), base_style),
+                    Span::styled(age, base_style),
+                ])
+            };
+            frame.render_widget(Paragraph::new(line), rows_layout[layout_idx]);
+        }
+    }
+
+    // Hint row (last slot before end)
+    let hint_idx = rows_layout.len() - 1;
+    let hint = Line::from(vec![
+        Span::styled(
+            "[↑↓]",
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" scroll  ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            "[o]",
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" open  ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            "[Esc]",
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" close", Style::default().fg(Color::DarkGray)),
+    ]);
+    frame.render_widget(Paragraph::new(hint), rows_layout[hint_idx]);
 }
 
 // -- SSE background task --
@@ -1987,6 +2284,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 branch,
                                 levels,
                                 active: 0,
+                            };
+                        }
+                        Some(SseUpdate::EnterHistory {
+                            repo,
+                            branch,
+                            entries,
+                        }) => {
+                            app.input_mode = InputMode::History {
+                                repo,
+                                branch,
+                                entries,
+                                selected: 0,
                             };
                         }
                         None => {}

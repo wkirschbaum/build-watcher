@@ -30,7 +30,7 @@ use build_watcher::format;
 use build_watcher::github::{validate_branch, validate_repo};
 use build_watcher::persistence::Persistence;
 use build_watcher::status::{
-    ActiveRunView, LastBuildView, StatsResponse, StatusResponse, WatchStatus,
+    ActiveRunView, HistoryEntryView, LastBuildView, StatsResponse, StatusResponse, WatchStatus,
 };
 use build_watcher::watcher::{
     MIN_ACTIVE_SECS, MIN_IDLE_SECS, PauseState, RateLimitState, SharedConfig, WatchEntry, WatchKey,
@@ -653,6 +653,51 @@ async fn shutdown_handler(State(state): State<AppState>) -> axum::Json<serde_jso
     axum::Json(serde_json::json!({ "ok": true, "message": "shutting down" }))
 }
 
+#[derive(Deserialize)]
+struct HistoryQuery {
+    repo: String,
+    #[serde(default)]
+    branch: Option<String>,
+    #[serde(default)]
+    limit: Option<u32>,
+}
+
+/// `GET /history` — Recent build history for a repo, optionally filtered by branch.
+async fn history_handler(
+    State(state): State<AppState>,
+    Query(q): Query<HistoryQuery>,
+) -> axum::response::Response {
+    let limit = q.limit.unwrap_or(15).min(50);
+    let branch = q.branch.as_deref();
+    let now = unix_now();
+    match state.github.run_list_history(&q.repo, branch, limit).await {
+        Ok(entries) => {
+            let views: Vec<HistoryEntryView> = entries
+                .into_iter()
+                .map(|e| {
+                    let duration_secs = e.duration_secs();
+                    let age_secs = e.age_secs(now);
+                    let title = e.display_title();
+                    HistoryEntryView {
+                        id: e.id,
+                        conclusion: e.conclusion,
+                        workflow: e.workflow,
+                        title,
+                        branch: e.branch,
+                        event: e.event,
+                        created_at: e.created_at,
+                        updated_at: e.updated_at,
+                        duration_secs,
+                        age_secs,
+                    }
+                })
+                .collect();
+            axum::Json(views).into_response()
+        }
+        Err(e) => json_error(e.to_string()),
+    }
+}
+
 /// Bind to the preferred port, trying up to 9 consecutive ports on conflict.
 async fn bind_with_fallback(preferred: u16) -> AnyResult<tokio::net::TcpListener> {
     let last = preferred.saturating_add(9);
@@ -728,6 +773,7 @@ fn build_router(
             "/defaults",
             axum::routing::get(get_defaults_handler).post(set_defaults_handler),
         )
+        .route("/history", get(history_handler))
         .route("/shutdown", axum::routing::post(shutdown_handler))
         .with_state(app_state)
         .nest_service("/mcp", service)
