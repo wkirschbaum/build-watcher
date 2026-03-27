@@ -599,7 +599,7 @@ impl App {
                     }
                 }
             }
-            KeyCode::Char('e') => {
+            KeyCode::Tab | KeyCode::Char('e') => {
                 if let Some((repo, _, _, _)) = selected {
                     let repo = repo.to_string();
                     if self.collapsed.contains(&repo) {
@@ -609,7 +609,7 @@ impl App {
                     }
                 }
             }
-            KeyCode::Char('E') => {
+            KeyCode::BackTab | KeyCode::Char('E') => {
                 // Expand all if any collapsed, collapse all if all expanded
                 let all_repos: HashSet<String> =
                     self.status.watches.iter().map(|w| w.repo.clone()).collect();
