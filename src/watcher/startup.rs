@@ -1,7 +1,7 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use tokio::sync::Notify;
+use tokio::sync::{Mutex, Notify};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
@@ -12,7 +12,7 @@ use crate::github::GitHubClient;
 use crate::history::{SharedHistory, push_build};
 use crate::persistence::Persistence;
 
-use super::poller::Poller;
+use super::repo_poller::RepoPoller;
 use super::types::{ActiveRun, WatchEntry, WatchKey};
 use super::{RateLimitState, SharedConfig, Watches, filter_runs};
 
@@ -29,6 +29,8 @@ pub struct WatcherHandle {
     pub history: SharedHistory,
     /// Notified when config changes so pollers wake early and recompute intervals.
     pub config_changed: Arc<Notify>,
+    /// Tracks which repos have an active `RepoPoller` to avoid spawning duplicates.
+    active_repo_pollers: Arc<Mutex<HashSet<String>>>,
 }
 
 impl WatcherHandle {
@@ -47,6 +49,7 @@ impl WatcherHandle {
             persistence,
             history,
             config_changed: Arc::new(Notify::new()),
+            active_repo_pollers: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -157,19 +160,33 @@ pub async fn start_watch(
     // Persistence is the caller's responsibility — start_watch only updates
     // in-memory state and spawns the poller.
 
-    spawn_poller(watches, config, handle, rate_limit, key);
+    spawn_repo_poller(watches, config, handle, rate_limit, &key.repo).await;
     Ok(msg)
 }
 
-pub(super) fn spawn_poller(
+/// Spawn a `RepoPoller` for `repo` if one isn't already running.
+/// If a poller already exists, notifies it via `config_changed` so it picks up
+/// the new branch on its next cycle.
+pub(super) async fn spawn_repo_poller(
     watches: &Watches,
     config: &SharedConfig,
     handle: &WatcherHandle,
     rate_limit: &RateLimitState,
-    key: WatchKey,
+    repo: &str,
 ) {
-    let poller = Poller {
-        key,
+    let mut active = handle.active_repo_pollers.lock().await;
+    if active.contains(repo) {
+        // Poller already running — wake it so it picks up the new branch.
+        handle.config_changed.notify_waiters();
+        return;
+    }
+    active.insert(repo.to_string());
+    drop(active);
+
+    let pollers = handle.active_repo_pollers.clone();
+    let repo_owned = repo.to_string();
+    let poller = RepoPoller {
+        repo: repo.to_string(),
         watches: watches.clone(),
         config: config.clone(),
         rate_limit: rate_limit.clone(),
@@ -181,7 +198,11 @@ pub(super) fn spawn_poller(
         config_changed: handle.config_changed.clone(),
         last_active_secs: 0,
     };
-    handle.tracker.spawn(poller.run());
+    handle.tracker.spawn(async move {
+        poller.run().await;
+        // Clean up when the poller exits.
+        pollers.lock().await.remove(&repo_owned);
+    });
 }
 
 // -- Startup --
@@ -258,8 +279,12 @@ pub(super) async fn recover_existing_watches(
         } else if let Err(e) = &result {
             tracing::warn!(key = %key, error = %e, "Could not recover runs");
         }
+    }
 
-        spawn_poller(watches, config, handle, rate_limit, key);
+    // Spawn one RepoPoller per unique repo.
+    let unique_repos: HashSet<String> = snapshot.iter().map(|k| k.repo.clone()).collect();
+    for repo in unique_repos {
+        spawn_repo_poller(watches, config, handle, rate_limit, &repo).await;
     }
 }
 

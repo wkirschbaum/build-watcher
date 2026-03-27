@@ -506,6 +506,19 @@ mod tests {
         ) -> Result<Vec<build_watcher::github::RunInfo>, build_watcher::github::GhError> {
             Ok(vec![])
         }
+        async fn recent_runs_for_repo(
+            &self,
+            _: &str,
+            _: u32,
+        ) -> Result<Vec<build_watcher::github::RunInfo>, build_watcher::github::GhError> {
+            Ok(vec![])
+        }
+        async fn in_progress_runs_for_repo(
+            &self,
+            _: &str,
+        ) -> Result<Vec<build_watcher::github::RunInfo>, build_watcher::github::GhError> {
+            Ok(vec![])
+        }
         async fn run_status(
             &self,
             _: &str,

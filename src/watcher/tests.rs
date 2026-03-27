@@ -10,7 +10,7 @@ use tokio_util::sync::CancellationToken;
 use crate::config::Config;
 use crate::github::{GhError, RunInfo};
 
-use super::poller::{PollConfig, Poller};
+use super::repo_poller::RepoPoller;
 
 fn make_run(id: u64, status: &str, conclusion: &str) -> RunInfo {
     RunInfo {
@@ -295,6 +295,31 @@ fn persisted_roundtrip_preserves_fields() {
     assert_eq!(restored.last_build.unwrap().run_id, 101);
 }
 
+// -- runs_for_branch tests --
+
+#[test]
+fn runs_for_branch_filters_by_branch() {
+    let mut r1 = make_run(1, "in_progress", "");
+    r1.head_branch = "main".to_string();
+    let mut r2 = make_run(2, "in_progress", "");
+    r2.head_branch = "develop".to_string();
+    let mut r3 = make_run(3, "completed", "success");
+    r3.head_branch = "main".to_string();
+    let runs = vec![r1, r2, r3];
+
+    let main_runs = runs_for_branch(&runs, "main");
+    assert_eq!(main_runs.len(), 2);
+    assert_eq!(main_runs[0].id, 1);
+    assert_eq!(main_runs[1].id, 3);
+
+    let dev_runs = runs_for_branch(&runs, "develop");
+    assert_eq!(dev_runs.len(), 1);
+    assert_eq!(dev_runs[0].id, 2);
+
+    let empty = runs_for_branch(&runs, "feature/xyz");
+    assert!(empty.is_empty());
+}
+
 // -- filter_runs tests --
 
 #[test]
@@ -434,8 +459,32 @@ fn count_api_calls_reflects_active_runs() {
     watches.insert(WatchKey::new("owner/repo1", "main"), entry1);
     watches.insert(WatchKey::new("owner/repo2", "main"), entry2);
 
-    // 2 base calls (one per watch) + 3 active run calls = 5
-    assert_eq!(count_api_calls(&watches), 5);
+    // 2 unique repos = 2 base calls, repo1 has active runs = +1 batch call = 3
+    assert_eq!(count_api_calls(&watches), 3);
+}
+
+#[test]
+fn count_api_calls_same_repo_multiple_branches() {
+    let mut watches = HashMap::new();
+    let mut active_runs = HashMap::new();
+    active_runs.insert(1, make_active("in_progress"));
+    let entry1 = WatchEntry {
+        last_seen_run_id: 100,
+        active_runs,
+        failure_counts: HashMap::new(),
+        last_build: None,
+    };
+    let entry2 = WatchEntry {
+        last_seen_run_id: 100,
+        active_runs: HashMap::new(),
+        failure_counts: HashMap::new(),
+        last_build: None,
+    };
+    watches.insert(WatchKey::new("owner/repo1", "main"), entry1);
+    watches.insert(WatchKey::new("owner/repo1", "develop"), entry2);
+
+    // 1 unique repo = 1 base call, has active runs = +1 batch call = 2
+    assert_eq!(count_api_calls(&watches), 2);
 }
 
 #[test]
@@ -474,6 +523,17 @@ impl MockGitHub {
 impl crate::github::GitHubClient for MockGitHub {
     async fn recent_runs(&self, _: &str, _: &str) -> Result<Vec<RunInfo>, GhError> {
         Ok(self.runs.clone())
+    }
+    async fn recent_runs_for_repo(&self, _: &str, _: u32) -> Result<Vec<RunInfo>, GhError> {
+        Ok(self.runs.clone())
+    }
+    async fn in_progress_runs_for_repo(&self, _: &str) -> Result<Vec<RunInfo>, GhError> {
+        Ok(self
+            .runs
+            .iter()
+            .filter(|r| !r.is_completed())
+            .cloned()
+            .collect())
     }
     async fn run_status(&self, _: &str, run_id: u64) -> Result<RunInfo, GhError> {
         self.runs
@@ -518,15 +578,15 @@ fn mock_handle(github: Arc<dyn crate::github::GitHubClient>) -> WatcherHandle {
     )
 }
 
-fn make_poller(
-    key: &WatchKey,
+fn make_repo_poller(
+    repo: &str,
     watches: &Watches,
     config: &SharedConfig,
     rate_limit: &RateLimitState,
     handle: &WatcherHandle,
-) -> Poller {
-    Poller {
-        key: key.clone(),
+) -> RepoPoller {
+    RepoPoller {
+        repo: repo.to_string(),
         watches: watches.clone(),
         config: config.clone(),
         rate_limit: rate_limit.clone(),
@@ -597,7 +657,7 @@ async fn start_watch_deduplicates() {
     handle.cancel.cancel();
 }
 
-// -- Poller: check_for_new_runs --
+// -- RepoPoller: check_for_new_runs_repo_wide --
 
 #[tokio::test]
 async fn check_for_new_runs_detects_new_builds() {
@@ -630,15 +690,9 @@ async fn check_for_new_runs_detects_new_builds() {
     }
 
     let mut rx = handle.events.subscribe();
-    let poller = make_poller(&key, &watches, &config, &rate_limit, &handle);
-    let pcfg = PollConfig {
-        active_secs: 15,
-        idle_secs: 60,
-        workflows: vec![],
-        ignored: vec![],
-    };
+    let poller = make_repo_poller("alice/app", &watches, &config, &rate_limit, &handle);
 
-    poller.check_for_new_runs("alice/app", "main", &pcfg).await;
+    poller.check_for_new_runs_repo_wide().await;
 
     // Verify high-water mark advanced
     let w = watches.lock().await;
@@ -674,7 +728,10 @@ async fn check_for_new_runs_applies_workflow_filter() {
 
     let gh = MockGitHub::with_runs(vec![ci, semgrep]);
     let watches: Watches = Arc::new(Mutex::new(HashMap::new()));
-    let config: SharedConfig = Arc::new(Mutex::new(Config::default()));
+    // Set ignored_workflows via config so the RepoPoller picks them up.
+    let mut cfg = Config::default();
+    cfg.ignored_workflows = vec!["Semgrep".to_string()];
+    let config: SharedConfig = Arc::new(Mutex::new(cfg));
     let rate_limit: RateLimitState = Arc::new(Mutex::new(None));
     let handle = mock_handle(gh);
 
@@ -691,15 +748,9 @@ async fn check_for_new_runs_applies_workflow_filter() {
         );
     }
 
-    let poller = make_poller(&key, &watches, &config, &rate_limit, &handle);
-    let pcfg = PollConfig {
-        active_secs: 15,
-        idle_secs: 60,
-        workflows: vec![],
-        ignored: vec!["Semgrep".to_string()],
-    };
+    let poller = make_repo_poller("alice/app", &watches, &config, &rate_limit, &handle);
 
-    poller.check_for_new_runs("alice/app", "main", &pcfg).await;
+    poller.check_for_new_runs_repo_wide().await;
 
     let w = watches.lock().await;
     let entry = &w[&key];
@@ -712,12 +763,12 @@ async fn check_for_new_runs_applies_workflow_filter() {
     handle.cancel.cancel();
 }
 
-// -- Poller: poll_active_runs --
+// -- RepoPoller: poll_active_runs_batch --
 
 #[tokio::test]
 async fn poll_active_runs_detects_completion() {
     let key = WatchKey::new("alice/app", "main");
-    // Mock: run 101 now completed
+    // Mock: run 101 now completed (not in in_progress list, so fallback to run_status)
     let runs = vec![make_run(101, "completed", "success")];
     let gh = MockGitHub::with_runs(runs);
     let watches: Watches = Arc::new(Mutex::new(HashMap::new()));
@@ -739,9 +790,9 @@ async fn poll_active_runs_detects_completion() {
     }
 
     let mut rx = handle.events.subscribe();
-    let poller = make_poller(&key, &watches, &config, &rate_limit, &handle);
+    let poller = make_repo_poller("alice/app", &watches, &config, &rate_limit, &handle);
 
-    poller.poll_active_runs("alice/app", "main").await;
+    poller.poll_active_runs_batch().await;
 
     let w = watches.lock().await;
     let entry = &w[&key];
@@ -765,7 +816,7 @@ async fn poll_active_runs_detects_completion() {
 #[tokio::test]
 async fn poll_active_runs_emits_status_change() {
     let key = WatchKey::new("alice/app", "main");
-    // Mock: run 101 changed from queued to in_progress
+    // Mock: run 101 changed from queued to in_progress (found in batch response)
     let runs = vec![make_run(101, "in_progress", "")];
     let gh = MockGitHub::with_runs(runs);
     let watches: Watches = Arc::new(Mutex::new(HashMap::new()));
@@ -786,9 +837,9 @@ async fn poll_active_runs_emits_status_change() {
     }
 
     let mut rx = handle.events.subscribe();
-    let poller = make_poller(&key, &watches, &config, &rate_limit, &handle);
+    let poller = make_repo_poller("alice/app", &watches, &config, &rate_limit, &handle);
 
-    poller.poll_active_runs("alice/app", "main").await;
+    poller.poll_active_runs_batch().await;
 
     // Still active, status updated
     let w = watches.lock().await;
@@ -810,6 +861,7 @@ async fn poll_active_runs_emits_status_change() {
 #[tokio::test]
 async fn poll_active_runs_fetches_failing_steps() {
     let key = WatchKey::new("alice/app", "main");
+    // Mock: run 101 completed with failure (falls back to run_status since not in_progress)
     let runs = vec![make_run(101, "completed", "failure")];
     let gh = MockGitHub::with_runs_and_failures(runs, "Build / Run tests");
     let watches: Watches = Arc::new(Mutex::new(HashMap::new()));
@@ -830,9 +882,9 @@ async fn poll_active_runs_fetches_failing_steps() {
     }
 
     let mut rx = handle.events.subscribe();
-    let poller = make_poller(&key, &watches, &config, &rate_limit, &handle);
+    let poller = make_repo_poller("alice/app", &watches, &config, &rate_limit, &handle);
 
-    poller.poll_active_runs("alice/app", "main").await;
+    poller.poll_active_runs_batch().await;
 
     match rx.try_recv() {
         Ok(crate::events::WatchEvent::RunCompleted {

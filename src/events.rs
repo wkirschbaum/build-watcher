@@ -160,6 +160,7 @@ mod tests {
             workflow: "Deploy".to_string(),
             head_sha: "abc1234".to_string(),
             event: "pull_request".to_string(),
+            head_branch: "feature/deps".to_string(),
         };
         let s = RunSnapshot::from_run_info(&run, "alice/app", "release");
         assert_eq!(s.repo, "alice/app");

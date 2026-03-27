@@ -3,7 +3,8 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 const GH_TIMEOUT: Duration = Duration::from_secs(30);
-const GH_JSON_FIELDS: &str = "databaseId,status,conclusion,displayTitle,workflowName,headSha,event";
+const GH_JSON_FIELDS: &str =
+    "databaseId,status,conclusion,displayTitle,workflowName,headSha,event,headBranch";
 
 /// Truncates a hex SHA to 7 characters. Returns the full string if shorter.
 pub fn short_sha(sha: &str) -> &str {
@@ -117,6 +118,8 @@ struct GhRunJson {
     head_sha: String,
     #[serde(default)]
     event: String,
+    #[serde(default)]
+    head_branch: String,
 }
 
 /// A GitHub Actions run parsed for internal use.
@@ -129,6 +132,7 @@ pub struct RunInfo {
     pub workflow: String,
     pub head_sha: String,
     pub event: String,
+    pub head_branch: String,
 }
 
 impl RunInfo {
@@ -153,6 +157,7 @@ impl RunInfo {
             },
             head_sha: raw.head_sha,
             event: raw.event,
+            head_branch: raw.head_branch,
         })
     }
 
@@ -197,6 +202,10 @@ impl RunInfo {
 #[async_trait::async_trait]
 pub trait GitHubClient: Send + Sync + 'static {
     async fn recent_runs(&self, repo: &str, branch: &str) -> Result<Vec<RunInfo>, GhError>;
+    /// Fetch recent runs across all branches for a repo (no `--branch` filter).
+    async fn recent_runs_for_repo(&self, repo: &str, limit: u32) -> Result<Vec<RunInfo>, GhError>;
+    /// Fetch all in-progress runs for a repo (no branch filter, `--status in_progress`).
+    async fn in_progress_runs_for_repo(&self, repo: &str) -> Result<Vec<RunInfo>, GhError>;
     async fn run_status(&self, repo: &str, run_id: u64) -> Result<RunInfo, GhError>;
     async fn failing_steps(&self, repo: &str, run_id: u64) -> Option<String>;
     async fn run_rerun(
@@ -232,6 +241,59 @@ impl GitHubClient for GhCliClient {
                 branch,
                 "--limit",
                 "10",
+                "--json",
+                GH_JSON_FIELDS,
+            ],
+        )
+        .await?;
+
+        let raw: Vec<GhRunJson> = serde_json::from_slice(&stdout).map_err(|e| GhError::Parse {
+            repo: repo.to_string(),
+            source: e,
+        })?;
+
+        Ok(raw.into_iter().filter_map(RunInfo::from_gh_json).collect())
+    }
+
+    #[tracing::instrument(skip_all, fields(%repo, %limit))]
+    async fn recent_runs_for_repo(&self, repo: &str, limit: u32) -> Result<Vec<RunInfo>, GhError> {
+        let limit_str = limit.to_string();
+        let stdout = gh_exec(
+            repo,
+            &[
+                "run",
+                "list",
+                "--repo",
+                repo,
+                "--limit",
+                &limit_str,
+                "--json",
+                GH_JSON_FIELDS,
+            ],
+        )
+        .await?;
+
+        let raw: Vec<GhRunJson> = serde_json::from_slice(&stdout).map_err(|e| GhError::Parse {
+            repo: repo.to_string(),
+            source: e,
+        })?;
+
+        Ok(raw.into_iter().filter_map(RunInfo::from_gh_json).collect())
+    }
+
+    #[tracing::instrument(skip_all, fields(%repo))]
+    async fn in_progress_runs_for_repo(&self, repo: &str) -> Result<Vec<RunInfo>, GhError> {
+        let stdout = gh_exec(
+            repo,
+            &[
+                "run",
+                "list",
+                "--repo",
+                repo,
+                "--status",
+                "in_progress",
+                "--limit",
+                "100",
                 "--json",
                 GH_JSON_FIELDS,
             ],
@@ -548,7 +610,8 @@ mod tests {
             "displayTitle": "Fix login bug",
             "workflowName": "Lint and Test",
             "headSha": "abc1234def5678",
-            "event": "push"
+            "event": "push",
+            "headBranch": "main"
         })
     }
 
@@ -567,6 +630,7 @@ mod tests {
         assert_eq!(run.workflow, "Lint and Test");
         assert_eq!(run.head_sha, "abc1234def5678");
         assert_eq!(run.event, "push");
+        assert_eq!(run.head_branch, "main");
     }
 
     #[test]
@@ -620,6 +684,7 @@ mod tests {
         assert_eq!(run.conclusion, "");
         assert_eq!(run.head_sha, "");
         assert_eq!(run.event, "");
+        assert_eq!(run.head_branch, "");
     }
 
     #[test]
