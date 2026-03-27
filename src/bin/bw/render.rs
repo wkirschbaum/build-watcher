@@ -71,6 +71,12 @@ fn repo_group_display_key(
 ) -> Option<String> {
     match group_by {
         GroupBy::Org => Some(repo.split('/').next().unwrap_or(repo).to_string()),
+        GroupBy::Branch => Some(
+            branches
+                .first()
+                .map(|w| w.branch.clone())
+                .unwrap_or_default(),
+        ),
         GroupBy::Workflow => {
             let wf = branches
                 .iter()
@@ -99,6 +105,10 @@ fn repo_group_display_key(
 fn repo_group_sort_key(repo: &str, branches: &[WatchStatus], group_by: GroupBy) -> String {
     match group_by {
         GroupBy::Org => repo.split('/').next().unwrap_or(repo).to_string(),
+        GroupBy::Branch => branches
+            .first()
+            .map(|w| w.branch.clone())
+            .unwrap_or_default(),
         GroupBy::Workflow => branches
             .iter()
             .map(watch_workflow)
@@ -139,7 +149,15 @@ pub(crate) fn flatten_rows<'a>(
     let mut selectable = Vec::new();
     let mut current_group: Option<String> = None;
 
-    let repo_groups = group_watches_by_repo(watches);
+    let repo_groups = if group_by.splits_repo() {
+        // Each watch gets its own group entry so repos appear under each matching group.
+        watches
+            .iter()
+            .map(|w| (w.repo.as_str(), vec![w]))
+            .collect::<Vec<_>>()
+    } else {
+        group_watches_by_repo(watches)
+    };
 
     for (repo, branches) in &repo_groups {
         // Group header (from group-by mode)
@@ -305,13 +323,19 @@ pub(crate) fn sorted_watches(
     ascending: bool,
     group_by: GroupBy,
 ) -> Vec<WatchStatus> {
-    // Group by repo
+    // Group by repo (or keep individual when splitting)
     let mut groups: Vec<(String, Vec<WatchStatus>)> = Vec::new();
-    for w in watches {
-        if let Some(g) = groups.iter_mut().find(|(r, _)| r == &w.repo) {
-            g.1.push(w.clone());
-        } else {
+    if group_by.splits_repo() {
+        for w in watches {
             groups.push((w.repo.clone(), vec![w.clone()]));
+        }
+    } else {
+        for w in watches {
+            if let Some(g) = groups.iter_mut().find(|(r, _)| r == &w.repo) {
+                g.1.push(w.clone());
+            } else {
+                groups.push((w.repo.clone(), vec![w.clone()]));
+            }
         }
     }
 

@@ -95,6 +95,7 @@ macro_rules! impl_cycle {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum GroupBy {
     Org,
+    Branch,
     Workflow,
     Status,
     None,
@@ -104,6 +105,7 @@ impl_cycle!(
     GroupBy,
     [
         GroupBy::Org,
+        GroupBy::Branch,
         GroupBy::Workflow,
         GroupBy::Status,
         GroupBy::None
@@ -114,10 +116,17 @@ impl GroupBy {
     pub(crate) fn label(self) -> &'static str {
         match self {
             GroupBy::Org => "org",
+            GroupBy::Branch => "branch",
             GroupBy::Workflow => "workflow",
             GroupBy::Status => "status",
             GroupBy::None => "none",
         }
+    }
+
+    /// Whether this group mode splits a repo's branches across groups
+    /// (each branch shown only under its matching group).
+    pub(crate) fn splits_repo(self) -> bool {
+        matches!(self, GroupBy::Branch | GroupBy::Workflow)
     }
 }
 
@@ -1543,7 +1552,7 @@ mod tests {
             seen.push(g);
         }
         assert_eq!(seen.first(), seen.last());
-        assert_eq!(seen.len(), 5);
+        assert_eq!(seen.len(), 6);
     }
 
     fn count_group_headers(flat: &FlatRows) -> usize {
@@ -1572,6 +1581,19 @@ mod tests {
         ];
         let flat = flatten_rows(&watches, GroupBy::Org, &no_collapsed());
         assert_eq!(group_header_labels(&flat), vec!["alice", "bob"]);
+    }
+
+    #[test]
+    fn flatten_rows_group_by_branch() {
+        let watches = vec![
+            watch_with_build("alice/app", "main", "success", 10.0),
+            watch_with_build("alice/app", "develop", "success", 20.0),
+            watch_with_build("bob/lib", "main", "failure", 30.0),
+        ];
+        let sorted = sorted_watches(&watches, SortColumn::Branch, true, GroupBy::Branch);
+        let flat = flatten_rows(&sorted, GroupBy::Branch, &no_collapsed());
+        // "develop" group has alice/app, "main" group has alice/app and bob/lib
+        assert_eq!(group_header_labels(&flat), vec!["develop", "main"]);
     }
 
     #[test]
