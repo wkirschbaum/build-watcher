@@ -19,8 +19,8 @@ use build_watcher::config::{NotificationLevel, state_dir, unix_now};
 use build_watcher::events::EventBus;
 use build_watcher::status::{ActiveRunView, LastBuildView, StatusResponse, WatchStatus};
 use build_watcher::watcher::{
-    PauseState, RateLimitState, SharedConfig, WatchEntry, WatchKey, WatcherHandle, Watches,
-    collect_persisted,
+    PauseState, RateLimitState, SharedConfig, SharedHistory, WatchEntry, WatchKey, WatcherHandle,
+    Watches, collect_persisted,
 };
 
 pub use mcp::BuildWatcher;
@@ -37,6 +37,7 @@ pub(crate) struct AppState {
     pub events: EventBus,
     pub github: Arc<dyn build_watcher::github::GitHubClient>,
     pub rate_limit: RateLimitState,
+    pub history: SharedHistory,
     pub started_at: std::time::Instant,
 }
 
@@ -153,6 +154,7 @@ fn build_router(
         events: handle.events.clone(),
         github: handle.github.clone(),
         rate_limit: rate_limit.clone(),
+        history: handle.history.clone(),
         started_at,
     };
 
@@ -252,6 +254,8 @@ pub async fn serve(
     handle.shutdown().await;
     let persisted = collect_persisted(&watches).await;
     handle.persistence.save_watches(&persisted).await;
+    let hist = handle.history.lock().await.clone();
+    handle.persistence.save_history(&hist).await;
     let _ = std::fs::remove_file(&port_file);
     tracing::info!("State saved, goodbye.");
 

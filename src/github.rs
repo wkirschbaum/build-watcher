@@ -87,6 +87,10 @@ pub struct LastBuild {
     /// Unix timestamp (seconds) when this build completed. Persisted so age survives restarts.
     #[serde(default)]
     pub completed_at: Option<u64>,
+    /// Duration in seconds from run start to completion. Only set for runs completed while the
+    /// daemon was watching; `None` for already-completed runs detected on startup or mid-poll.
+    #[serde(default)]
+    pub duration_secs: Option<u64>,
 }
 
 impl LastBuild {
@@ -183,6 +187,7 @@ impl RunInfo {
             event: self.event.clone(),
             failing_steps: None,
             completed_at: None,
+            duration_secs: None,
         }
     }
 }

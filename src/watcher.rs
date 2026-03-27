@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
@@ -11,12 +11,16 @@ use tokio_util::task::TaskTracker;
 use crate::config::{Config, load_json, state_dir, unix_now};
 use crate::events::{EventBus, RunSnapshot, WatchEvent};
 use crate::github::{GhError, GitHubClient, LastBuild, RateLimit, RunInfo};
+use crate::history::push_build;
 use crate::persistence::Persistence;
 
 pub type SharedConfig = Arc<Mutex<Config>>;
 pub type Watches = Arc<Mutex<HashMap<WatchKey, WatchEntry>>>;
 pub type PauseState = Arc<Mutex<Option<Instant>>>;
 pub type RateLimitState = Arc<Mutex<Option<RateLimit>>>;
+
+// Re-export SharedHistory so server code can import it from watcher.
+pub use crate::history::SharedHistory;
 
 /// Returns `true` if notifications are currently paused (deadline is in the future).
 pub async fn is_paused(pause: &PauseState) -> bool {
@@ -207,6 +211,7 @@ impl WatchEntry {
         let mut last_build = run.to_last_build();
         last_build.failing_steps = failing_steps;
         last_build.completed_at = Some(now_unix);
+        last_build.duration_secs = elapsed.map(|d| d.as_secs());
         self.last_build = Some(last_build);
         elapsed
     }
@@ -272,6 +277,9 @@ pub struct WatcherHandle {
     pub events: EventBus,
     pub github: Arc<dyn GitHubClient>,
     pub persistence: Arc<dyn Persistence>,
+    pub history: SharedHistory,
+    /// Notified when config changes so pollers wake early and recompute intervals.
+    pub config_changed: Arc<Notify>,
 }
 
 impl WatcherHandle {
@@ -280,6 +288,7 @@ impl WatcherHandle {
         events: EventBus,
         github: Arc<dyn GitHubClient>,
         persistence: Arc<dyn Persistence>,
+        history: SharedHistory,
     ) -> Self {
         Self {
             tracker: TaskTracker::new(),
@@ -287,6 +296,8 @@ impl WatcherHandle {
             events,
             github,
             persistence,
+            history,
+            config_changed: Arc::new(Notify::new()),
         }
     }
 
@@ -376,7 +387,7 @@ pub async fn start_watch(
         last_seen_run_id: max_id,
         active_runs: active,
         failure_counts: HashMap::new(),
-        last_build,
+        last_build: last_build.clone(),
     };
 
     {
@@ -387,6 +398,13 @@ pub async fn start_watch(
         }
         w.insert(key.clone(), entry);
     }
+
+    // Seed history with the initial completed build (in-memory; caller persists).
+    if let Some(lb) = last_build {
+        let mut hist = handle.history.lock().await;
+        push_build(&mut hist, &key, lb);
+    }
+
     // Persistence is the caller's responsibility — start_watch only updates
     // in-memory state and spawns the poller.
 
@@ -410,6 +428,8 @@ fn spawn_poller(
         events: handle.events.clone(),
         github: handle.github.clone(),
         persistence: handle.persistence.clone(),
+        history: handle.history.clone(),
+        config_changed: handle.config_changed.clone(),
         last_active_secs: 0,
     };
     handle.tracker.spawn(poller.run());
@@ -433,6 +453,13 @@ fn filter_runs<'a>(
 
 // -- Poller --
 
+/// Reason a `cancellable_sleep` call returned.
+enum WakeReason {
+    Elapsed,
+    ConfigChanged,
+    Cancelled,
+}
+
 /// Per-repo/branch async polling task.
 struct Poller {
     key: WatchKey,
@@ -443,6 +470,8 @@ struct Poller {
     events: EventBus,
     github: Arc<dyn GitHubClient>,
     persistence: Arc<dyn Persistence>,
+    history: SharedHistory,
+    config_changed: Arc<Notify>,
     /// Last computed active poll interval, used to back-project our own API call count.
     /// Zero on the first cycle (conservative: all of `rl.used` attributed to external).
     last_active_secs: u64,
@@ -468,14 +497,15 @@ impl Poller {
         }
     }
 
-    /// Sleep for `duration`, returning `false` if cancelled during sleep.
-    async fn cancellable_sleep(&self, duration: Duration) -> bool {
+    /// Sleep for `duration`. Returns the reason the sleep ended.
+    async fn cancellable_sleep(&self, duration: Duration) -> WakeReason {
         tokio::select! {
-            () = tokio::time::sleep(duration) => true,
+            () = tokio::time::sleep(duration) => WakeReason::Elapsed,
             () = self.token.cancelled() => {
                 tracing::info!(key = %self.key, "Shutting down poller");
-                false
+                WakeReason::Cancelled
             }
+            () = self.config_changed.notified() => WakeReason::ConfigChanged,
         }
     }
 
@@ -522,8 +552,14 @@ impl Poller {
                 pcfg.idle_secs
             };
 
-            if !self.cancellable_sleep(Duration::from_secs(delay)).await {
-                return;
+            match self.cancellable_sleep(Duration::from_secs(delay)).await {
+                WakeReason::Cancelled => return,
+                WakeReason::ConfigChanged => {
+                    // Force an immediate poll so the new aggression takes effect now,
+                    // not just on the next scheduled cycle.
+                    last_new_run_check = None;
+                }
+                WakeReason::Elapsed => {}
             }
             if !self.is_active().await {
                 return;
@@ -663,9 +699,18 @@ impl Poller {
                     "Build completed"
                 );
 
-                let mut w = self.watches.lock().await;
-                if let Some(entry) = w.get_mut(&self.key) {
-                    entry.record_completion(&run, failing_steps, unix_now());
+                let new_build = {
+                    let mut w = self.watches.lock().await;
+                    if let Some(entry) = w.get_mut(&self.key) {
+                        entry.record_completion(&run, failing_steps, unix_now());
+                        entry.last_build.clone()
+                    } else {
+                        None
+                    }
+                };
+                if let Some(lb) = new_build {
+                    let mut hist = self.history.lock().await;
+                    push_build(&mut hist, &self.key, lb);
                 }
                 changed = true;
             } else {
@@ -685,6 +730,8 @@ impl Poller {
         if changed {
             let persisted = collect_persisted(&self.watches).await;
             self.persistence.save_watches(&persisted).await;
+            let hist = self.history.lock().await.clone();
+            self.persistence.save_history(&hist).await;
         }
     }
 
@@ -777,6 +824,30 @@ impl Poller {
         }
         let persisted = collect_persisted(&self.watches).await;
         self.persistence.save_watches(&persisted).await;
+
+        // Push completed new runs into history (oldest→newest so newest ends at index 0).
+        let now_unix = unix_now();
+        let completed: Vec<LastBuild> = new_runs
+            .iter()
+            .filter(|r| r.is_completed())
+            .map(|r| {
+                let mut lb = r.to_last_build();
+                lb.completed_at = Some(now_unix);
+                lb.failing_steps = failing_steps_by_id.get(&r.id).and_then(|s| s.clone());
+                lb
+            })
+            .collect();
+        if !completed.is_empty() {
+            let mut hist = self.history.lock().await;
+            // new_runs is newest-first; iterate in reverse to push oldest first so newest
+            // ends up at index 0 after all inserts.
+            for lb in completed.into_iter().rev() {
+                push_build(&mut hist, &self.key, lb);
+            }
+            let hist_snapshot = hist.clone();
+            drop(hist);
+            self.persistence.save_history(&hist_snapshot).await;
+        }
     }
 }
 
@@ -1440,6 +1511,7 @@ mod tests {
             crate::events::EventBus::new(),
             github,
             Arc::new(crate::persistence::NullPersistence),
+            Arc::new(Mutex::new(HashMap::new())),
         )
     }
 
@@ -1459,6 +1531,8 @@ mod tests {
             events: handle.events.clone(),
             github: handle.github.clone(),
             persistence: handle.persistence.clone(),
+            history: handle.history.clone(),
+            config_changed: handle.config_changed.clone(),
             last_active_secs: 0,
         }
     }

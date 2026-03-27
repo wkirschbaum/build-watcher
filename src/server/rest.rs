@@ -9,10 +9,11 @@ use tokio_stream::StreamExt as _;
 use tokio_stream::wrappers::BroadcastStream;
 
 use build_watcher::config::{
-    NotificationConfig, NotificationLevel, NotificationOverrides, unix_now,
+    NotificationConfig, NotificationLevel, NotificationOverrides, PollAggression, unix_now,
 };
 use build_watcher::events::WatchEvent;
 use build_watcher::github::{validate_branch, validate_repo};
+use build_watcher::history::history_for;
 use build_watcher::rate_limiter::compute_intervals;
 use build_watcher::status::{HistoryEntryView, StatsResponse};
 use build_watcher::watcher::{count_api_calls, is_paused};
@@ -321,9 +322,10 @@ pub(crate) async fn notifications_handler(
 pub(crate) struct DefaultsResponse {
     default_branches: Vec<String>,
     ignored_workflows: Vec<String>,
+    poll_aggression: String,
 }
 
-/// `GET /defaults` — Read global default config (branches, ignored workflows).
+/// `GET /defaults` — Read global default config (branches, ignored workflows, poll aggression).
 pub(crate) async fn get_defaults_handler(
     State(state): State<AppState>,
 ) -> axum::Json<DefaultsResponse> {
@@ -331,6 +333,7 @@ pub(crate) async fn get_defaults_handler(
     axum::Json(DefaultsResponse {
         default_branches: cfg.default_branches.clone(),
         ignored_workflows: cfg.ignored_workflows.clone(),
+        poll_aggression: cfg.poll_aggression.to_string(),
     })
 }
 
@@ -340,6 +343,8 @@ pub(crate) struct SetDefaultsRequest {
     default_branches: Option<Vec<String>>,
     #[serde(default)]
     ignored_workflows: Option<Vec<String>>,
+    #[serde(default)]
+    poll_aggression: Option<String>,
 }
 
 /// `POST /defaults` — Update global default config fields.
@@ -370,8 +375,18 @@ pub(crate) async fn set_defaults_handler(
                 messages.push(format!("ignored workflows: {}", workflows.join(", ")));
             }
         }
+        if let Some(level) = body.poll_aggression {
+            let aggression = match level.to_lowercase().as_str() {
+                "low" => PollAggression::Low,
+                "high" => PollAggression::High,
+                _ => PollAggression::Medium,
+            };
+            cfg.poll_aggression = aggression;
+            messages.push(format!("poll aggression: {aggression}"));
+        }
         (cfg.clone(), messages)
     };
+    state.handle.config_changed.notify_waiters();
     if let Some(warning) = persist_config(&*state.handle.persistence, snapshot).await {
         return axum::Json(
             serde_json::json!({ "ok": true, "messages": messages, "warning": warning }),
@@ -399,40 +414,37 @@ pub(crate) struct HistoryQuery {
     limit: Option<u32>,
 }
 
-/// `GET /history` — Recent build history for a repo, optionally filtered by branch.
+/// `GET /history` — Persisted build history for a repo, optionally filtered by branch.
 pub(crate) async fn history_handler(
     State(state): State<AppState>,
     Query(q): Query<HistoryQuery>,
 ) -> axum::response::Response {
-    let limit = q.limit.unwrap_or(15).min(50);
+    let limit = q.limit.unwrap_or(15).min(50) as usize;
     let branch = q.branch.as_deref();
     let now = unix_now();
-    match state.github.run_list_history(&q.repo, branch, limit).await {
-        Ok(entries) => {
-            let views: Vec<HistoryEntryView> = entries
-                .into_iter()
-                .map(|e| {
-                    let duration_secs = e.duration_secs();
-                    let age_secs = e.age_secs(now);
-                    let title = e.display_title();
-                    HistoryEntryView {
-                        id: e.id,
-                        conclusion: e.conclusion,
-                        workflow: e.workflow,
-                        title,
-                        branch: e.branch,
-                        event: e.event,
-                        created_at: e.created_at,
-                        updated_at: e.updated_at,
-                        duration_secs,
-                        age_secs,
-                    }
-                })
-                .collect();
-            axum::Json(views).into_response()
-        }
-        Err(e) => json_error(e.to_string()),
-    }
+    let hist = state.history.lock().await;
+    let entries = history_for(&hist, &q.repo, branch, limit);
+    drop(hist);
+    let views: Vec<HistoryEntryView> = entries
+        .into_iter()
+        .map(|(br, lb)| {
+            let title = lb.display_title();
+            let age_secs = lb.completed_at.map(|t| now.saturating_sub(t));
+            HistoryEntryView {
+                id: lb.run_id,
+                conclusion: lb.conclusion,
+                workflow: lb.workflow,
+                title,
+                branch: br,
+                event: lb.event,
+                created_at: String::new(),
+                updated_at: String::new(),
+                duration_secs: lb.duration_secs,
+                age_secs,
+            }
+        })
+        .collect();
+    axum::Json(views).into_response()
 }
 
 #[cfg(test)]
@@ -506,6 +518,7 @@ mod tests {
             EventBus::new(),
             Arc::new(StubGitHub),
             Arc::new(build_watcher::persistence::NullPersistence),
+            Arc::new(Mutex::new(HashMap::new())),
         )
     }
 
@@ -519,6 +532,7 @@ mod tests {
             events,
             github: Arc::new(StubGitHub),
             rate_limit: Arc::new(Mutex::new(None)),
+            history: Arc::new(Mutex::new(HashMap::new())),
             started_at: std::time::Instant::now(),
         };
         axum::Router::new()
@@ -540,6 +554,7 @@ mod tests {
             events,
             github: Arc::new(StubGitHub),
             rate_limit: Arc::new(Mutex::new(None)),
+            history: Arc::new(Mutex::new(HashMap::new())),
             started_at: std::time::Instant::now(),
         };
         axum::Router::new()
@@ -609,6 +624,7 @@ mod tests {
             event: "push".to_string(),
             failing_steps: Some("Build / Run tests".to_string()),
             completed_at: None,
+            duration_secs: None,
         });
         watches.lock().await.insert(key, entry);
 
@@ -658,6 +674,7 @@ mod tests {
             events,
             github: Arc::new(StubGitHub),
             rate_limit: Arc::new(Mutex::new(None)),
+            history: Arc::new(Mutex::new(HashMap::new())),
             started_at: std::time::Instant::now(),
         };
         axum::Router::new()

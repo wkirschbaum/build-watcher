@@ -45,6 +45,8 @@ pub(crate) async fn do_watch_builds(
             .persistence
             .save_watches(&collect_persisted(watches).await)
             .await;
+        let hist = handle.history.lock().await.clone();
+        handle.persistence.save_history(&hist).await;
         let snapshot = {
             let mut cfg = config.lock().await;
             cfg.add_repos(&started_repos);

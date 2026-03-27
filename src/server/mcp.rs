@@ -8,6 +8,7 @@ use rmcp::{ErrorData as McpError, ServerHandler, tool, tool_handler, tool_router
 use build_watcher::config::{PollAggression, QuietHours, config_dir, unix_now};
 use build_watcher::format;
 use build_watcher::github::{validate_branch, validate_repo};
+use build_watcher::history::history_for;
 use build_watcher::rate_limiter::{MIN_ACTIVE_SECS, MIN_IDLE_SECS, compute_intervals};
 use build_watcher::watcher::{
     PauseState, RateLimitState, SharedConfig, WatcherHandle, Watches, count_api_calls, is_paused,
@@ -542,15 +543,10 @@ impl BuildWatcher {
             return Ok(CallToolResult::error(vec![Content::text(e)]));
         }
 
-        let limit = params.limit.unwrap_or(10).min(50);
-        let entries = match self
-            .handle
-            .github
-            .run_list_history(&params.repo, params.branch.as_deref(), limit)
-            .await
-        {
-            Ok(e) => e,
-            Err(e) => return Ok(CallToolResult::error(vec![Content::text(e.to_string())])),
+        let limit = params.limit.unwrap_or(10).min(50) as usize;
+        let entries = {
+            let hist = self.handle.history.lock().await;
+            history_for(&hist, &params.repo, params.branch.as_deref(), limit)
         };
 
         if entries.is_empty() {
@@ -561,7 +557,7 @@ impl BuildWatcher {
 
         let distinct_branches = entries
             .iter()
-            .map(|e| &e.branch)
+            .map(|(br, _)| br)
             .collect::<std::collections::HashSet<_>>()
             .len();
         let show_branch = params.branch.is_none() && distinct_branches > 1;
@@ -597,21 +593,22 @@ impl BuildWatcher {
         }
 
         let now = unix_now();
-        for entry in &entries {
-            let duration = entry
-                .duration_secs()
+        for (branch, lb) in &entries {
+            let duration = lb
+                .duration_secs
                 .map_or_else(|| "—".to_string(), format::seconds);
-            let age = entry
-                .age_secs(now)
+            let age = lb
+                .completed_at
+                .map(|t| now.saturating_sub(t))
                 .map_or_else(|| "—".to_string(), format::age);
-            let title = entry.display_title();
+            let title = lb.display_title();
 
             if show_branch {
                 lines.push(format!(
                     "{:<12} {:<15} {:<20} {:<30} {:<10} {}",
-                    entry.conclusion,
-                    format::truncate(&entry.branch, 13),
-                    format::truncate(&entry.workflow, 18),
+                    lb.conclusion,
+                    format::truncate(branch, 13),
+                    format::truncate(&lb.workflow, 18),
                     format::truncate(&title, 28),
                     duration,
                     age,
@@ -619,8 +616,8 @@ impl BuildWatcher {
             } else {
                 lines.push(format!(
                     "{:<12} {:<20} {:<35} {:<10} {}",
-                    entry.conclusion,
-                    format::truncate(&entry.workflow, 18),
+                    lb.conclusion,
+                    format::truncate(&lb.workflow, 18),
                     format::truncate(&title, 33),
                     duration,
                     age,
@@ -801,8 +798,7 @@ impl BuildWatcher {
 
     #[tool(
         description = "Set poll aggression: how much of the GitHub rate-limit budget \
-            the daemon uses per hour. low=≤10%, medium=≤25% (default), high=≤50%. \
-            Takes effect on the next poll cycle."
+            the daemon uses per hour. low=≤10%, medium=≤25% (default), high=≤50%."
     )]
     async fn set_poll_aggression(
         &self,
@@ -823,11 +819,12 @@ impl BuildWatcher {
             cfg.poll_aggression = level;
             cfg.clone()
         };
+        self.handle.config_changed.notify_waiters();
         if let Some(w) = persist_config(&*self.handle.persistence, snapshot).await {
             return Ok(CallToolResult::success(vec![Content::text(w)]));
         }
         Ok(CallToolResult::success(vec![Content::text(format!(
-            "Poll aggression set to {level}. Takes effect on the next poll cycle."
+            "Poll aggression set to {level}."
         ))]))
     }
 }

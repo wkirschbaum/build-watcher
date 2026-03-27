@@ -2,6 +2,7 @@ pub mod config;
 pub mod events;
 pub mod format;
 pub mod github;
+pub mod history;
 pub mod persistence;
 pub mod rate_limiter;
 pub mod status;

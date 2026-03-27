@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 
 use crate::config::{self, Config, PersistError};
+use crate::history::{BuildHistory, MAX_HISTORY};
 use crate::watcher::{PersistedWatch, WatchKey};
 
 /// Abstraction over state/config persistence.
@@ -11,6 +12,7 @@ use crate::watcher::{PersistedWatch, WatchKey};
 pub trait Persistence: Send + Sync {
     async fn save_watches(&self, watches: &HashMap<WatchKey, PersistedWatch>);
     async fn save_config(&self, config: &Config) -> Result<(), PersistError>;
+    async fn save_history(&self, history: &BuildHistory);
 }
 
 /// Real persistence — writes JSON to the state/config directories.
@@ -28,6 +30,17 @@ impl Persistence for FilePersistence {
     async fn save_config(&self, config: &Config) -> Result<(), PersistError> {
         config::save_config_async(config).await
     }
+
+    async fn save_history(&self, history: &BuildHistory) {
+        let pruned: BuildHistory = history
+            .iter()
+            .map(|(k, v)| (k.clone(), v.iter().take(MAX_HISTORY).cloned().collect()))
+            .collect();
+        let path = config::state_dir().join("history.json");
+        if let Err(e) = config::save_json_async(path, pruned).await {
+            tracing::error!("Failed to save history: {e}");
+        }
+    }
 }
 
 /// No-op persistence for tests.
@@ -39,4 +52,5 @@ impl Persistence for NullPersistence {
     async fn save_config(&self, _config: &Config) -> Result<(), PersistError> {
         Ok(())
     }
+    async fn save_history(&self, _history: &BuildHistory) {}
 }
