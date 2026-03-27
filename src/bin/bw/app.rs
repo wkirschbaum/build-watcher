@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::future::Future;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -201,6 +202,8 @@ pub(crate) struct App {
     pub(crate) sort_column: SortColumn,
     pub(crate) sort_ascending: bool,
     pub(crate) group_by: GroupBy,
+    /// Repos whose branches are collapsed (hidden) in the tree view.
+    pub(crate) collapsed: HashSet<String>,
 }
 
 impl App {
@@ -544,12 +547,19 @@ impl App {
         modifiers: KeyModifiers,
         daemon: &DaemonClient,
     ) -> QuitAction {
-        let flat = flatten_rows(&self.status.watches, self.group_by);
+        let sorted = super::render::sorted_watches(
+            &self.status.watches,
+            self.sort_column,
+            self.sort_ascending,
+            self.group_by,
+        );
+        let flat = flatten_rows(&sorted, self.group_by, &self.collapsed);
         let sel_count = flat.selectable.len();
-        let selected = flat
-            .selectable
-            .get(self.selected)
-            .map(|&idx| flat.rows[idx].repo_branch_run());
+        let selected_display_idx = flat.selectable.get(self.selected).copied();
+        let selected = selected_display_idx.map(|idx| flat.rows[idx].repo_branch_run());
+        let is_repo_row = selected_display_idx
+            .map(|idx| flat.rows[idx].is_repo_header())
+            .unwrap_or(false);
 
         match code {
             KeyCode::Char('q') => return QuitAction::Quit,
@@ -563,6 +573,50 @@ impl App {
             KeyCode::Down | KeyCode::Char('j') => {
                 if sel_count > 0 {
                     self.selected = (self.selected + 1).min(sel_count - 1);
+                }
+            }
+            KeyCode::Enter | KeyCode::Right if is_repo_row => {
+                if let Some((repo, _, _, _)) = selected {
+                    let repo = repo.to_string();
+                    if self.collapsed.contains(&repo) {
+                        self.collapsed.remove(&repo);
+                    } else {
+                        self.collapsed.insert(repo);
+                    }
+                }
+            }
+            KeyCode::Left if !is_repo_row => {
+                // Collapse parent repo and move selection to it
+                if let Some((repo, _, _, _)) = selected {
+                    let repo = repo.to_string();
+                    self.collapsed.insert(repo.clone());
+                    // Find the repo header's selectable index
+                    if let Some(pos) = flat.selectable.iter().position(|&idx| {
+                        flat.rows[idx].is_repo_header()
+                            && flat.rows[idx].repo_branch_run().0 == repo
+                    }) {
+                        self.selected = pos;
+                    }
+                }
+            }
+            KeyCode::Char('e') => {
+                if let Some((repo, _, _, _)) = selected {
+                    let repo = repo.to_string();
+                    if self.collapsed.contains(&repo) {
+                        self.collapsed.remove(&repo);
+                    } else {
+                        self.collapsed.insert(repo);
+                    }
+                }
+            }
+            KeyCode::Char('E') => {
+                // Expand all if any collapsed, collapse all if all expanded
+                let all_repos: HashSet<String> =
+                    self.status.watches.iter().map(|w| w.repo.clone()).collect();
+                if self.collapsed.is_empty() {
+                    self.collapsed = all_repos;
+                } else {
+                    self.collapsed.clear();
                 }
             }
             KeyCode::Char('a') => {
@@ -602,15 +656,33 @@ impl App {
                 if let Some((repo, branch, _, muted)) = selected {
                     let d = daemon.clone();
                     let repo = repo.to_string();
-                    let branch = branch.to_string();
                     let action = if muted { "unmute" } else { "mute" };
                     let verb = if muted { "Unmuted" } else { "Muted" };
-                    let label = format!("{repo}/{branch}");
-                    self.spawn_action(format!("{verb} {label}…"), true, async move {
-                        d.set_notifications(&repo, &branch, action)
-                            .await
-                            .map(|()| format!("{verb} {label}"))
-                    });
+                    if is_repo_row {
+                        // Mute/unmute all branches for this repo
+                        let branches: Vec<String> = self
+                            .status
+                            .watches
+                            .iter()
+                            .filter(|w| w.repo == repo)
+                            .map(|w| w.branch.clone())
+                            .collect();
+                        let label = repo.clone();
+                        self.spawn_action(format!("{verb} {label}…"), true, async move {
+                            for b in &branches {
+                                d.set_notifications(&repo, b, action).await?;
+                            }
+                            Ok(format!("{verb} {label}"))
+                        });
+                    } else {
+                        let branch = branch.to_string();
+                        let label = format!("{repo}/{branch}");
+                        self.spawn_action(format!("{verb} {label}…"), true, async move {
+                            d.set_notifications(&repo, &branch, action)
+                                .await
+                                .map(|()| format!("{verb} {label}"))
+                        });
+                    }
                 }
             }
             KeyCode::Char('N') => {
@@ -660,7 +732,12 @@ impl App {
                 });
             }
             KeyCode::Char('o') => {
-                if let Some((repo, _, Some(run_id), _)) = selected {
+                if is_repo_row {
+                    // Open repo Actions page
+                    if let Some((repo, _, _, _)) = selected {
+                        open_browser(&format!("{}/actions", repo_url(repo)));
+                    }
+                } else if let Some((repo, _, Some(run_id), _)) = selected {
                     open_browser(&run_url(repo, run_id));
                 }
             }
@@ -673,30 +750,55 @@ impl App {
                 if let Some((repo, branch, _, _)) = selected {
                     let d = daemon.clone();
                     let repo = repo.to_string();
-                    let branch = branch.to_string();
                     let tx = self.bg_tx.clone();
                     self.set_flash("Loading history…");
-                    tokio::spawn(async move {
-                        match d.get_history(&repo, Some(&branch), 20).await {
-                            Ok(entries) => {
-                                let _ = tx
-                                    .send(SseUpdate::EnterHistory {
-                                        repo,
-                                        branch: Some(branch),
-                                        entries,
-                                    })
-                                    .await;
+                    if is_repo_row {
+                        // Repo row: show all-branch history
+                        tokio::spawn(async move {
+                            match d.get_history(&repo, None, 20).await {
+                                Ok(entries) => {
+                                    let _ = tx
+                                        .send(SseUpdate::EnterHistory {
+                                            repo,
+                                            branch: None,
+                                            entries,
+                                        })
+                                        .await;
+                                }
+                                Err(e) => {
+                                    let _ = tx
+                                        .send(SseUpdate::BackgroundResult {
+                                            flash: e,
+                                            resync: false,
+                                        })
+                                        .await;
+                                }
                             }
-                            Err(e) => {
-                                let _ = tx
-                                    .send(SseUpdate::BackgroundResult {
-                                        flash: e,
-                                        resync: false,
-                                    })
-                                    .await;
+                        });
+                    } else {
+                        let branch = branch.to_string();
+                        tokio::spawn(async move {
+                            match d.get_history(&repo, Some(&branch), 20).await {
+                                Ok(entries) => {
+                                    let _ = tx
+                                        .send(SseUpdate::EnterHistory {
+                                            repo,
+                                            branch: Some(branch),
+                                            entries,
+                                        })
+                                        .await;
+                                }
+                                Err(e) => {
+                                    let _ = tx
+                                        .send(SseUpdate::BackgroundResult {
+                                            flash: e,
+                                            resync: false,
+                                        })
+                                        .await;
+                                }
                             }
-                        }
-                    });
+                        });
+                    }
                 }
             }
             KeyCode::Char('H') => {
@@ -919,6 +1021,11 @@ mod tests {
     use build_watcher::events::{RunSnapshot, WatchEvent};
     use build_watcher::status::{ActiveRunView, StatusResponse, WatchStatus};
     use ratatui::style::Color;
+    use std::collections::HashSet;
+
+    fn no_collapsed() -> HashSet<String> {
+        HashSet::new()
+    }
 
     fn snap(repo: &str, branch: &str, run_id: u64) -> RunSnapshot {
         RunSnapshot {
@@ -1143,7 +1250,7 @@ mod tests {
 
     #[test]
     fn flatten_rows_empty() {
-        let flat = flatten_rows(&[], GroupBy::Org);
+        let flat = flatten_rows(&[], GroupBy::Org, &no_collapsed());
         assert!(flat.rows.is_empty());
         assert!(flat.selectable.is_empty());
     }
@@ -1151,11 +1258,13 @@ mod tests {
     #[test]
     fn flatten_rows_idle_watch() {
         let watches = vec![watch("alice/app", "main")];
-        let flat = flatten_rows(&watches, GroupBy::Org);
-        assert_eq!(flat.rows.len(), 2); // GroupHeader + NeverRan
-        assert_eq!(flat.selectable.len(), 1);
+        let flat = flatten_rows(&watches, GroupBy::Org, &no_collapsed());
+        // GroupHeader + RepoHeader + NeverRan
+        assert_eq!(flat.rows.len(), 3);
+        assert_eq!(flat.selectable.len(), 2); // RepoHeader + NeverRan
         assert!(matches!(flat.rows[0], DisplayRow::GroupHeader { .. }));
-        assert!(matches!(flat.rows[1], DisplayRow::NeverRan { .. }));
+        assert!(matches!(flat.rows[1], DisplayRow::RepoHeader { .. }));
+        assert!(matches!(flat.rows[2], DisplayRow::NeverRan { .. }));
     }
 
     #[test]
@@ -1174,13 +1283,14 @@ mod tests {
             }),
             muted: false,
         }];
-        let flat = flatten_rows(&watches, GroupBy::Org);
-        // GroupHeader + LastBuild + FailingSteps
-        assert_eq!(flat.rows.len(), 3);
-        // Only the LastBuild row is selectable
-        assert_eq!(flat.selectable.len(), 1);
-        assert_eq!(flat.selectable[0], 1); // index 1 (after GroupHeader)
-        assert!(matches!(flat.rows[2], DisplayRow::FailingSteps { .. }));
+        let flat = flatten_rows(&watches, GroupBy::Org, &no_collapsed());
+        // GroupHeader + RepoHeader + LastBuild + FailingSteps
+        assert_eq!(flat.rows.len(), 4);
+        // RepoHeader + LastBuild are selectable
+        assert_eq!(flat.selectable.len(), 2);
+        assert_eq!(flat.selectable[0], 1); // RepoHeader (index 1, after GroupHeader)
+        assert_eq!(flat.selectable[1], 2); // LastBuild (index 2)
+        assert!(matches!(flat.rows[3], DisplayRow::FailingSteps { .. }));
     }
 
     #[test]
@@ -1199,9 +1309,11 @@ mod tests {
             }),
             muted: false,
         }];
-        let flat = flatten_rows(&watches, GroupBy::Org);
-        assert_eq!(flat.rows.len(), 2); // GroupHeader + LastBuild
-        assert!(matches!(flat.rows[1], DisplayRow::LastBuild { .. }));
+        let flat = flatten_rows(&watches, GroupBy::Org, &no_collapsed());
+        // GroupHeader + RepoHeader + LastBuild
+        assert_eq!(flat.rows.len(), 3);
+        assert!(matches!(flat.rows[1], DisplayRow::RepoHeader { .. }));
+        assert!(matches!(flat.rows[2], DisplayRow::LastBuild { .. }));
     }
 
     // -- status_style / status_emoji --
@@ -1263,9 +1375,9 @@ mod tests {
             last_build: None,
             muted: false,
         }];
-        let flat = flatten_rows(&watches, GroupBy::Org);
-        // First row is GroupHeader, second is the active run
-        let (repo, branch, run_id, _muted) = flat.rows[1].repo_branch_run();
+        let flat = flatten_rows(&watches, GroupBy::Org, &no_collapsed());
+        // Row 0: GroupHeader, Row 1: RepoHeader, Row 2: ActiveRun
+        let (repo, branch, run_id, _muted) = flat.rows[2].repo_branch_run();
         assert_eq!(repo, "alice/app");
         assert_eq!(branch, "main");
         assert_eq!(run_id, Some(42));
@@ -1458,7 +1570,7 @@ mod tests {
             watch_with_build("alice/lib", "main", "success", 20.0),
             watch_with_build("bob/api", "main", "failure", 30.0),
         ];
-        let flat = flatten_rows(&watches, GroupBy::Org);
+        let flat = flatten_rows(&watches, GroupBy::Org, &no_collapsed());
         assert_eq!(group_header_labels(&flat), vec!["alice", "bob"]);
     }
 
@@ -1470,7 +1582,7 @@ mod tests {
             watch_with_build("bob/lib", "main", "failure", 30.0),
         ];
         let sorted = sorted_watches(&watches, SortColumn::Branch, true, GroupBy::None);
-        let flat = flatten_rows(&sorted, GroupBy::Branch);
+        let flat = flatten_rows(&sorted, GroupBy::Branch, &no_collapsed());
         assert_eq!(group_header_labels(&flat), vec!["develop", "main"]);
     }
 
@@ -1482,10 +1594,10 @@ mod tests {
             watch_with_active("carol/api", "main", "in_progress", 5.0),
         ];
         let sorted = sorted_watches(&watches, SortColumn::Status, true, GroupBy::None);
-        let flat = flatten_rows(&sorted, GroupBy::Status);
+        let flat = flatten_rows(&sorted, GroupBy::Status, &no_collapsed());
         let labels = group_header_labels(&flat);
         assert_eq!(labels.len(), 3);
-        assert_eq!(labels[0], "in_progress"); // active tier
+        assert_eq!(labels[0], "in progress"); // active tier
         assert_eq!(labels[1], "failure"); // completed, alphabetical
         assert_eq!(labels[2], "success");
     }
@@ -1496,10 +1608,10 @@ mod tests {
             watch_with_build("alice/app", "main", "success", 10.0),
             watch_with_build("bob/lib", "main", "failure", 20.0),
         ];
-        let flat = flatten_rows(&watches, GroupBy::None);
+        let flat = flatten_rows(&watches, GroupBy::None, &no_collapsed());
         assert_eq!(count_group_headers(&flat), 0);
-        // Just the watch rows, no headers
-        assert_eq!(flat.rows.len(), 2);
+        // 2 RepoHeaders + 2 branch rows (no group headers)
+        assert_eq!(flat.rows.len(), 4);
     }
 
     #[test]
@@ -1509,7 +1621,7 @@ mod tests {
             watch_with_active("bob/lib", "main", "in_progress", 5.0), // Deploy
             watch("carol/api", "main"),                             // no workflow
         ];
-        let flat = flatten_rows(&watches, GroupBy::Workflow);
+        let flat = flatten_rows(&watches, GroupBy::Workflow, &no_collapsed());
         let labels = group_header_labels(&flat);
         assert_eq!(labels, vec!["CI", "Deploy", "(none)"]);
     }

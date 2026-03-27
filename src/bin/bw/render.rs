@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::time::Duration;
 
 use ratatui::layout::{Constraint, Direction, Layout};
@@ -15,6 +16,17 @@ pub(crate) enum DisplayRow<'a> {
     GroupHeader {
         label: String,
     },
+    RepoHeader {
+        repo: &'a str,
+        branch_count: usize,
+        collapsed: bool,
+        failing: usize,
+        active: usize,
+        passing: usize,
+        idle: usize,
+        muted: bool,
+        newest_age: Option<f64>,
+    },
     ActiveRun {
         repo: &'a str,
         branch: &'a str,
@@ -23,20 +35,24 @@ pub(crate) enum DisplayRow<'a> {
         /// Empty when this is the only active run.
         extra_badge: String,
         muted: bool,
+        tree_prefix: &'static str,
     },
     FailingSteps {
         steps: &'a str,
+        tree_indent: &'static str,
     },
     LastBuild {
         repo: &'a str,
         branch: &'a str,
         build: &'a LastBuildView,
         muted: bool,
+        tree_prefix: &'static str,
     },
     NeverRan {
         repo: &'a str,
         branch: &'a str,
         muted: bool,
+        tree_prefix: &'static str,
     },
 }
 
@@ -47,28 +63,36 @@ pub(crate) struct FlatRows<'a> {
     pub(crate) selectable: Vec<usize>,
 }
 
-/// Group key as a sortable string (used to ensure items with the same group are contiguous).
-pub(crate) fn group_key_for_sort(w: &WatchStatus, group_by: GroupBy) -> String {
-    group_key(w, group_by).unwrap_or_default()
-}
-
-/// Extract the group key for a watch based on the grouping mode.
-pub(crate) fn group_key(w: &WatchStatus, group_by: GroupBy) -> Option<String> {
+/// Compute the group-by display key for a repo group.
+fn repo_group_display_key(
+    repo: &str,
+    branches: &[&WatchStatus],
+    group_by: GroupBy,
+) -> Option<String> {
     match group_by {
-        GroupBy::Org => Some(w.repo.split('/').next().unwrap_or(&w.repo).to_string()),
-        GroupBy::Branch => Some(w.branch.clone()),
+        GroupBy::Org => Some(repo.split('/').next().unwrap_or(repo).to_string()),
+        GroupBy::Branch => Some(
+            branches
+                .first()
+                .map(|w| w.branch.clone())
+                .unwrap_or_default(),
+        ),
         GroupBy::Workflow => {
-            let wf = watch_workflow(w);
-            if wf.is_empty() {
-                Some("(none)".to_string())
-            } else {
-                Some(wf.to_string())
-            }
+            let wf = branches
+                .iter()
+                .map(|w| watch_workflow(w))
+                .find(|w| !w.is_empty())
+                .unwrap_or("(none)");
+            Some(wf.to_string())
         }
         GroupBy::Status => {
-            let (tier, status) = watch_status(w);
-            Some(if tier <= 1 {
-                status.to_string()
+            let worst = branches
+                .iter()
+                .map(|w| watch_status(w))
+                .min()
+                .unwrap_or((2, ""));
+            Some(if worst.0 <= 1 {
+                format::status(worst.1).to_string()
             } else {
                 "idle".to_string()
             })
@@ -77,70 +101,179 @@ pub(crate) fn group_key(w: &WatchStatus, group_by: GroupBy) -> Option<String> {
     }
 }
 
-pub(crate) fn flatten_rows(watches: &[WatchStatus], group_by: GroupBy) -> FlatRows<'_> {
+/// Group-by sort key for owned watch slices (used in `sorted_watches`).
+fn repo_group_sort_key(repo: &str, branches: &[WatchStatus], group_by: GroupBy) -> String {
+    match group_by {
+        GroupBy::Org => repo.split('/').next().unwrap_or(repo).to_string(),
+        GroupBy::Branch => branches
+            .first()
+            .map(|w| w.branch.clone())
+            .unwrap_or_default(),
+        GroupBy::Workflow => branches
+            .iter()
+            .map(watch_workflow)
+            .find(|w| !w.is_empty())
+            .unwrap_or("(none)")
+            .to_string(),
+        GroupBy::Status => {
+            let worst = branches.iter().map(watch_status).min().unwrap_or((2, ""));
+            if worst.0 <= 1 {
+                format::status(worst.1).to_string()
+            } else {
+                "idle".to_string()
+            }
+        }
+        GroupBy::None => String::new(),
+    }
+}
+
+/// Group consecutive watches by repo, preserving input order.
+fn group_watches_by_repo(watches: &[WatchStatus]) -> Vec<(&str, Vec<&WatchStatus>)> {
+    let mut groups: Vec<(&str, Vec<&WatchStatus>)> = Vec::new();
+    for w in watches {
+        if let Some(g) = groups.iter_mut().find(|(r, _)| *r == w.repo.as_str()) {
+            g.1.push(w);
+        } else {
+            groups.push((w.repo.as_str(), vec![w]));
+        }
+    }
+    groups
+}
+
+pub(crate) fn flatten_rows<'a>(
+    watches: &'a [WatchStatus],
+    group_by: GroupBy,
+    collapsed: &HashSet<String>,
+) -> FlatRows<'a> {
     let mut rows = Vec::new();
     let mut selectable = Vec::new();
     let mut current_group: Option<String> = None;
 
-    for w in watches {
-        if let Some(key) = group_key(w, group_by)
+    let repo_groups = group_watches_by_repo(watches);
+
+    for (repo, branches) in &repo_groups {
+        // Group header (from group-by mode)
+        if let Some(key) = repo_group_display_key(repo, branches, group_by)
             && current_group.as_deref() != Some(&key)
         {
             current_group = Some(key.clone());
             rows.push(DisplayRow::GroupHeader { label: key });
         }
 
-        if w.active_runs.is_empty() {
-            match &w.last_build {
-                Some(b) => {
-                    selectable.push(rows.len());
-                    rows.push(DisplayRow::LastBuild {
-                        repo: &w.repo,
-                        branch: &w.branch,
-                        build: b,
-                        muted: w.muted,
-                    });
-                    if b.conclusion != "success"
-                        && let Some(steps) = &b.failing_steps
-                    {
-                        rows.push(DisplayRow::FailingSteps { steps });
-                    }
+        // Compute aggregate stats for repo header
+        let mut failing = 0usize;
+        let mut active = 0usize;
+        let mut passing = 0usize;
+        let mut idle = 0usize;
+        let mut newest_age: Option<f64> = None;
+        let mut all_muted = true;
+
+        for w in branches {
+            if !w.active_runs.is_empty() {
+                active += 1;
+            } else if let Some(b) = &w.last_build {
+                match b.conclusion.as_str() {
+                    "success" => passing += 1,
+                    _ => failing += 1,
                 }
-                None => {
+                if let Some(age) = b.age_secs {
+                    newest_age = Some(newest_age.map_or(age, |cur: f64| cur.min(age)));
+                }
+            } else {
+                idle += 1;
+            }
+            if !w.muted {
+                all_muted = false;
+            }
+            for run in &w.active_runs {
+                if let Some(e) = run.elapsed_secs {
+                    newest_age = Some(newest_age.map_or(e, |cur: f64| cur.min(e)));
+                }
+            }
+        }
+
+        let is_collapsed = collapsed.contains(*repo);
+
+        // Repo header row
+        selectable.push(rows.len());
+        rows.push(DisplayRow::RepoHeader {
+            repo,
+            branch_count: branches.len(),
+            collapsed: is_collapsed,
+            failing,
+            active,
+            passing,
+            idle,
+            muted: all_muted && !branches.is_empty(),
+            newest_age,
+        });
+
+        // Branch rows (only when expanded)
+        if !is_collapsed {
+            let last_idx = branches.len() - 1;
+            for (i, w) in branches.iter().enumerate() {
+                let is_last = i == last_idx;
+                let tree_prefix: &'static str = if is_last { "└─ " } else { "├─ " };
+                let tree_indent: &'static str = if is_last { "   " } else { "│  " };
+
+                if w.active_runs.is_empty() {
+                    match &w.last_build {
+                        Some(b) => {
+                            selectable.push(rows.len());
+                            rows.push(DisplayRow::LastBuild {
+                                repo: &w.repo,
+                                branch: &w.branch,
+                                build: b,
+                                muted: w.muted,
+                                tree_prefix,
+                            });
+                            if b.conclusion != "success"
+                                && let Some(steps) = &b.failing_steps
+                            {
+                                rows.push(DisplayRow::FailingSteps { steps, tree_indent });
+                            }
+                        }
+                        None => {
+                            selectable.push(rows.len());
+                            rows.push(DisplayRow::NeverRan {
+                                repo: &w.repo,
+                                branch: &w.branch,
+                                muted: w.muted,
+                                tree_prefix,
+                            });
+                        }
+                    }
+                } else {
+                    let primary_idx = w
+                        .active_runs
+                        .iter()
+                        .rposition(|r| r.status == "in_progress")
+                        .unwrap_or(w.active_runs.len() - 1);
+                    let primary = &w.active_runs[primary_idx];
+                    let extra_badge = extra_runs_badge(&w.active_runs, primary_idx);
                     selectable.push(rows.len());
-                    rows.push(DisplayRow::NeverRan {
+                    rows.push(DisplayRow::ActiveRun {
                         repo: &w.repo,
                         branch: &w.branch,
+                        run: primary,
+                        extra_badge,
                         muted: w.muted,
+                        tree_prefix,
                     });
                 }
             }
-        } else {
-            // Prefer in_progress as the primary row; fall back to the last (newest) run.
-            let primary_idx = w
-                .active_runs
-                .iter()
-                .rposition(|r| r.status == "in_progress")
-                .unwrap_or(w.active_runs.len() - 1);
-            let primary = &w.active_runs[primary_idx];
-            let extra_badge = extra_runs_badge(&w.active_runs, primary_idx);
-            selectable.push(rows.len());
-            rows.push(DisplayRow::ActiveRun {
-                repo: &w.repo,
-                branch: &w.branch,
-                run: primary,
-                extra_badge,
-                muted: w.muted,
-            });
         }
     }
+
     FlatRows { rows, selectable }
 }
 
 impl DisplayRow<'_> {
-    /// Returns `(repo, branch, run_id, muted)` for the selected row. Only valid for selectable rows.
+    /// Returns `(repo, branch, run_id, muted)` for the selected row.
+    /// For `RepoHeader`, branch is empty.
     pub(crate) fn repo_branch_run(&self) -> (&str, &str, Option<u64>, bool) {
         match self {
+            DisplayRow::RepoHeader { repo, muted, .. } => (repo, "", None, *muted),
             DisplayRow::ActiveRun {
                 repo,
                 branch,
@@ -153,60 +286,107 @@ impl DisplayRow<'_> {
                 branch,
                 build,
                 muted,
+                ..
             } => (repo, branch, Some(build.run_id), *muted),
             DisplayRow::NeverRan {
                 repo,
                 branch,
                 muted,
+                ..
             } => (repo, branch, None, *muted),
             DisplayRow::GroupHeader { .. } | DisplayRow::FailingSteps { .. } => {
                 unreachable!("not selectable")
             }
         }
     }
+
+    /// Returns `true` if this is a `RepoHeader` row.
+    pub(crate) fn is_repo_header(&self) -> bool {
+        matches!(self, DisplayRow::RepoHeader { .. })
+    }
 }
 
-/// Sort watches by the selected column. Returns a new sorted vec.
-/// When `group_by` is active, the group key is used as the primary sort key
-/// so that items in the same group are contiguous for header insertion.
+/// Sort watches as repo groups. Repos are sorted by aggregate column value;
+/// branches within each repo are sorted by the same column.
+/// When `group_by` is active, the group key is the primary sort key.
 pub(crate) fn sorted_watches(
     watches: &[WatchStatus],
     column: SortColumn,
     ascending: bool,
     group_by: GroupBy,
 ) -> Vec<WatchStatus> {
-    let mut sorted = watches.to_vec();
-    sorted.sort_by(|a, b| {
-        // Group key as primary sort when grouping is active.
+    // Group by repo
+    let mut groups: Vec<(String, Vec<WatchStatus>)> = Vec::new();
+    for w in watches {
+        if let Some(g) = groups.iter_mut().find(|(r, _)| r == &w.repo) {
+            g.1.push(w.clone());
+        } else {
+            groups.push((w.repo.clone(), vec![w.clone()]));
+        }
+    }
+
+    // Sort branches within each repo
+    for (_, branches) in &mut groups {
+        branches.sort_by(|a, b| {
+            let cmp = match column {
+                SortColumn::Repo | SortColumn::Branch => a.branch.cmp(&b.branch),
+                SortColumn::Status => watch_status(a).cmp(&watch_status(b)),
+                SortColumn::Workflow => watch_workflow(a).cmp(watch_workflow(b)),
+                SortColumn::Age => watch_age(a)
+                    .partial_cmp(&watch_age(b))
+                    .unwrap_or(std::cmp::Ordering::Equal),
+            };
+            if ascending { cmp } else { cmp.reverse() }
+        });
+    }
+
+    // Sort repo groups
+    groups.sort_by(|a, b| {
+        // Group-by key as primary sort
         let group_ord = match group_by {
             GroupBy::None => std::cmp::Ordering::Equal,
-            _ => group_key_for_sort(a, group_by).cmp(&group_key_for_sort(b, group_by)),
+            _ => {
+                let ka = repo_group_sort_key(&a.0, &a.1, group_by);
+                let kb = repo_group_sort_key(&b.0, &b.1, group_by);
+                ka.cmp(&kb)
+            }
         };
         if group_ord != std::cmp::Ordering::Equal {
             return group_ord;
         }
+
+        // Then by aggregate column value
         let cmp = match column {
-            SortColumn::Repo => a.repo.cmp(&b.repo).then(a.branch.cmp(&b.branch)),
-            SortColumn::Branch => a.branch.cmp(&b.branch).then(a.repo.cmp(&b.repo)),
+            SortColumn::Repo => a.0.cmp(&b.0),
+            SortColumn::Branch => {
+                let ba = a.1.first().map(|w| w.branch.as_str()).unwrap_or("");
+                let bb = b.1.first().map(|w| w.branch.as_str()).unwrap_or("");
+                ba.cmp(bb).then(a.0.cmp(&b.0))
+            }
             SortColumn::Status => {
-                let sa = watch_status(a);
-                let sb = watch_status(b);
+                let sa = a.1.iter().map(watch_status).min();
+                let sb = b.1.iter().map(watch_status).min();
                 sa.cmp(&sb)
             }
             SortColumn::Workflow => {
-                let wa = watch_workflow(a);
-                let wb = watch_workflow(b);
-                wa.cmp(wb)
+                let wa = a.1.iter().map(watch_workflow).min();
+                let wb = b.1.iter().map(watch_workflow).min();
+                wa.cmp(&wb)
             }
             SortColumn::Age => {
-                let aa = watch_age(a);
-                let ab = watch_age(b);
+                let aa = a.1.iter().map(watch_age).fold(f64::MAX, f64::min);
+                let ab = b.1.iter().map(watch_age).fold(f64::MAX, f64::min);
                 aa.partial_cmp(&ab).unwrap_or(std::cmp::Ordering::Equal)
             }
         };
         if ascending { cmp } else { cmp.reverse() }
     });
-    sorted
+
+    // Flatten back to a flat vec (repos contiguous)
+    groups
+        .into_iter()
+        .flat_map(|(_, branches)| branches)
+        .collect()
 }
 
 /// Build a compact badge summarising the non-primary active runs.
@@ -387,7 +567,12 @@ pub(crate) fn render_header(frame: &mut ratatui::Frame, area: ratatui::layout::R
     ]);
 
     // Line 2: watches + state
-    let repo_count = app.status.watches.len();
+    let repo_count = {
+        let mut repos: Vec<&str> = app.status.watches.iter().map(|w| w.repo.as_str()).collect();
+        repos.sort_unstable();
+        repos.dedup();
+        repos.len()
+    };
     let active_count = app.active_count();
     let group_label = if app.group_by != GroupBy::Org {
         format!("  group: {}", app.group_by.label())
@@ -479,7 +664,7 @@ pub(crate) fn render_body(
         app.sort_ascending,
         app.group_by,
     );
-    let flat = flatten_rows(&sorted, app.group_by);
+    let flat = flatten_rows(&sorted, app.group_by, &app.collapsed);
     let selected_display_idx = flat
         .selectable
         .get(app.selected)
@@ -530,12 +715,62 @@ fn render_display_row<'a>(
             Cell::from(""),
             Cell::from(""),
         ]),
-        DisplayRow::ActiveRun {
+        DisplayRow::RepoHeader {
             repo,
+            branch_count,
+            collapsed,
+            failing,
+            active,
+            passing,
+            idle,
+            muted,
+            newest_age,
+        } => {
+            let arrow = if *collapsed { "▶" } else { "▼" };
+            let name = format!("{arrow} {}{}", short_repo(repo), mute_indicator(*muted));
+            let count_label = if *branch_count == 1 {
+                "1 branch".to_string()
+            } else {
+                format!("{branch_count} branches")
+            };
+
+            // Compact status summary
+            let mut parts = Vec::new();
+            if *failing > 0 {
+                parts.push(format!("❌ {failing}"));
+            }
+            if *active > 0 {
+                parts.push(format!("⏳ {active}"));
+            }
+            if *passing > 0 {
+                parts.push(format!("✅ {passing}"));
+            }
+            if *idle > 0 {
+                parts.push(format!("· {idle}"));
+            }
+            let status_text = parts.join("  ");
+
+            let age = newest_age
+                .map(|s| format::age(s as u64))
+                .unwrap_or_default();
+
+            let repo_style = Style::default().add_modifier(Modifier::BOLD);
+            Row::new(vec![
+                Cell::from(format::truncate(&name, cw.repo)).style(repo_style),
+                Cell::from(format::truncate(&count_label, BRANCH_W)),
+                Cell::from(format::truncate(&status_text, STATUS_W)),
+                Cell::from(""),
+                Cell::from(""),
+                Cell::from(age),
+            ])
+        }
+        DisplayRow::ActiveRun {
             branch,
             run,
             extra_badge,
             muted,
+            tree_prefix,
+            ..
         } => {
             let style = status_style(&run.status);
             let emoji = status_emoji(&run.status);
@@ -543,14 +778,14 @@ fn render_display_row<'a>(
                 .elapsed_secs
                 .map(|s| format::duration(Duration::from_secs_f64(s)))
                 .unwrap_or_default();
-            let name = format!("  {}{}", short_repo(repo), mute_indicator(*muted));
+            let tree_name = format!("  {tree_prefix}{}{}", branch, mute_indicator(*muted));
             let status_text = if extra_badge.is_empty() {
                 format!("{emoji} {}", format::status(&run.status))
             } else {
                 format!("{emoji} {} {extra_badge}", format::status(&run.status))
             };
             Row::new(vec![
-                Cell::from(format::truncate(&name, cw.repo)),
+                Cell::from(format::truncate(&tree_name, cw.repo)),
                 Cell::from(format::truncate(branch, BRANCH_W)),
                 Cell::from(format::truncate(&status_text, STATUS_W)).style(style),
                 Cell::from(format::truncate(&run.workflow, cw.workflow)),
@@ -558,20 +793,21 @@ fn render_display_row<'a>(
                 Cell::from(elapsed).style(style),
             ])
         }
-        DisplayRow::FailingSteps { steps } => Row::new(vec![
+        DisplayRow::FailingSteps { steps, tree_indent } => Row::new(vec![
+            Cell::from(format!("  {tree_indent}")),
             Cell::from(""),
             Cell::from(""),
             Cell::from(""),
-            Cell::from(""),
-            Cell::from(format!("  ↳ {}", format::truncate(steps, cw.title)))
+            Cell::from(format!("↳ {}", format::truncate(steps, cw.title)))
                 .style(Style::default().fg(Color::Red)),
             Cell::from(""),
         ]),
         DisplayRow::LastBuild {
-            repo,
             branch,
             build,
             muted,
+            tree_prefix,
+            ..
         } => {
             let style = status_style(&build.conclusion);
             let emoji = status_emoji(&build.conclusion);
@@ -579,9 +815,9 @@ fn render_display_row<'a>(
                 .age_secs
                 .map(|s| format::age(s as u64))
                 .unwrap_or_default();
-            let name = format!("  {}{}", short_repo(repo), mute_indicator(*muted));
+            let tree_name = format!("  {tree_prefix}{}{}", branch, mute_indicator(*muted));
             Row::new(vec![
-                Cell::from(format::truncate(&name, cw.repo)),
+                Cell::from(format::truncate(&tree_name, cw.repo)),
                 Cell::from(format::truncate(branch, BRANCH_W)),
                 Cell::from(format!("{emoji} {}", format::status(&build.conclusion))).style(style),
                 Cell::from(format::truncate(&build.workflow, cw.workflow)),
@@ -590,13 +826,14 @@ fn render_display_row<'a>(
             ])
         }
         DisplayRow::NeverRan {
-            repo,
             branch,
             muted,
+            tree_prefix,
+            ..
         } => {
-            let name = format!("  {}{}", short_repo(repo), mute_indicator(*muted));
+            let tree_name = format!("  {tree_prefix}{}{}", branch, mute_indicator(*muted));
             Row::new(vec![
-                Cell::from(format::truncate(&name, cw.repo)),
+                Cell::from(format::truncate(&tree_name, cw.repo)),
                 Cell::from(format::truncate(branch, BRANCH_W)),
                 Cell::from("· idle").style(Style::default().fg(Color::DarkGray)),
                 Cell::from(""),
@@ -688,6 +925,8 @@ pub(crate) fn render_footer(frame: &mut ratatui::Frame, area: ratatui::layout::R
             Span::raw(" mute/levels  "),
             Span::styled("[p]", key_style),
             Span::raw(" pause  "),
+            Span::styled("[e/E]", key_style),
+            Span::raw(" expand  "),
             Span::styled("[s/S]", key_style),
             Span::raw(" sort  "),
             Span::styled("[g/G]", key_style),
@@ -717,7 +956,9 @@ pub(crate) fn render(frame: &mut ratatui::Frame, app: &App) {
         app.sort_ascending,
         app.group_by,
     );
-    let table_rows = flatten_rows(&sorted, app.group_by).rows.len() as u16;
+    let table_rows = flatten_rows(&sorted, app.group_by, &app.collapsed)
+        .rows
+        .len() as u16;
 
     let recent_count = app.recent_history.len();
     let recent_height = recent_count.min(4) as u16;

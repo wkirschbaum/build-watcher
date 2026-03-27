@@ -65,6 +65,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         sort_column: prefs.sort_column,
         sort_ascending: prefs.sort_ascending,
         group_by: prefs.group_by,
+        collapsed: std::collections::HashSet::new(),
     };
 
     // Terminal setup.
