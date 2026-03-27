@@ -1591,6 +1591,70 @@ fn render_display_row<'a>(
     }
 }
 
+fn render_recent_panel(
+    frame: &mut ratatui::Frame,
+    sep_area: ratatui::layout::Rect,
+    body_area: ratatui::layout::Rect,
+    app: &App,
+    cw: &ColWidths,
+) {
+    let w = sep_area.width as usize;
+    let dim = Style::default().fg(Color::DarkGray);
+    let label = " Recent ";
+    let dashes = w.saturating_sub(label.len());
+    let left = dashes / 2;
+    let right = dashes - left;
+    let sep_line = Line::from(vec![
+        Span::styled("─".repeat(left), dim),
+        Span::styled(label, dim),
+        Span::styled("─".repeat(right), dim),
+    ]);
+    frame.render_widget(Paragraph::new(sep_line), sep_area);
+
+    // Collect watches with a last_build, sorted most-recent-first.
+    let mut recent: Vec<(&WatchStatus, &LastBuildView)> = app
+        .status
+        .watches
+        .iter()
+        .filter_map(|w| w.last_build.as_ref().map(|lb| (w, lb)))
+        .collect();
+    recent.sort_by(|a, b| {
+        let age_a = a.1.age_secs.unwrap_or(u64::MAX as f64) as u64;
+        let age_b = b.1.age_secs.unwrap_or(u64::MAX as f64) as u64;
+        age_a.cmp(&age_b)
+    });
+
+    let rows: Vec<Row> = recent
+        .into_iter()
+        .take(body_area.height as usize)
+        .map(|(watch, lb)| {
+            let style = status_style(&lb.conclusion);
+            let emoji = status_emoji(&lb.conclusion);
+            let repo = format::truncate(&watch.repo, cw.repo);
+            let branch = format::truncate(&watch.branch, BRANCH_W);
+            let status_cell = format!("{emoji} {}", format::status(&lb.conclusion));
+            let workflow = format::truncate(&lb.workflow, cw.workflow);
+            let title = format::truncate(&lb.title, cw.title);
+            let age = lb
+                .age_secs
+                .map(|s| format::age(s as u64))
+                .unwrap_or_default();
+            Row::new(vec![
+                Cell::from(repo),
+                Cell::from(branch),
+                Cell::from(status_cell).style(style),
+                Cell::from(workflow),
+                Cell::from(title),
+                Cell::from(age),
+            ])
+            .style(Style::default().fg(Color::DarkGray))
+        })
+        .collect();
+
+    let table = Table::new(rows, cw.constraints());
+    frame.render_widget(table, body_area);
+}
+
 fn render_footer(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &App) {
     let key_style = Style::default()
         .fg(Color::DarkGray)
@@ -1645,19 +1709,48 @@ fn render(frame: &mut ratatui::Frame, app: &App) {
     let area = frame.area();
     let cw = ColWidths::from_terminal_width(area.width);
 
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3), // header (2 info lines + separator)
-            Constraint::Length(1), // column headings
-            Constraint::Min(0),    // table body
-            Constraint::Length(1), // footer
-        ])
-        .split(area);
+    // Count watches with a last_build to size the recent panel.
+    let recent_count = app
+        .status
+        .watches
+        .iter()
+        .filter(|w| w.last_build.is_some())
+        .count();
+    let recent_height = recent_count.min(4) as u16;
+    let show_recent = recent_height > 0;
+
+    let chunks = if show_recent {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3),             // header
+                Constraint::Length(1),             // column headings
+                Constraint::Min(0),                // table body
+                Constraint::Length(1),             // recent separator
+                Constraint::Length(recent_height), // recent panel
+                Constraint::Length(1),             // footer
+            ])
+            .split(area)
+    } else {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3), // header
+                Constraint::Length(1), // column headings
+                Constraint::Min(0),    // table body
+                Constraint::Length(1), // footer
+            ])
+            .split(area)
+    };
 
     render_header(frame, chunks[0], app);
     render_body(frame, chunks[1], chunks[2], app, &cw);
-    render_footer(frame, chunks[3], app);
+    if show_recent {
+        render_recent_panel(frame, chunks[3], chunks[4], app, &cw);
+        render_footer(frame, chunks[5], app);
+    } else {
+        render_footer(frame, chunks[3], app);
+    }
 
     // Overlay the form popup if active.
     if let InputMode::Form {
