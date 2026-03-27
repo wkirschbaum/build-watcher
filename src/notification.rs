@@ -82,7 +82,6 @@ async fn handle_notification(event: WatchEvent, cfg: &config::Config, level: Not
                 url: Some(run.url()),
                 group: run.notification_group(),
                 app_name: run.repo,
-                rerun_run_id: None,
             })
             .await;
         }
@@ -112,7 +111,6 @@ async fn handle_notification(event: WatchEvent, cfg: &config::Config, level: Not
                 let _ = write!(body, "\nFailed: {steps}");
             }
 
-            let rerun_run_id = if !succeeded { Some(run.run_id) } else { None };
             platform::send(platform::Notification {
                 title: format!("{emoji} {status}: {} | {}", repo_label, run.workflow),
                 body,
@@ -120,7 +118,6 @@ async fn handle_notification(event: WatchEvent, cfg: &config::Config, level: Not
                 url: Some(run.url()),
                 group: run.notification_group(),
                 app_name: run.repo,
-                rerun_run_id,
             })
             .await;
         }

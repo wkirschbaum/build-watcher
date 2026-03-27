@@ -538,6 +538,9 @@ impl App {
                             open_browser(&url);
                         }
                     }
+                    KeyCode::Char('q') => {
+                        self.input_mode = InputMode::Normal;
+                    }
                     _ => {}
                 }
                 true
@@ -1969,11 +1972,11 @@ fn render_history_popup(
             let status_str = format::status(&entry.conclusion);
             let duration = entry
                 .duration_secs
-                .map(|s| format::seconds(s))
+                .map(format::seconds)
                 .unwrap_or_else(|| "—".to_string());
             let age = entry
                 .age_secs
-                .map(|s| format::age(s))
+                .map(format::age)
                 .unwrap_or_else(|| "—".to_string());
             let title_str = format::truncate(&entry.title, 32);
             let workflow_str = format::truncate(&entry.workflow, 14);
