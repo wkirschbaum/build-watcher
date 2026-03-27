@@ -879,6 +879,57 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    #[test]
+    fn load_returns_none_when_both_missing() {
+        let dir = std::env::temp_dir().join(format!("bw-test-none-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        let result: Option<Config> = load_json(&path);
+        assert!(result.is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn save_creates_backup_of_previous() {
+        let dir = std::env::temp_dir().join(format!("bw-test-bak2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("data.json");
+        let bak = dir.join("data.json.bak");
+
+        // First save — no backup should be created.
+        save_json(&path, &vec!["v1"]).unwrap();
+        assert!(!bak.exists());
+
+        // Second save — previous version becomes .bak.
+        save_json(&path, &vec!["v2"]).unwrap();
+        assert!(bak.exists());
+        let backup: Vec<String> = load_json(&bak).unwrap();
+        assert_eq!(backup, vec!["v1"]);
+
+        // Primary has the new version.
+        let current: Vec<String> = load_json(&path).unwrap();
+        assert_eq!(current, vec!["v2"]);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn save_no_draft_left_behind() {
+        let dir = std::env::temp_dir().join(format!("bw-test-draft-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("clean.json");
+        let draft = dir.join("clean.json.draft");
+
+        save_json(&path, &"hello").unwrap();
+        assert!(path.exists());
+        assert!(
+            !draft.exists(),
+            "draft file should be cleaned up after save"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     fn config_with_repos(repos: &[&str]) -> Config {
         let mut config = Config::default();
         for repo in repos {
