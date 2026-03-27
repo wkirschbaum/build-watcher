@@ -1709,6 +1709,15 @@ fn render(frame: &mut ratatui::Frame, app: &App) {
     let area = frame.area();
     let cw = ColWidths::from_terminal_width(area.width);
 
+    // Count rows in the main table to give it an exact height.
+    let sorted = sorted_watches(
+        &app.status.watches,
+        app.sort_column,
+        app.sort_ascending,
+        app.group_by,
+    );
+    let table_rows = flatten_rows(&sorted, app.group_by).rows.len() as u16;
+
     // Count watches with a last_build to size the recent panel.
     let recent_count = app
         .status
@@ -1725,10 +1734,10 @@ fn render(frame: &mut ratatui::Frame, app: &App) {
             .constraints([
                 Constraint::Length(3),             // header
                 Constraint::Length(1),             // column headings
-                Constraint::Min(0),                // table body
-                Constraint::Length(1),             // spacer
+                Constraint::Length(table_rows),    // table body (exact)
                 Constraint::Length(1),             // recent separator
                 Constraint::Length(recent_height), // recent panel
+                Constraint::Min(0),                // remaining space
                 Constraint::Length(1),             // footer
             ])
             .split(area)
@@ -1736,10 +1745,11 @@ fn render(frame: &mut ratatui::Frame, app: &App) {
         Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(3), // header
-                Constraint::Length(1), // column headings
-                Constraint::Min(0),    // table body
-                Constraint::Length(1), // footer
+                Constraint::Length(3),          // header
+                Constraint::Length(1),          // column headings
+                Constraint::Length(table_rows), // table body (exact)
+                Constraint::Min(0),             // remaining space
+                Constraint::Length(1),          // footer
             ])
             .split(area)
     };
@@ -1747,10 +1757,10 @@ fn render(frame: &mut ratatui::Frame, app: &App) {
     render_header(frame, chunks[0], app);
     render_body(frame, chunks[1], chunks[2], app, &cw);
     if show_recent {
-        render_recent_panel(frame, chunks[4], chunks[5], app, &cw);
+        render_recent_panel(frame, chunks[3], chunks[4], app, &cw);
         render_footer(frame, chunks[6], app);
     } else {
-        render_footer(frame, chunks[3], app);
+        render_footer(frame, chunks[4], app);
     }
 
     // Overlay the form popup if active.
