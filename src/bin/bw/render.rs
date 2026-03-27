@@ -71,12 +71,6 @@ fn repo_group_display_key(
 ) -> Option<String> {
     match group_by {
         GroupBy::Org => Some(repo.split('/').next().unwrap_or(repo).to_string()),
-        GroupBy::Branch => Some(
-            branches
-                .first()
-                .map(|w| w.branch.clone())
-                .unwrap_or_default(),
-        ),
         GroupBy::Workflow => {
             let wf = branches
                 .iter()
@@ -105,10 +99,6 @@ fn repo_group_display_key(
 fn repo_group_sort_key(repo: &str, branches: &[WatchStatus], group_by: GroupBy) -> String {
     match group_by {
         GroupBy::Org => repo.split('/').next().unwrap_or(repo).to_string(),
-        GroupBy::Branch => branches
-            .first()
-            .map(|w| w.branch.clone())
-            .unwrap_or_default(),
         GroupBy::Workflow => branches
             .iter()
             .map(watch_workflow)
