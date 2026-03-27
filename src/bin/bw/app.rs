@@ -290,18 +290,21 @@ impl App {
     }
 
     /// Spawn a background HTTP action that reports its result via the channel.
+    ///
+    /// `resync_on_success` controls whether to resync after a successful action.
+    /// On error, we **always** resync to clear any stale local state.
     fn spawn_action(
         &mut self,
         flash: impl Into<String>,
-        resync: bool,
+        resync_on_success: bool,
         action: impl Future<Output = Result<String, String>> + Send + 'static,
     ) {
         self.set_flash(flash);
         let tx = self.bg_tx.clone();
         tokio::spawn(async move {
-            let flash = match action.await {
-                Ok(msg) => msg,
-                Err(e) => e,
+            let (flash, resync) = match action.await {
+                Ok(msg) => (msg, resync_on_success),
+                Err(e) => (e, true),
             };
             let _ = tx.send(SseUpdate::BackgroundResult { flash, resync }).await;
         });
