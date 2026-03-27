@@ -237,6 +237,21 @@ pub(crate) fn flatten_rows<'a>(
             single_branch,
         });
 
+        // Failing steps for single-branch repos (shown directly under the header)
+        if branches.len() == 1 {
+            let w = branches[0];
+            if w.active_runs.is_empty()
+                && let Some(b) = &w.last_build
+                && b.conclusion != "success"
+                && let Some(steps) = &b.failing_steps
+            {
+                rows.push(DisplayRow::FailingSteps {
+                    steps,
+                    tree_indent: "",
+                });
+            }
+        }
+
         // Branch rows (only for multi-branch repos when expanded)
         if !is_collapsed && branches.len() > 1 {
             let last_idx = branches.len() - 1;
@@ -1016,36 +1031,48 @@ pub(crate) fn render_footer(frame: &mut ratatui::Frame, area: ratatui::layout::R
         InputMode::Form { .. }
         | InputMode::NotificationPicker { .. }
         | InputMode::History { .. } => Paragraph::new(""),
-        InputMode::Normal => Paragraph::new(Line::from(vec![
-            Span::styled("[↑↓]", key_style),
-            Span::raw(" select  "),
-            Span::styled("[a]", key_style),
-            Span::raw(" add  "),
-            Span::styled("[b]", key_style),
-            Span::raw(" branches  "),
-            Span::styled("[d]", key_style),
-            Span::raw(" remove  "),
-            Span::styled("[o/O]", key_style),
-            Span::raw(" open  "),
-            Span::styled("[n/N]", key_style),
-            Span::raw(" mute/levels  "),
-            Span::styled("[p]", key_style),
-            Span::raw(" pause  "),
-            Span::styled("[e/E]", key_style),
-            Span::raw(" expand  "),
-            Span::styled("[s/S]", key_style),
-            Span::raw(" sort  "),
-            Span::styled("[g/G]", key_style),
-            Span::raw(" group  "),
-            Span::styled("[h/H]", key_style),
-            Span::raw(" history  "),
-            Span::styled("[C]", key_style),
-            Span::raw(" config  "),
-            Span::styled("[q]", key_style),
-            Span::raw(" quit  "),
-            Span::styled("[Q]", key_style),
-            Span::raw(" quit+stop"),
-        ]))
+        InputMode::Normal => {
+            let sep = Span::styled("  │  ", Style::default().fg(Color::DarkGray));
+            Paragraph::new(Line::from(vec![
+                // ── Navigate ──────────────────────────────────────────────
+                Span::styled("[↑↓/jk]", key_style),
+                Span::raw(" nav  "),
+                Span::styled("[e/E]", key_style),
+                Span::raw(" expand"),
+                sep.clone(),
+                // ── Repos ─────────────────────────────────────────────────
+                Span::styled("[a]", key_style),
+                Span::raw(" add  "),
+                Span::styled("[b]", key_style),
+                Span::raw(" branch  "),
+                Span::styled("[d]", key_style),
+                Span::raw(" del  "),
+                Span::styled("[o/O]", key_style),
+                Span::raw(" open"),
+                sep.clone(),
+                // ── Notifications ─────────────────────────────────────────
+                Span::styled("[n/N]", key_style),
+                Span::raw(" mute  "),
+                Span::styled("[p]", key_style),
+                Span::raw(" pause  "),
+                Span::styled("[h/H]", key_style),
+                Span::raw(" hist"),
+                sep.clone(),
+                // ── View ──────────────────────────────────────────────────
+                Span::styled("[s/S]", key_style),
+                Span::raw(" sort  "),
+                Span::styled("[g/G]", key_style),
+                Span::raw(" group  "),
+                Span::styled("[C]", key_style),
+                Span::raw(" config"),
+                sep.clone(),
+                // ── Quit ──────────────────────────────────────────────────
+                Span::styled("[q]", key_style),
+                Span::raw(" quit  "),
+                Span::styled("[Q]", key_style),
+                Span::raw(" stop"),
+            ]))
+        }
         .style(Style::default().fg(Color::DarkGray)),
     };
     frame.render_widget(footer, area);

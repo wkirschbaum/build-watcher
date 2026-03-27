@@ -1272,7 +1272,7 @@ mod tests {
 
     #[test]
     fn flatten_rows_with_failing_steps_single_branch() {
-        // Single-branch repo: no child rows, just the RepoHeader with inline info.
+        // Single-branch repo with a failed build: GroupHeader + RepoHeader + FailingSteps.
         let watches = vec![WatchStatus {
             repo: "alice/app".to_string(),
             branch: "main".to_string(),
@@ -1288,10 +1288,10 @@ mod tests {
             muted: false,
         }];
         let flat = flatten_rows(&watches, GroupBy::Org, &no_collapsed());
-        // GroupHeader + RepoHeader (single-branch, no child rows)
-        assert_eq!(flat.rows.len(), 2);
-        assert_eq!(flat.selectable.len(), 1);
+        assert_eq!(flat.rows.len(), 3);
+        assert_eq!(flat.selectable.len(), 1); // FailingSteps is not selectable
         assert!(matches!(flat.rows[1], DisplayRow::RepoHeader { .. }));
+        assert!(matches!(flat.rows[2], DisplayRow::FailingSteps { .. }));
     }
 
     #[test]
