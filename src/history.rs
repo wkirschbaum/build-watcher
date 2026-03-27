@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
-use crate::config::{load_json, save_json_async, state_dir};
+use crate::config::{load_json, state_dir};
 use crate::github::LastBuild;
 use crate::watcher::WatchKey;
 
@@ -65,14 +65,6 @@ pub fn pruned(history: &BuildHistory) -> BuildHistory {
         .iter()
         .map(|(k, v)| (k.clone(), v.iter().take(MAX_HISTORY).cloned().collect()))
         .collect()
-}
-
-/// Persist `history` to disk, pruning each key to at most MAX_HISTORY entries on save.
-pub async fn save_history(history: &BuildHistory) {
-    let path = state_dir().join("history.json");
-    if let Err(e) = save_json_async(path, pruned(history)).await {
-        tracing::error!("Failed to save history: {e}");
-    }
 }
 
 #[cfg(test)]
@@ -176,23 +168,18 @@ mod tests {
     }
 
     #[test]
-    fn save_history_prunes_on_write() {
+    fn pruned_caps_at_max_history() {
         let mut hist = BuildHistory::new();
         let key = make_key("alice/app", "main");
-        // Manually overfill beyond MAX_HISTORY
-        let v = hist.entry(key).or_default();
+        let v = hist.entry(key.clone()).or_default();
         for i in 0..30u64 {
             v.push(make_build(i, Some(i)));
         }
         assert_eq!(v.len(), 30);
 
-        // The pruning inside save_history should cap at MAX_HISTORY.
-        // We verify the logic by checking what the pruned map would contain.
-        let pruned: BuildHistory = hist
-            .iter()
-            .map(|(k, v)| (k.clone(), v.iter().take(MAX_HISTORY).cloned().collect()))
-            .collect();
-        let pruned_v = pruned.values().next().unwrap();
-        assert_eq!(pruned_v.len(), MAX_HISTORY);
+        let result = pruned(&hist);
+        assert_eq!(result[&key].len(), MAX_HISTORY);
+        // Preserves order (oldest entries kept since they were pushed, not prepended).
+        assert_eq!(result[&key][0].run_id, 0);
     }
 }

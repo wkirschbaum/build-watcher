@@ -7,7 +7,7 @@ use crossterm::event::{KeyCode, KeyModifiers};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
-use build_watcher::config::{NOTIFICATION_EVENT_COUNT, NotificationLevel, state_dir};
+use build_watcher::config::{self, NOTIFICATION_EVENT_COUNT, NotificationLevel, state_dir};
 use build_watcher::events::WatchEvent;
 use build_watcher::github::{repo_url, run_url, validate_branch, validate_repo};
 use build_watcher::status::{
@@ -153,16 +153,11 @@ impl_cycle!(
     ]
 );
 
-fn default_true() -> bool {
-    true
-}
-
 /// Persisted TUI preferences (sort/group/collapse state).
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub(crate) struct TuiPrefs {
     pub(crate) sort_column: SortColumn,
-    #[serde(default = "default_true")]
     pub(crate) sort_ascending: bool,
     pub(crate) group_by: GroupBy,
     pub(crate) collapsed: HashSet<String>,
@@ -185,21 +180,12 @@ impl TuiPrefs {
     }
 
     pub(crate) fn load() -> Self {
-        std::fs::read_to_string(Self::path())
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default()
+        config::load_json(&Self::path()).unwrap_or_default()
     }
 
-    /// Atomic write: serialize → write to .tmp → rename over target.
     pub(crate) fn save(&self) {
-        let path = Self::path();
-        let tmp = path.with_extension("json.tmp");
-        let Ok(json) = serde_json::to_string_pretty(self) else {
-            return;
-        };
-        if std::fs::write(&tmp, &json).is_ok() {
-            let _ = std::fs::rename(&tmp, &path);
+        if let Err(e) = config::save_json(&Self::path(), self) {
+            tracing::warn!("Failed to save TUI preferences: {e}");
         }
     }
 }
@@ -265,9 +251,16 @@ impl App {
     }
 
     fn save_prefs(&self) {
-        // Only persist collapsed repos that are still being watched.
-        let watched: HashSet<String> = self.status.watches.iter().map(|w| w.repo.clone()).collect();
-        let collapsed = self.collapsed.intersection(&watched).cloned().collect();
+        // Prune collapsed repos no longer watched, but only when we have a
+        // non-empty watch list — avoids wiping state when the daemon is
+        // unreachable and status.watches is temporarily empty.
+        let collapsed = if self.status.watches.is_empty() {
+            self.collapsed.clone()
+        } else {
+            let watched: HashSet<String> =
+                self.status.watches.iter().map(|w| w.repo.clone()).collect();
+            self.collapsed.intersection(&watched).cloned().collect()
+        };
         TuiPrefs {
             sort_column: self.sort_column,
             sort_ascending: self.sort_ascending,
@@ -620,6 +613,10 @@ impl App {
         let is_repo_row = selected_display_idx
             .map(|idx| flat.rows[idx].is_repo_header())
             .unwrap_or(false);
+        let is_collapsible = is_repo_row
+            && !selected_display_idx
+                .map(|idx| flat.rows[idx].is_single_branch())
+                .unwrap_or(false);
 
         match code {
             KeyCode::Char('q') => return QuitAction::Quit,
@@ -635,7 +632,7 @@ impl App {
                     self.selected = (self.selected + 1).min(sel_count - 1);
                 }
             }
-            KeyCode::Enter | KeyCode::Right if is_repo_row => {
+            KeyCode::Enter | KeyCode::Right if is_collapsible => {
                 if let Some((repo, _, _, _)) = selected {
                     let repo = repo.to_string();
                     if self.collapsed.contains(&repo) {
@@ -661,7 +658,7 @@ impl App {
                     self.save_prefs();
                 }
             }
-            KeyCode::Tab | KeyCode::Char('e') => {
+            KeyCode::Tab | KeyCode::Char('e') if is_collapsible => {
                 if let Some((repo, _, _, _)) = selected {
                     let repo = repo.to_string();
                     if self.collapsed.contains(&repo) {
@@ -1252,16 +1249,16 @@ mod tests {
     fn flatten_rows_idle_watch() {
         let watches = vec![watch("alice/app", "main")];
         let flat = flatten_rows(&watches, GroupBy::Org, &no_collapsed());
-        // GroupHeader + RepoHeader + NeverRan
-        assert_eq!(flat.rows.len(), 3);
-        assert_eq!(flat.selectable.len(), 2); // RepoHeader + NeverRan
+        // Single-branch: GroupHeader + RepoHeader (no child row)
+        assert_eq!(flat.rows.len(), 2);
+        assert_eq!(flat.selectable.len(), 1); // RepoHeader only
         assert!(matches!(flat.rows[0], DisplayRow::GroupHeader { .. }));
         assert!(matches!(flat.rows[1], DisplayRow::RepoHeader { .. }));
-        assert!(matches!(flat.rows[2], DisplayRow::NeverRan { .. }));
     }
 
     #[test]
-    fn flatten_rows_with_failing_steps_not_selectable() {
+    fn flatten_rows_with_failing_steps_single_branch() {
+        // Single-branch repo: no child rows, just the RepoHeader with inline info.
         let watches = vec![WatchStatus {
             repo: "alice/app".to_string(),
             branch: "main".to_string(),
@@ -1277,17 +1274,46 @@ mod tests {
             muted: false,
         }];
         let flat = flatten_rows(&watches, GroupBy::Org, &no_collapsed());
-        // GroupHeader + RepoHeader + LastBuild + FailingSteps
-        assert_eq!(flat.rows.len(), 4);
-        // RepoHeader + LastBuild are selectable
-        assert_eq!(flat.selectable.len(), 2);
-        assert_eq!(flat.selectable[0], 1); // RepoHeader (index 1, after GroupHeader)
-        assert_eq!(flat.selectable[1], 2); // LastBuild (index 2)
+        // GroupHeader + RepoHeader (single-branch, no child rows)
+        assert_eq!(flat.rows.len(), 2);
+        assert_eq!(flat.selectable.len(), 1);
+        assert!(matches!(flat.rows[1], DisplayRow::RepoHeader { .. }));
+    }
+
+    #[test]
+    fn flatten_rows_multi_branch_with_failing_steps() {
+        // Multi-branch repo: child rows including FailingSteps are emitted.
+        let watches = vec![
+            WatchStatus {
+                repo: "alice/app".to_string(),
+                branch: "main".to_string(),
+                active_runs: vec![],
+                last_build: Some(LastBuildView {
+                    run_id: 1,
+                    conclusion: "failure".to_string(),
+                    workflow: "CI".to_string(),
+                    title: "Fix".to_string(),
+                    failing_steps: Some("Build / tests".to_string()),
+                    age_secs: Some(60.0),
+                }),
+                muted: false,
+            },
+            WatchStatus {
+                repo: "alice/app".to_string(),
+                branch: "develop".to_string(),
+                active_runs: vec![],
+                last_build: None,
+                muted: false,
+            },
+        ];
+        let flat = flatten_rows(&watches, GroupBy::Org, &no_collapsed());
+        // GroupHeader + RepoHeader + LastBuild + FailingSteps + NeverRan
+        assert_eq!(flat.rows.len(), 5);
         assert!(matches!(flat.rows[3], DisplayRow::FailingSteps { .. }));
     }
 
     #[test]
-    fn flatten_rows_success_no_failing_steps_row() {
+    fn flatten_rows_success_single_branch() {
         let watches = vec![WatchStatus {
             repo: "alice/app".to_string(),
             branch: "main".to_string(),
@@ -1303,10 +1329,9 @@ mod tests {
             muted: false,
         }];
         let flat = flatten_rows(&watches, GroupBy::Org, &no_collapsed());
-        // GroupHeader + RepoHeader + LastBuild
-        assert_eq!(flat.rows.len(), 3);
+        // Single-branch: GroupHeader + RepoHeader (no child row)
+        assert_eq!(flat.rows.len(), 2);
         assert!(matches!(flat.rows[1], DisplayRow::RepoHeader { .. }));
-        assert!(matches!(flat.rows[2], DisplayRow::LastBuild { .. }));
     }
 
     // -- status_style / status_emoji --
@@ -1353,7 +1378,7 @@ mod tests {
     // -- DisplayRow::repo_branch_run --
 
     #[test]
-    fn display_row_repo_branch_run() {
+    fn display_row_repo_branch_run_single_branch() {
         let watches = vec![WatchStatus {
             repo: "alice/app".to_string(),
             branch: "main".to_string(),
@@ -1369,11 +1394,11 @@ mod tests {
             muted: false,
         }];
         let flat = flatten_rows(&watches, GroupBy::Org, &no_collapsed());
-        // Row 0: GroupHeader, Row 1: RepoHeader, Row 2: ActiveRun
-        let (repo, branch, run_id, _muted) = flat.rows[2].repo_branch_run();
+        // Single-branch: Row 0: GroupHeader, Row 1: RepoHeader (inline)
+        assert_eq!(flat.rows.len(), 2);
+        let (repo, branch, _run_id, _muted) = flat.rows[1].repo_branch_run();
         assert_eq!(repo, "alice/app");
         assert_eq!(branch, "main");
-        assert_eq!(run_id, Some(42));
     }
 
     #[test]
@@ -1604,8 +1629,8 @@ mod tests {
         ];
         let flat = flatten_rows(&watches, GroupBy::None, &no_collapsed());
         assert_eq!(count_group_headers(&flat), 0);
-        // 2 RepoHeaders + 2 branch rows (no group headers)
-        assert_eq!(flat.rows.len(), 4);
+        // 2 single-branch RepoHeaders (no group headers, no child rows)
+        assert_eq!(flat.rows.len(), 2);
     }
 
     #[test]
@@ -1640,5 +1665,123 @@ mod tests {
         );
         assert_eq!(NotificationLevel::Normal.prev(), NotificationLevel::Low);
         assert_eq!(NotificationLevel::Low.prev(), NotificationLevel::Off);
+    }
+
+    // -- TuiPrefs persistence tests --
+
+    fn temp_prefs_path(suffix: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("bw-prefs-{}-{suffix}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("tui-prefs.json")
+    }
+
+    #[test]
+    fn tui_prefs_roundtrip() {
+        let path = temp_prefs_path("roundtrip");
+        let prefs = TuiPrefs {
+            sort_column: SortColumn::Workflow,
+            sort_ascending: false,
+            group_by: GroupBy::Status,
+            collapsed: HashSet::from(["alice/app".to_string(), "bob/lib".to_string()]),
+        };
+        config::save_json(&path, &prefs).unwrap();
+        let loaded: TuiPrefs = config::load_json(&path).unwrap();
+        assert_eq!(loaded.sort_column, SortColumn::Workflow);
+        assert!(!loaded.sort_ascending);
+        assert_eq!(loaded.group_by, GroupBy::Status);
+        assert_eq!(loaded.collapsed.len(), 2);
+        assert!(loaded.collapsed.contains("alice/app"));
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn tui_prefs_corrupt_file_returns_defaults() {
+        let path = temp_prefs_path("corrupt");
+        std::fs::write(&path, "not json at all {{{").unwrap();
+        let loaded: Option<TuiPrefs> = config::load_json(&path);
+        assert!(loaded.is_none());
+        // Callers use unwrap_or_default:
+        let prefs = loaded.unwrap_or_default();
+        assert_eq!(prefs.sort_column, SortColumn::Repo);
+        assert!(prefs.sort_ascending);
+        assert_eq!(prefs.group_by, GroupBy::Org);
+        assert!(prefs.collapsed.is_empty());
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn tui_prefs_missing_file_returns_defaults() {
+        let dir = std::env::temp_dir().join(format!("bw-prefs-{}-missing", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tui-prefs.json");
+        // Don't create the file
+        let loaded: Option<TuiPrefs> = config::load_json(&path);
+        assert!(loaded.is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn tui_prefs_old_format_without_collapsed() {
+        let path = temp_prefs_path("old-format");
+        // Simulate a prefs file written before the collapsed field existed.
+        std::fs::write(
+            &path,
+            r#"{"sort_column":"Branch","sort_ascending":false,"group_by":"Workflow"}"#,
+        )
+        .unwrap();
+        let loaded: TuiPrefs = config::load_json(&path).unwrap();
+        assert_eq!(loaded.sort_column, SortColumn::Branch);
+        assert!(!loaded.sort_ascending);
+        assert_eq!(loaded.group_by, GroupBy::Workflow);
+        assert!(loaded.collapsed.is_empty());
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn tui_prefs_partial_json_fills_defaults() {
+        let path = temp_prefs_path("partial");
+        // Only sort_column present — everything else should get defaults.
+        std::fs::write(&path, r#"{"sort_column":"Age"}"#).unwrap();
+        let loaded: TuiPrefs = config::load_json(&path).unwrap();
+        assert_eq!(loaded.sort_column, SortColumn::Age);
+        assert!(loaded.sort_ascending); // default: true
+        assert_eq!(loaded.group_by, GroupBy::Org); // default
+        assert!(loaded.collapsed.is_empty()); // default
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn tui_prefs_unknown_enum_value_returns_none() {
+        let path = temp_prefs_path("bad-enum");
+        // Invalid sort_column value — strict deserialization fails.
+        std::fs::write(
+            &path,
+            r#"{"sort_column":"NonExistent","sort_ascending":true,"group_by":"Org"}"#,
+        )
+        .unwrap();
+        let loaded: Option<TuiPrefs> = config::load_json(&path);
+        assert!(loaded.is_none());
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn tui_prefs_backup_recovery() {
+        let path = temp_prefs_path("backup");
+        let bak = path.with_extension("json.bak");
+        let prefs = TuiPrefs {
+            sort_column: SortColumn::Status,
+            sort_ascending: false,
+            group_by: GroupBy::Branch,
+            collapsed: HashSet::from(["repo/x".to_string()]),
+        };
+        // Write valid backup, corrupt primary.
+        std::fs::write(&bak, serde_json::to_string(&prefs).unwrap()).unwrap();
+        std::fs::write(&path, "corrupt!!!").unwrap();
+        let loaded: TuiPrefs = config::load_json(&path).unwrap();
+        assert_eq!(loaded.sort_column, SortColumn::Status);
+        assert!(!loaded.sort_ascending);
+        assert_eq!(loaded.group_by, GroupBy::Branch);
+        assert!(loaded.collapsed.contains("repo/x"));
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 }

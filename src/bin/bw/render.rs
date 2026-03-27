@@ -12,6 +12,15 @@ use build_watcher::status::{ActiveRunView, HistoryEntryView, LastBuildView, Watc
 
 use super::app::{App, FormField, GroupBy, InputMode, SortColumn, SseState};
 
+/// Inline info shown on the repo header when there's exactly one watched branch.
+pub(crate) struct SingleBranchInfo<'a> {
+    pub branch: &'a str,
+    pub workflows: String,
+    pub title: String,
+    /// The status string for styling (e.g. "in_progress", "success", "failure").
+    pub status_key: String,
+}
+
 pub(crate) enum DisplayRow<'a> {
     GroupHeader {
         label: String,
@@ -26,6 +35,8 @@ pub(crate) enum DisplayRow<'a> {
         idle: usize,
         muted: bool,
         newest_age: Option<f64>,
+        /// When there's exactly 1 branch: its name, workflow(s), and title for inline display.
+        single_branch: Option<SingleBranchInfo<'a>>,
     },
     ActiveRun {
         repo: &'a str,
@@ -180,6 +191,37 @@ pub(crate) fn flatten_rows<'a>(
 
         let is_collapsed = collapsed.contains(*repo);
 
+        // For single-branch repos, collect workflow/title info for inline display.
+        let single_branch = if branches.len() == 1 {
+            let w = branches[0];
+            let (title, status_key) = if let Some(run) = w.active_runs.first() {
+                (run.title.clone(), run.status.clone())
+            } else if let Some(b) = &w.last_build {
+                (b.title.clone(), b.conclusion.clone())
+            } else {
+                (String::new(), String::new())
+            };
+            let mut wf_set: Vec<&str> = Vec::new();
+            for run in &w.active_runs {
+                if !wf_set.contains(&run.workflow.as_str()) {
+                    wf_set.push(&run.workflow);
+                }
+            }
+            if wf_set.is_empty()
+                && let Some(b) = &w.last_build
+            {
+                wf_set.push(&b.workflow);
+            }
+            Some(SingleBranchInfo {
+                branch: &w.branch,
+                workflows: wf_set.join(", "),
+                title,
+                status_key,
+            })
+        } else {
+            None
+        };
+
         // Repo header row
         selectable.push(rows.len());
         rows.push(DisplayRow::RepoHeader {
@@ -192,10 +234,11 @@ pub(crate) fn flatten_rows<'a>(
             idle,
             muted: all_muted && !branches.is_empty(),
             newest_age,
+            single_branch,
         });
 
-        // Branch rows (only when expanded)
-        if !is_collapsed {
+        // Branch rows (only for multi-branch repos when expanded)
+        if !is_collapsed && branches.len() > 1 {
             let last_idx = branches.len() - 1;
             for (i, w) in branches.iter().enumerate() {
                 let is_last = i == last_idx;
@@ -256,9 +299,15 @@ pub(crate) fn flatten_rows<'a>(
 
 impl DisplayRow<'_> {
     /// Returns `(repo, branch, run_id, muted)` for the selected row.
-    /// For `RepoHeader`, branch is empty.
+    /// For multi-branch `RepoHeader`, branch is empty. For single-branch, returns the branch name.
     pub(crate) fn repo_branch_run(&self) -> (&str, &str, Option<u64>, bool) {
         match self {
+            DisplayRow::RepoHeader {
+                repo,
+                muted,
+                single_branch: Some(sb),
+                ..
+            } => (repo, sb.branch, None, *muted),
             DisplayRow::RepoHeader { repo, muted, .. } => (repo, "", None, *muted),
             DisplayRow::ActiveRun {
                 repo,
@@ -289,6 +338,17 @@ impl DisplayRow<'_> {
     /// Returns `true` if this is a `RepoHeader` row.
     pub(crate) fn is_repo_header(&self) -> bool {
         matches!(self, DisplayRow::RepoHeader { .. })
+    }
+
+    /// Returns `true` if this is a single-branch repo header (not collapsible).
+    pub(crate) fn is_single_branch(&self) -> bool {
+        matches!(
+            self,
+            DisplayRow::RepoHeader {
+                single_branch: Some(_),
+                ..
+            }
+        )
     }
 }
 
@@ -741,13 +801,13 @@ fn render_display_row<'a>(
             idle,
             muted,
             newest_age,
+            single_branch,
         } => {
-            let arrow = if *collapsed { "›" } else { "⌄" };
-            let name = format!("{arrow} {}{}", short_repo(repo), mute_indicator(*muted));
-            let count_label = if *branch_count == 1 {
-                "1 branch".to_string()
+            let name = if single_branch.is_some() {
+                format!("  {}{}", short_repo(repo), mute_indicator(*muted))
             } else {
-                format!("{branch_count} branches")
+                let arrow = if *collapsed { "›" } else { "⌄" };
+                format!("{arrow} {}{}", short_repo(repo), mute_indicator(*muted))
             };
 
             // Compact status summary
@@ -771,14 +831,36 @@ fn render_display_row<'a>(
                 .unwrap_or_default();
 
             let repo_style = Style::default().add_modifier(Modifier::BOLD);
-            Row::new(vec![
-                Cell::from(format::truncate(&name, cw.repo)).style(repo_style),
-                Cell::from(format::truncate(&count_label, BRANCH_W)),
-                Cell::from(format::truncate(&status_text, STATUS_W)),
-                Cell::from(""),
-                Cell::from(""),
-                Cell::from(age),
-            ])
+
+            // Single-branch repos: show branch name, workflow, and title inline
+            // with the actual status (e.g. "✅ success") instead of aggregate counts.
+            if let Some(sb) = single_branch {
+                let emoji = status_emoji(&sb.status_key);
+                let style = status_style(&sb.status_key);
+                let inline_status = if sb.status_key.is_empty() {
+                    "· idle".to_string()
+                } else {
+                    format!("{emoji} {}", format::status(&sb.status_key))
+                };
+                Row::new(vec![
+                    Cell::from(format::truncate(&name, cw.repo)).style(repo_style),
+                    Cell::from(format::truncate(sb.branch, BRANCH_W)),
+                    Cell::from(format::truncate(&inline_status, STATUS_W)).style(style),
+                    Cell::from(format::truncate(&sb.workflows, cw.workflow)),
+                    Cell::from(format::truncate(&sb.title, cw.title)),
+                    Cell::from(age).style(style),
+                ])
+            } else {
+                let count_label = format!("{branch_count} branches");
+                Row::new(vec![
+                    Cell::from(format::truncate(&name, cw.repo)).style(repo_style),
+                    Cell::from(format::truncate(&count_label, BRANCH_W)),
+                    Cell::from(format::truncate(&status_text, STATUS_W)),
+                    Cell::from(""),
+                    Cell::from(""),
+                    Cell::from(age),
+                ])
+            }
         }
         DisplayRow::ActiveRun {
             branch,
