@@ -1735,6 +1735,7 @@ fn render(frame: &mut ratatui::Frame, app: &App) {
                 Constraint::Length(3),             // header
                 Constraint::Length(1),             // column headings
                 Constraint::Length(table_rows),    // table body (exact)
+                Constraint::Length(1),             // margin
                 Constraint::Length(1),             // recent separator
                 Constraint::Length(recent_height), // recent panel
                 Constraint::Min(0),                // remaining space
@@ -1757,8 +1758,8 @@ fn render(frame: &mut ratatui::Frame, app: &App) {
     render_header(frame, chunks[0], app);
     render_body(frame, chunks[1], chunks[2], app, &cw);
     if show_recent {
-        render_recent_panel(frame, chunks[3], chunks[4], app, &cw);
-        render_footer(frame, chunks[6], app);
+        render_recent_panel(frame, chunks[4], chunks[5], app, &cw);
+        render_footer(frame, chunks[7], app);
     } else {
         render_footer(frame, chunks[4], app);
     }
