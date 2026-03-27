@@ -21,6 +21,7 @@ fn make_run(id: u64, status: &str, conclusion: &str) -> RunInfo {
         workflow: "CI".to_string(),
         head_sha: "abc1234".to_string(),
         event: "push".to_string(),
+        head_branch: "main".to_string(),
     }
 }
 

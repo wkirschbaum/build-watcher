@@ -1,10 +1,12 @@
 use std::future::Future;
+use std::path::PathBuf;
 use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyModifiers};
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
-use build_watcher::config::NotificationLevel;
+use build_watcher::config::{NotificationLevel, state_dir};
 use build_watcher::events::WatchEvent;
 use build_watcher::github::{repo_url, run_url, validate_branch, validate_repo};
 use build_watcher::status::{
@@ -89,7 +91,7 @@ macro_rules! impl_cycle {
 }
 
 /// How to group rows in the watch list.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum GroupBy {
     Org,
     Branch,
@@ -122,7 +124,7 @@ impl GroupBy {
 }
 
 /// Column used for sorting the watch list.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum SortColumn {
     Repo,
     Branch,
@@ -141,6 +143,43 @@ impl_cycle!(
         SortColumn::Age
     ]
 );
+
+/// Persisted TUI preferences (sort/group state).
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct TuiPrefs {
+    pub(crate) sort_column: SortColumn,
+    pub(crate) sort_ascending: bool,
+    pub(crate) group_by: GroupBy,
+}
+
+impl Default for TuiPrefs {
+    fn default() -> Self {
+        Self {
+            sort_column: SortColumn::Repo,
+            sort_ascending: true,
+            group_by: GroupBy::Org,
+        }
+    }
+}
+
+impl TuiPrefs {
+    fn path() -> PathBuf {
+        state_dir().join("tui-prefs.json")
+    }
+
+    pub(crate) fn load() -> Self {
+        std::fs::read_to_string(Self::path())
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn save(&self) {
+        if let Ok(json) = serde_json::to_string_pretty(self) {
+            let _ = std::fs::write(Self::path(), json);
+        }
+    }
+}
 
 pub(crate) struct App {
     pub(crate) status: StatusResponse,
@@ -175,43 +214,38 @@ impl App {
 
     /// Build a terminal title string summarising build status counts.
     pub(crate) fn terminal_title(&self) -> String {
+        if self.status.watches.is_empty() {
+            return "bw".to_string();
+        }
+
         let active = self.active_count();
         let mut success = 0usize;
         let mut failed = 0usize;
-        let mut other = 0usize;
 
         for w in &self.status.watches {
             if let Some(lb) = &w.last_build {
                 match lb.conclusion.as_str() {
                     "success" => success += 1,
                     "failure" | "timed_out" | "startup_failure" => failed += 1,
-                    _ => other += 1,
+                    _ => {}
                 }
             }
         }
 
-        let mut parts = Vec::new();
-        if failed > 0 {
-            parts.push(format!("{failed}\u{2717}"));
-        }
-        if active > 0 {
-            parts.push(format!("{active}\u{23f3}"));
-        }
-        if success > 0 {
-            parts.push(format!("{success}\u{2713}"));
-        }
-        if other > 0 {
-            parts.push(format!("{other}?"));
-        }
-        if parts.is_empty() {
-            "bw".to_string()
-        } else {
-            format!("bw: {}", parts.join(" "))
-        }
+        format!("builds: {active} / {success} / {failed}")
     }
 
     pub(crate) fn set_flash(&mut self, msg: impl Into<String>) {
         self.flash = Some((msg.into(), Instant::now()));
+    }
+
+    fn save_prefs(&self) {
+        TuiPrefs {
+            sort_column: self.sort_column,
+            sort_ascending: self.sort_ascending,
+            group_by: self.group_by,
+        }
+        .save();
     }
 
     pub(crate) async fn resync(&mut self, daemon: &DaemonClient) {
@@ -701,6 +735,7 @@ impl App {
                     self.sort_column = self.sort_column.next();
                     self.sort_ascending = true;
                 }
+                self.save_prefs();
             }
             KeyCode::Char('S') => {
                 if !self.sort_ascending {
@@ -709,12 +744,15 @@ impl App {
                     self.sort_column = self.sort_column.prev();
                     self.sort_ascending = false;
                 }
+                self.save_prefs();
             }
             KeyCode::Char('g') => {
                 self.group_by = self.group_by.next();
+                self.save_prefs();
             }
             KeyCode::Char('G') => {
                 self.group_by = self.group_by.prev();
+                self.save_prefs();
             }
             KeyCode::Char('C') => {
                 let d = daemon.clone();

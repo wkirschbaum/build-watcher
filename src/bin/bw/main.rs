@@ -21,7 +21,7 @@ use tokio_stream::StreamExt as _;
 
 use build_watcher::status::{StatsResponse, StatusResponse};
 
-use app::{App, GroupBy, InputMode, QuitAction, SortColumn, SseState, SseUpdate, apply_event};
+use app::{App, InputMode, QuitAction, SseState, SseUpdate, TuiPrefs, apply_event};
 use client::{DaemonClient, discover_or_start_daemon, sse_task};
 use render::render;
 
@@ -50,6 +50,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Shared channel for SSE events and background action results.
     let (sse_tx, mut sse_rx) = mpsc::channel::<SseUpdate>(64);
 
+    let prefs = TuiPrefs::load();
     let mut app = App {
         status: initial,
         stats: initial_stats,
@@ -61,9 +62,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         flash: None,
         input_mode: InputMode::Normal,
         bg_tx: sse_tx.clone(),
-        sort_column: SortColumn::Repo,
-        sort_ascending: true,
-        group_by: GroupBy::Org,
+        sort_column: prefs.sort_column,
+        sort_ascending: prefs.sort_ascending,
+        group_by: prefs.group_by,
     };
 
     // Terminal setup.
