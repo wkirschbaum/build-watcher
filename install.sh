@@ -19,10 +19,10 @@
 
 set -euo pipefail
 
-# When piped (curl | bash), BASH_SOURCE is unset. Detect this so we can
-# generate service files inline instead of reading templates from the repo.
-if [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "${BASH_SOURCE[0]}" ]; then
-  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# When piped (curl | bash), $0 is "bash" (not a file path). Detect this so we
+# can generate service files inline instead of reading templates from the repo.
+if [ -f "$0" ]; then
+  SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
   PLATFORM_DIR="$SCRIPT_DIR/src/platform"
 else
   SCRIPT_DIR=""
