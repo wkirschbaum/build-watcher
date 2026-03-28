@@ -8,7 +8,9 @@ use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table};
 
 use build_watcher::config::NotificationLevel;
 use build_watcher::format;
-use build_watcher::status::{ActiveRunView, HistoryEntryView, LastBuildView, WatchStatus};
+use build_watcher::status::{
+    ActiveRunView, HistoryEntryView, LastBuildView, RunConclusion, RunStatus, WatchStatus,
+};
 
 use super::app::{App, FormField, GroupBy, InputMode, SortColumn, SseState};
 
@@ -169,8 +171,8 @@ pub(crate) fn flatten_rows<'a>(
             if !w.active_runs.is_empty() {
                 active += 1;
             } else if let Some(b) = &w.last_build {
-                match b.conclusion.as_str() {
-                    "success" => passing += 1,
+                match b.conclusion {
+                    RunConclusion::Success => passing += 1,
                     _ => failing += 1,
                 }
                 if let Some(age) = b.age_secs {
@@ -195,9 +197,9 @@ pub(crate) fn flatten_rows<'a>(
         let single_branch = if branches.len() == 1 {
             let w = branches[0];
             let (title, status_key) = if let Some(run) = w.active_runs.first() {
-                (run.title.clone(), run.status.clone())
+                (run.title.clone(), run.status.as_str().to_string())
             } else if let Some(b) = &w.last_build {
-                (b.title.clone(), b.conclusion.clone())
+                (b.title.clone(), b.conclusion.as_str().to_string())
             } else {
                 (String::new(), String::new())
             };
@@ -242,7 +244,7 @@ pub(crate) fn flatten_rows<'a>(
             let w = branches[0];
             if w.active_runs.is_empty()
                 && let Some(b) = &w.last_build
-                && b.conclusion != "success"
+                && b.conclusion != RunConclusion::Success
                 && let Some(steps) = &b.failing_steps
             {
                 rows.push(DisplayRow::FailingSteps {
@@ -271,7 +273,7 @@ pub(crate) fn flatten_rows<'a>(
                                 muted: w.muted,
                                 tree_prefix,
                             });
-                            if b.conclusion != "success"
+                            if b.conclusion != RunConclusion::Success
                                 && let Some(steps) = &b.failing_steps
                             {
                                 rows.push(DisplayRow::FailingSteps { steps, tree_indent });
@@ -291,7 +293,7 @@ pub(crate) fn flatten_rows<'a>(
                     let primary_idx = w
                         .active_runs
                         .iter()
-                        .rposition(|r| r.status == "in_progress")
+                        .rposition(|r| r.status == RunStatus::InProgress)
                         .unwrap_or(w.active_runs.len() - 1);
                     let primary = &w.active_runs[primary_idx];
                     let extra_badge = extra_runs_badge(&w.active_runs, primary_idx);
@@ -491,11 +493,11 @@ pub(crate) fn extra_runs_badge(runs: &[ActiveRunView], primary_idx: usize) -> St
 }
 
 /// Status key: active runs (tier 0), completed (tier 1), idle (tier 2).
-pub(crate) fn watch_status(w: &WatchStatus) -> (u8, &str) {
+pub(crate) fn watch_status(w: &WatchStatus) -> (u8, &'static str) {
     if let Some(run) = w.active_runs.first() {
-        (0, &run.status)
+        (0, run.status.as_str())
     } else if let Some(b) = &w.last_build {
-        (1, &b.conclusion)
+        (1, b.conclusion.as_str())
     } else {
         (2, "")
     }
@@ -692,6 +694,12 @@ pub(crate) fn render_header(frame: &mut ratatui::Frame, area: ratatui::layout::R
             Style::default().fg(Color::Cyan),
         ));
     }
+    if let Some(version) = &app.update_available {
+        left2_spans.push(Span::styled(
+            format!("  ↑ {version} available [U]"),
+            Style::default().fg(Color::Yellow),
+        ));
+    }
     let line2 = Line::from(left2_spans);
 
     // Line 3: separator
@@ -885,16 +893,17 @@ fn render_display_row<'a>(
             tree_prefix,
             ..
         } => {
-            let style = status_style(&run.status);
-            let emoji = status_emoji(&run.status);
+            let status_str = run.status.as_str();
+            let style = status_style(status_str);
+            let emoji = status_emoji(status_str);
             let elapsed = run
                 .elapsed_secs
                 .map(|s| format::duration(Duration::from_secs_f64(s)))
                 .unwrap_or_default();
             let status_text = if extra_badge.is_empty() {
-                format!("{emoji} {}", format::status(&run.status))
+                format!("{emoji} {}", format::status(status_str))
             } else {
-                format!("{emoji} {} {extra_badge}", format::status(&run.status))
+                format!("{emoji} {} {extra_badge}", format::status(status_str))
             };
             branch_row(
                 branch,
@@ -925,13 +934,14 @@ fn render_display_row<'a>(
             tree_prefix,
             ..
         } => {
-            let style = status_style(&build.conclusion);
-            let emoji = status_emoji(&build.conclusion);
+            let conclusion_str = build.conclusion.as_str();
+            let style = status_style(conclusion_str);
+            let emoji = status_emoji(conclusion_str);
             let age = build
                 .age_secs
                 .map(|s| format::age(s as u64))
                 .unwrap_or_default();
-            let status_text = format!("{emoji} {}", format::status(&build.conclusion));
+            let status_text = format!("{emoji} {}", format::status(conclusion_str));
             branch_row(
                 branch,
                 *muted,
@@ -1033,7 +1043,7 @@ pub(crate) fn render_footer(frame: &mut ratatui::Frame, area: ratatui::layout::R
         | InputMode::History { .. } => Paragraph::new(""),
         InputMode::Normal => {
             let sep = Span::styled("  │  ", Style::default().fg(Color::DarkGray));
-            Paragraph::new(Line::from(vec![
+            let mut spans = vec![
                 // ── Navigate ──────────────────────────────────────────────
                 Span::styled("[↑↓/jk]", key_style),
                 Span::raw(" nav  "),
@@ -1071,7 +1081,15 @@ pub(crate) fn render_footer(frame: &mut ratatui::Frame, area: ratatui::layout::R
                 Span::raw(" quit  "),
                 Span::styled("[Q]", key_style),
                 Span::raw(" stop"),
-            ]))
+            ];
+            if app.update_available.is_some() {
+                spans.extend([
+                    Span::raw("  "),
+                    Span::styled("[U]", key_style),
+                    Span::raw(" update"),
+                ]);
+            }
+            Paragraph::new(Line::from(spans))
         }
         .style(Style::default().fg(Color::DarkGray)),
     };
@@ -1178,6 +1196,23 @@ pub(crate) fn centered_rect(
     ratatui::layout::Rect::new(x, y, w, h)
 }
 
+/// Build a styled hint bar from `(key_label, description)` pairs.
+///
+/// Renders as: `[Key] desc  [Key] desc  …` in dim/bold styling.
+fn popup_hint(pairs: &[(&str, &str)]) -> Line<'static> {
+    let key_style = Style::default()
+        .fg(Color::DarkGray)
+        .add_modifier(Modifier::BOLD);
+    let desc_style = Style::default().fg(Color::DarkGray);
+
+    let mut spans = Vec::with_capacity(pairs.len() * 2);
+    for (key, desc) in pairs {
+        spans.push(Span::styled(key.to_string(), key_style));
+        spans.push(Span::styled(format!(" {desc}"), desc_style));
+    }
+    Line::from(spans)
+}
+
 pub(crate) fn render_form_popup(
     frame: &mut ratatui::Frame,
     title: &str,
@@ -1256,30 +1291,14 @@ pub(crate) fn render_form_popup(
 
     // Footer hint — separated by a blank row from the last field
     let hint_row = fields.len() * 3 + 1;
-    let hint = Paragraph::new(Line::from(vec![
-        Span::styled(
-            "[Tab]",
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(" next  ", Style::default().fg(Color::DarkGray)),
-        Span::styled(
-            "[Enter]",
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(" save  ", Style::default().fg(Color::DarkGray)),
-        Span::styled(
-            "[Esc]",
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(" cancel", Style::default().fg(Color::DarkGray)),
-    ]));
-    frame.render_widget(hint, rows[hint_row]);
+    frame.render_widget(
+        Paragraph::new(popup_hint(&[
+            ("[Tab]", "next  "),
+            ("[Enter]", "save  "),
+            ("[Esc]", "cancel"),
+        ])),
+        rows[hint_row],
+    );
 }
 
 pub(crate) fn render_notification_picker_popup(
@@ -1337,30 +1356,14 @@ pub(crate) fn render_notification_picker_popup(
         frame.render_widget(Paragraph::new(line), rows[i + 1]);
     }
 
-    let hint = Line::from(vec![
-        Span::styled(
-            "[←/→]",
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(" cycle  ", Style::default().fg(Color::DarkGray)),
-        Span::styled(
-            "[Enter]",
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(" save  ", Style::default().fg(Color::DarkGray)),
-        Span::styled(
-            "[Esc]",
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(" cancel", Style::default().fg(Color::DarkGray)),
-    ]);
-    frame.render_widget(Paragraph::new(hint), rows[5]);
+    frame.render_widget(
+        Paragraph::new(popup_hint(&[
+            ("[←/→]", "cycle  "),
+            ("[Enter]", "save  "),
+            ("[Esc]", "cancel"),
+        ])),
+        rows[5],
+    );
 }
 
 pub(crate) fn render_history_popup(

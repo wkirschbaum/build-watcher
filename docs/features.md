@@ -86,9 +86,17 @@ Runs as an HTTP server exposing tools via the MCP protocol, allowing Claude Code
 
 The MCP server binds to a preferred port (default 8417, configurable via `BUILD_WATCHER_PORT`), falling back to up to 9 consecutive higher ports if the preferred port is occupied. The actual bound port is written to `~/.local/state/build-watcher/port` for discovery by other tools.
 
+## Self-Update
+
+The TUI checks for new releases in the background (10s after startup, then hourly) by querying the GitHub releases API. When a newer version is found, the header displays `↑ vX.Y.Z available [U]` and the `U` keybinding appears in the footer. Pressing `U` exits the TUI and runs the `self_update` crate to download and replace the `bw` binary. The `--update` CLI flag runs the updater directly without entering the TUI.
+
+## Cross-Platform Release Workflow
+
+A GitHub Actions workflow (`.github/workflows/release.yml`) builds cross-platform binaries on tag push (`v*`). It compiles for four targets (Linux x86_64/aarch64, macOS x86_64/aarch64) using `cross` for aarch64-linux, packages each binary as a `.tar.gz`, and creates a GitHub release with auto-generated release notes.
+
 ## Cross-Platform Service Installation
 
-`install.sh` builds the release binary, installs it to `~/.local/bin/`, seeds a default config, and registers the daemon as a system service:
+`install.sh` downloads pre-built binaries from the latest GitHub release, installs them to `~/.local/bin/`, seeds a default config, and registers the daemon as a system service:
 
 - **Linux**: systemd user service with `systemctl --user enable --now`. Installs a `.desktop` file for notification grouping.
 - **macOS**: launchd user agent via `launchctl bootstrap`.
@@ -118,6 +126,7 @@ Features:
 - **Responsive columns** that scale to terminal width
 - **Reconnection** with exponential backoff when the daemon connection drops
 - **Quit and shutdown** — `Q` exits the TUI and also stops the daemon
+- **Self-update** — `U` exits and upgrades to the latest release (shown when update available)
 
 ## REST API
 
@@ -130,6 +139,11 @@ The daemon exposes REST endpoints alongside the MCP server for the TUI and other
 - `POST /notifications` — mute, unmute, or set per-event levels for a repo/branch; supports `action: "mute" | "unmute" | "set_levels"` and optional `branch`
 - `GET /defaults` — global config defaults (default branches and ignored workflows)
 - `POST /defaults` — update global default branches and/or ignored workflows
+- `GET /history` — build history for a repo (`?repo=&branch=&limit=`)
+- `GET /history/all` — recent builds across all repos (`?limit=`)
+- `POST /watch` — add a repo to watches
+- `POST /unwatch` — remove a repo from watches
+- `POST /branches` — update branch config for a repo
 - `POST /pause` — toggle notification pause
 - `POST /rerun` — rerun a build by repo and run ID
 - `POST /shutdown` — initiate graceful daemon shutdown

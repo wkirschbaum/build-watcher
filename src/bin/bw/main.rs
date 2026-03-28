@@ -6,6 +6,7 @@
 mod app;
 mod client;
 mod render;
+mod update;
 
 use std::time::{Duration, Instant};
 
@@ -19,54 +20,117 @@ use ratatui::backend::CrosstermBackend;
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt as _;
 
+use build_watcher::dirs::state_dir;
 use build_watcher::status::{StatsResponse, StatusResponse};
 
-use app::{App, InputMode, QuitAction, SseState, SseUpdate, TuiPrefs, apply_event};
-use client::{DaemonClient, discover_or_start_daemon, sse_task};
+use app::{App, InputMode, QuitAction, SseState, SseUpdate, TuiPrefs};
+use client::{DaemonClient, sse_task};
 use render::render;
+
+/// Read the daemon port from the port file, or start the daemon if it's not running.
+fn discover_or_start_daemon() -> Result<u16, Box<dyn std::error::Error>> {
+    let port_file = state_dir().join("port");
+
+    // Try reading existing port file first.
+    if let Ok(contents) = std::fs::read_to_string(&port_file)
+        && let Ok(port) = contents.trim().parse::<u16>()
+    {
+        if std::net::TcpStream::connect(format!("127.0.0.1:{port}")).is_ok() {
+            return Ok(port);
+        }
+        // Port file exists but daemon is not responding — stale file.
+        let _ = std::fs::remove_file(&port_file);
+    }
+
+    // Daemon not running — try to start it.
+    eprintln!("Daemon not running, starting build-watcher…");
+    let exe = std::env::current_exe()?;
+    let daemon_bin = exe
+        .parent()
+        .ok_or("cannot resolve binary directory")?
+        .join("build-watcher");
+
+    if !daemon_bin.exists() {
+        return Err(format!(
+            "build-watcher binary not found at {}\nInstall it with ./install.sh",
+            daemon_bin.display()
+        )
+        .into());
+    }
+
+    std::process::Command::new(&daemon_bin)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("Failed to start daemon: {e}"))?;
+
+    // Wait for the port file to appear (up to 5 seconds).
+    for _ in 0..50 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        if let Ok(contents) = std::fs::read_to_string(&port_file)
+            && let Ok(port) = contents.trim().parse::<u16>()
+            && std::net::TcpStream::connect(format!("127.0.0.1:{port}")).is_ok()
+        {
+            return Ok(port);
+        }
+    }
+
+    Err("Timed out waiting for daemon to start".into())
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if std::env::args().any(|a| a == "--update") {
+        return update::run();
+    }
+
     let port = discover_or_start_daemon()?;
 
-    // Initial fetch so there's something to display before SSE connects.
+    // Fetch initial data concurrently so there's something to display before SSE connects.
     let daemon = DaemonClient::new(port);
-    let initial = daemon
-        .get_json::<StatusResponse>("/status")
-        .await
-        .unwrap_or_else(|e| {
-            eprintln!("Warning: could not fetch initial status: {e}");
-            StatusResponse {
-                paused: false,
-                watches: vec![],
-            }
-        });
-    let initial_stats = daemon
-        .get_json::<StatsResponse>("/stats")
-        .await
-        .unwrap_or_default();
-    let initial_history = daemon.get_all_history(20).await.unwrap_or_default();
+    let (initial, initial_stats, initial_history) = tokio::join!(
+        daemon.get_json::<StatusResponse>("/status"),
+        daemon.get_json::<StatsResponse>("/stats"),
+        daemon.get_all_history(20),
+    );
+    let initial = initial.unwrap_or_else(|e| {
+        eprintln!("Warning: could not fetch initial status: {e}");
+        StatusResponse {
+            paused: false,
+            watches: vec![],
+        }
+    });
+    let initial_stats = initial_stats.unwrap_or_default();
+    let initial_history = initial_history.unwrap_or_default();
 
     // Shared channel for SSE events and background action results.
     let (sse_tx, mut sse_rx) = mpsc::channel::<SseUpdate>(64);
 
+    // Check for a newer release at startup (10s delay), then every hour.
+    tokio::spawn({
+        let client = daemon.client.clone();
+        let tx = sse_tx.clone();
+        async move {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            loop {
+                if let Some(version) = update::check_latest(&client).await {
+                    let _ = tx.send(SseUpdate::UpdateAvailable(version)).await;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+            }
+        }
+    });
+
     let prefs = TuiPrefs::load();
-    let mut app = App {
-        status: initial,
-        stats: initial_stats,
-        recent_history: initial_history,
-        last_fetch: Instant::now(),
-        fetch_error: None,
-        sse_state: SseState::Connecting,
-        selected: 0,
-        flash: None,
-        input_mode: InputMode::Normal,
-        bg_tx: sse_tx.clone(),
-        sort_column: prefs.sort_column,
-        sort_ascending: prefs.sort_ascending,
-        group_by: prefs.group_by,
-        collapsed: prefs.collapsed,
-    };
+    let mut app = App::new(
+        initial,
+        initial_stats,
+        initial_history,
+        prefs,
+        sse_tx.clone(),
+    );
 
     // Terminal setup.
     enable_raw_mode()?;
@@ -75,7 +139,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    tokio::spawn(sse_task(daemon.inner().clone(), port, sse_tx));
+    tokio::spawn(sse_task(daemon.clone(), sse_tx));
 
     let mut keyboard = EventStream::new();
 
@@ -91,6 +155,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     resync_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+    let mut do_update = false;
     let result = async {
         loop {
             execute!(terminal.backend_mut(), SetTitle(app.terminal_title()))?;
@@ -106,7 +171,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 maybe_update = sse_rx.recv() => {
                     match maybe_update {
                         Some(SseUpdate::Event(event)) => {
-                            apply_event(&mut app.status, *event);
+                            app.status.apply_event(*event);
                         }
                         Some(SseUpdate::Connected) => {
                             app.sse_state = SseState::Connected;
@@ -152,6 +217,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 selected: 0,
                             };
                         }
+                        Some(SseUpdate::UpdateAvailable(version)) => {
+                            app.update_available = Some(version);
+                        }
                         None => {}
                     }
                 }
@@ -165,6 +233,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 QuitAction::Quit => break,
                                 QuitAction::QuitAndShutdown => {
                                     let _ = daemon.shutdown().await;
+                                    break;
+                                }
+                                QuitAction::Update => {
+                                    do_update = true;
                                     break;
                                 }
                                 QuitAction::None => {}
@@ -187,6 +259,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .backend_mut()
         .execute(SetTitle(""))
         .and_then(|s| s.execute(LeaveAlternateScreen))?;
+
+    if do_update {
+        update::run()?;
+        return Ok(());
+    }
 
     result
 }

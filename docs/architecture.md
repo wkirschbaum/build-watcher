@@ -41,8 +41,8 @@ Claude Code ──HTTP/MCP──► server.rs (axum + rmcp)
 ```
 src/
 ├── main.rs          — entry point, wires up config, watches, event bus, server
-├── server.rs        — MCP tool handlers, BuildWatcher struct, axum router, REST endpoints
-├── watcher.rs       — watch lifecycle, Poller task, state persistence
+├── server/          — server module directory (see below)
+├── watcher/         — watch lifecycle module directory (see below)
 ├── events.rs        — EventBus (broadcast channel), WatchEvent types
 ├── config.rs        — Config structs, crash-safe JSON persistence helpers
 ├── status.rs        — shared HTTP response types (StatusResponse, StatsResponse)
@@ -51,7 +51,12 @@ src/
 ├── notification.rs  — notification handler, subscribes to EventBus, dispatches to platform
 ├── register.rs      — MCP server registration in ~/.claude.json (--register flag)
 ├── bin/
-│   └── bw.rs        — TUI dashboard binary (ratatui + SSE + REST actions)
+│   └── bw/          — TUI dashboard binary
+│       ├── main.rs  — entry point, terminal setup, event loop, daemon discovery
+│       ├── app.rs   — App state, input handling, event application
+│       ├── client.rs — HTTP client for daemon REST API, SSE streaming
+│       ├── render.rs — TUI rendering, display rows, sorting, grouping
+│       └── update.rs — Background update checker, self-update via GitHub releases
 └── platform/
     ├── mod.rs       — Notifier trait, global singleton, platform dispatch
     ├── universal/
@@ -80,6 +85,7 @@ src/
 | `HistoryEntry` | `github` | A build history entry with timestamps for duration/age |
 | `StatusResponse` | `status` | JSON snapshot of all watches, used by `GET /status` and the TUI |
 | `StatsResponse` | `status` | Daemon stats (uptime, poll intervals, rate limit), used by `GET /stats` |
+| `DefaultsConfig` | `status` | Global config defaults (branches, ignored workflows, poll aggression), used by `GET /defaults` |
 | `Notifier` | `platform` | Trait for desktop notification backends |
 
 ## Startup sequence
@@ -172,13 +178,15 @@ Alongside the MCP endpoint, the daemon exposes REST endpoints on the same port f
 | `/events` | GET | SSE stream of `WatchEvent`s (RunStarted, RunCompleted, StatusChanged) |
 | `/notifications` | GET | Resolved notification config for `?repo=&branch=` |
 | `/notifications` | POST | Mute, unmute, or set per-event levels (`action: mute\|unmute\|set_levels`) |
-| `/defaults` | GET | Global config defaults (branches, ignored workflows) |
+| `/defaults` | GET | Global config defaults (branches, ignored workflows, poll aggression) |
 | `/defaults` | POST | Update global default branches and/or ignored workflows |
-| `/pause` | POST | Toggle notification pause (`{"pause": true/false}`) |
-| `/rerun` | POST | Rerun a build (`{"repo": "owner/repo", "run_id": 123}`) |
+| `/history` | GET | Build history for a repo (`?repo=&branch=&limit=`) |
+| `/history/all` | GET | Recent builds across all repos (`?limit=`) |
 | `/watch` | POST | Add a repo/branch to watches |
 | `/unwatch` | POST | Remove a repo from watches |
 | `/branches` | POST | Update branch config for a repo |
+| `/pause` | POST | Toggle notification pause (`{"pause": true/false}`) |
+| `/rerun` | POST | Rerun a build (`{"repo": "owner/repo", "run_id": 123}`) |
 | `/shutdown` | POST | Initiate graceful daemon shutdown |
 
 ## TUI dashboard (`bw`)

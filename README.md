@@ -20,11 +20,12 @@ A background daemon that monitors GitHub Actions builds and sends desktop notifi
 - Dynamic rate-limit-aware polling — speeds up when quota is plentiful, backs off as it depletes (minimum 15s active, 60s idle)
 - **MCP server** — manage watches, rerun builds, and configure notifications from any MCP client
 - **Live TUI dashboard** (`bw`) — top-like terminal UI with real-time SSE updates, sortable columns, grouping, and full watch management
+- **Self-update** — background update checker with in-TUI upgrade (`U`) and `bw --update` CLI flag
 
 ## Requirements
 
-- **Rust** — to build from source. Install via [rustup](https://rustup.rs/).
 - **GitHub CLI (`gh`)** — must be authenticated (`gh auth login`). Install: https://cli.github.com/
+- **Rust** — only needed if building from source. Install via [rustup](https://rustup.rs/).
 
 #### Linux
 
@@ -39,12 +40,10 @@ A background daemon that monitors GitHub Actions builds and sends desktop notifi
 ## Installation
 
 ```sh
-git clone <this-repo>
-cd build-watcher
-./install.sh
+curl -fsSL https://raw.githubusercontent.com/wkirschbaum/build-watcher/main/install.sh | bash
 ```
 
-This builds the binary, installs it to `~/.local/bin/`, creates a default config, and registers a system service.
+Or clone the repo and run `./install.sh` manually. The script downloads pre-built binaries from the latest GitHub release for your platform (Linux x86_64/aarch64, macOS x86_64/aarch64), installs them to `~/.local/bin/`, creates a default config, registers a system service, and configures the MCP server in `~/.claude.json`.
 
 ## Usage
 
@@ -86,6 +85,7 @@ wkirschbaum/build…   main      ✅ success      CI             Add TUI        
 | `C` | Edit global config (default branches, ignored workflows) |
 | `q` | Quit |
 | `Q` | Quit and shut down daemon |
+| `U` | Quit and run self-update (shown when update available) |
 | `Ctrl-C` | Quit |
 
 **Sort columns:** repo, branch, status, workflow, age
@@ -170,6 +170,11 @@ The daemon exposes REST endpoints on the same port for the TUI and other consume
 | `/notifications` | POST | Mute, unmute, or set per-event levels for a repo/branch |
 | `/defaults` | GET | Global config defaults (branches + ignored workflows) |
 | `/defaults` | POST | Update global config defaults |
+| `/history` | GET | Build history for a repo (`?repo=&branch=&limit=`) |
+| `/history/all` | GET | Recent builds across all repos (`?limit=`) |
+| `/watch` | POST | Add a repo to watches |
+| `/unwatch` | POST | Remove a repo from watches |
+| `/branches` | POST | Update branch config for a repo |
 | `/pause` | POST | Toggle notification pause |
 | `/rerun` | POST | Rerun a build by repo and run ID |
 | `/shutdown` | POST | Graceful daemon shutdown |
@@ -195,8 +200,18 @@ launchctl bootout "gui/$(id -u)" ~/Library/LaunchAgents/com.build-watcher.plist
 
 ## Updating
 
+From the TUI, press `U` when an update is available. Or run:
+
 ```sh
-./install.sh
+bw --update
 ```
 
-Re-running the install script stops the service, rebuilds, and restarts.
+This downloads and installs the latest release. Alternatively, re-run `./install.sh` to upgrade from a GitHub release.
+
+## Uninstalling
+
+```sh
+./uninstall.sh
+```
+
+Stops the service, removes binaries and the MCP registration. Config and state files are preserved.

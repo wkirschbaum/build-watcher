@@ -1,4 +1,21 @@
 #!/usr/bin/env bash
+# install.sh — Install build-watcher from a GitHub release.
+#
+# Downloads the pre-built binaries for the current platform from the latest
+# GitHub release, installs the daemon and CLI to ~/.local/bin/, sets up the
+# platform service (systemd on Linux, launchd on macOS), and registers the MCP
+# server in ~/.claude.json.
+#
+# This script handles both fresh installs and upgrades. If a previous install
+# exists (regardless of whether it was built from source or downloaded from a
+# release), it safely stops the running service before overwriting the binaries.
+#
+# Requirements:
+#   - gh (GitHub CLI), authenticated: https://cli.github.com
+#   - This script must be run from the repository root (needs src/platform/)
+#
+# Usage: ./install.sh
+
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -9,31 +26,74 @@ BINARY_PATH="$INSTALL_DIR/$BINARY_NAME"
 CLAUDE_CONFIG="$HOME/.claude.json"
 PORT=8417
 OS="$(uname -s)"
+ARCH="$(uname -m)"
 
-# -- Pre-flight checks --
-command -v gh >/dev/null 2>&1 || { echo "Error: gh (GitHub CLI) is required but not found. Install it from https://cli.github.com"; exit 1; }
+# -- Pre-flight checks --------------------------------------------------------
 
-echo "==> Building release binary..."
-cargo build --release --manifest-path "$SCRIPT_DIR/Cargo.toml"
+command -v gh >/dev/null 2>&1 || {
+  echo "Error: gh (GitHub CLI) is required but not found."
+  echo "Install it from https://cli.github.com and run 'gh auth login'."
+  exit 1
+}
 
-echo "==> Installing binary to $INSTALL_DIR..."
-mkdir -p "$INSTALL_DIR"
+# -- Detect target triple -----------------------------------------------------
+# Maps uname output to the Rust target triple used when naming release assets.
 
-# Stop the running service before overwriting the binary (Text file busy)
+case "$OS/$ARCH" in
+  Linux/x86_64)   TARGET="x86_64-unknown-linux-gnu" ;;
+  Linux/aarch64)  TARGET="aarch64-unknown-linux-gnu" ;;
+  Darwin/x86_64)  TARGET="x86_64-apple-darwin" ;;
+  Darwin/arm64)   TARGET="aarch64-apple-darwin" ;;
+  *)
+    echo "Error: unsupported platform $OS/$ARCH"
+    exit 1
+    ;;
+esac
+
+# -- Download release binaries ------------------------------------------------
+# Fetches the two .tar.gz archives from the latest GitHub release and extracts
+# them into a temp directory. The archives each contain a single binary named
+# after the crate (build-watcher or bw, without the target suffix).
+
+echo "==> Downloading latest release for $TARGET..."
+TMPDIR="$(mktemp -d)"
+trap 'rm -rf "$TMPDIR"' EXIT
+
+gh release download \
+  --repo wkirschbaum/build-watcher \
+  --pattern "bw-${TARGET}.tar.gz" \
+  --pattern "build-watcher-${TARGET}.tar.gz" \
+  --dir "$TMPDIR"
+
+tar -xzf "$TMPDIR/bw-${TARGET}.tar.gz" -C "$TMPDIR"
+tar -xzf "$TMPDIR/build-watcher-${TARGET}.tar.gz" -C "$TMPDIR"
+
+# -- Stop any running instance ------------------------------------------------
+# The daemon binary must not be running when we overwrite it (Linux raises
+# "Text file busy" otherwise). This covers both service-managed and orphan
+# processes left by MCP clients starting the daemon directly.
+
+echo "==> Stopping existing service (if running)..."
 if [ "$OS" = "Darwin" ]; then
   PLIST_PATH="$HOME/Library/LaunchAgents/com.build-watcher.plist"
   [ -f "$PLIST_PATH" ] && launchctl bootout "gui/$(id -u)" "$PLIST_PATH" 2>/dev/null || true
 else
   systemctl --user disable --now "$BINARY_NAME.service" 2>/dev/null || true
 fi
-# Kill any orphan processes not managed by the service (e.g. leftover from MCP clients)
+# Kill orphan processes not managed by the service manager.
 pkill -f "$BINARY_PATH" 2>/dev/null || true
 sleep 0.5
 
-cp "$SCRIPT_DIR/target/release/$BINARY_NAME" "$INSTALL_DIR/$BINARY_NAME"
-cp "$SCRIPT_DIR/target/release/bw" "$INSTALL_DIR/bw"
+# -- Install binaries ---------------------------------------------------------
 
-# -- Seed config file if missing --
+echo "==> Installing binaries to $INSTALL_DIR..."
+mkdir -p "$INSTALL_DIR"
+cp "$TMPDIR/$BINARY_NAME" "$INSTALL_DIR/$BINARY_NAME"
+cp "$TMPDIR/bw" "$INSTALL_DIR/bw"
+
+# -- Seed config file if missing ----------------------------------------------
+# Only written on a fresh install; existing config is never overwritten so
+# user-added repos and settings are preserved across upgrades.
 
 CONFIG_DIR="$HOME/.config/build-watcher"
 CONFIG_FILE="$CONFIG_DIR/config.json"
@@ -54,13 +114,13 @@ if [ ! -f "$CONFIG_FILE" ]; then
 CONFJSON
   echo "  Edit $CONFIG_FILE to add repos, or use the watch_builds MCP tool."
 else
-  echo "==> Config already exists at $CONFIG_FILE"
+  echo "==> Config already exists at $CONFIG_FILE (preserved)"
 fi
 
-# -- Install .desktop file (Linux) --
+# -- Install .desktop file (Linux only) ---------------------------------------
 
-echo "==> Installing desktop entry..."
 if [ "$OS" != "Darwin" ]; then
+  echo "==> Installing desktop entry..."
   DESKTOP_DIR="$HOME/.local/share/applications"
   mkdir -p "$DESKTOP_DIR"
   cp "$SCRIPT_DIR/build-watcher.desktop" "$DESKTOP_DIR/build-watcher.desktop"
@@ -68,7 +128,10 @@ if [ "$OS" != "Darwin" ]; then
   echo "  Desktop:  $DESKTOP_DIR/build-watcher.desktop"
 fi
 
-# -- Platform-specific service install --
+# -- Platform-specific service install ----------------------------------------
+# Generates the service file from the template (substituting the binary path),
+# then registers and starts it. On upgrades the service is re-enabled with the
+# updated binary without any manual intervention.
 
 if [ "$OS" = "Darwin" ]; then
   echo "==> Installing launchd service (macOS)..."
@@ -97,7 +160,9 @@ else
   echo "  Service:  $SYSTEMD_DIR/$BINARY_NAME.service (running)"
 fi
 
-# -- Claude Code MCP config --
+# -- Claude Code MCP registration ---------------------------------------------
+# Writes the MCP server entry into ~/.claude.json so Claude Code can discover
+# the running daemon. Safe to run on upgrades — the binary handles idempotency.
 
 echo "==> Configuring Claude Code MCP server..."
 "$BINARY_PATH" --register --port "$PORT"

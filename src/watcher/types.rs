@@ -7,13 +7,14 @@ use tokio::time::Instant;
 use crate::dirs::state_dir;
 use crate::github::{GhError, LastBuild, RunInfo};
 use crate::persistence::load_json;
+use crate::status::RunStatus;
 
 use super::Watches;
 
 /// Runtime state for an in-progress run, including when we first saw it.
 #[derive(Debug, Clone)]
 pub struct ActiveRun {
-    pub status: String,
+    pub status: RunStatus,
     pub started_at: Instant,
     pub workflow: String,
     pub title: String,
@@ -200,12 +201,16 @@ impl WatchEntry {
     }
 
     /// Update a run's status. Returns the old status if it changed.
-    pub(super) fn update_status(&mut self, run_id: u64, new_status: &str) -> Option<String> {
+    pub(super) fn update_status(
+        &mut self,
+        run_id: u64,
+        new_status: &RunStatus,
+    ) -> Option<RunStatus> {
         if let Some(active) = self.active_runs.get_mut(&run_id)
-            && active.status != new_status
+            && active.status != *new_status
         {
-            let old = std::mem::replace(&mut active.status, new_status.to_string());
-            tracing::debug!(run_id, old = %old, new = %new_status, "Run status changed");
+            let old = std::mem::replace(&mut active.status, new_status.clone());
+            tracing::debug!(run_id, old = %old.as_str(), new = %new_status.as_str(), "Run status changed");
             Some(old)
         } else {
             None
@@ -221,7 +226,7 @@ impl WatchEntry {
         now_unix: u64,
     ) {
         if let Some(max_id) = new_runs.iter().map(|r| r.id).max() {
-            self.last_seen_run_id = max_id;
+            self.last_seen_run_id = self.last_seen_run_id.max(max_id);
         }
         for run in new_runs.iter().rev() {
             if run.is_completed() {

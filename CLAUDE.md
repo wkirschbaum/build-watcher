@@ -53,10 +53,11 @@ cargo clippy                # Lint
 - `src/notification.rs` — Daemon-only notification handler; subscribes to the event bus and dispatches platform notifications
 - `src/status.rs` — Shared HTTP response types (`StatusResponse`, `StatsResponse`) used by both daemon and TUI
 - `src/bin/bw/` — `bw` TUI dashboard module directory:
-  - `main.rs` — Entry point, terminal setup, event loop
+  - `main.rs` — Entry point, terminal setup, event loop, daemon discovery
   - `app.rs` — App state, input handling, event application
   - `client.rs` — HTTP client for daemon communication, SSE streaming
   - `render.rs` — TUI rendering, display rows, sorting, grouping
+  - `update.rs` — Background update checker, self-update via GitHub releases
 - `src/platform/` — `Notifier` trait + backends (Linux: D-Bus via `zbus`; macOS: `terminal-notifier` → `osascript` fallback)
 
 ### How it works

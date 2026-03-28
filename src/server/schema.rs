@@ -3,81 +3,75 @@ use serde::Deserialize;
 
 use build_watcher::config::NotificationLevel;
 
-/// Deserialize a `Vec<String>` that may arrive as either a proper JSON array
-/// or as a JSON-encoded string (e.g. `"[\"a\",\"b\"]"`). Some MCP clients
-/// double-encode array parameters; this handles both forms transparently.
+/// Visitor that deserializes a `Vec<String>` from either a JSON array or a
+/// JSON-encoded string (e.g. `"[\"a\",\"b\"]"`). Some MCP clients double-encode
+/// array parameters; this handles both forms transparently.
+struct StringVecVisitor;
+
+impl<'de> serde::de::Visitor<'de> for StringVecVisitor {
+    type Value = Vec<String>;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("a string array or a JSON-encoded string array")
+    }
+
+    fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+        serde_json::from_str(v).map_err(serde::de::Error::custom)
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+        let mut vec = Vec::new();
+        while let Some(item) = seq.next_element()? {
+            vec.push(item);
+        }
+        Ok(vec)
+    }
+}
+
+/// Deserialize a `Vec<String>` that may arrive as a JSON array or a JSON-encoded
+/// string. Use with `#[serde(deserialize_with = "deserialize_string_or_vec")]`.
 pub(crate) fn deserialize_string_or_vec<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    use serde::de;
-
-    struct StringOrVec;
-
-    impl<'de> de::Visitor<'de> for StringOrVec {
-        type Value = Vec<String>;
-
-        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-            f.write_str("a string array or a JSON-encoded string array")
-        }
-
-        fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
-            serde_json::from_str(v).map_err(de::Error::custom)
-        }
-
-        fn visit_seq<A: de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
-            let mut vec = Vec::new();
-            while let Some(item) = seq.next_element()? {
-                vec.push(item);
-            }
-            Ok(vec)
-        }
-    }
-
-    deserializer.deserialize_any(StringOrVec)
+    deserializer.deserialize_any(StringVecVisitor)
 }
 
 /// Like `deserialize_string_or_vec` but wraps the result in `Some`, and returns `None` for null
-/// or absent fields (use with `#[serde(default)]`).
+/// or absent fields (use with `#[serde(default, deserialize_with = "...")]`).
 pub(crate) fn deserialize_opt_string_or_vec<'de, D>(
     deserializer: D,
 ) -> Result<Option<Vec<String>>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    use serde::de;
+    struct OptVisitor;
 
-    struct OptStringOrVec;
-
-    impl<'de> de::Visitor<'de> for OptStringOrVec {
+    impl<'de> serde::de::Visitor<'de> for OptVisitor {
         type Value = Option<Vec<String>>;
 
         fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
             f.write_str("a string array, a JSON-encoded string array, or null")
         }
 
-        fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+        fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
             Ok(None)
         }
 
-        fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+        fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
             Ok(None)
         }
 
-        fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
-            serde_json::from_str(v).map(Some).map_err(de::Error::custom)
+        fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+            StringVecVisitor.visit_str(v).map(Some)
         }
 
-        fn visit_seq<A: de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
-            let mut vec = Vec::new();
-            while let Some(item) = seq.next_element()? {
-                vec.push(item);
-            }
-            Ok(Some(vec))
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(self, seq: A) -> Result<Self::Value, A::Error> {
+            StringVecVisitor.visit_seq(seq).map(Some)
         }
     }
 
-    deserializer.deserialize_any(OptStringOrVec)
+    deserializer.deserialize_any(OptVisitor)
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]

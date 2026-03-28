@@ -48,7 +48,7 @@ pub(crate) async fn do_watch_builds(
             cfg.add_repos(&started_repos);
             cfg.clone()
         };
-        if let Some(warning) = persist_config(snapshot).await {
+        if let Err(warning) = persist_config(snapshot).await {
             results.push(warning);
         }
     }
@@ -100,7 +100,7 @@ pub(crate) async fn do_stop_watches(
         }
         (cfg.clone(), results)
     };
-    if let Some(warning) = persist_config(snapshot).await {
+    if let Err(warning) = persist_config(snapshot).await {
         results.push(warning);
     }
 
@@ -164,39 +164,95 @@ pub(crate) async fn do_configure_branches(
         tracing::error!(error = %e, "Failed to persist watches");
     }
     let snapshot = config.lock().await.clone();
-    if let Some(warning) = persist_config(snapshot).await {
+    if let Err(warning) = persist_config(snapshot).await {
         results.push(warning);
     }
 
     results
 }
 
-pub(crate) async fn persist_config(cfg: build_watcher::config::Config) -> Option<String> {
-    match config::save_config_async(&cfg).await {
-        Ok(()) => None,
-        Err(e) => {
-            tracing::error!("Failed to save config: {e}");
-            Some(format!(
-                "\n⚠️ Warning: config could not be saved to disk: {e}"
-            ))
-        }
+pub(crate) async fn persist_config(cfg: build_watcher::config::Config) -> Result<(), String> {
+    config::save_config_async(&cfg).await.map_err(|e| {
+        tracing::error!("Failed to save config: {e}");
+        format!("\n⚠️ Warning: config could not be saved to disk: {e}")
+    })
+}
+
+/// Types that can have notification levels applied to them field-by-field.
+pub(crate) trait ApplyNotificationLevels {
+    fn apply_started(&mut self, v: NotificationLevel);
+    fn apply_success(&mut self, v: NotificationLevel);
+    fn apply_failure(&mut self, v: NotificationLevel);
+}
+
+impl ApplyNotificationLevels for build_watcher::config::NotificationConfig {
+    fn apply_started(&mut self, v: NotificationLevel) {
+        self.build_started = v;
+    }
+    fn apply_success(&mut self, v: NotificationLevel) {
+        self.build_success = v;
+    }
+    fn apply_failure(&mut self, v: NotificationLevel) {
+        self.build_failure = v;
     }
 }
 
-/// Apply notification level params to a global `NotificationConfig` (sets values directly).
+impl ApplyNotificationLevels for NotificationOverrides {
+    fn apply_started(&mut self, v: NotificationLevel) {
+        self.build_started = Some(v);
+    }
+    fn apply_success(&mut self, v: NotificationLevel) {
+        self.build_success = Some(v);
+    }
+    fn apply_failure(&mut self, v: NotificationLevel) {
+        self.build_failure = Some(v);
+    }
+}
+
+/// Apply optional per-event levels to any `ApplyNotificationLevels` target.
+///
+/// Only `Some` values are applied; `None` fields are left unchanged.
+pub(crate) fn apply_levels<T: ApplyNotificationLevels>(
+    target: &mut T,
+    started: Option<NotificationLevel>,
+    success: Option<NotificationLevel>,
+    failure: Option<NotificationLevel>,
+) {
+    if let Some(l) = started {
+        target.apply_started(l);
+    }
+    if let Some(l) = success {
+        target.apply_success(l);
+    }
+    if let Some(l) = failure {
+        target.apply_failure(l);
+    }
+}
+
+/// Apply notification level params to a global `NotificationConfig`.
 pub(crate) fn apply_notification_levels(
     notif: &mut build_watcher::config::NotificationConfig,
     params: &UpdateNotificationsParams,
 ) {
-    if let Some(l) = params.build_started {
-        notif.build_started = l;
-    }
-    if let Some(l) = params.build_success {
-        notif.build_success = l;
-    }
-    if let Some(l) = params.build_failure {
-        notif.build_failure = l;
-    }
+    apply_levels(
+        notif,
+        params.build_started,
+        params.build_success,
+        params.build_failure,
+    );
+}
+
+/// Apply notification level params to an override struct.
+pub(crate) fn apply_notification_overrides(
+    overrides: &mut NotificationOverrides,
+    params: &UpdateNotificationsParams,
+) {
+    apply_levels(
+        overrides,
+        params.build_started,
+        params.build_success,
+        params.build_failure,
+    );
 }
 
 /// Apply optional per-event levels to a `NotificationOverrides` struct.
@@ -208,28 +264,7 @@ pub(crate) fn apply_level_overrides(
     success: Option<NotificationLevel>,
     failure: Option<NotificationLevel>,
 ) {
-    if let Some(l) = started {
-        overrides.build_started = Some(l);
-    }
-    if let Some(l) = success {
-        overrides.build_success = Some(l);
-    }
-    if let Some(l) = failure {
-        overrides.build_failure = Some(l);
-    }
-}
-
-/// Apply notification level params to an override struct (sets Option values).
-pub(crate) fn apply_notification_overrides(
-    overrides: &mut NotificationOverrides,
-    params: &UpdateNotificationsParams,
-) {
-    apply_level_overrides(
-        overrides,
-        params.build_started,
-        params.build_success,
-        params.build_failure,
-    );
+    apply_levels(overrides, started, success, failure);
 }
 
 /// Mute, unmute, or set per-event notification levels for a repo/branch.

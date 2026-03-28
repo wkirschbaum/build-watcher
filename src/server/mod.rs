@@ -21,9 +21,11 @@ use rmcp::transport::streamable_http_server::{
 };
 use tokio_util::sync::CancellationToken;
 
-use build_watcher::config::{NotificationLevel, unix_now};
+use build_watcher::config::unix_now;
 use build_watcher::dirs::state_dir;
-use build_watcher::status::{ActiveRunView, LastBuildView, StatusResponse, WatchStatus};
+use build_watcher::status::{
+    ActiveRunView, LastBuildView, RunConclusion, StatusResponse, WatchStatus,
+};
 use build_watcher::watcher::{
     PauseState, RateLimitState, SharedConfig, WatchEntry, WatchKey, WatcherHandle, Watches,
     collect_persisted,
@@ -79,9 +81,12 @@ pub(crate) fn build_watch_snapshot(
 
             let last_build = entry.last_build.as_ref().map(|lb| {
                 let age_secs = lb.completed_at.map(|t| unix_now().saturating_sub(t) as f64);
+                let conclusion =
+                    serde_json::from_value(serde_json::Value::String(lb.conclusion.clone()))
+                        .unwrap_or(RunConclusion::Unknown);
                 LastBuildView {
                     run_id: lb.run_id,
-                    conclusion: lb.conclusion.clone(),
+                    conclusion,
                     workflow: lb.workflow.clone(),
                     title: lb.display_title(),
                     failing_steps: lb.failing_steps.clone(),
@@ -89,12 +94,8 @@ pub(crate) fn build_watch_snapshot(
                 }
             });
 
-            let muted = config.is_some_and(|cfg| {
-                let n = cfg.notifications_for(&key.repo, &key.branch);
-                n.build_started == NotificationLevel::Off
-                    && n.build_success == NotificationLevel::Off
-                    && n.build_failure == NotificationLevel::Off
-            });
+            let muted = config
+                .is_some_and(|cfg| cfg.notifications_for(&key.repo, &key.branch).is_all_off());
 
             WatchStatus {
                 repo: key.repo.clone(),

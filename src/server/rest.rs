@@ -4,7 +4,7 @@ use std::time::Duration;
 use axum::extract::{Query, State};
 use axum::response::IntoResponse as _;
 use axum::response::sse::{Event, KeepAlive, Sse};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use tokio_stream::StreamExt as _;
 use tokio_stream::wrappers::BroadcastStream;
 
@@ -13,7 +13,7 @@ use build_watcher::events::WatchEvent;
 use build_watcher::github::{validate_branch, validate_repo};
 use build_watcher::history::{history_all, history_for};
 use build_watcher::rate_limiter::compute_intervals;
-use build_watcher::status::{HistoryEntryView, StatsResponse};
+use build_watcher::status::{DefaultsConfig, HistoryEntryView, StatsResponse};
 use build_watcher::watcher::{count_api_calls, is_paused};
 
 use super::AppState;
@@ -119,6 +119,8 @@ pub(crate) async fn pause_handler(
 pub(crate) struct RerunRequest {
     repo: String,
     run_id: u64,
+    #[serde(default)]
+    failed_only: bool,
 }
 
 /// `POST /rerun` — Rerun a GitHub Actions build by run ID.
@@ -131,7 +133,7 @@ pub(crate) async fn rerun_handler(
     match state
         .handle
         .github
-        .run_rerun(&body.repo, body.run_id, false)
+        .run_rerun(&body.repo, body.run_id, body.failed_only)
         .await
     {
         Ok(_) => axum::Json(serde_json::json!({ "ok": true })).into_response(),
@@ -270,26 +272,19 @@ pub(crate) async fn notifications_handler(
         };
         (cfg.clone(), msg)
     };
-    if let Some(warning) = persist_config(snapshot).await {
+    if let Err(warning) = persist_config(snapshot).await {
         return axum::Json(serde_json::json!({ "ok": true, "message": msg, "warning": warning }))
             .into_response();
     }
     axum::Json(serde_json::json!({ "ok": true, "message": msg })).into_response()
 }
 
-#[derive(Serialize)]
-pub(crate) struct DefaultsResponse {
-    default_branches: Vec<String>,
-    ignored_workflows: Vec<String>,
-    poll_aggression: String,
-}
-
 /// `GET /defaults` — Read global default config (branches, ignored workflows, poll aggression).
 pub(crate) async fn get_defaults_handler(
     State(state): State<AppState>,
-) -> axum::Json<DefaultsResponse> {
+) -> axum::Json<DefaultsConfig> {
     let cfg = state.config.lock().await;
-    axum::Json(DefaultsResponse {
+    axum::Json(DefaultsConfig {
         default_branches: cfg.default_branches.clone(),
         ignored_workflows: cfg.ignored_workflows.clone(),
         poll_aggression: cfg.poll_aggression.to_string(),
@@ -346,7 +341,7 @@ pub(crate) async fn set_defaults_handler(
         (cfg.clone(), messages)
     };
     state.handle.config_changed.notify_waiters();
-    if let Some(warning) = persist_config(snapshot).await {
+    if let Err(warning) = persist_config(snapshot).await {
         return axum::Json(
             serde_json::json!({ "ok": true, "messages": messages, "warning": warning }),
         )
@@ -430,8 +425,6 @@ fn to_history_view(
         repo,
         branch,
         event: lb.event,
-        created_at: String::new(),
-        updated_at: String::new(),
         duration_secs: lb.duration_secs,
         age_secs,
     }
@@ -592,7 +585,7 @@ mod tests {
             workflow: "CI".to_string(),
             title: "Fix bug".to_string(),
             event: "push".to_string(),
-            status: "in_progress".to_string(),
+            status: build_watcher::status::RunStatus::InProgress,
         }
     }
 
@@ -749,7 +742,7 @@ mod tests {
         entry.active_runs.insert(
             42,
             ActiveRun {
-                status: "in_progress".to_string(),
+                status: build_watcher::status::RunStatus::InProgress,
                 started_at: Instant::now(),
                 workflow: "CI".to_string(),
                 title: "Fix bug".to_string(),

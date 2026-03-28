@@ -10,13 +10,14 @@ use tokio_util::sync::CancellationToken;
 use crate::config::Config;
 use crate::events::WatchEvent;
 use crate::github::{GhError, RunInfo};
+use crate::status::{RunConclusion, RunStatus};
 
 use super::repo_poller::RepoPoller;
 
-fn make_run(id: u64, status: &str, conclusion: &str) -> RunInfo {
+fn make_run(id: u64, status: RunStatus, conclusion: &str) -> RunInfo {
     RunInfo {
         id,
-        status: status.to_string(),
+        status,
         conclusion: conclusion.to_string(),
         title: "Test PR".to_string(),
         workflow: "CI".to_string(),
@@ -26,9 +27,9 @@ fn make_run(id: u64, status: &str, conclusion: &str) -> RunInfo {
     }
 }
 
-fn make_active(status: &str) -> ActiveRun {
+fn make_active(status: RunStatus) -> ActiveRun {
     ActiveRun {
-        status: status.to_string(),
+        status,
         started_at: Instant::now(),
         workflow: "CI".to_string(),
         title: "Test PR".to_string(),
@@ -40,8 +41,8 @@ fn make_entry() -> WatchEntry {
     WatchEntry {
         last_seen_run_id: 100,
         active_runs: HashMap::from([
-            (101, make_active("in_progress")),
-            (102, make_active("queued")),
+            (101, make_active(RunStatus::InProgress)),
+            (102, make_active(RunStatus::Queued)),
         ]),
         failure_counts: HashMap::new(),
         last_build: None,
@@ -77,10 +78,10 @@ fn watch_key_serde_roundtrip() {
 
 #[test]
 fn active_run_display_title() {
-    let push = make_active("in_progress");
+    let push = make_active(RunStatus::InProgress);
     assert_eq!(push.display_title(), "Test PR");
 
-    let mut pr = make_active("queued");
+    let mut pr = make_active(RunStatus::Queued);
     pr.event = "pull_request".to_string();
     assert_eq!(pr.display_title(), "PR: Test PR");
 }
@@ -90,7 +91,7 @@ fn active_run_display_title() {
 #[test]
 fn record_completion_returns_elapsed() {
     let mut entry = make_entry();
-    let run = make_run(101, "completed", "success");
+    let run = make_run(101, RunStatus::Completed, "success");
 
     let elapsed = entry.record_completion(&run, None, 0);
 
@@ -103,7 +104,7 @@ fn record_completion_returns_elapsed() {
 #[test]
 fn record_completion_returns_none_for_unknown_run() {
     let mut entry = make_entry();
-    let run = make_run(999, "completed", "success");
+    let run = make_run(999, RunStatus::Completed, "success");
 
     let elapsed = entry.record_completion(&run, None, 0);
 
@@ -113,7 +114,7 @@ fn record_completion_returns_none_for_unknown_run() {
 #[test]
 fn record_completion_removes_run_and_sets_last_build() {
     let mut entry = make_entry();
-    let run = make_run(101, "completed", "success");
+    let run = make_run(101, RunStatus::Completed, "success");
 
     entry.record_completion(&run, None, 0);
 
@@ -127,7 +128,7 @@ fn record_completion_removes_run_and_sets_last_build() {
 #[test]
 fn record_completion_stores_failing_steps() {
     let mut entry = make_entry();
-    let run = make_run(101, "completed", "failure");
+    let run = make_run(101, RunStatus::Completed, "failure");
 
     entry.record_completion(&run, Some("Build / Run tests".to_string()), 0);
 
@@ -139,7 +140,7 @@ fn record_completion_stores_failing_steps() {
 fn record_completion_clears_failure_count() {
     let mut entry = make_entry();
     entry.failure_counts.insert(101, 3);
-    let run = make_run(101, "completed", "failure");
+    let run = make_run(101, RunStatus::Completed, "failure");
 
     entry.record_completion(&run, None, 0);
 
@@ -191,27 +192,27 @@ fn clear_failure_count_resets_on_success() {
 fn update_status_changes_when_different() {
     let mut entry = make_entry();
 
-    let old = entry.update_status(101, "queued");
+    let old = entry.update_status(101, &RunStatus::Queued);
 
-    assert_eq!(old, Some("in_progress".to_string()));
-    assert_eq!(entry.active_runs[&101].status, "queued");
+    assert_eq!(old, Some(RunStatus::InProgress));
+    assert_eq!(entry.active_runs[&101].status, RunStatus::Queued);
 }
 
 #[test]
 fn update_status_noop_when_same() {
     let mut entry = make_entry();
 
-    let old = entry.update_status(101, "in_progress");
+    let old = entry.update_status(101, &RunStatus::InProgress);
 
     assert!(old.is_none());
-    assert_eq!(entry.active_runs[&101].status, "in_progress");
+    assert_eq!(entry.active_runs[&101].status, RunStatus::InProgress);
 }
 
 #[test]
 fn update_status_noop_for_unknown_run() {
     let mut entry = make_entry();
 
-    entry.update_status(999, "completed");
+    entry.update_status(999, &RunStatus::Completed);
 
     assert!(!entry.active_runs.contains_key(&999));
 }
@@ -219,20 +220,20 @@ fn update_status_noop_for_unknown_run() {
 #[test]
 fn incorporate_new_runs_tracks_in_progress() {
     let mut entry = make_entry();
-    let run = make_run(200, "in_progress", "");
+    let run = make_run(200, RunStatus::InProgress, "");
     let new_runs: Vec<&RunInfo> = vec![&run];
 
     entry.incorporate_new_runs(&new_runs, Instant::now(), 0);
 
     assert_eq!(entry.last_seen_run_id, 200);
-    assert_eq!(entry.active_runs[&200].status, "in_progress");
+    assert_eq!(entry.active_runs[&200].status, RunStatus::InProgress);
     assert!(entry.last_build.is_none());
 }
 
 #[test]
 fn incorporate_new_runs_records_completed() {
     let mut entry = make_entry();
-    let run = make_run(200, "completed", "success");
+    let run = make_run(200, RunStatus::Completed, "success");
     let new_runs: Vec<&RunInfo> = vec![&run];
 
     entry.incorporate_new_runs(&new_runs, Instant::now(), 0);
@@ -245,8 +246,8 @@ fn incorporate_new_runs_records_completed() {
 #[test]
 fn incorporate_new_runs_newest_completed_wins_last_build() {
     let mut entry = make_entry();
-    let old = make_run(200, "completed", "failure");
-    let new = make_run(201, "completed", "success");
+    let old = make_run(200, RunStatus::Completed, "failure");
+    let new = make_run(201, RunStatus::Completed, "success");
     let new_runs: Vec<&RunInfo> = vec![&new, &old];
 
     entry.incorporate_new_runs(&new_runs, Instant::now(), 0);
@@ -260,14 +261,14 @@ fn incorporate_new_runs_newest_completed_wins_last_build() {
 #[test]
 fn incorporate_new_runs_mixed_statuses() {
     let mut entry = make_entry();
-    let completed = make_run(200, "completed", "success");
-    let active = make_run(201, "in_progress", "");
+    let completed = make_run(200, RunStatus::Completed, "success");
+    let active = make_run(201, RunStatus::InProgress, "");
     let new_runs: Vec<&RunInfo> = vec![&active, &completed];
 
     entry.incorporate_new_runs(&new_runs, Instant::now(), 0);
 
     assert_eq!(entry.last_seen_run_id, 201);
-    assert_eq!(entry.active_runs[&201].status, "in_progress");
+    assert_eq!(entry.active_runs[&201].status, RunStatus::InProgress);
     assert!(!entry.active_runs.contains_key(&200));
     assert_eq!(entry.last_build.unwrap().run_id, 200);
 }
@@ -284,7 +285,7 @@ fn has_active_runs_reflects_state() {
 #[test]
 fn persisted_roundtrip_preserves_fields() {
     let mut entry = make_entry();
-    let run = make_run(101, "completed", "success");
+    let run = make_run(101, RunStatus::Completed, "success");
     entry.record_completion(&run, None, 0);
 
     let persisted = entry.to_persisted();
@@ -300,11 +301,11 @@ fn persisted_roundtrip_preserves_fields() {
 
 #[test]
 fn runs_for_branch_filters_by_branch() {
-    let mut r1 = make_run(1, "in_progress", "");
+    let mut r1 = make_run(1, RunStatus::InProgress, "");
     r1.head_branch = "main".to_string();
-    let mut r2 = make_run(2, "in_progress", "");
+    let mut r2 = make_run(2, RunStatus::InProgress, "");
     r2.head_branch = "develop".to_string();
-    let mut r3 = make_run(3, "completed", "success");
+    let mut r3 = make_run(3, RunStatus::Completed, "success");
     r3.head_branch = "main".to_string();
     let runs = vec![r1, r2, r3];
 
@@ -326,17 +327,17 @@ fn runs_for_branch_filters_by_branch() {
 #[test]
 fn filter_runs_no_filters() {
     let runs = vec![
-        make_run(1, "completed", "success"),
-        make_run(2, "in_progress", ""),
+        make_run(1, RunStatus::Completed, "success"),
+        make_run(2, RunStatus::InProgress, ""),
     ];
     assert_eq!(filter_runs(&runs, &[], &[]).len(), 2);
 }
 
 #[test]
 fn filter_runs_workflow_allowlist() {
-    let mut r1 = make_run(1, "completed", "success");
+    let mut r1 = make_run(1, RunStatus::Completed, "success");
     r1.workflow = "CI".to_string();
-    let mut r2 = make_run(2, "completed", "success");
+    let mut r2 = make_run(2, RunStatus::Completed, "success");
     r2.workflow = "Deploy".to_string();
     let runs = vec![r1, r2];
 
@@ -347,9 +348,9 @@ fn filter_runs_workflow_allowlist() {
 
 #[test]
 fn filter_runs_ignored_workflows() {
-    let mut r1 = make_run(1, "completed", "success");
+    let mut r1 = make_run(1, RunStatus::Completed, "success");
     r1.workflow = "CI".to_string();
-    let mut r2 = make_run(2, "completed", "success");
+    let mut r2 = make_run(2, RunStatus::Completed, "success");
     r2.workflow = "Semgrep".to_string();
     let runs = vec![r1, r2];
 
@@ -360,11 +361,11 @@ fn filter_runs_ignored_workflows() {
 
 #[test]
 fn filter_runs_both_filters() {
-    let mut r1 = make_run(1, "completed", "success");
+    let mut r1 = make_run(1, RunStatus::Completed, "success");
     r1.workflow = "CI".to_string();
-    let mut r2 = make_run(2, "completed", "success");
+    let mut r2 = make_run(2, RunStatus::Completed, "success");
     r2.workflow = "Deploy".to_string();
-    let mut r3 = make_run(3, "completed", "success");
+    let mut r3 = make_run(3, RunStatus::Completed, "success");
     r3.workflow = "Semgrep".to_string();
     let runs = vec![r1, r2, r3];
 
@@ -383,7 +384,7 @@ fn filter_runs_both_filters() {
 fn last_failed_build_finds_failure() {
     let mut watches = HashMap::new();
     let mut entry = make_entry();
-    let run = make_run(200, "completed", "failure");
+    let run = make_run(200, RunStatus::Completed, "failure");
     entry.record_completion(&run, None, 0);
     watches.insert(WatchKey::new("alice/app", "main"), entry);
 
@@ -399,7 +400,7 @@ fn last_failed_build_finds_failure() {
 fn last_failed_build_ignores_success() {
     let mut watches = HashMap::new();
     let mut entry = make_entry();
-    let run = make_run(200, "completed", "success");
+    let run = make_run(200, RunStatus::Completed, "success");
     entry.record_completion(&run, None, 0);
     watches.insert(WatchKey::new("alice/app", "main"), entry);
 
@@ -411,12 +412,12 @@ fn last_failed_build_picks_most_recent() {
     let mut watches = HashMap::new();
 
     let mut entry1 = make_entry();
-    let run1 = make_run(100, "completed", "failure");
+    let run1 = make_run(100, RunStatus::Completed, "failure");
     entry1.record_completion(&run1, None, 0);
     watches.insert(WatchKey::new("alice/app", "main"), entry1);
 
     let mut entry2 = make_entry();
-    let run2 = make_run(200, "completed", "failure");
+    let run2 = make_run(200, RunStatus::Completed, "failure");
     entry2.record_completion(&run2, None, 0);
     watches.insert(WatchKey::new("alice/app", "develop"), entry2);
 
@@ -428,7 +429,7 @@ fn last_failed_build_picks_most_recent() {
 fn last_failed_build_ignores_other_repos() {
     let mut watches = HashMap::new();
     let mut entry = make_entry();
-    let run = make_run(200, "completed", "failure");
+    let run = make_run(200, RunStatus::Completed, "failure");
     entry.record_completion(&run, None, 0);
     watches.insert(WatchKey::new("bob/other", "main"), entry);
 
@@ -443,7 +444,7 @@ fn count_api_calls_reflects_active_runs() {
     // 2 watches, one with 3 active runs, one idle
     let mut active_runs = HashMap::new();
     for id in 1..=3 {
-        active_runs.insert(id, make_active("in_progress"));
+        active_runs.insert(id, make_active(RunStatus::InProgress));
     }
     let entry1 = WatchEntry {
         last_seen_run_id: 100,
@@ -468,7 +469,7 @@ fn count_api_calls_reflects_active_runs() {
 fn count_api_calls_same_repo_multiple_branches() {
     let mut watches = HashMap::new();
     let mut active_runs = HashMap::new();
-    active_runs.insert(1, make_active("in_progress"));
+    active_runs.insert(1, make_active(RunStatus::InProgress));
     let entry1 = WatchEntry {
         last_seen_run_id: 100,
         active_runs,
@@ -604,8 +605,8 @@ fn make_repo_poller(
 #[tokio::test]
 async fn start_watch_with_mock_github() {
     let runs = vec![
-        make_run(100, "completed", "success"),
-        make_run(101, "in_progress", ""),
+        make_run(100, RunStatus::Completed, "success"),
+        make_run(101, RunStatus::InProgress, ""),
     ];
     let gh = MockGitHub::with_runs(runs);
     let watches: Watches = Arc::new(Mutex::new(HashMap::new()));
@@ -642,7 +643,7 @@ async fn start_watch_rejects_empty_runs() {
 
 #[tokio::test]
 async fn start_watch_deduplicates() {
-    let runs = vec![make_run(100, "completed", "success")];
+    let runs = vec![make_run(100, RunStatus::Completed, "success")];
     let gh = MockGitHub::with_runs(runs);
     let watches: Watches = Arc::new(Mutex::new(HashMap::new()));
     let config: SharedConfig = Arc::new(Mutex::new(Config::default()));
@@ -665,10 +666,10 @@ async fn check_for_new_runs_detects_new_builds() {
     let key = WatchKey::new("alice/app", "main");
     // Mock returns runs 99-102; watch has seen up to 100
     let runs = vec![
-        make_run(99, "completed", "success"),
-        make_run(100, "completed", "success"),
-        make_run(101, "in_progress", ""),
-        make_run(102, "completed", "failure"),
+        make_run(99, RunStatus::Completed, "success"),
+        make_run(100, RunStatus::Completed, "success"),
+        make_run(101, RunStatus::InProgress, ""),
+        make_run(102, RunStatus::Completed, "failure"),
     ];
     let gh = MockGitHub::with_runs_and_failures(runs, "Build / Run tests");
     let watches: Watches = Arc::new(Mutex::new(HashMap::new()));
@@ -729,9 +730,9 @@ async fn check_for_new_runs_detects_new_builds() {
 #[tokio::test]
 async fn check_for_new_runs_applies_workflow_filter() {
     let key = WatchKey::new("alice/app", "main");
-    let mut ci = make_run(101, "in_progress", "");
+    let mut ci = make_run(101, RunStatus::InProgress, "");
     ci.workflow = "CI".to_string();
-    let mut semgrep = make_run(102, "in_progress", "");
+    let mut semgrep = make_run(102, RunStatus::InProgress, "");
     semgrep.workflow = "Semgrep".to_string();
 
     let gh = MockGitHub::with_runs(vec![ci, semgrep]);
@@ -777,7 +778,7 @@ async fn check_for_new_runs_applies_workflow_filter() {
 async fn poll_active_runs_detects_completion() {
     let key = WatchKey::new("alice/app", "main");
     // Mock: run 101 now completed (not in in_progress list, so fallback to run_status)
-    let runs = vec![make_run(101, "completed", "success")];
+    let runs = vec![make_run(101, RunStatus::Completed, "success")];
     let gh = MockGitHub::with_runs(runs);
     let watches: Watches = Arc::new(Mutex::new(HashMap::new()));
     let config: SharedConfig = Arc::new(Mutex::new(Config::default()));
@@ -793,7 +794,9 @@ async fn poll_active_runs_detects_completion() {
             failure_counts: HashMap::new(),
             last_build: None,
         };
-        entry.active_runs.insert(101, make_active("in_progress"));
+        entry
+            .active_runs
+            .insert(101, make_active(RunStatus::InProgress));
         w.insert(key.clone(), entry);
     }
 
@@ -813,7 +816,7 @@ async fn poll_active_runs_detects_completion() {
     // RunCompleted event emitted
     match rx.try_recv() {
         Ok(crate::events::WatchEvent::RunCompleted { conclusion, .. }) => {
-            assert_eq!(conclusion, "success");
+            assert_eq!(conclusion, RunConclusion::Success);
         }
         other => panic!("expected RunCompleted, got {other:?}"),
     }
@@ -825,7 +828,7 @@ async fn poll_active_runs_detects_completion() {
 async fn poll_active_runs_emits_status_change() {
     let key = WatchKey::new("alice/app", "main");
     // Mock: run 101 changed from queued to in_progress (found in batch response)
-    let runs = vec![make_run(101, "in_progress", "")];
+    let runs = vec![make_run(101, RunStatus::InProgress, "")];
     let gh = MockGitHub::with_runs(runs);
     let watches: Watches = Arc::new(Mutex::new(HashMap::new()));
     let config: SharedConfig = Arc::new(Mutex::new(Config::default()));
@@ -840,7 +843,9 @@ async fn poll_active_runs_emits_status_change() {
             failure_counts: HashMap::new(),
             last_build: None,
         };
-        entry.active_runs.insert(101, make_active("queued"));
+        entry
+            .active_runs
+            .insert(101, make_active(RunStatus::Queued));
         w.insert(key.clone(), entry);
     }
 
@@ -851,14 +856,14 @@ async fn poll_active_runs_emits_status_change() {
 
     // Still active, status updated
     let w = watches.lock().await;
-    assert_eq!(w[&key].active_runs[&101].status, "in_progress");
+    assert_eq!(w[&key].active_runs[&101].status, RunStatus::InProgress);
     drop(w);
 
     // StatusChanged event
     match rx.try_recv() {
         Ok(crate::events::WatchEvent::StatusChanged { from, to, .. }) => {
-            assert_eq!(from, "queued");
-            assert_eq!(to, "in_progress");
+            assert_eq!(from, RunStatus::Queued);
+            assert_eq!(to, RunStatus::InProgress);
         }
         other => panic!("expected StatusChanged, got {other:?}"),
     }
@@ -870,7 +875,7 @@ async fn poll_active_runs_emits_status_change() {
 async fn poll_active_runs_fetches_failing_steps() {
     let key = WatchKey::new("alice/app", "main");
     // Mock: run 101 completed with failure (falls back to run_status since not in_progress)
-    let runs = vec![make_run(101, "completed", "failure")];
+    let runs = vec![make_run(101, RunStatus::Completed, "failure")];
     let gh = MockGitHub::with_runs_and_failures(runs, "Build / Run tests");
     let watches: Watches = Arc::new(Mutex::new(HashMap::new()));
     let config: SharedConfig = Arc::new(Mutex::new(Config::default()));
@@ -885,7 +890,9 @@ async fn poll_active_runs_fetches_failing_steps() {
             failure_counts: HashMap::new(),
             last_build: None,
         };
-        entry.active_runs.insert(101, make_active("in_progress"));
+        entry
+            .active_runs
+            .insert(101, make_active(RunStatus::InProgress));
         w.insert(key.clone(), entry);
     }
 
@@ -900,7 +907,7 @@ async fn poll_active_runs_fetches_failing_steps() {
             conclusion,
             ..
         }) => {
-            assert_eq!(conclusion, "failure");
+            assert_eq!(conclusion, RunConclusion::Failure);
             assert_eq!(failing_steps.as_deref(), Some("Build / Run tests"));
         }
         other => panic!("expected RunCompleted, got {other:?}"),
@@ -917,8 +924,8 @@ async fn check_for_new_runs_skips_already_active() {
     // Run 101 is in_progress and already tracked as active.
     // A stale last_seen_run_id (100) should NOT cause 101 to be re-emitted.
     let runs = vec![
-        make_run(100, "completed", "success"),
-        make_run(101, "in_progress", ""),
+        make_run(100, RunStatus::Completed, "success"),
+        make_run(101, RunStatus::InProgress, ""),
     ];
     let gh = MockGitHub::with_runs(runs);
     let watches: Watches = Arc::new(Mutex::new(HashMap::new()));
@@ -933,7 +940,7 @@ async fn check_for_new_runs_skips_already_active() {
             key.clone(),
             WatchEntry {
                 last_seen_run_id: 100,
-                active_runs: HashMap::from([(101, make_active("in_progress"))]),
+                active_runs: HashMap::from([(101, make_active(RunStatus::InProgress))]),
                 failure_counts: HashMap::new(),
                 last_build: None,
             },
@@ -959,11 +966,11 @@ async fn check_for_new_runs_skips_already_active() {
 async fn record_completion_bumps_last_seen() {
     let mut entry = WatchEntry {
         last_seen_run_id: 50,
-        active_runs: HashMap::from([(100, make_active("in_progress"))]),
+        active_runs: HashMap::from([(100, make_active(RunStatus::InProgress))]),
         failure_counts: HashMap::new(),
         last_build: None,
     };
-    let run = make_run(100, "completed", "success");
+    let run = make_run(100, RunStatus::Completed, "success");
     entry.record_completion(&run, None, 999);
 
     assert_eq!(
@@ -979,8 +986,8 @@ async fn recover_existing_watches_recovers_active_runs() {
     let key = WatchKey::new("alice/app", "main");
     // Mock returns a mix: 100 completed, 101 in_progress
     let runs = vec![
-        make_run(100, "completed", "success"),
-        make_run(101, "in_progress", ""),
+        make_run(100, RunStatus::Completed, "success"),
+        make_run(101, RunStatus::InProgress, ""),
     ];
     let gh = MockGitHub::with_runs(runs);
     let watches: Watches = Arc::new(Mutex::new(HashMap::new()));

@@ -7,6 +7,7 @@ use tokio::sync::{Mutex, broadcast};
 use build_watcher::config::{self, NotificationLevel};
 use build_watcher::events::WatchEvent;
 use build_watcher::format;
+use build_watcher::status::RunConclusion;
 use build_watcher::watcher::{PauseState, is_paused};
 
 use crate::platform;
@@ -73,7 +74,7 @@ pub(crate) fn effective_level(event: &WatchEvent, cfg: &config::Config) -> Notif
             run, conclusion, ..
         } => {
             let notif = cfg.notifications_for(&run.repo, &run.branch);
-            if conclusion == "success" {
+            if *conclusion == RunConclusion::Success {
                 notif.build_success
             } else {
                 notif.build_failure
@@ -102,7 +103,7 @@ async fn handle_notification(event: WatchEvent, repo_label: &str, level: Notific
             elapsed,
             failing_steps,
         } => {
-            let succeeded = conclusion == "success";
+            let succeeded = conclusion == RunConclusion::Success;
 
             let (emoji, status) = if succeeded {
                 ("✅", "succeeded")
@@ -151,14 +152,14 @@ mod tests {
             workflow: "CI".to_string(),
             title: "Fix login bug".to_string(),
             event: "push".to_string(),
-            status: "in_progress".to_string(),
+            status: build_watcher::status::RunStatus::InProgress,
         }
     }
 
-    fn completed(conclusion: &str) -> WatchEvent {
+    fn completed(conclusion: build_watcher::status::RunConclusion) -> WatchEvent {
         WatchEvent::RunCompleted {
             run: snap(),
-            conclusion: conclusion.to_string(),
+            conclusion,
             elapsed: None,
             failing_steps: None,
         }
@@ -166,19 +167,27 @@ mod tests {
 
     #[test]
     fn effective_level_by_event_type() {
+        use build_watcher::status::{RunConclusion, RunStatus};
+
         let cfg = config::Config::default();
 
         assert_eq!(
             effective_level(&WatchEvent::RunStarted(snap()), &cfg),
             Normal
         );
-        assert_eq!(effective_level(&completed("success"), &cfg), Normal);
-        assert_eq!(effective_level(&completed("failure"), &cfg), Critical);
+        assert_eq!(
+            effective_level(&completed(RunConclusion::Success), &cfg),
+            Normal
+        );
+        assert_eq!(
+            effective_level(&completed(RunConclusion::Failure), &cfg),
+            Critical
+        );
 
         let status = WatchEvent::StatusChanged {
             run: snap(),
-            from: "queued".to_string(),
-            to: "in_progress".to_string(),
+            from: RunStatus::Queued,
+            to: RunStatus::InProgress,
         };
         assert_eq!(effective_level(&status, &cfg), Off);
     }

@@ -2,6 +2,8 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use crate::status::RunStatus;
+
 const GH_TIMEOUT: Duration = Duration::from_secs(30);
 const GH_JSON_FIELDS: &str =
     "databaseId,status,conclusion,displayTitle,workflowName,headSha,event,headBranch";
@@ -132,7 +134,7 @@ struct GhRunJson {
 #[derive(Debug, Clone)]
 pub struct RunInfo {
     pub id: u64,
-    pub status: String,
+    pub status: RunStatus,
     pub conclusion: String,
     pub title: String,
     pub workflow: String,
@@ -153,7 +155,8 @@ impl RunInfo {
                     repo: repo.to_string(),
                 });
             } else {
-                raw.status
+                serde_json::from_value(serde_json::Value::String(raw.status))
+                    .unwrap_or(RunStatus::Unknown)
             },
             conclusion: raw.conclusion,
             title: if raw.display_title.is_empty() {
@@ -186,11 +189,17 @@ impl RunInfo {
     }
 
     pub fn is_completed(&self) -> bool {
-        self.status == "completed"
+        self.status == RunStatus::Completed
     }
 
     pub fn succeeded(&self) -> bool {
         self.conclusion == "success"
+    }
+
+    /// Parse the conclusion string into a typed `RunConclusion`.
+    pub fn run_conclusion(&self) -> crate::status::RunConclusion {
+        serde_json::from_value(serde_json::Value::String(self.conclusion.clone()))
+            .unwrap_or(crate::status::RunConclusion::Unknown)
     }
 
     pub fn url(&self, repo: &str) -> String {
@@ -610,7 +619,7 @@ mod tests {
     fn from_json_parses_all_fields() {
         let run = run_from_value(&sample_json()).unwrap();
         assert_eq!(run.id, 123456789);
-        assert_eq!(run.status, "completed");
+        assert_eq!(run.status, RunStatus::Completed);
         assert_eq!(run.conclusion, "success");
         assert_eq!(run.title, "Fix login bug");
         assert_eq!(run.workflow, "Lint and Test");

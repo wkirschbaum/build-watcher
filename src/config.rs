@@ -193,6 +193,15 @@ fn default_critical() -> NotificationLevel {
     NotificationLevel::Critical
 }
 
+impl NotificationConfig {
+    /// Returns `true` when all notification levels are set to `Off` (i.e. effectively muted).
+    pub fn is_all_off(&self) -> bool {
+        self.build_started == NotificationLevel::Off
+            && self.build_success == NotificationLevel::Off
+            && self.build_failure == NotificationLevel::Off
+    }
+}
+
 impl Default for NotificationConfig {
     fn default() -> Self {
         Self {

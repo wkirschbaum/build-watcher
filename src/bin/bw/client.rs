@@ -1,9 +1,9 @@
 use std::time::Duration;
 
 use build_watcher::config::{NotificationConfig, NotificationLevel};
-use build_watcher::dirs::state_dir;
 use build_watcher::events::WatchEvent;
-use build_watcher::status::HistoryEntryView;
+use build_watcher::status::{DefaultsConfig, HistoryEntryView};
+use serde::Serialize;
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt as _;
 
@@ -11,7 +11,7 @@ use super::app::SseUpdate;
 
 #[derive(Clone)]
 pub(crate) struct DaemonClient {
-    client: reqwest::Client,
+    pub(crate) client: reqwest::Client,
     port: u16,
 }
 
@@ -23,7 +23,7 @@ impl DaemonClient {
         }
     }
 
-    fn url(&self, path: &str) -> String {
+    pub(crate) fn url(&self, path: &str) -> String {
         format!("http://127.0.0.1:{}{path}", self.port)
     }
 
@@ -40,11 +40,7 @@ impl DaemonClient {
         resp.json::<T>().await.map_err(|e| format!("parse: {e}"))
     }
 
-    pub(crate) async fn post_json(
-        &self,
-        path: &str,
-        body: &serde_json::Value,
-    ) -> Result<(), String> {
+    async fn post_json<T: Serialize>(&self, path: &str, body: &T) -> Result<(), String> {
         let resp = self
             .client
             .post(self.url(path))
@@ -64,18 +60,27 @@ impl DaemonClient {
     }
 
     pub(crate) async fn pause(&self, pause: bool) -> Result<(), String> {
-        self.post_json("/pause", &serde_json::json!({ "pause": pause }))
-            .await
+        #[derive(Serialize)]
+        struct Req {
+            pause: bool,
+        }
+        self.post_json("/pause", &Req { pause }).await
     }
 
     pub(crate) async fn watch(&self, repo: &str) -> Result<(), String> {
-        self.post_json("/watch", &serde_json::json!({ "repos": [repo] }))
-            .await
+        #[derive(Serialize)]
+        struct Req<'a> {
+            repos: [&'a str; 1],
+        }
+        self.post_json("/watch", &Req { repos: [repo] }).await
     }
 
     pub(crate) async fn unwatch(&self, repo: &str) -> Result<(), String> {
-        self.post_json("/unwatch", &serde_json::json!({ "repos": [repo] }))
-            .await
+        #[derive(Serialize)]
+        struct Req<'a> {
+            repos: [&'a str; 1],
+        }
+        self.post_json("/unwatch", &Req { repos: [repo] }).await
     }
 
     pub(crate) async fn set_notifications(
@@ -84,9 +89,19 @@ impl DaemonClient {
         branch: &str,
         action: &str,
     ) -> Result<(), String> {
+        #[derive(Serialize)]
+        struct Req<'a> {
+            repo: &'a str,
+            branch: &'a str,
+            action: &'a str,
+        }
         self.post_json(
             "/notifications",
-            &serde_json::json!({ "repo": repo, "branch": branch, "action": action }),
+            &Req {
+                repo,
+                branch,
+                action,
+            },
         )
         .await
     }
@@ -116,33 +131,68 @@ impl DaemonClient {
         success: NotificationLevel,
         failure: NotificationLevel,
     ) -> Result<(), String> {
+        #[derive(Serialize)]
+        struct Req<'a> {
+            repo: &'a str,
+            branch: &'a str,
+            action: &'static str,
+            build_started: String,
+            build_success: String,
+            build_failure: String,
+        }
         self.post_json(
             "/notifications",
-            &serde_json::json!({
-                "repo": repo,
-                "branch": branch,
-                "action": "set_levels",
-                "build_started": started.to_string(),
-                "build_success": success.to_string(),
-                "build_failure": failure.to_string(),
-            }),
+            &Req {
+                repo,
+                branch,
+                action: "set_levels",
+                build_started: started.to_string(),
+                build_success: success.to_string(),
+                build_failure: failure.to_string(),
+            },
         )
         .await
     }
 
     pub(crate) async fn set_branches(&self, repo: &str, branches: &[String]) -> Result<(), String> {
+        #[derive(Serialize)]
+        struct Req<'a> {
+            repo: &'a str,
+            branches: &'a [String],
+        }
+        self.post_json("/branches", &Req { repo, branches }).await
+    }
+
+    pub(crate) async fn rerun(
+        &self,
+        repo: &str,
+        run_id: u64,
+        failed_only: bool,
+    ) -> Result<(), String> {
+        #[derive(Serialize)]
+        struct Req<'a> {
+            repo: &'a str,
+            run_id: u64,
+            failed_only: bool,
+        }
         self.post_json(
-            "/branches",
-            &serde_json::json!({ "repo": repo, "branches": branches }),
+            "/rerun",
+            &Req {
+                repo,
+                run_id,
+                failed_only,
+            },
         )
         .await
     }
 
     pub(crate) async fn shutdown(&self) -> Result<(), String> {
-        self.post_json("/shutdown", &serde_json::json!({})).await
+        #[derive(Serialize)]
+        struct Req {}
+        self.post_json("/shutdown", &Req {}).await
     }
 
-    pub(crate) async fn get_defaults(&self) -> Result<Defaults, String> {
+    pub(crate) async fn get_defaults(&self) -> Result<DefaultsConfig, String> {
         self.get_json("/defaults").await
     }
 
@@ -152,13 +202,19 @@ impl DaemonClient {
         ignored_workflows: Option<Vec<String>>,
         poll_aggression: Option<String>,
     ) -> Result<(), String> {
+        #[derive(Serialize)]
+        struct Req {
+            default_branches: Option<Vec<String>>,
+            ignored_workflows: Option<Vec<String>>,
+            poll_aggression: Option<String>,
+        }
         self.post_json(
             "/defaults",
-            &serde_json::json!({
-                "default_branches": default_branches,
-                "ignored_workflows": ignored_workflows,
-                "poll_aggression": poll_aggression,
-            }),
+            &Req {
+                default_branches,
+                ignored_workflows,
+                poll_aggression,
+            },
         )
         .await
     }
@@ -169,16 +225,14 @@ impl DaemonClient {
         branch: Option<&str>,
         limit: u32,
     ) -> Result<Vec<HistoryEntryView>, String> {
-        let mut url = format!(
-            "http://127.0.0.1:{}/history?repo={}&limit={}",
-            self.port, repo, limit
-        );
+        let mut query = vec![("repo", repo.to_string()), ("limit", limit.to_string())];
         if let Some(b) = branch {
-            url.push_str(&format!("&branch={}", b));
+            query.push(("branch", b.to_string()));
         }
         let resp = self
             .client
-            .get(&url)
+            .get(self.url("/history"))
+            .query(&query)
             .send()
             .await
             .map_err(|e| e.to_string())?;
@@ -198,30 +252,16 @@ impl DaemonClient {
         self.get_json::<Vec<HistoryEntryView>>(&format!("/history/all?limit={limit}"))
             .await
     }
-
-    /// Inner client ref for the SSE background task (which needs `bytes_stream`).
-    pub(crate) fn inner(&self) -> &reqwest::Client {
-        &self.client
-    }
 }
 
-/// Global defaults returned by `GET /defaults`.
-#[derive(serde::Deserialize)]
-pub(crate) struct Defaults {
-    pub(crate) default_branches: Vec<String>,
-    pub(crate) ignored_workflows: Vec<String>,
-    #[serde(default)]
-    pub(crate) poll_aggression: String,
-}
+// -- SSE streaming --
 
 async fn stream_sse(
-    client: &reqwest::Client,
-    port: u16,
+    daemon: &DaemonClient,
     tx: &mpsc::Sender<SseUpdate>,
     connected: &mut bool,
 ) -> bool {
-    let url = format!("http://127.0.0.1:{port}/events");
-    let response = match client.get(&url).send().await {
+    let response = match daemon.client.get(daemon.url("/events")).send().await {
         Ok(r) => r,
         Err(_) => return false,
     };
@@ -265,11 +305,11 @@ async fn stream_sse(
 }
 
 /// SSE background task: connects, streams events, reconnects with exponential backoff.
-pub(crate) async fn sse_task(client: reqwest::Client, port: u16, tx: mpsc::Sender<SseUpdate>) {
+pub(crate) async fn sse_task(daemon: DaemonClient, tx: mpsc::Sender<SseUpdate>) {
     let mut backoff_secs = 1u64;
     loop {
         let mut connected = false;
-        if stream_sse(&client, port, &tx, &mut connected).await {
+        if stream_sse(&daemon, &tx, &mut connected).await {
             break; // channel closed
         }
         if tx.send(SseUpdate::Disconnected).await.is_err() {
@@ -284,7 +324,7 @@ pub(crate) async fn sse_task(client: reqwest::Client, port: u16, tx: mpsc::Sende
     }
 }
 
-// -- Actions --
+// -- Utilities --
 
 pub(crate) fn open_browser(url: &str) {
     let cmd = if cfg!(target_os = "macos") {
@@ -298,58 +338,4 @@ pub(crate) fn open_browser(url: &str) {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn();
-}
-
-// -- Entry point --
-
-/// Read the daemon port from the port file, or start the daemon if it's not running.
-pub(crate) fn discover_or_start_daemon() -> Result<u16, Box<dyn std::error::Error>> {
-    let port_file = state_dir().join("port");
-
-    // Try reading existing port file first.
-    if let Ok(contents) = std::fs::read_to_string(&port_file)
-        && let Ok(port) = contents.trim().parse::<u16>()
-    {
-        if std::net::TcpStream::connect(format!("127.0.0.1:{port}")).is_ok() {
-            return Ok(port);
-        }
-        // Port file exists but daemon is not responding — stale file.
-        let _ = std::fs::remove_file(&port_file);
-    }
-
-    // Daemon not running — try to start it.
-    eprintln!("Daemon not running, starting build-watcher…");
-    let exe = std::env::current_exe()?;
-    let daemon_bin = exe
-        .parent()
-        .ok_or("cannot resolve binary directory")?
-        .join("build-watcher");
-
-    if !daemon_bin.exists() {
-        return Err(format!(
-            "build-watcher binary not found at {}\nInstall it with ./install.sh",
-            daemon_bin.display()
-        )
-        .into());
-    }
-
-    std::process::Command::new(&daemon_bin)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map_err(|e| format!("Failed to start daemon: {e}"))?;
-
-    // Wait for the port file to appear (up to 5 seconds).
-    for _ in 0..50 {
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        if let Ok(contents) = std::fs::read_to_string(&port_file)
-            && let Ok(port) = contents.trim().parse::<u16>()
-            && std::net::TcpStream::connect(format!("127.0.0.1:{port}")).is_ok()
-        {
-            return Ok(port);
-        }
-    }
-
-    Err("Timed out waiting for daemon to start".into())
 }

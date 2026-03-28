@@ -123,7 +123,14 @@ impl BuildWatcher {
                 let last = w
                     .last_build
                     .as_ref()
-                    .map(|b| format!(" (last: {} — {}: {})", b.conclusion, b.workflow, b.title))
+                    .map(|b| {
+                        format!(
+                            " (last: {} — {}: {})",
+                            b.conclusion.as_str(),
+                            b.workflow,
+                            b.title
+                        )
+                    })
                     .unwrap_or_default();
 
                 if w.active_runs.is_empty() {
@@ -137,7 +144,12 @@ impl BuildWatcher {
                                 .elapsed_secs
                                 .map(|s| format::duration(Duration::from_secs_f64(s)))
                                 .unwrap_or_default();
-                            format!("{}: {} ({}, {time})", r.workflow, r.title, r.status)
+                            format!(
+                                "{}: {} ({}, {time})",
+                                r.workflow,
+                                r.title,
+                                r.status.as_str()
+                            )
                         })
                         .collect();
                     format!(
@@ -183,7 +195,7 @@ impl BuildWatcher {
                     let msg = format!("Default branches set to {:?}", config.default_branches);
                     (config.clone(), msg)
                 };
-                if let Some(warning) = persist_config(snapshot).await {
+                if let Err(warning) = persist_config(snapshot).await {
                     msg.push_str(&warning);
                 }
                 Ok(CallToolResult::success(vec![Content::text(msg)]))
@@ -372,7 +384,7 @@ impl BuildWatcher {
             }
             (config.clone(), msgs)
         };
-        if let Some(warning) = persist_config(snapshot).await {
+        if let Err(warning) = persist_config(snapshot).await {
             msgs.push(warning);
         }
         Ok(CallToolResult::success(vec![Content::text(
@@ -438,7 +450,7 @@ impl BuildWatcher {
 
             (config.clone(), msgs)
         };
-        if let Some(warning) = persist_config(snapshot).await {
+        if let Err(warning) = persist_config(snapshot).await {
             msgs.push(warning);
         }
 
@@ -759,7 +771,7 @@ impl BuildWatcher {
                 ));
             }
 
-            if let Some(warning) = persist_config(snapshot).await {
+            if let Err(warning) = persist_config(snapshot).await {
                 msgs.push(warning);
             }
         }
@@ -793,7 +805,7 @@ impl BuildWatcher {
             cfg.clone()
         };
         self.handle.config_changed.notify_waiters();
-        if let Some(w) = persist_config(snapshot).await {
+        if let Err(w) = persist_config(snapshot).await {
             return Ok(CallToolResult::success(vec![Content::text(w)]));
         }
         Ok(CallToolResult::success(vec![Content::text(format!(

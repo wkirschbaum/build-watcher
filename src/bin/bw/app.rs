@@ -12,18 +12,26 @@ use build_watcher::dirs::state_dir;
 use build_watcher::events::WatchEvent;
 use build_watcher::github::{repo_url, run_url, validate_branch, validate_repo};
 use build_watcher::persistence::{load_json, save_json};
-use build_watcher::status::{
-    ActiveRunView, HistoryEntryView, LastBuildView, StatsResponse, StatusResponse, WatchStatus,
-};
+use build_watcher::status::{HistoryEntryView, RunConclusion, StatsResponse, StatusResponse};
 
 use super::client::{DaemonClient, open_browser};
 use super::render::flatten_rows;
+
+/// Split a comma-separated string into a trimmed, non-empty list.
+fn parse_csv(s: &str) -> Vec<String> {
+    s.split(',')
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty())
+        .collect()
+}
 
 /// What to do when the user presses a quit key.
 pub(crate) enum QuitAction {
     None,
     Quit,
     QuitAndShutdown,
+    /// Exit and run the self-updater.
+    Update,
 }
 
 // -- App state --
@@ -214,9 +222,37 @@ pub(crate) struct App {
     pub(crate) group_by: GroupBy,
     /// Repos whose branches are collapsed (hidden) in the tree view.
     pub(crate) collapsed: HashSet<String>,
+    /// Tag name of a newer release, if one was found by the background checker.
+    pub(crate) update_available: Option<String>,
 }
 
 impl App {
+    pub(crate) fn new(
+        status: StatusResponse,
+        stats: StatsResponse,
+        recent_history: Vec<HistoryEntryView>,
+        prefs: TuiPrefs,
+        bg_tx: mpsc::Sender<SseUpdate>,
+    ) -> Self {
+        Self {
+            status,
+            stats,
+            recent_history,
+            last_fetch: Instant::now(),
+            fetch_error: None,
+            sse_state: SseState::Connecting,
+            selected: 0,
+            flash: None,
+            input_mode: InputMode::Normal,
+            bg_tx,
+            sort_column: prefs.sort_column,
+            sort_ascending: prefs.sort_ascending,
+            group_by: prefs.group_by,
+            collapsed: prefs.collapsed,
+            update_available: None,
+        }
+    }
+
     pub(crate) fn active_count(&self) -> usize {
         self.status
             .watches
@@ -237,9 +273,11 @@ impl App {
 
         for w in &self.status.watches {
             if let Some(lb) = &w.last_build {
-                match lb.conclusion.as_str() {
-                    "success" => success += 1,
-                    "failure" | "timed_out" | "startup_failure" => failed += 1,
+                match &lb.conclusion {
+                    RunConclusion::Success => success += 1,
+                    RunConclusion::Failure
+                    | RunConclusion::TimedOut
+                    | RunConclusion::StartupFailure => failed += 1,
                     _ => {}
                 }
             }
@@ -273,7 +311,12 @@ impl App {
     }
 
     pub(crate) async fn resync(&mut self, daemon: &DaemonClient) {
-        match daemon.get_json::<StatusResponse>("/status").await {
+        let (status_result, stats_result, history_result) = tokio::join!(
+            daemon.get_json::<StatusResponse>("/status"),
+            daemon.get_json::<StatsResponse>("/stats"),
+            daemon.get_all_history(20),
+        );
+        match status_result {
             Ok(status) => {
                 self.status = status;
                 self.last_fetch = Instant::now();
@@ -281,10 +324,10 @@ impl App {
             }
             Err(e) => self.fetch_error = Some(e),
         }
-        if let Ok(stats) = daemon.get_json::<StatsResponse>("/stats").await {
+        if let Ok(stats) = stats_result {
             self.stats = stats;
         }
-        if let Ok(history) = daemon.get_all_history(20).await {
+        if let Ok(history) = history_result {
             self.recent_history = history;
         }
     }
@@ -483,13 +526,6 @@ impl App {
             return;
         };
 
-        let parse_csv = |s: &str| -> Vec<String> {
-            s.split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect()
-        };
-
         let branches: Vec<String> = fields
             .iter()
             .find(|f| f.label == "Default branches")
@@ -569,11 +605,7 @@ impl App {
                 });
             }
             TextAction::SetBranches { repo } => {
-                let branches: Vec<String> = input
-                    .split(',')
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect();
+                let branches = parse_csv(&input);
                 if branches.is_empty() {
                     self.set_flash("No branches specified");
                     return;
@@ -623,6 +655,7 @@ impl App {
         match code {
             KeyCode::Char('q') => return QuitAction::Quit,
             KeyCode::Char('Q') => return QuitAction::QuitAndShutdown,
+            KeyCode::Char('U') if self.update_available.is_some() => return QuitAction::Update,
             KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => {
                 return QuitAction::Quit;
             }
@@ -839,6 +872,27 @@ impl App {
                 self.group_by = self.group_by.prev();
                 self.save_prefs();
             }
+            KeyCode::Char('r') | KeyCode::Char('R') => {
+                if let Some((repo, _, Some(run_id), _)) = selected {
+                    let repo = repo.to_string();
+                    let failed_only = code == KeyCode::Char('r');
+                    let label = if failed_only {
+                        "failed jobs"
+                    } else {
+                        "all jobs"
+                    };
+                    let d = daemon.clone();
+                    self.spawn_action(
+                        format!("Rerunning {label} for {repo}…"),
+                        false,
+                        async move {
+                            d.rerun(&repo, run_id, failed_only)
+                                .await
+                                .map(|()| format!("Rerun triggered for {repo}"))
+                        },
+                    );
+                }
+            }
             KeyCode::Char('C') => {
                 self.open_config_form(daemon);
             }
@@ -936,6 +990,8 @@ pub(crate) enum SseUpdate {
         branch: Option<String>,
         entries: Vec<HistoryEntryView>,
     },
+    /// A newer release was found; tag name to display in the header.
+    UpdateAvailable(String),
 }
 
 /// Tracks the SSE connection state for header display.
@@ -947,73 +1003,6 @@ pub(crate) enum SseState {
 
 // -- Rows --
 
-fn find_watch_mut<'a>(
-    watches: &'a mut [WatchStatus],
-    repo: &str,
-    branch: &str,
-) -> Option<&'a mut WatchStatus> {
-    watches
-        .iter_mut()
-        .find(|w| w.repo == repo && w.branch == branch)
-}
-
-/// Apply a watch event to the local status snapshot.
-///
-/// Updates only watches that already exist in the snapshot; new watches
-/// appear on the next `/status` resync.
-pub(crate) fn apply_event(status: &mut StatusResponse, event: WatchEvent) {
-    match event {
-        WatchEvent::RunStarted(snap) => {
-            let Some(watch) = find_watch_mut(&mut status.watches, &snap.repo, &snap.branch) else {
-                return;
-            };
-            if !watch.active_runs.iter().any(|r| r.run_id == snap.run_id) {
-                let title = snap.display_title();
-                watch.active_runs.push(ActiveRunView {
-                    run_id: snap.run_id,
-                    status: snap.status,
-                    workflow: snap.workflow,
-                    title,
-                    event: snap.event,
-                    elapsed_secs: Some(0.0),
-                });
-            }
-        }
-        WatchEvent::RunCompleted {
-            run,
-            conclusion,
-            failing_steps,
-            ..
-        } => {
-            let Some(watch) = find_watch_mut(&mut status.watches, &run.repo, &run.branch) else {
-                return;
-            };
-            watch.active_runs.retain(|r| r.run_id != run.run_id);
-            let title = run.display_title();
-            watch.last_build = Some(LastBuildView {
-                run_id: run.run_id,
-                conclusion,
-                workflow: run.workflow,
-                title,
-                failing_steps,
-                age_secs: Some(0.0),
-            });
-        }
-        WatchEvent::StatusChanged { run, to, .. } => {
-            let Some(watch) = find_watch_mut(&mut status.watches, &run.repo, &run.branch) else {
-                return;
-            };
-            if let Some(active) = watch
-                .active_runs
-                .iter_mut()
-                .find(|r| r.run_id == run.run_id)
-            {
-                active.status = to;
-            }
-        }
-    }
-}
-
 // -- Rendering --
 
 #[cfg(test)]
@@ -1023,7 +1012,9 @@ mod tests {
         ColWidths, DisplayRow, FlatRows, flatten_rows, sorted_watches, status_emoji, status_style,
     };
     use build_watcher::events::{RunSnapshot, WatchEvent};
-    use build_watcher::status::{ActiveRunView, StatusResponse, WatchStatus};
+    use build_watcher::status::{
+        ActiveRunView, LastBuildView, RunConclusion, RunStatus, StatusResponse, WatchStatus,
+    };
     use ratatui::style::Color;
     use std::collections::HashSet;
 
@@ -1039,7 +1030,7 @@ mod tests {
             workflow: "CI".to_string(),
             title: "Fix bug".to_string(),
             event: "push".to_string(),
-            status: "queued".to_string(),
+            status: RunStatus::Queued,
         }
     }
 
@@ -1065,15 +1056,12 @@ mod tests {
     #[test]
     fn run_started_inserts_active_run() {
         let mut status = status_with(vec![watch("alice/app", "main")]);
-        apply_event(
-            &mut status,
-            WatchEvent::RunStarted(snap("alice/app", "main", 1)),
-        );
+        status.apply_event(WatchEvent::RunStarted(snap("alice/app", "main", 1)));
 
         let runs = &status.watches[0].active_runs;
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].run_id, 1);
-        assert_eq!(runs[0].status, "queued");
+        assert_eq!(runs[0].status, RunStatus::Queued);
         assert_eq!(runs[0].workflow, "CI");
         assert_eq!(runs[0].elapsed_secs, Some(0.0));
     }
@@ -1081,14 +1069,8 @@ mod tests {
     #[test]
     fn run_started_dedup_same_run_id() {
         let mut status = status_with(vec![watch("alice/app", "main")]);
-        apply_event(
-            &mut status,
-            WatchEvent::RunStarted(snap("alice/app", "main", 42)),
-        );
-        apply_event(
-            &mut status,
-            WatchEvent::RunStarted(snap("alice/app", "main", 42)),
-        );
+        status.apply_event(WatchEvent::RunStarted(snap("alice/app", "main", 42)));
+        status.apply_event(WatchEvent::RunStarted(snap("alice/app", "main", 42)));
 
         assert_eq!(status.watches[0].active_runs.len(), 1);
     }
@@ -1096,10 +1078,7 @@ mod tests {
     #[test]
     fn run_started_ignores_unknown_watch() {
         let mut status = status_with(vec![watch("alice/app", "main")]);
-        apply_event(
-            &mut status,
-            WatchEvent::RunStarted(snap("alice/app", "release", 1)),
-        );
+        status.apply_event(WatchEvent::RunStarted(snap("alice/app", "release", 1)));
 
         assert!(status.watches[0].active_runs.is_empty());
     }
@@ -1113,7 +1092,7 @@ mod tests {
             branch: "main".to_string(),
             active_runs: vec![ActiveRunView {
                 run_id: 7,
-                status: "in_progress".to_string(),
+                status: RunStatus::InProgress,
                 workflow: "CI".to_string(),
                 title: "Fix bug".to_string(),
                 event: "push".to_string(),
@@ -1123,20 +1102,17 @@ mod tests {
             muted: false,
         }]);
 
-        apply_event(
-            &mut status,
-            WatchEvent::RunCompleted {
-                run: snap("alice/app", "main", 7),
-                conclusion: "success".to_string(),
-                elapsed: Some(35.0),
-                failing_steps: None,
-            },
-        );
+        status.apply_event(WatchEvent::RunCompleted {
+            run: snap("alice/app", "main", 7),
+            conclusion: RunConclusion::Success,
+            elapsed: Some(35.0),
+            failing_steps: None,
+        });
 
         assert!(status.watches[0].active_runs.is_empty());
         let lb = status.watches[0].last_build.as_ref().unwrap();
         assert_eq!(lb.run_id, 7);
-        assert_eq!(lb.conclusion, "success");
+        assert_eq!(lb.conclusion, RunConclusion::Success);
         assert_eq!(lb.workflow, "CI");
         assert!(lb.failing_steps.is_none());
         assert_eq!(lb.age_secs, Some(0.0));
@@ -1145,15 +1121,12 @@ mod tests {
     #[test]
     fn run_completed_sets_failing_steps() {
         let mut status = status_with(vec![watch("alice/app", "main")]);
-        apply_event(
-            &mut status,
-            WatchEvent::RunCompleted {
-                run: snap("alice/app", "main", 5),
-                conclusion: "failure".to_string(),
-                elapsed: None,
-                failing_steps: Some("Build / tests".to_string()),
-            },
-        );
+        status.apply_event(WatchEvent::RunCompleted {
+            run: snap("alice/app", "main", 5),
+            conclusion: RunConclusion::Failure,
+            elapsed: None,
+            failing_steps: Some("Build / tests".to_string()),
+        });
 
         let lb = status.watches[0].last_build.as_ref().unwrap();
         assert_eq!(lb.failing_steps.as_deref(), Some("Build / tests"));
@@ -1162,15 +1135,12 @@ mod tests {
     #[test]
     fn run_completed_ignores_unknown_watch() {
         let mut status = status_with(vec![watch("alice/app", "main")]);
-        apply_event(
-            &mut status,
-            WatchEvent::RunCompleted {
-                run: snap("other/repo", "main", 1),
-                conclusion: "success".to_string(),
-                elapsed: None,
-                failing_steps: None,
-            },
-        );
+        status.apply_event(WatchEvent::RunCompleted {
+            run: snap("other/repo", "main", 1),
+            conclusion: RunConclusion::Success,
+            elapsed: None,
+            failing_steps: None,
+        });
 
         assert!(status.watches[0].last_build.is_none());
     }
@@ -1184,7 +1154,7 @@ mod tests {
             branch: "main".to_string(),
             active_runs: vec![ActiveRunView {
                 run_id: 3,
-                status: "queued".to_string(),
+                status: RunStatus::Queued,
                 workflow: "CI".to_string(),
                 title: "Fix bug".to_string(),
                 event: "push".to_string(),
@@ -1194,16 +1164,16 @@ mod tests {
             muted: false,
         }]);
 
-        apply_event(
-            &mut status,
-            WatchEvent::StatusChanged {
-                run: snap("alice/app", "main", 3),
-                from: "queued".to_string(),
-                to: "in_progress".to_string(),
-            },
-        );
+        status.apply_event(WatchEvent::StatusChanged {
+            run: snap("alice/app", "main", 3),
+            from: RunStatus::Queued,
+            to: RunStatus::InProgress,
+        });
 
-        assert_eq!(status.watches[0].active_runs[0].status, "in_progress");
+        assert_eq!(
+            status.watches[0].active_runs[0].status,
+            RunStatus::InProgress
+        );
     }
 
     #[test]
@@ -1213,7 +1183,7 @@ mod tests {
             branch: "main".to_string(),
             active_runs: vec![ActiveRunView {
                 run_id: 3,
-                status: "queued".to_string(),
+                status: RunStatus::Queued,
                 workflow: "CI".to_string(),
                 title: "Fix bug".to_string(),
                 event: "push".to_string(),
@@ -1223,29 +1193,23 @@ mod tests {
             muted: false,
         }]);
 
-        apply_event(
-            &mut status,
-            WatchEvent::StatusChanged {
-                run: snap("alice/app", "main", 999),
-                from: "queued".to_string(),
-                to: "in_progress".to_string(),
-            },
-        );
+        status.apply_event(WatchEvent::StatusChanged {
+            run: snap("alice/app", "main", 999),
+            from: RunStatus::Queued,
+            to: RunStatus::InProgress,
+        });
 
-        assert_eq!(status.watches[0].active_runs[0].status, "queued");
+        assert_eq!(status.watches[0].active_runs[0].status, RunStatus::Queued);
     }
 
     #[test]
     fn status_changed_ignores_unknown_watch() {
         let mut status = status_with(vec![watch("alice/app", "main")]);
-        apply_event(
-            &mut status,
-            WatchEvent::StatusChanged {
-                run: snap("other/repo", "main", 1),
-                from: "queued".to_string(),
-                to: "in_progress".to_string(),
-            },
-        );
+        status.apply_event(WatchEvent::StatusChanged {
+            run: snap("other/repo", "main", 1),
+            from: RunStatus::Queued,
+            to: RunStatus::InProgress,
+        });
         // No panic, no state change.
         assert!(status.watches[0].active_runs.is_empty());
     }
@@ -1279,7 +1243,7 @@ mod tests {
             active_runs: vec![],
             last_build: Some(LastBuildView {
                 run_id: 1,
-                conclusion: "failure".to_string(),
+                conclusion: RunConclusion::Failure,
                 workflow: "CI".to_string(),
                 title: "Fix".to_string(),
                 failing_steps: Some("Build / tests".to_string()),
@@ -1304,7 +1268,7 @@ mod tests {
                 active_runs: vec![],
                 last_build: Some(LastBuildView {
                     run_id: 1,
-                    conclusion: "failure".to_string(),
+                    conclusion: RunConclusion::Failure,
                     workflow: "CI".to_string(),
                     title: "Fix".to_string(),
                     failing_steps: Some("Build / tests".to_string()),
@@ -1334,7 +1298,7 @@ mod tests {
             active_runs: vec![],
             last_build: Some(LastBuildView {
                 run_id: 1,
-                conclusion: "success".to_string(),
+                conclusion: RunConclusion::Success,
                 workflow: "CI".to_string(),
                 title: "Fix".to_string(),
                 failing_steps: None,
@@ -1398,7 +1362,7 @@ mod tests {
             branch: "main".to_string(),
             active_runs: vec![ActiveRunView {
                 run_id: 42,
-                status: "in_progress".to_string(),
+                status: RunStatus::InProgress,
                 workflow: "CI".to_string(),
                 title: "Fix".to_string(),
                 event: "push".to_string(),
@@ -1422,15 +1386,12 @@ mod tests {
         pr_snap.title = "Add feature".to_string();
 
         let mut status = status_with(vec![watch("alice/app", "main")]);
-        apply_event(
-            &mut status,
-            WatchEvent::RunCompleted {
-                run: pr_snap,
-                conclusion: "success".to_string(),
-                elapsed: None,
-                failing_steps: None,
-            },
-        );
+        status.apply_event(WatchEvent::RunCompleted {
+            run: pr_snap,
+            conclusion: RunConclusion::Success,
+            elapsed: None,
+            failing_steps: None,
+        });
 
         let lb = status.watches[0].last_build.as_ref().unwrap();
         assert_eq!(lb.title, "PR: Add feature");
@@ -1453,14 +1414,19 @@ mod tests {
 
     // -- sorted_watches --
 
-    fn watch_with_build(repo: &str, branch: &str, conclusion: &str, age: f64) -> WatchStatus {
+    fn watch_with_build(
+        repo: &str,
+        branch: &str,
+        conclusion: RunConclusion,
+        age: f64,
+    ) -> WatchStatus {
         WatchStatus {
             repo: repo.to_string(),
             branch: branch.to_string(),
             active_runs: vec![],
             last_build: Some(LastBuildView {
                 run_id: 1,
-                conclusion: conclusion.to_string(),
+                conclusion,
                 workflow: "CI".to_string(),
                 title: "Fix".to_string(),
                 failing_steps: None,
@@ -1470,13 +1436,13 @@ mod tests {
         }
     }
 
-    fn watch_with_active(repo: &str, branch: &str, status: &str, elapsed: f64) -> WatchStatus {
+    fn watch_with_active(repo: &str, branch: &str, status: RunStatus, elapsed: f64) -> WatchStatus {
         WatchStatus {
             repo: repo.to_string(),
             branch: branch.to_string(),
             active_runs: vec![ActiveRunView {
                 run_id: 1,
-                status: status.to_string(),
+                status,
                 workflow: "Deploy".to_string(),
                 title: "Ship".to_string(),
                 event: "push".to_string(),
@@ -1490,8 +1456,8 @@ mod tests {
     #[test]
     fn sorted_watches_by_repo() {
         let watches = vec![
-            watch_with_build("zoo/app", "main", "success", 10.0),
-            watch_with_build("alice/lib", "main", "failure", 20.0),
+            watch_with_build("zoo/app", "main", RunConclusion::Success, 10.0),
+            watch_with_build("alice/lib", "main", RunConclusion::Failure, 20.0),
         ];
         let sorted = sorted_watches(&watches, SortColumn::Repo, true, GroupBy::None);
         assert_eq!(sorted[0].repo, "alice/lib");
@@ -1504,9 +1470,9 @@ mod tests {
     #[test]
     fn sorted_watches_by_branch() {
         let watches = vec![
-            watch_with_build("alice/app", "release", "success", 10.0),
-            watch_with_build("alice/app", "develop", "success", 20.0),
-            watch_with_build("alice/app", "main", "success", 30.0),
+            watch_with_build("alice/app", "release", RunConclusion::Success, 10.0),
+            watch_with_build("alice/app", "develop", RunConclusion::Success, 20.0),
+            watch_with_build("alice/app", "main", RunConclusion::Success, 30.0),
         ];
         let sorted = sorted_watches(&watches, SortColumn::Branch, true, GroupBy::None);
         assert_eq!(sorted[0].branch, "develop");
@@ -1517,8 +1483,8 @@ mod tests {
     #[test]
     fn sorted_watches_by_status_active_before_completed() {
         let watches = vec![
-            watch_with_build("alice/app", "main", "success", 10.0),
-            watch_with_active("bob/lib", "main", "in_progress", 5.0),
+            watch_with_build("alice/app", "main", RunConclusion::Success, 10.0),
+            watch_with_active("bob/lib", "main", RunStatus::InProgress, 5.0),
             watch("carol/api", "main"),
         ];
         let sorted = sorted_watches(&watches, SortColumn::Status, true, GroupBy::None);
@@ -1531,8 +1497,8 @@ mod tests {
     #[test]
     fn sorted_watches_by_workflow() {
         let watches = vec![
-            watch_with_build("alice/app", "main", "success", 10.0), // CI
-            watch_with_active("bob/lib", "main", "in_progress", 5.0), // Deploy
+            watch_with_build("alice/app", "main", RunConclusion::Success, 10.0), // CI
+            watch_with_active("bob/lib", "main", RunStatus::InProgress, 5.0),    // Deploy
         ];
         let sorted = sorted_watches(&watches, SortColumn::Workflow, true, GroupBy::None);
         assert_eq!(sorted[0].repo, "alice/app"); // CI < Deploy
@@ -1542,9 +1508,9 @@ mod tests {
     #[test]
     fn sorted_watches_by_age() {
         let watches = vec![
-            watch_with_build("alice/app", "main", "success", 100.0),
-            watch_with_build("bob/lib", "main", "failure", 10.0),
-            watch_with_active("carol/api", "main", "in_progress", 5.0),
+            watch_with_build("alice/app", "main", RunConclusion::Success, 100.0),
+            watch_with_build("bob/lib", "main", RunConclusion::Failure, 10.0),
+            watch_with_active("carol/api", "main", RunStatus::InProgress, 5.0),
         ];
         let sorted = sorted_watches(&watches, SortColumn::Age, true, GroupBy::None);
         assert_eq!(sorted[0].repo, "carol/api"); // 5s elapsed
@@ -1555,8 +1521,8 @@ mod tests {
     #[test]
     fn sorted_watches_descending_reverses() {
         let watches = vec![
-            watch_with_build("alice/app", "main", "success", 10.0),
-            watch_with_build("bob/lib", "main", "failure", 100.0),
+            watch_with_build("alice/app", "main", RunConclusion::Success, 10.0),
+            watch_with_build("bob/lib", "main", RunConclusion::Failure, 100.0),
         ];
         let asc = sorted_watches(&watches, SortColumn::Age, true, GroupBy::None);
         let desc = sorted_watches(&watches, SortColumn::Age, false, GroupBy::None);
@@ -1598,9 +1564,9 @@ mod tests {
     #[test]
     fn flatten_rows_group_by_org() {
         let watches = vec![
-            watch_with_build("alice/app", "main", "success", 10.0),
-            watch_with_build("alice/lib", "main", "success", 20.0),
-            watch_with_build("bob/api", "main", "failure", 30.0),
+            watch_with_build("alice/app", "main", RunConclusion::Success, 10.0),
+            watch_with_build("alice/lib", "main", RunConclusion::Success, 20.0),
+            watch_with_build("bob/api", "main", RunConclusion::Failure, 30.0),
         ];
         let flat = flatten_rows(&watches, GroupBy::Org, &no_collapsed());
         assert_eq!(group_header_labels(&flat), vec!["alice", "bob"]);
@@ -1609,9 +1575,9 @@ mod tests {
     #[test]
     fn flatten_rows_group_by_branch() {
         let watches = vec![
-            watch_with_build("alice/app", "main", "success", 10.0),
-            watch_with_build("alice/app", "develop", "success", 20.0),
-            watch_with_build("bob/lib", "main", "failure", 30.0),
+            watch_with_build("alice/app", "main", RunConclusion::Success, 10.0),
+            watch_with_build("alice/app", "develop", RunConclusion::Success, 20.0),
+            watch_with_build("bob/lib", "main", RunConclusion::Failure, 30.0),
         ];
         let sorted = sorted_watches(&watches, SortColumn::Branch, true, GroupBy::Branch);
         let flat = flatten_rows(&sorted, GroupBy::Branch, &no_collapsed());
@@ -1622,9 +1588,9 @@ mod tests {
     #[test]
     fn flatten_rows_group_by_status() {
         let watches = vec![
-            watch_with_build("alice/app", "main", "success", 10.0),
-            watch_with_build("bob/lib", "main", "failure", 20.0),
-            watch_with_active("carol/api", "main", "in_progress", 5.0),
+            watch_with_build("alice/app", "main", RunConclusion::Success, 10.0),
+            watch_with_build("bob/lib", "main", RunConclusion::Failure, 20.0),
+            watch_with_active("carol/api", "main", RunStatus::InProgress, 5.0),
         ];
         let sorted = sorted_watches(&watches, SortColumn::Status, true, GroupBy::None);
         let flat = flatten_rows(&sorted, GroupBy::Status, &no_collapsed());
@@ -1638,8 +1604,8 @@ mod tests {
     #[test]
     fn flatten_rows_group_by_none() {
         let watches = vec![
-            watch_with_build("alice/app", "main", "success", 10.0),
-            watch_with_build("bob/lib", "main", "failure", 20.0),
+            watch_with_build("alice/app", "main", RunConclusion::Success, 10.0),
+            watch_with_build("bob/lib", "main", RunConclusion::Failure, 20.0),
         ];
         let flat = flatten_rows(&watches, GroupBy::None, &no_collapsed());
         assert_eq!(count_group_headers(&flat), 0);
@@ -1650,9 +1616,9 @@ mod tests {
     #[test]
     fn flatten_rows_group_by_workflow() {
         let watches = vec![
-            watch_with_build("alice/app", "main", "success", 10.0), // CI
-            watch_with_active("bob/lib", "main", "in_progress", 5.0), // Deploy
-            watch("carol/api", "main"),                             // no workflow
+            watch_with_build("alice/app", "main", RunConclusion::Success, 10.0), // CI
+            watch_with_active("bob/lib", "main", RunStatus::InProgress, 5.0),    // Deploy
+            watch("carol/api", "main"),                                          // no workflow
         ];
         let flat = flatten_rows(&watches, GroupBy::Workflow, &no_collapsed());
         let labels = group_header_labels(&flat);

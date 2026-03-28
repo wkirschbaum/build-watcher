@@ -26,6 +26,7 @@ const MAX_FALLBACK_CALLS: usize = 10;
 /// Reason a `cancellable_sleep` call returned.
 enum WakeReason {
     Elapsed,
+    /// Config changed (e.g. new watch added) — treated identically to `Elapsed`.
     ConfigChanged,
     Cancelled,
 }
@@ -115,7 +116,6 @@ impl RepoPoller {
     /// Main poller loop.
     #[tracing::instrument(skip_all, fields(repo = %self.repo))]
     pub(super) async fn run(mut self) {
-        let mut last_new_run_check: Option<Instant> = None;
         let mut last_rate_limit_refresh: Option<Instant> = None;
 
         loop {
@@ -149,10 +149,7 @@ impl RepoPoller {
 
             match self.cancellable_sleep(Duration::from_secs(delay)).await {
                 WakeReason::Cancelled => return,
-                WakeReason::ConfigChanged => {
-                    last_new_run_check = None;
-                }
-                WakeReason::Elapsed => {}
+                WakeReason::ConfigChanged | WakeReason::Elapsed => {}
             }
 
             if !self.has_any_watches().await {
@@ -160,23 +157,12 @@ impl RepoPoller {
                 return;
             }
 
-            if has_active {
-                self.poll_active_runs_batch().await;
-            }
-
-            // Check for new runs at idle_secs intervals (or active_secs when builds are running,
-            // so new pushes during active builds are detected promptly).
-            let new_run_interval = if has_active {
-                active_secs.max(idle_secs / 2)
-            } else {
-                idle_secs
-            };
-            let due = last_new_run_check
-                .is_none_or(|t| t.elapsed() >= Duration::from_secs(new_run_interval));
-            if due {
-                self.check_for_new_runs_repo_wide().await;
-                last_new_run_check = Some(Instant::now());
-            }
+            // Always run both: poll_active_runs_batch returns early when there are no
+            // tracked active runs, so calling it unconditionally is cheap.
+            // Running check_for_new_runs_repo_wide every cycle ensures new builds are
+            // detected within one sleep interval regardless of active state.
+            self.poll_active_runs_batch().await;
+            self.check_for_new_runs_repo_wide().await;
         }
     }
 
@@ -318,7 +304,7 @@ impl RepoPoller {
 
                 self.events.emit(WatchEvent::RunCompleted {
                     run: RunSnapshot::from_run_info(run, &self.repo, &key.branch),
-                    conclusion: run.conclusion.clone(),
+                    conclusion: run.run_conclusion(),
                     elapsed,
                     failing_steps: failing_steps.clone(),
                 });
@@ -438,7 +424,7 @@ impl RepoPoller {
                     );
                     self.events.emit(WatchEvent::RunCompleted {
                         run: snapshot,
-                        conclusion: run.conclusion.clone(),
+                        conclusion: run.run_conclusion(),
                         elapsed: None,
                         failing_steps: failing_steps.clone(),
                     });
@@ -462,12 +448,14 @@ impl RepoPoller {
                     {
                         lb.failing_steps = steps.clone();
                     }
+                    // Bump the high-water mark for ALL unseen runs (including filtered-out
+                    // ones) so ignored workflows don't re-trigger on the next poll.
                     if let Some(max_id) = unseen.iter().map(|r| r.id).max() {
                         entry.last_seen_run_id = entry.last_seen_run_id.max(max_id);
                     }
+                    any_changed = true;
                 }
             }
-            any_changed = true;
 
             // Push completed new runs into history.
             let now_unix = unix_now();

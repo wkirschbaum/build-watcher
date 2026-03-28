@@ -33,6 +33,7 @@ chrono = "0.4"
 ratatui = "0.29"
 crossterm = { version = "0.28", features = ["event-stream"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+self_update = { version = "0.41", default-features = false, features = ["archive-tar", "compression-flate2", "rustls"] }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::sync::broadcast;
@@ -5,6 +6,7 @@ use tokio::sync::broadcast;
 use serde::{Deserialize, Serialize};
 
 use crate::github::RunInfo;
+use crate::status::{RunConclusion, RunStatus};
 
 const CHANNEL_CAPACITY: usize = 256;
 
@@ -17,10 +19,10 @@ pub struct RunSnapshot {
     pub workflow: String,
     pub title: String,
     pub event: String,
-    /// GitHub run status at the moment this snapshot was taken (e.g. `"queued"`, `"in_progress"`).
+    /// GitHub run status at the moment this snapshot was taken.
     /// Allows TUI clients to populate `ActiveRunView.status` from a `RunStarted` event
     /// without re-fetching `/status`.
-    pub status: String,
+    pub status: RunStatus,
 }
 
 impl RunSnapshot {
@@ -58,7 +60,7 @@ pub enum WatchEvent {
     /// A build completed (success, failure, cancelled, etc.).
     RunCompleted {
         run: RunSnapshot,
-        conclusion: String,
+        conclusion: RunConclusion,
         /// Elapsed seconds from when the poller first saw the run until completion.
         /// `None` for runs that were already completed when first detected.
         elapsed: Option<f64>,
@@ -68,8 +70,8 @@ pub enum WatchEvent {
     /// A build's status changed (e.g. queued -> `in_progress`).
     StatusChanged {
         run: RunSnapshot,
-        from: String,
-        to: String,
+        from: RunStatus,
+        to: RunStatus,
     },
 }
 
@@ -79,8 +81,6 @@ pub struct EventBus {
     tx: broadcast::Sender<WatchEvent>,
     dropped: Arc<AtomicU64>,
 }
-
-use std::sync::Arc;
 
 impl EventBus {
     pub fn new() -> Self {
@@ -125,14 +125,14 @@ mod tests {
             workflow: "CI".to_string(),
             title: "Fix login bug".to_string(),
             event: "push".to_string(),
-            status: "in_progress".to_string(),
+            status: RunStatus::InProgress,
         }
     }
 
-    fn completed(conclusion: &str) -> WatchEvent {
+    fn completed(conclusion: RunConclusion) -> WatchEvent {
         WatchEvent::RunCompleted {
             run: snap(),
-            conclusion: conclusion.to_string(),
+            conclusion,
             elapsed: None,
             failing_steps: None,
         }
@@ -154,7 +154,7 @@ mod tests {
     fn from_run_info_copies_fields() {
         let run = crate::github::RunInfo {
             id: 99,
-            status: "in_progress".to_string(),
+            status: RunStatus::InProgress,
             conclusion: String::new(),
             title: "Update deps".to_string(),
             workflow: "Deploy".to_string(),
@@ -169,17 +169,17 @@ mod tests {
         assert_eq!(s.workflow, "Deploy");
         assert_eq!(s.title, "Update deps");
         assert_eq!(s.event, "pull_request");
-        assert_eq!(s.status, "in_progress");
+        assert_eq!(s.status, RunStatus::InProgress);
     }
 
     #[test]
     fn elapsed_serializes_as_float() {
-        let json = serde_json::to_value(completed("success")).unwrap();
+        let json = serde_json::to_value(completed(RunConclusion::Success)).unwrap();
         assert_eq!(json["RunCompleted"]["elapsed"], serde_json::Value::Null);
 
         let event = WatchEvent::RunCompleted {
             run: snap(),
-            conclusion: "success".to_string(),
+            conclusion: RunConclusion::Success,
             elapsed: Some(134.5),
             failing_steps: None,
         };
@@ -191,7 +191,7 @@ mod tests {
     fn elapsed_round_trips_through_json() {
         let event = WatchEvent::RunCompleted {
             run: snap(),
-            conclusion: "failure".to_string(),
+            conclusion: RunConclusion::Failure,
             elapsed: Some(42.0),
             failing_steps: Some("Build / Run tests".to_string()),
         };
@@ -206,7 +206,7 @@ mod tests {
             } => {
                 assert_eq!(elapsed, Some(42.0));
                 assert_eq!(failing_steps.as_deref(), Some("Build / Run tests"));
-                assert_eq!(conclusion, "failure");
+                assert_eq!(conclusion, RunConclusion::Failure);
             }
             other => panic!("expected RunCompleted, got {other:?}"),
         }
