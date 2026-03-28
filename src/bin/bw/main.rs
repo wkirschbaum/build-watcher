@@ -102,14 +102,14 @@ fn reset_state() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Download and execute the uninstall script from GitHub.
-fn uninstall() -> Result<(), Box<dyn std::error::Error>> {
-    let url = "https://raw.githubusercontent.com/wkirschbaum/build-watcher/main/uninstall.sh";
+/// Download and execute a script from GitHub.
+fn run_remote_script(script: &str, label: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let url = format!("https://raw.githubusercontent.com/wkirschbaum/build-watcher/main/{script}");
     let status = std::process::Command::new("bash")
         .args(["-c", &format!("curl -fsSL '{url}' | bash")])
         .status()?;
     if !status.success() {
-        return Err("uninstall failed".into());
+        return Err(format!("{label} failed").into());
     }
     Ok(())
 }
@@ -120,7 +120,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return reset_state();
     }
     if std::env::args().any(|a| a == "--uninstall") {
-        return uninstall();
+        return run_remote_script("uninstall.sh", "uninstall");
+    }
+    if std::env::args().any(|a| a == "--update") {
+        return run_remote_script("install.sh", "update");
     }
 
     let port = discover_or_start_daemon()?;
