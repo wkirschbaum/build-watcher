@@ -11,14 +11,12 @@ use build_watcher::format;
 use build_watcher::github::{validate_branch, validate_repo};
 use build_watcher::history::history_for;
 use build_watcher::rate_limiter::{MIN_ACTIVE_SECS, MIN_IDLE_SECS, compute_intervals};
-use build_watcher::watcher::{
-    PauseState, RateLimitState, SharedConfig, WatcherHandle, Watches, count_api_calls, is_paused,
-    last_failed_build,
-};
+use build_watcher::watcher::{count_api_calls, is_paused, last_failed_build};
 
+use super::DaemonState;
 use super::actions::{
     apply_levels, apply_pause, apply_quiet_hours, do_configure_branches, do_stop_watches,
-    do_watch_builds, persist_config, validate_hhmm,
+    do_watch_builds, format_outcomes, persist_config, validate_hhmm,
 };
 use super::build_watch_snapshot;
 use super::schema::{
@@ -30,32 +28,15 @@ use super::schema::{
 #[derive(Clone)]
 pub struct BuildWatcher {
     tool_router: ToolRouter<Self>,
-    watches: Watches,
-    config: SharedConfig,
-    handle: WatcherHandle,
-    pause: PauseState,
-    rate_limit: RateLimitState,
-    started_at: std::time::Instant,
+    state: DaemonState,
 }
 
 #[tool_router]
 impl BuildWatcher {
-    pub(crate) fn new(
-        watches: Watches,
-        config: SharedConfig,
-        handle: WatcherHandle,
-        pause: PauseState,
-        rate_limit: RateLimitState,
-        started_at: std::time::Instant,
-    ) -> Self {
+    pub(crate) fn new(state: DaemonState) -> Self {
         Self {
             tool_router: Self::tool_router(),
-            watches,
-            config,
-            handle,
-            pause,
-            rate_limit,
-            started_at,
+            state,
         }
     }
 
@@ -72,17 +53,10 @@ impl BuildWatcher {
             }
         }
 
-        let results = do_watch_builds(
-            &self.watches,
-            &self.config,
-            &self.handle,
-            &self.rate_limit,
-            &params.repos,
-        )
-        .await;
+        let results = do_watch_builds(&self.state, &params.repos).await;
 
         Ok(CallToolResult::success(vec![Content::text(
-            results.join("\n\n"),
+            format_outcomes(&results, "\n\n"),
         )]))
     }
 
@@ -93,17 +67,16 @@ impl BuildWatcher {
         &self,
         Parameters(params): Parameters<ReposParams>,
     ) -> Result<CallToolResult, McpError> {
-        let results =
-            do_stop_watches(&self.watches, &self.config, &self.handle, &params.repos).await;
+        let results = do_stop_watches(&self.state, &params.repos).await;
         Ok(CallToolResult::success(vec![Content::text(
-            results.join("\n"),
+            format_outcomes(&results, "\n"),
         )]))
     }
 
     #[tool(description = "List all currently watched builds and their status")]
     async fn list_watches(&self) -> Result<CallToolResult, McpError> {
-        let paused = is_paused(&self.pause).await;
-        let watches = self.watches.lock().await;
+        let paused = is_paused(&self.state.pause).await;
+        let watches = self.state.watches.lock().await;
         if watches.is_empty() {
             return Ok(CallToolResult::success(vec![Content::text(
                 "No active watches",
@@ -198,7 +171,7 @@ impl BuildWatcher {
                 }
 
                 let (snapshot, mut msgs) = {
-                    let mut config = self.config.lock().await;
+                    let mut config = self.state.config.lock().await;
                     let mut msgs = Vec::new();
                     config.default_branches = params.branches;
                     msgs.push(format!(
@@ -234,17 +207,9 @@ impl BuildWatcher {
                 if let Err(e) = validate_repo(&repo) {
                     return Ok(CallToolResult::error(vec![Content::text(e)]));
                 }
-                let results = do_configure_branches(
-                    &self.watches,
-                    &self.config,
-                    &self.handle,
-                    &self.rate_limit,
-                    &repo,
-                    params.branches,
-                )
-                .await;
+                let results = do_configure_branches(&self.state, &repo, params.branches).await;
                 Ok(CallToolResult::success(vec![Content::text(
-                    results.join("\n"),
+                    format_outcomes(&results, "\n"),
                 )]))
             }
         }
@@ -257,9 +222,9 @@ impl BuildWatcher {
     async fn get_stats(&self) -> Result<CallToolResult, McpError> {
         // Lock order: rate_limit → watches → pause → config (matches poller order).
         let now = unix_now();
-        let rl = self.rate_limit.lock().await;
+        let rl = self.state.rate_limit.lock().await;
         let (watches_snap, api_calls) = {
-            let w = self.watches.lock().await;
+            let w = self.state.watches.lock().await;
             let snap: Vec<(String, usize)> = w
                 .iter()
                 .map(|(k, e)| (k.to_string(), e.active_runs.len()))
@@ -267,14 +232,14 @@ impl BuildWatcher {
             let calls = count_api_calls(&w);
             (snap, calls)
         };
-        let aggression = self.config.lock().await.poll_aggression;
+        let aggression = self.state.config.lock().await.poll_aggression;
         let (active_secs, idle_secs) =
             compute_intervals(rl.as_ref(), api_calls, now, aggression, 0);
         let throttled = active_secs > MIN_ACTIVE_SECS || idle_secs > MIN_IDLE_SECS;
 
-        let paused = is_paused(&self.pause).await;
+        let paused = is_paused(&self.state.pause).await;
         let (quiet_hours_label, quiet_active, notif_levels, ignored_workflows, repo_count) = {
-            let cfg = self.config.lock().await;
+            let cfg = self.state.config.lock().await;
             let label = cfg.quiet_hours.as_ref().map_or_else(
                 || "off".to_string(),
                 |qh| format!("{}–{}", qh.start, qh.end),
@@ -286,7 +251,7 @@ impl BuildWatcher {
             (label, active, levels, ignored, repos)
         };
 
-        let uptime = format::seconds(self.started_at.elapsed().as_secs());
+        let uptime = format::seconds(self.state.started_at.elapsed().as_secs());
         let mut lines = Vec::new();
 
         lines.push(format!("Uptime    : {uptime}"));
@@ -349,7 +314,7 @@ impl BuildWatcher {
             ));
         }
 
-        let dropped = self.handle.events.dropped_count();
+        let dropped = self.state.handle.events.dropped_count();
         if dropped > 0 {
             lines.push(format!("  Dropped events   : {dropped}"));
         }
@@ -386,7 +351,7 @@ impl BuildWatcher {
         }
 
         let (snapshot, mut msgs) = {
-            let mut config = self.config.lock().await;
+            let mut config = self.state.config.lock().await;
             let Some(rc) = config.repos.get_mut(&params.repo) else {
                 return Ok(CallToolResult::error(vec![Content::text(format!(
                     "{} is not being watched — use watch_builds first",
@@ -438,7 +403,7 @@ impl BuildWatcher {
         }
 
         let (snapshot, mut msgs) = {
-            let mut config = self.config.lock().await;
+            let mut config = self.state.config.lock().await;
 
             let mut added = Vec::new();
             for w in &params.add {
@@ -504,7 +469,7 @@ impl BuildWatcher {
             id
         } else {
             let in_memory = {
-                let watches = self.watches.lock().await;
+                let watches = self.state.watches.lock().await;
                 last_failed_build(&watches, &params.repo).map(|(key, build)| {
                     tracing::info!(
                         repo = params.repo,
@@ -524,6 +489,7 @@ impl BuildWatcher {
                     "No in-memory failed build; querying GitHub history"
                 );
                 match self
+                    .state
                     .handle
                     .github
                     .run_list_history(&params.repo, None, 20)
@@ -555,6 +521,7 @@ impl BuildWatcher {
         };
 
         match self
+            .state
             .handle
             .github
             .run_rerun(&params.repo, run_id, params.failed_only)
@@ -593,7 +560,7 @@ impl BuildWatcher {
 
         let limit = params.limit.unwrap_or(10).min(50) as usize;
         let entries = {
-            let hist = self.handle.history.lock().await;
+            let hist = self.state.handle.history.lock().await;
             history_for(&hist, &params.repo, params.branch.as_deref(), limit)
         };
 
@@ -732,13 +699,13 @@ impl BuildWatcher {
 
         // Pause / resume
         if let Some(pause) = params.pause {
-            msgs.push(apply_pause(&self.pause, pause, params.pause_minutes).await);
+            msgs.push(apply_pause(&self.state.pause, pause, params.pause_minutes).await);
         }
 
         // Quiet hours + notification levels (both touch config)
         if has_levels || has_quiet {
             let (snapshot, scope, effective) = {
-                let mut config = self.config.lock().await;
+                let mut config = self.state.config.lock().await;
 
                 // Quiet hours
                 msgs.extend(apply_quiet_hours(
@@ -835,11 +802,11 @@ impl BuildWatcher {
             }
         };
         let snapshot = {
-            let mut cfg = self.config.lock().await;
+            let mut cfg = self.state.config.lock().await;
             cfg.poll_aggression = level;
             cfg.clone()
         };
-        self.handle.config_changed.notify_waiters();
+        self.state.handle.config_changed.notify_waiters();
         if let Err(w) = persist_config(snapshot).await {
             return Ok(CallToolResult::success(vec![Content::text(w)]));
         }

@@ -37,7 +37,7 @@ pub const DEFAULT_PORT: u16 = 8417;
 
 /// Shared state for the HTTP routes.
 #[derive(Clone)]
-pub(crate) struct AppState {
+pub(crate) struct DaemonState {
     pub watches: Watches,
     pub config: SharedConfig,
     pub handle: WatcherHandle,
@@ -127,29 +127,45 @@ pub(crate) fn json_error(msg: impl std::fmt::Display) -> axum::response::Respons
     axum::Json(serde_json::json!({ "error": msg.to_string() })).into_response()
 }
 
-/// Bind to the preferred port, trying up to 9 consecutive ports on conflict.
-async fn bind_with_fallback(preferred: u16) -> Result<tokio::net::TcpListener, ServerError> {
-    let last = preferred.saturating_add(9);
-    for port in preferred..=last {
-        match tokio::net::TcpListener::bind(format!("127.0.0.1:{port}")).await {
-            Ok(l) => return Ok(l),
-            Err(e) if port == last => return Err(e.into()),
-            Err(_) => {}
-        }
+/// Acquire an exclusive lock file to prevent multiple daemon instances.
+///
+/// The kernel releases the lock automatically when the process exits (even on
+/// SIGKILL), so there are no stale-lock issues. The returned `File` handle must
+/// be kept alive for the lifetime of the server.
+fn acquire_instance_lock() -> Result<std::fs::File, ServerError> {
+    use std::io::Write;
+    use std::os::unix::io::AsRawFd;
+
+    let lock_path = state_dir().join("daemon.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&lock_path)
+        .map_err(|e| {
+            ServerError::Other(format!(
+                "Failed to open lock file {}: {e}",
+                lock_path.display()
+            ))
+        })?;
+
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc != 0 {
+        return Err(ServerError::Other(
+            "Another build-watcher instance is already running. \
+             Stop it first, or set BUILD_WATCHER_PORT to run a separate instance."
+                .to_string(),
+        ));
     }
-    unreachable!("preferred..=last is never empty")
+
+    // Write our PID for observability (not used for locking).
+    let _ = (&file).write_all(std::process::id().to_string().as_bytes());
+
+    Ok(file)
 }
 
 /// Build the axum router with the MCP `StreamableHttpService` and SSE/status routes.
-fn build_router(
-    watches: Watches,
-    config: SharedConfig,
-    handle: WatcherHandle,
-    pause: PauseState,
-    rate_limit: RateLimitState,
-    started_at: std::time::Instant,
-    ct: &CancellationToken,
-) -> axum::Router {
+fn build_router(state: DaemonState, ct: &CancellationToken) -> axum::Router {
     let http_config = StreamableHttpServerConfig {
         stateful_mode: false,
         json_response: true,
@@ -158,27 +174,10 @@ fn build_router(
         ..Default::default()
     };
 
-    let app_state = AppState {
-        watches: watches.clone(),
-        config: config.clone(),
-        handle: handle.clone(),
-        pause: pause.clone(),
-        rate_limit: rate_limit.clone(),
-        started_at,
-    };
-
+    let mcp_state = state.clone();
     let service: StreamableHttpService<BuildWatcher, LocalSessionManager> =
         StreamableHttpService::new(
-            move || {
-                Ok(BuildWatcher::new(
-                    watches.clone(),
-                    config.clone(),
-                    handle.clone(),
-                    pause.clone(),
-                    rate_limit.clone(),
-                    started_at,
-                ))
-            },
+            move || Ok(BuildWatcher::new(mcp_state.clone())),
             Arc::default(),
             http_config,
         );
@@ -203,7 +202,7 @@ fn build_router(
         .route("/history", get(rest::history_handler))
         .route("/history/all", get(rest::history_all_handler))
         .route("/shutdown", axum::routing::post(rest::shutdown_handler))
-        .with_state(app_state)
+        .with_state(state)
         .nest_service("/mcp", service)
 }
 
@@ -211,45 +210,30 @@ fn build_router(
 ///
 /// Binds to the configured port, writes a port-discovery file, serves until
 /// ctrl-c, then shuts down pollers and persists state.
-pub async fn serve(
-    watches: Watches,
-    config: SharedConfig,
-    handle: WatcherHandle,
-    pause: PauseState,
-    rate_limit: RateLimitState,
-    ct: CancellationToken,
-) -> Result<(), ServerError> {
-    let started_at = std::time::Instant::now();
+pub async fn serve(state: DaemonState, ct: CancellationToken) -> Result<(), ServerError> {
+    // Acquire instance lock BEFORE binding the port so we get a clear error
+    // instead of a confusing "address in use" when another instance is running.
+    let _lock = acquire_instance_lock()?;
+
     let port: u16 = std::env::var("BUILD_WATCHER_PORT")
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(DEFAULT_PORT);
 
-    let router = build_router(
-        watches.clone(),
-        config,
-        handle.clone(),
-        pause,
-        rate_limit,
-        started_at,
-        &ct,
-    );
-    let listener = bind_with_fallback(port).await?;
-    let bound_port = listener.local_addr()?.port();
+    let router = build_router(state.clone(), &ct);
+    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{port}"))
+        .await
+        .map_err(ServerError::Io)?;
 
     let port_file = state_dir().join("port");
-    std::fs::write(&port_file, bound_port.to_string()).map_err(|e| {
+    std::fs::write(&port_file, port.to_string()).map_err(|e| {
         ServerError::Other(format!(
             "Failed to write port file {}: {e}",
             port_file.display()
         ))
     })?;
 
-    if bound_port != port {
-        tracing::warn!("Port {port} was occupied, using port {bound_port} instead");
-        tracing::warn!("Re-run install.sh to update the MCP URL in ~/.claude.json");
-    }
-    tracing::info!("build-watcher listening on http://127.0.0.1:{bound_port}/mcp");
+    tracing::info!("build-watcher listening on http://127.0.0.1:{port}/mcp");
 
     axum::serve(listener, router)
         .with_graceful_shutdown(async move {
@@ -266,10 +250,10 @@ pub async fn serve(
         .await
         .map_err(ServerError::Io)?;
 
-    handle.shutdown().await;
-    let persisted = collect_persisted(&watches).await;
-    let hist = handle.history.lock().await.clone();
-    handle.persistence.save_state(&persisted, &hist).await;
+    state.handle.shutdown().await;
+    let persisted = collect_persisted(&state.watches).await;
+    let hist = state.handle.history.lock().await.clone();
+    state.handle.persistence.save_state(&persisted, &hist).await;
     let _ = std::fs::remove_file(&port_file);
     tracing::info!("State saved, goodbye.");
 

@@ -5,6 +5,8 @@
 
 mod app;
 mod client;
+mod forms;
+mod input;
 mod render;
 mod update;
 

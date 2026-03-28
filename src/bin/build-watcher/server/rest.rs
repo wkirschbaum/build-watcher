@@ -16,13 +16,13 @@ use build_watcher::rate_limiter::compute_intervals;
 use build_watcher::status::{DefaultsConfig, HistoryEntryView, StatsResponse};
 use build_watcher::watcher::{count_api_calls, is_paused};
 
-use super::AppState;
+use super::DaemonState;
 use super::actions::{do_configure_branches, do_stop_watches, do_watch_builds, persist_config};
 use super::{build_watch_snapshot, json_error};
 
 /// `GET /status` — JSON snapshot of all current watches and their build state.
 pub(crate) async fn status_handler(
-    State(state): State<AppState>,
+    State(state): State<DaemonState>,
 ) -> axum::Json<build_watcher::status::StatusResponse> {
     let now = tokio::time::Instant::now();
     let paused = is_paused(&state.pause).await;
@@ -36,7 +36,7 @@ pub(crate) async fn status_handler(
 /// Each frame has an event type matching the variant name and a JSON data payload.
 /// A keepalive comment is sent every 30 seconds to detect dropped connections.
 pub(crate) async fn events_handler(
-    State(state): State<AppState>,
+    State(state): State<DaemonState>,
 ) -> impl axum::response::IntoResponse {
     let stream = BroadcastStream::new(state.handle.events.subscribe())
         .filter_map(|result| result.ok())
@@ -64,7 +64,7 @@ pub(crate) async fn events_handler(
 }
 
 /// `GET /stats` — Daemon stats: uptime, polling intervals, rate limit.
-pub(crate) async fn stats_handler(State(state): State<AppState>) -> axum::Json<StatsResponse> {
+pub(crate) async fn stats_handler(State(state): State<DaemonState>) -> axum::Json<StatsResponse> {
     let uptime_secs = state.started_at.elapsed().as_secs();
     let api_calls = count_api_calls(&*state.watches.lock().await);
     let rl = state.rate_limit.lock().await;
@@ -101,7 +101,7 @@ pub(crate) struct PauseRequest {
 
 /// `POST /pause` — Toggle notification pause.
 pub(crate) async fn pause_handler(
-    State(state): State<AppState>,
+    State(state): State<DaemonState>,
     axum::Json(body): axum::Json<PauseRequest>,
 ) -> axum::Json<serde_json::Value> {
     let mut p = state.pause.lock().await;
@@ -125,7 +125,7 @@ pub(crate) struct RerunRequest {
 
 /// `POST /rerun` — Rerun a GitHub Actions build by run ID.
 pub(crate) async fn rerun_handler(
-    State(state): State<AppState>,
+    State(state): State<DaemonState>,
     axum::Json(body): axum::Json<RerunRequest>,
 ) -> axum::Json<serde_json::Value> {
     match state
@@ -148,7 +148,7 @@ pub(crate) struct WatchRequest {
 
 /// `POST /watch` — Start watching one or more repos.
 pub(crate) async fn watch_handler(
-    State(state): State<AppState>,
+    State(state): State<DaemonState>,
     axum::Json(body): axum::Json<WatchRequest>,
 ) -> axum::response::Response {
     for repo in &body.repos {
@@ -157,24 +157,19 @@ pub(crate) async fn watch_handler(
         }
     }
 
-    let results = do_watch_builds(
-        &state.watches,
-        &state.config,
-        &state.handle,
-        &state.rate_limit,
-        &body.repos,
-    )
-    .await;
-    axum::Json(serde_json::json!({ "ok": true, "messages": results })).into_response()
+    let results = do_watch_builds(&state, &body.repos).await;
+    let messages: Vec<&str> = results.iter().map(|o| o.message()).collect();
+    axum::Json(serde_json::json!({ "ok": true, "messages": messages })).into_response()
 }
 
 /// `POST /unwatch` — Stop watching one or more repos.
 pub(crate) async fn unwatch_handler(
-    State(state): State<AppState>,
+    State(state): State<DaemonState>,
     axum::Json(body): axum::Json<WatchRequest>,
 ) -> axum::Json<serde_json::Value> {
-    let results = do_stop_watches(&state.watches, &state.config, &state.handle, &body.repos).await;
-    axum::Json(serde_json::json!({ "ok": true, "messages": results }))
+    let results = do_stop_watches(&state, &body.repos).await;
+    let messages: Vec<&str> = results.iter().map(|o| o.message()).collect();
+    axum::Json(serde_json::json!({ "ok": true, "messages": messages }))
 }
 
 #[derive(Deserialize)]
@@ -185,7 +180,7 @@ pub(crate) struct BranchesRequest {
 
 /// `POST /branches` — Set which branches to watch for a repo.
 pub(crate) async fn branches_handler(
-    State(state): State<AppState>,
+    State(state): State<DaemonState>,
     axum::Json(body): axum::Json<BranchesRequest>,
 ) -> axum::response::Response {
     if let Err(e) = validate_repo(&body.repo) {
@@ -200,16 +195,9 @@ pub(crate) async fn branches_handler(
         return json_error("branches must not be empty");
     }
 
-    let results = do_configure_branches(
-        &state.watches,
-        &state.config,
-        &state.handle,
-        &state.rate_limit,
-        &body.repo,
-        body.branches,
-    )
-    .await;
-    axum::Json(serde_json::json!({ "ok": true, "messages": results })).into_response()
+    let results = do_configure_branches(&state, &body.repo, body.branches).await;
+    let messages: Vec<&str> = results.iter().map(|o| o.message()).collect();
+    axum::Json(serde_json::json!({ "ok": true, "messages": messages })).into_response()
 }
 
 #[derive(Deserialize)]
@@ -220,7 +208,7 @@ pub(crate) struct NotificationsQuery {
 
 /// `GET /notifications` — Resolved notification config for a specific repo/branch.
 pub(crate) async fn get_notifications_handler(
-    State(state): State<AppState>,
+    State(state): State<DaemonState>,
     Query(q): Query<NotificationsQuery>,
 ) -> axum::Json<NotificationConfig> {
     let cfg = state.config.lock().await;
@@ -245,7 +233,7 @@ pub(crate) struct NotificationsRequest {
 
 /// `POST /notifications` — Mute, unmute, or set per-event levels for repo/branch notifications.
 pub(crate) async fn notifications_handler(
-    State(state): State<AppState>,
+    State(state): State<DaemonState>,
     axum::Json(body): axum::Json<NotificationsRequest>,
 ) -> axum::response::Response {
     use super::actions::do_notification_action;
@@ -275,7 +263,7 @@ pub(crate) async fn notifications_handler(
 
 /// `GET /defaults` — Read global default config (branches, ignored workflows, poll aggression).
 pub(crate) async fn get_defaults_handler(
-    State(state): State<AppState>,
+    State(state): State<DaemonState>,
 ) -> axum::Json<DefaultsConfig> {
     let cfg = state.config.lock().await;
     axum::Json(DefaultsConfig {
@@ -303,7 +291,7 @@ pub(crate) struct SetDefaultsRequest {
 
 /// `POST /defaults` — Update global default config fields.
 pub(crate) async fn set_defaults_handler(
-    State(state): State<AppState>,
+    State(state): State<DaemonState>,
     axum::Json(body): axum::Json<SetDefaultsRequest>,
 ) -> axum::response::Response {
     let (snapshot, messages) = {
@@ -370,7 +358,7 @@ pub(crate) async fn set_defaults_handler(
 
 /// `POST /shutdown` — Initiate graceful daemon shutdown.
 pub(crate) async fn shutdown_handler(
-    State(state): State<AppState>,
+    State(state): State<DaemonState>,
 ) -> axum::Json<serde_json::Value> {
     tracing::info!("Shutdown requested via REST API");
     state.handle.cancel.cancel();
@@ -388,7 +376,7 @@ pub(crate) struct HistoryQuery {
 
 /// `GET /history` — Persisted build history for a repo, optionally filtered by branch.
 pub(crate) async fn history_handler(
-    State(state): State<AppState>,
+    State(state): State<DaemonState>,
     Query(q): Query<HistoryQuery>,
 ) -> axum::response::Response {
     let limit = q.limit.unwrap_or(15).min(50) as usize;
@@ -412,7 +400,7 @@ pub(crate) struct LimitQuery {
 
 /// `GET /history/all` — Recent builds across all repos, ungrouped, newest-first.
 pub(crate) async fn history_all_handler(
-    State(state): State<AppState>,
+    State(state): State<DaemonState>,
     Query(q): Query<LimitQuery>,
 ) -> axum::response::Response {
     let limit = q.limit.unwrap_or(20).min(50) as usize;
@@ -553,7 +541,7 @@ mod tests {
         pause: PauseState,
         handle: build_watcher::watcher::WatcherHandle,
     ) -> axum::Router {
-        let app_state = super::super::AppState {
+        let app_state = super::super::DaemonState {
             watches,
             config: Arc::new(Mutex::new(build_watcher::config::Config::default())),
             handle,
@@ -572,7 +560,7 @@ mod tests {
     ) -> axum::Router {
         let (watches, pause, _events) = empty_state();
         let handle = stub_handle();
-        let app_state = super::super::AppState {
+        let app_state = super::super::DaemonState {
             watches,
             config,
             handle,
@@ -696,7 +684,7 @@ mod tests {
 
     fn test_router_full(watches: Watches, pause: PauseState, _events: EventBus) -> axum::Router {
         let handle = stub_handle();
-        let app_state = super::super::AppState {
+        let app_state = super::super::DaemonState {
             watches,
             config: Arc::new(Mutex::new(build_watcher::config::Config::default())),
             handle,

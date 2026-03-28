@@ -153,6 +153,7 @@ dependencies = [
  "futures-lite",
  "http",
  "http-body-util",
+ "libc",
  "ratatui",
  "regex",
  "reqwest",

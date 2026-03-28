@@ -2,20 +2,51 @@ use std::collections::HashSet;
 
 use build_watcher::config::{self, NotificationLevel, NotificationOverrides};
 use build_watcher::github::DEFAULT_REPO_LIMIT;
-use build_watcher::watcher::{
-    RateLimitState, SharedConfig, WatcherHandle, Watches, collect_persisted, start_watch,
-};
+use build_watcher::watcher::{SharedConfig, WatcherHandle, collect_persisted, start_watch};
+
+use super::DaemonState;
+
+/// Result of a single action on a repo or branch.
+pub(crate) struct ActionOutcome {
+    pub target: String,
+    pub result: Result<String, String>,
+}
+
+impl ActionOutcome {
+    fn ok(target: impl Into<String>, msg: impl Into<String>) -> Self {
+        Self {
+            target: target.into(),
+            result: Ok(msg.into()),
+        }
+    }
+
+    fn err(target: impl Into<String>, msg: impl Into<String>) -> Self {
+        Self {
+            target: target.into(),
+            result: Err(msg.into()),
+        }
+    }
+
+    pub fn message(&self) -> &str {
+        match &self.result {
+            Ok(msg) | Err(msg) => msg,
+        }
+    }
+}
+
+/// Join all outcome messages into a single string.
+pub(crate) fn format_outcomes(outcomes: &[ActionOutcome], sep: &str) -> String {
+    outcomes
+        .iter()
+        .map(|o| o.message())
+        .collect::<Vec<_>>()
+        .join(sep)
+}
 
 /// Shared logic for adding repos to watch — used by both the MCP tool and REST endpoint.
-pub(crate) async fn do_watch_builds(
-    watches: &Watches,
-    config: &SharedConfig,
-    handle: &WatcherHandle,
-    rate_limit: &RateLimitState,
-    repos: &[String],
-) -> Vec<String> {
+pub(crate) async fn do_watch_builds(state: &DaemonState, repos: &[String]) -> Vec<ActionOutcome> {
     let repo_branches: Vec<(String, Vec<String>)> = {
-        let cfg = config.lock().await;
+        let cfg = state.config.lock().await;
         repos
             .iter()
             .map(|repo| (repo.clone(), cfg.branches_for(repo).to_vec()))
@@ -27,20 +58,40 @@ pub(crate) async fn do_watch_builds(
     for (repo, branches) in &repo_branches {
         let mut any_started = false;
         for branch in branches {
-            match start_watch(watches, config, handle, rate_limit, repo, branch).await {
+            let target = format!("{repo} [{branch}]");
+            match start_watch(
+                &state.watches,
+                &state.config,
+                &state.handle,
+                &state.rate_limit,
+                repo,
+                branch,
+            )
+            .await
+            {
                 Ok(msg) => {
                     any_started = true;
-                    results.push(msg);
+                    results.push(ActionOutcome::ok(&target, msg));
                 }
-                Err(msg) => results.push(msg),
+                Err(msg) => results.push(ActionOutcome::err(&target, msg)),
             }
         }
 
         // Auto-discover additional branches from recent runs.
-        for branch in discover_branches(config, handle, repo, branches).await {
-            if let Ok(msg) = start_watch(watches, config, handle, rate_limit, repo, &branch).await {
+        for branch in discover_branches(&state.config, &state.handle, repo, branches).await {
+            let target = format!("{repo} [{branch}]");
+            if let Ok(msg) = start_watch(
+                &state.watches,
+                &state.config,
+                &state.handle,
+                &state.rate_limit,
+                repo,
+                &branch,
+            )
+            .await
+            {
                 any_started = true;
-                results.push(msg);
+                results.push(ActionOutcome::ok(&target, msg));
             }
         }
 
@@ -50,16 +101,16 @@ pub(crate) async fn do_watch_builds(
     }
 
     if !started_repos.is_empty() {
-        let persisted = collect_persisted(watches).await;
-        let hist = handle.history.lock().await.clone();
-        handle.persistence.save_state(&persisted, &hist).await;
+        let persisted = collect_persisted(&state.watches).await;
+        let hist = state.handle.history.lock().await.clone();
+        state.handle.persistence.save_state(&persisted, &hist).await;
         let snapshot = {
-            let mut cfg = config.lock().await;
+            let mut cfg = state.config.lock().await;
             cfg.add_repos(&started_repos);
             cfg.clone()
         };
         if let Err(warning) = persist_config(snapshot).await {
-            results.push(warning);
+            results.push(ActionOutcome::err("config", warning));
         }
     }
 
@@ -126,14 +177,9 @@ async fn discover_branches(
 }
 
 /// Shared logic for removing repos from watch — used by both the MCP tool and REST endpoint.
-pub(crate) async fn do_stop_watches(
-    watches: &Watches,
-    config: &SharedConfig,
-    handle: &WatcherHandle,
-    repos: &[String],
-) -> Vec<String> {
+pub(crate) async fn do_stop_watches(state: &DaemonState, repos: &[String]) -> Vec<ActionOutcome> {
     let removed_counts: Vec<(String, usize)> = {
-        let mut w = watches.lock().await;
+        let mut w = state.watches.lock().await;
         repos
             .iter()
             .map(|repo| {
@@ -146,31 +192,37 @@ pub(crate) async fn do_stop_watches(
             })
             .collect()
     };
-    if let Err(e) = handle
+    if let Err(e) = state
+        .handle
         .persistence
-        .save_watches(&collect_persisted(watches).await)
+        .save_watches(&collect_persisted(&state.watches).await)
         .await
     {
         tracing::error!(error = %e, "Failed to persist watches");
     }
 
     let (snapshot, mut results) = {
-        let mut cfg = config.lock().await;
-        let mut results = Vec::new();
+        let mut cfg = state.config.lock().await;
+        let mut results: Vec<ActionOutcome> = Vec::new();
         for (repo, branch_count) in removed_counts {
             let was_in_config = cfg.repos.contains_key(&repo);
             cfg.repos.remove(&repo);
-            let msg = match (branch_count, was_in_config) {
-                (n, _) if n > 0 => format!("Stopped watching {repo} ({n} branches)"),
-                (_, true) => format!("{repo}: removed from config (was not actively polling)"),
-                _ => format!("{repo}: not found"),
-            };
-            results.push(msg);
+            match (branch_count, was_in_config) {
+                (n, _) if n > 0 => results.push(ActionOutcome::ok(
+                    &repo,
+                    format!("Stopped watching {repo} ({n} branches)"),
+                )),
+                (_, true) => results.push(ActionOutcome::ok(
+                    &repo,
+                    format!("{repo}: removed from config (was not actively polling)"),
+                )),
+                _ => results.push(ActionOutcome::err(&repo, format!("{repo}: not found"))),
+            }
         }
         (cfg.clone(), results)
     };
     if let Err(warning) = persist_config(snapshot).await {
-        results.push(warning);
+        results.push(ActionOutcome::err("config", warning));
     }
 
     results
@@ -181,18 +233,15 @@ pub(crate) async fn do_stop_watches(
 /// Stops watches for branches no longer in the list, starts watches for new
 /// branches, updates config, and persists both.
 pub(crate) async fn do_configure_branches(
-    watches: &Watches,
-    config: &SharedConfig,
-    handle: &WatcherHandle,
-    rate_limit: &RateLimitState,
+    state: &DaemonState,
     repo: &str,
     new_branches: Vec<String>,
-) -> Vec<String> {
+) -> Vec<ActionOutcome> {
     let mut results = Vec::new();
 
     // Current branches from live watches.
     let current_branches: Vec<String> = {
-        let w = watches.lock().await;
+        let w = state.watches.lock().await;
         w.keys()
             .filter(|k| k.matches_repo(repo))
             .map(|k| k.branch.clone())
@@ -201,12 +250,15 @@ pub(crate) async fn do_configure_branches(
 
     // Stop watches for removed branches.
     {
-        let mut w = watches.lock().await;
+        let mut w = state.watches.lock().await;
         for branch in &current_branches {
             if !new_branches.contains(branch) {
                 let key = build_watcher::watcher::WatchKey::new(repo, branch);
                 if w.remove(&key).is_some() {
-                    results.push(format!("Stopped watching {repo} [{branch}]"));
+                    results.push(ActionOutcome::ok(
+                        format!("{repo} [{branch}]"),
+                        format!("Stopped watching {repo} [{branch}]"),
+                    ));
                 }
             }
         }
@@ -215,26 +267,36 @@ pub(crate) async fn do_configure_branches(
     // Start watches for new branches.
     for branch in &new_branches {
         if !current_branches.contains(branch) {
-            match start_watch(watches, config, handle, rate_limit, repo, branch).await {
-                Ok(msg) => results.push(msg),
-                Err(msg) => results.push(msg),
+            let target = format!("{repo} [{branch}]");
+            match start_watch(
+                &state.watches,
+                &state.config,
+                &state.handle,
+                &state.rate_limit,
+                repo,
+                branch,
+            )
+            .await
+            {
+                Ok(msg) => results.push(ActionOutcome::ok(&target, msg)),
+                Err(msg) => results.push(ActionOutcome::err(&target, msg)),
             }
         }
     }
 
     // Update config and persist.
     {
-        let mut cfg = config.lock().await;
+        let mut cfg = state.config.lock().await;
         let rc = cfg.repos.entry(repo.to_string()).or_default();
         rc.branches = new_branches;
     }
-    let persisted = collect_persisted(watches).await;
-    if let Err(e) = handle.persistence.save_watches(&persisted).await {
+    let persisted = collect_persisted(&state.watches).await;
+    if let Err(e) = state.handle.persistence.save_watches(&persisted).await {
         tracing::error!(error = %e, "Failed to persist watches");
     }
-    let snapshot = config.lock().await.clone();
+    let snapshot = state.config.lock().await.clone();
     if let Err(warning) = persist_config(snapshot).await {
-        results.push(warning);
+        results.push(ActionOutcome::err("config", warning));
     }
 
     results

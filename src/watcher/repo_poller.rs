@@ -408,6 +408,46 @@ impl RepoPoller {
             }
         }
 
+        // Retry fetching failing_steps for failed builds that are missing them.
+        // Give up after 10 minutes to avoid hammering the API indefinitely.
+        {
+            let now = unix_now();
+            let missing: Vec<(WatchKey, u64, String)> = {
+                let w = self.watches.lock().await;
+                w.iter()
+                    .filter(|(k, _)| k.repo == self.repo)
+                    .flat_map(|(k, entry)| {
+                        entry.last_builds.values().filter_map(move |lb| {
+                            if lb.conclusion != "success"
+                                && lb.failing_steps.is_none()
+                                && lb.completed_at.is_some_and(|t| now.saturating_sub(t) < 600)
+                            {
+                                Some((k.clone(), lb.run_id, lb.workflow.clone()))
+                            } else {
+                                None
+                            }
+                        })
+                    })
+                    .collect()
+            };
+            for (key, run_id, workflow) in missing {
+                if self.token.is_cancelled() {
+                    break;
+                }
+                if let Some(info) = self.github.failing_steps(&self.repo, run_id).await {
+                    let mut w = self.watches.lock().await;
+                    if let Some(entry) = w.get_mut(&key)
+                        && let Some(lb) = entry.last_builds.get_mut(&workflow)
+                        && lb.run_id == run_id
+                    {
+                        lb.failing_steps = Some(info.steps);
+                        lb.failing_job_id = info.first_job_id;
+                        changed = true;
+                    }
+                }
+            }
+        }
+
         if changed {
             let persisted = collect_persisted(&self.watches).await;
             let hist = self.history.lock().await.clone();
