@@ -19,15 +19,18 @@
 
 set -euo pipefail
 
-# When piped (curl | bash), $0 is "bash" (not a file path). Detect this so we
-# can generate service files inline instead of reading templates from the repo.
-if [ -f "$0" ]; then
-  SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-  PLATFORM_DIR="$SCRIPT_DIR/src/platform"
-else
-  SCRIPT_DIR=""
-  PLATFORM_DIR=""
-fi
+# When piped (curl | bash), $0 is "bash" — not a path to this script.
+# Detect this so we generate service files inline instead of reading repo templates.
+case "$0" in
+  */install.sh)
+    SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+    PLATFORM_DIR="$SCRIPT_DIR/src/platform"
+    ;;
+  *)
+    SCRIPT_DIR=""
+    PLATFORM_DIR=""
+    ;;
+esac
 BINARY_NAME="build-watcher"
 INSTALL_DIR="$HOME/.local/bin"
 BINARY_PATH="$INSTALL_DIR/$BINARY_NAME"
