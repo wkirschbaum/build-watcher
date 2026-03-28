@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -12,6 +12,7 @@ use crate::github::{DEFAULT_REPO_LIMIT, GitHubClient, LastBuild, RunInfo};
 use crate::history::push_build;
 use crate::persistence::Persistence;
 use crate::rate_limiter::compute_intervals;
+use crate::status::{RunConclusion, RunStatus};
 
 use super::types::WatchKey;
 use super::{
@@ -29,6 +30,54 @@ enum WakeReason {
     /// Config changed (e.g. new watch added) — treated identically to `Elapsed`.
     ConfigChanged,
     Cancelled,
+}
+
+/// State change detected during a poll cycle.
+/// Collected from both poll methods and deduplicated before emission.
+#[derive(Debug)]
+pub(super) enum RunChange {
+    Started {
+        run: RunSnapshot,
+    },
+    Completed {
+        run: RunSnapshot,
+        conclusion: RunConclusion,
+        elapsed: Option<f64>,
+        failing_steps: Option<String>,
+    },
+    StatusChanged {
+        run: RunSnapshot,
+        from: RunStatus,
+        to: RunStatus,
+    },
+}
+
+impl RunChange {
+    pub(super) fn run_id(&self) -> u64 {
+        match self {
+            Self::Started { run }
+            | Self::Completed { run, .. }
+            | Self::StatusChanged { run, .. } => run.run_id,
+        }
+    }
+
+    pub(super) fn into_event(self) -> WatchEvent {
+        match self {
+            Self::Started { run } => WatchEvent::RunStarted(run),
+            Self::Completed {
+                run,
+                conclusion,
+                elapsed,
+                failing_steps,
+            } => WatchEvent::RunCompleted {
+                run,
+                conclusion,
+                elapsed,
+                failing_steps,
+            },
+            Self::StatusChanged { run, from, to } => WatchEvent::StatusChanged { run, from, to },
+        }
+    }
 }
 
 /// Snapshot of config values needed for a poll cycle, per branch.
@@ -157,12 +206,20 @@ impl RepoPoller {
                 return;
             }
 
-            // Always run both: poll_active_runs_batch returns early when there are no
-            // tracked active runs, so calling it unconditionally is cheap.
-            // Running check_for_new_runs_repo_wide every cycle ensures new builds are
-            // detected within one sleep interval regardless of active state.
-            self.poll_active_runs_batch().await;
-            self.check_for_new_runs_repo_wide().await;
+            // Collect changes from both poll methods, then deduplicate by run_id
+            // before emitting. This prevents double notifications when a run completes
+            // between the two API calls within a single cycle.
+            let mut changes = self.poll_active_runs_batch().await;
+            changes.extend(self.check_for_new_runs_repo_wide().await);
+
+            let mut seen = HashSet::new();
+            for change in changes {
+                if seen.insert(change.run_id()) {
+                    self.events.emit(change.into_event());
+                } else {
+                    tracing::debug!(run_id = change.run_id(), "Suppressed duplicate event");
+                }
+            }
         }
     }
 
@@ -199,7 +256,9 @@ impl RepoPoller {
     /// Batch-check all active runs for this repo using a single API call.
     /// Falls back to individual `run_status` for runs missing from the batch response,
     /// capped at `MAX_FALLBACK_CALLS` to avoid rate-limit exhaustion.
-    pub(super) async fn poll_active_runs_batch(&self) {
+    pub(super) async fn poll_active_runs_batch(&self) -> Vec<RunChange> {
+        let mut changes = Vec::new();
+
         // Collect all (run_id, WatchKey) pairs for active runs in this repo.
         let active_run_keys: Vec<(u64, WatchKey)> = {
             let w = self.watches.lock().await;
@@ -210,7 +269,7 @@ impl RepoPoller {
         };
 
         if active_run_keys.is_empty() {
-            return;
+            return changes;
         }
 
         // One API call to get all in-progress runs for the repo.
@@ -218,7 +277,7 @@ impl RepoPoller {
             Ok(runs) => runs,
             Err(e) => {
                 tracing::error!(repo = %self.repo, error = %e, "Failed to batch-check active runs");
-                return;
+                return changes;
             }
         };
         let batch_by_id: HashMap<u64, &RunInfo> = batch_runs.iter().map(|r| (r.id, r)).collect();
@@ -259,7 +318,7 @@ impl RepoPoller {
         let mut fallback_errors: Vec<(u64, WatchKey, crate::github::GhError)> = Vec::new();
         for (run_id, key) in missing_runs.iter().take(MAX_FALLBACK_CALLS) {
             if self.token.is_cancelled() {
-                return;
+                return changes;
             }
             match self.github.run_status(&self.repo, *run_id).await {
                 Ok(run) => found_runs.push((run, key.clone())),
@@ -285,7 +344,7 @@ impl RepoPoller {
         let mut changed = false;
         for (run, key) in &found_runs {
             if self.token.is_cancelled() {
-                return;
+                return changes;
             }
 
             if run.is_completed() {
@@ -302,7 +361,7 @@ impl RepoPoller {
                     self.github.failing_steps(&self.repo, run.id).await
                 };
 
-                self.events.emit(WatchEvent::RunCompleted {
+                changes.push(RunChange::Completed {
                     run: RunSnapshot::from_run_info(run, &self.repo, &key.branch),
                     conclusion: run.run_conclusion(),
                     elapsed,
@@ -334,7 +393,7 @@ impl RepoPoller {
                 if let Some(entry) = w.get_mut(key)
                     && let Some(old_status) = entry.update_status(run.id, &run.status)
                 {
-                    self.events.emit(WatchEvent::StatusChanged {
+                    changes.push(RunChange::StatusChanged {
                         run: RunSnapshot::from_run_info(run, &self.repo, &key.branch),
                         from: old_status,
                         to: run.status.clone(),
@@ -348,13 +407,17 @@ impl RepoPoller {
             let hist = self.history.lock().await.clone();
             self.persistence.save_state(&persisted, &hist).await;
         }
+
+        changes
     }
 
     /// Check for new runs across all watched branches using a single repo-wide API call.
-    pub(super) async fn check_for_new_runs_repo_wide(&self) {
+    pub(super) async fn check_for_new_runs_repo_wide(&self) -> Vec<RunChange> {
+        let mut changes = Vec::new();
+
         let branches = self.watched_branches().await;
         if branches.is_empty() {
-            return;
+            return changes;
         }
 
         let all_runs = match self
@@ -366,11 +429,11 @@ impl RepoPoller {
             Err(e) if e.is_repo_not_found() => {
                 tracing::warn!(repo = %self.repo, error = %e, "Repo not found, removing watches");
                 self.remove_dead_repo().await;
-                return;
+                return changes;
             }
             Err(e) => {
                 tracing::error!(repo = %self.repo, error = %e, "Failed to check for new runs");
-                return;
+                return changes;
             }
         };
 
@@ -422,7 +485,7 @@ impl RepoPoller {
                         sha = run.short_sha(), conclusion = %run.conclusion,
                         "Build already completed"
                     );
-                    self.events.emit(WatchEvent::RunCompleted {
+                    changes.push(RunChange::Completed {
                         run: snapshot,
                         conclusion: run.run_conclusion(),
                         elapsed: None,
@@ -435,7 +498,7 @@ impl RepoPoller {
                         sha = run.short_sha(), workflow = %run.workflow, title = %run.title,
                         "New build detected"
                     );
-                    self.events.emit(WatchEvent::RunStarted(snapshot));
+                    changes.push(RunChange::Started { run: snapshot });
                 }
             }
 
@@ -482,5 +545,7 @@ impl RepoPoller {
             let hist = self.history.lock().await.clone();
             self.persistence.save_state(&persisted, &hist).await;
         }
+
+        changes
     }
 }

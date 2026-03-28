@@ -12,7 +12,7 @@ use crate::events::WatchEvent;
 use crate::github::{GhError, RunInfo};
 use crate::status::{RunConclusion, RunStatus};
 
-use super::repo_poller::RepoPoller;
+use super::repo_poller::{RepoPoller, RunChange};
 
 fn make_run(id: u64, status: RunStatus, conclusion: &str) -> RunInfo {
     RunInfo {
@@ -694,7 +694,7 @@ async fn check_for_new_runs_detects_new_builds() {
     let mut rx = handle.events.subscribe();
     let poller = make_repo_poller("alice/app", &watches, &config, &rate_limit, &handle);
 
-    poller.check_for_new_runs_repo_wide().await;
+    let changes = poller.check_for_new_runs_repo_wide().await;
 
     // Verify high-water mark advanced
     let w = watches.lock().await;
@@ -706,13 +706,20 @@ async fn check_for_new_runs_detects_new_builds() {
     assert_eq!(entry.last_build.as_ref().unwrap().run_id, 102);
     drop(w);
 
-    // Verify events: RunStarted for 101 (in_progress), RunCompleted for 102 (already done).
+    // Verify returned changes: RunStarted for 101, RunCompleted for 102.
     // No RunStarted for 102 — it was already completed when discovered.
+    assert_eq!(changes.len(), 2, "expected 2 changes, got {changes:?}");
+    assert_eq!(changes[0].run_id(), 101);
+    assert_eq!(changes[1].run_id(), 102);
+
+    // Emit and verify event content via bus
+    for c in changes {
+        handle.events.emit(c.into_event());
+    }
     let mut events = vec![];
     while let Ok(e) = rx.try_recv() {
         events.push(e);
     }
-    assert_eq!(events.len(), 2, "expected 2 events, got {events:?}");
     assert!(
         matches!(&events[0], WatchEvent::RunStarted(s) if s.run_id == 101),
         "expected RunStarted(101), got {:?}",
@@ -803,7 +810,7 @@ async fn poll_active_runs_detects_completion() {
     let mut rx = handle.events.subscribe();
     let poller = make_repo_poller("alice/app", &watches, &config, &rate_limit, &handle);
 
-    poller.poll_active_runs_batch().await;
+    let changes = poller.poll_active_runs_batch().await;
 
     let w = watches.lock().await;
     let entry = &w[&key];
@@ -813,7 +820,11 @@ async fn poll_active_runs_detects_completion() {
     assert_eq!(entry.last_build.as_ref().unwrap().conclusion, "success");
     drop(w);
 
-    // RunCompleted event emitted
+    // RunCompleted change returned
+    assert_eq!(changes.len(), 1);
+    for c in changes {
+        handle.events.emit(c.into_event());
+    }
     match rx.try_recv() {
         Ok(crate::events::WatchEvent::RunCompleted { conclusion, .. }) => {
             assert_eq!(conclusion, RunConclusion::Success);
@@ -852,14 +863,18 @@ async fn poll_active_runs_emits_status_change() {
     let mut rx = handle.events.subscribe();
     let poller = make_repo_poller("alice/app", &watches, &config, &rate_limit, &handle);
 
-    poller.poll_active_runs_batch().await;
+    let changes = poller.poll_active_runs_batch().await;
 
     // Still active, status updated
     let w = watches.lock().await;
     assert_eq!(w[&key].active_runs[&101].status, RunStatus::InProgress);
     drop(w);
 
-    // StatusChanged event
+    // StatusChanged change returned
+    assert_eq!(changes.len(), 1);
+    for c in changes {
+        handle.events.emit(c.into_event());
+    }
     match rx.try_recv() {
         Ok(crate::events::WatchEvent::StatusChanged { from, to, .. }) => {
             assert_eq!(from, RunStatus::Queued);
@@ -899,8 +914,12 @@ async fn poll_active_runs_fetches_failing_steps() {
     let mut rx = handle.events.subscribe();
     let poller = make_repo_poller("alice/app", &watches, &config, &rate_limit, &handle);
 
-    poller.poll_active_runs_batch().await;
+    let changes = poller.poll_active_runs_batch().await;
 
+    assert_eq!(changes.len(), 1);
+    for c in changes {
+        handle.events.emit(c.into_event());
+    }
     match rx.try_recv() {
         Ok(crate::events::WatchEvent::RunCompleted {
             failing_steps,
@@ -947,16 +966,14 @@ async fn check_for_new_runs_skips_already_active() {
         );
     }
 
-    let mut rx = handle.events.subscribe();
     let poller = make_repo_poller("alice/app", &watches, &config, &rate_limit, &handle);
-    poller.check_for_new_runs_repo_wide().await;
+    let changes = poller.check_for_new_runs_repo_wide().await;
 
-    // No events should be emitted — run 101 was already being tracked.
-    let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+    // No changes should be returned — run 101 was already being tracked.
     assert!(
-        events.is_empty(),
-        "expected no events for already-active run, got {} events",
-        events.len()
+        changes.is_empty(),
+        "expected no changes for already-active run, got {} changes",
+        changes.len()
     );
 
     handle.cancel.cancel();
@@ -1020,4 +1037,53 @@ async fn recover_existing_watches_recovers_active_runs() {
     assert_eq!(entry.last_seen_run_id, 101);
 
     handle.cancel.cancel();
+}
+
+#[test]
+fn run_change_dedup_keeps_first() {
+    use crate::events::RunSnapshot;
+    use std::collections::HashSet;
+
+    let snap = |id| RunSnapshot {
+        repo: "alice/app".to_string(),
+        branch: "main".to_string(),
+        run_id: id,
+        workflow: "CI".to_string(),
+        title: "Test".to_string(),
+        event: "push".to_string(),
+        status: RunStatus::InProgress,
+    };
+
+    let changes = vec![
+        RunChange::Completed {
+            run: snap(101),
+            conclusion: RunConclusion::Success,
+            elapsed: Some(42.0),
+            failing_steps: None,
+        },
+        RunChange::Started { run: snap(102) },
+        // Duplicate of 101 — should be suppressed
+        RunChange::Completed {
+            run: snap(101),
+            conclusion: RunConclusion::Success,
+            elapsed: None,
+            failing_steps: None,
+        },
+    ];
+
+    let mut seen = HashSet::new();
+    let emitted: Vec<_> = changes
+        .into_iter()
+        .filter(|c| seen.insert(c.run_id()))
+        .collect();
+
+    assert_eq!(emitted.len(), 2);
+    assert_eq!(emitted[0].run_id(), 101);
+    assert_eq!(emitted[1].run_id(), 102);
+
+    // First-wins: the kept 101 has elapsed data
+    match &emitted[0] {
+        RunChange::Completed { elapsed, .. } => assert_eq!(*elapsed, Some(42.0)),
+        other => panic!("expected Completed, got {other:?}"),
+    }
 }
