@@ -13,7 +13,9 @@
 # and settings survive a reinstall. Remove them manually if you want a clean
 # slate.
 #
-# Usage: ./uninstall.sh
+# Usage: bw uninstall
+#        curl -fsSL https://raw.githubusercontent.com/wkirschbaum/build-watcher/main/uninstall.sh | bash
+#        ./uninstall.sh
 
 set -euo pipefail
 
