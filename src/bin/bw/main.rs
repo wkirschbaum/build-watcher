@@ -119,7 +119,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if std::env::args().any(|a| a == "--reset-state") {
         return reset_state();
     }
-    if std::env::args().any(|a| a == "uninstall") {
+    if std::env::args().any(|a| a == "--uninstall") {
         return uninstall();
     }
 
