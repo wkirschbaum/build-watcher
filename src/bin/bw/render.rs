@@ -21,6 +21,12 @@ pub(crate) struct SingleBranchInfo<'a> {
     pub title: String,
     /// The status string for styling (e.g. "in_progress", "success", "failure").
     pub status_key: String,
+    /// GitHub Actions attempt number. Only shown when > 1.
+    pub attempt: u32,
+    /// Run ID of the most relevant run (active or last build).
+    pub run_id: Option<u64>,
+    /// Whether the last build was a failure (used for `o` key behavior).
+    pub failed: bool,
 }
 
 pub(crate) enum DisplayRow<'a> {
@@ -196,13 +202,26 @@ pub(crate) fn flatten_rows<'a>(
         // For single-branch repos, collect workflow/title info for inline display.
         let single_branch = if branches.len() == 1 {
             let w = branches[0];
-            let (title, status_key) = if let Some(run) = w.active_runs.first() {
-                (run.title.clone(), run.status.as_str().to_string())
-            } else if let Some(b) = &w.last_build {
-                (b.title.clone(), b.conclusion.as_str().to_string())
-            } else {
-                (String::new(), String::new())
-            };
+            let (title, status_key, attempt, run_id, failed) =
+                if let Some(run) = w.active_runs.first() {
+                    (
+                        run.title.clone(),
+                        run.status.as_str().to_string(),
+                        run.attempt,
+                        Some(run.run_id),
+                        false,
+                    )
+                } else if let Some(b) = &w.last_build {
+                    (
+                        b.title.clone(),
+                        b.conclusion.as_str().to_string(),
+                        b.attempt,
+                        Some(b.run_id),
+                        b.conclusion != RunConclusion::Success,
+                    )
+                } else {
+                    (String::new(), String::new(), 1, None, false)
+                };
             let mut wf_set: Vec<&str> = Vec::new();
             for run in &w.active_runs {
                 if !wf_set.contains(&run.workflow.as_str()) {
@@ -217,8 +236,11 @@ pub(crate) fn flatten_rows<'a>(
             Some(SingleBranchInfo {
                 branch: &w.branch,
                 workflows: wf_set.join(", "),
+                attempt,
                 title,
                 status_key,
+                run_id,
+                failed,
             })
         } else {
             None
@@ -324,7 +346,7 @@ impl DisplayRow<'_> {
                 muted,
                 single_branch: Some(sb),
                 ..
-            } => (repo, sb.branch, None, *muted),
+            } => (repo, sb.branch, sb.run_id, *muted),
             DisplayRow::RepoHeader { repo, muted, .. } => (repo, "", None, *muted),
             DisplayRow::ActiveRun {
                 repo,
@@ -355,6 +377,18 @@ impl DisplayRow<'_> {
     /// Returns `true` if this is a `RepoHeader` row.
     pub(crate) fn is_repo_header(&self) -> bool {
         matches!(self, DisplayRow::RepoHeader { .. })
+    }
+
+    /// Returns `true` if the selected row represents a failed build.
+    pub(crate) fn is_failed(&self) -> bool {
+        match self {
+            DisplayRow::RepoHeader {
+                single_branch: Some(sb),
+                ..
+            } => sb.failed,
+            DisplayRow::LastBuild { build, .. } => build.conclusion != RunConclusion::Success,
+            _ => false,
+        }
     }
 
     /// Returns `true` if this is a single-branch repo header (not collapsible).
@@ -860,10 +894,15 @@ fn render_display_row<'a>(
             if let Some(sb) = single_branch {
                 let emoji = status_emoji(&sb.status_key);
                 let style = status_style(&sb.status_key);
+                let attempt_suffix = if sb.attempt > 1 {
+                    format!(" (attempt {})", sb.attempt)
+                } else {
+                    String::new()
+                };
                 let inline_status = if sb.status_key.is_empty() {
                     "· idle".to_string()
                 } else {
-                    format!("{emoji} {}", format::status(&sb.status_key))
+                    format!("{emoji} {}{attempt_suffix}", format::status(&sb.status_key))
                 };
                 Row::new(vec![
                     Cell::from(format::truncate(&name, cw.repo)).style(repo_style),
@@ -900,10 +939,18 @@ fn render_display_row<'a>(
                 .elapsed_secs
                 .map(|s| format::duration(Duration::from_secs_f64(s)))
                 .unwrap_or_default();
-            let status_text = if extra_badge.is_empty() {
-                format!("{emoji} {}", format::status(status_str))
+            let attempt_suffix = if run.attempt > 1 {
+                format!(" (attempt {})", run.attempt)
             } else {
-                format!("{emoji} {} {extra_badge}", format::status(status_str))
+                String::new()
+            };
+            let status_text = if extra_badge.is_empty() {
+                format!("{emoji} {}{attempt_suffix}", format::status(status_str))
+            } else {
+                format!(
+                    "{emoji} {}{attempt_suffix} {extra_badge}",
+                    format::status(status_str)
+                )
             };
             branch_row(
                 branch,
@@ -941,7 +988,12 @@ fn render_display_row<'a>(
                 .age_secs
                 .map(|s| format::age(s as u64))
                 .unwrap_or_default();
-            let status_text = format!("{emoji} {}", format::status(conclusion_str));
+            let attempt_suffix = if build.attempt > 1 {
+                format!(" (attempt {})", build.attempt)
+            } else {
+                String::new()
+            };
+            let status_text = format!("{emoji} {}{attempt_suffix}", format::status(conclusion_str));
             branch_row(
                 branch,
                 *muted,

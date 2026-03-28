@@ -443,12 +443,12 @@ impl RepoPoller {
         for key in &branches {
             let branch_runs = runs_for_branch(&all_runs, &key.branch);
 
-            let (last_seen, active_ids) = {
+            let (last_seen, active_ids, prev_last_build) = {
                 let w = self.watches.lock().await;
                 match w.get(key) {
                     Some(entry) => {
                         let ids: Vec<u64> = entry.active_runs.keys().copied().collect();
-                        (entry.last_seen_run_id, ids)
+                        (entry.last_seen_run_id, ids, entry.last_build.clone())
                     }
                     None => continue,
                 }
@@ -462,7 +462,14 @@ impl RepoPoller {
                 .collect();
             let unseen_as_owned: Vec<RunInfo> = unseen.iter().map(|r| (*r).clone()).collect();
             let new_runs = filter_runs(&unseen_as_owned, &bpcfg.workflows, &bpcfg.ignored);
-            if new_runs.is_empty() && unseen.is_empty() {
+            // Check for re-runs: last_build's run_id appears in the API response
+            // but with a different conclusion or back to in-progress.
+            let may_have_rerun = prev_last_build.as_ref().is_some_and(|lb| {
+                branch_runs.iter().any(|r| {
+                    r.id == lb.run_id && (!r.is_completed() || r.conclusion != lb.conclusion)
+                })
+            });
+            if new_runs.is_empty() && unseen.is_empty() && !may_have_rerun {
                 continue;
             }
 
@@ -502,10 +509,72 @@ impl RepoPoller {
                 }
             }
 
+            // Detect re-runs: if last_build's run_id appears in the API response
+            // with a different status (back to in_progress) or different conclusion,
+            // the run was re-run on GitHub and we need to pick up the change.
+            let mut rerun_detected = false;
+            if let Some(ref lb) = prev_last_build
+                && let Some(rerun) = branch_runs.iter().find(|r| r.id == lb.run_id)
+            {
+                if !rerun.is_completed() {
+                    // Re-run is in progress — track it as active again.
+                    tracing::info!(
+                        key = %key, run_id = rerun.id,
+                        "Re-run detected (now in progress)"
+                    );
+                    let snapshot = RunSnapshot::from_run_info(rerun, &self.repo, &key.branch);
+                    changes.push(RunChange::Started { run: snapshot });
+                    rerun_detected = true;
+                } else if rerun.conclusion != lb.conclusion {
+                    // Re-run completed with a different conclusion.
+                    let failing_steps = if rerun.succeeded() {
+                        None
+                    } else {
+                        self.github.failing_steps(&self.repo, rerun.id).await
+                    };
+                    tracing::info!(
+                        key = %key, run_id = rerun.id,
+                        old_conclusion = %lb.conclusion, new_conclusion = %rerun.conclusion,
+                        "Re-run completed with different conclusion"
+                    );
+                    let snapshot = RunSnapshot::from_run_info(rerun, &self.repo, &key.branch);
+                    changes.push(RunChange::Completed {
+                        run: snapshot,
+                        conclusion: rerun.run_conclusion(),
+                        elapsed: None,
+                        failing_steps: failing_steps.clone(),
+                    });
+                    failing_steps_by_id.insert(rerun.id, failing_steps);
+                    rerun_detected = true;
+                }
+            }
+
             {
                 let mut w = self.watches.lock().await;
                 if let Some(entry) = w.get_mut(key) {
                     entry.incorporate_new_runs(&new_runs, Instant::now(), unix_now());
+
+                    // Apply re-run state changes.
+                    if rerun_detected
+                        && let Some(ref lb) = prev_last_build
+                        && let Some(rerun) = branch_runs.iter().find(|r| r.id == lb.run_id)
+                    {
+                        if !rerun.is_completed() {
+                            // Add back to active runs for poll_active_runs_batch to track.
+                            entry.active_runs.insert(
+                                rerun.id,
+                                super::types::ActiveRun::from_run(rerun, Instant::now()),
+                            );
+                        } else {
+                            // Update last_build with new conclusion.
+                            let mut new_lb = rerun.to_last_build();
+                            new_lb.completed_at = Some(unix_now());
+                            new_lb.failing_steps =
+                                failing_steps_by_id.get(&rerun.id).and_then(|s| s.clone());
+                            entry.last_build = Some(new_lb);
+                        }
+                    }
+
                     if let Some(ref mut lb) = entry.last_build
                         && let Some(steps) = failing_steps_by_id.get(&lb.run_id)
                     {
@@ -516,13 +585,16 @@ impl RepoPoller {
                     if let Some(max_id) = unseen.iter().map(|r| r.id).max() {
                         entry.last_seen_run_id = entry.last_seen_run_id.max(max_id);
                     }
-                    any_changed = true;
+                    any_changed = any_changed || rerun_detected;
+                    if !new_runs.is_empty() || !unseen.is_empty() {
+                        any_changed = true;
+                    }
                 }
             }
 
-            // Push completed new runs into history.
+            // Push completed new runs (and re-run completions) into history.
             let now_unix = unix_now();
-            let completed: Vec<LastBuild> = new_runs
+            let mut completed: Vec<LastBuild> = new_runs
                 .iter()
                 .filter(|r| r.is_completed())
                 .map(|r| {
@@ -532,10 +604,50 @@ impl RepoPoller {
                     lb
                 })
                 .collect();
+            // Include re-run completions in history.
+            if rerun_detected
+                && let Some(ref lb) = prev_last_build
+                && let Some(rerun) = branch_runs.iter().find(|r| r.id == lb.run_id)
+                && rerun.is_completed()
+                && rerun.conclusion != lb.conclusion
+            {
+                let mut new_lb = rerun.to_last_build();
+                new_lb.completed_at = Some(now_unix);
+                new_lb.failing_steps = failing_steps_by_id.get(&rerun.id).and_then(|s| s.clone());
+                completed.push(new_lb);
+            }
             if !completed.is_empty() {
                 let mut hist = self.history.lock().await;
                 for lb in completed.into_iter().rev() {
                     push_build(&mut hist, key, lb);
+                }
+            }
+
+            // Backfill: if last_build is a failure with no failing_steps, fetch them now.
+            let needs_backfill = {
+                let w = self.watches.lock().await;
+                w.get(key)
+                    .and_then(|e| e.last_build.as_ref())
+                    .is_some_and(|lb| lb.conclusion != "success" && lb.failing_steps.is_none())
+            };
+            if needs_backfill {
+                let run_id = {
+                    let w = self.watches.lock().await;
+                    w.get(key)
+                        .and_then(|e| e.last_build.as_ref().map(|lb| lb.run_id))
+                };
+                if let Some(run_id) = run_id {
+                    let steps = self.github.failing_steps(&self.repo, run_id).await;
+                    if steps.is_some() {
+                        let mut w = self.watches.lock().await;
+                        if let Some(entry) = w.get_mut(key)
+                            && let Some(ref mut lb) = entry.last_build
+                        {
+                            tracing::info!(key = %key, run_id, "Backfilled failing steps");
+                            lb.failing_steps = steps;
+                            any_changed = true;
+                        }
+                    }
                 }
             }
         }

@@ -24,6 +24,7 @@ fn make_run(id: u64, status: RunStatus, conclusion: &str) -> RunInfo {
         head_sha: "abc1234".to_string(),
         event: "push".to_string(),
         head_branch: "main".to_string(),
+        attempt: 1,
     }
 }
 
@@ -34,6 +35,7 @@ fn make_active(status: RunStatus) -> ActiveRun {
         workflow: "CI".to_string(),
         title: "Test PR".to_string(),
         event: "push".to_string(),
+        attempt: 1,
     }
 }
 
@@ -1052,6 +1054,7 @@ fn run_change_dedup_keeps_first() {
         title: "Test".to_string(),
         event: "push".to_string(),
         status: RunStatus::InProgress,
+        attempt: 1,
     };
 
     let changes = vec![
@@ -1086,4 +1089,169 @@ fn run_change_dedup_keeps_first() {
         RunChange::Completed { elapsed, .. } => assert_eq!(*elapsed, Some(42.0)),
         other => panic!("expected Completed, got {other:?}"),
     }
+}
+
+// -- Re-run detection tests --
+
+#[tokio::test]
+async fn check_for_new_runs_detects_rerun_with_different_conclusion() {
+    let key = WatchKey::new("alice/app", "main");
+    // The API now returns run 200 as success (it was re-run after initially failing).
+    let runs = vec![make_run(200, RunStatus::Completed, "success")];
+    let gh = MockGitHub::with_runs(runs);
+    let watches: Watches = Arc::new(Mutex::new(HashMap::new()));
+    let config: SharedConfig = Arc::new(Mutex::new(Config::default()));
+    let rate_limit: RateLimitState = Arc::new(Mutex::new(None));
+    let handle = mock_handle(gh);
+
+    // Seed watch with last_seen=200 and last_build=200 (failure).
+    {
+        let mut w = watches.lock().await;
+        w.insert(
+            key.clone(),
+            WatchEntry {
+                last_seen_run_id: 200,
+                active_runs: HashMap::new(),
+                failure_counts: HashMap::new(),
+                last_build: Some(crate::github::LastBuild {
+                    run_id: 200,
+                    conclusion: "failure".to_string(),
+                    workflow: "CI".to_string(),
+                    title: "Test PR".to_string(),
+                    head_sha: "abc1234".to_string(),
+                    event: "push".to_string(),
+                    failing_steps: Some("Build / Run tests".to_string()),
+                    completed_at: Some(1000),
+                    duration_secs: Some(60),
+                    attempt: 1,
+                }),
+            },
+        );
+    }
+
+    let poller = make_repo_poller("alice/app", &watches, &config, &rate_limit, &handle);
+    let changes = poller.check_for_new_runs_repo_wide().await;
+
+    // Should detect the re-run and emit a RunCompleted with new conclusion.
+    assert_eq!(changes.len(), 1, "expected 1 change, got {changes:?}");
+    match &changes[0] {
+        RunChange::Completed {
+            run, conclusion, ..
+        } => {
+            assert_eq!(run.run_id, 200);
+            assert_eq!(*conclusion, RunConclusion::Success);
+        }
+        other => panic!("expected Completed, got {other:?}"),
+    }
+
+    // Verify last_build was updated to success.
+    let w = watches.lock().await;
+    let entry = &w[&key];
+    let lb = entry.last_build.as_ref().unwrap();
+    assert_eq!(lb.run_id, 200);
+    assert_eq!(lb.conclusion, "success");
+
+    handle.cancel.cancel();
+}
+
+#[tokio::test]
+async fn check_for_new_runs_detects_rerun_in_progress() {
+    let key = WatchKey::new("alice/app", "main");
+    // The API now returns run 200 as in_progress (it was re-run).
+    let runs = vec![make_run(200, RunStatus::InProgress, "")];
+    let gh = MockGitHub::with_runs(runs);
+    let watches: Watches = Arc::new(Mutex::new(HashMap::new()));
+    let config: SharedConfig = Arc::new(Mutex::new(Config::default()));
+    let rate_limit: RateLimitState = Arc::new(Mutex::new(None));
+    let handle = mock_handle(gh);
+
+    // Seed watch with last_seen=200 and last_build=200 (failure).
+    {
+        let mut w = watches.lock().await;
+        w.insert(
+            key.clone(),
+            WatchEntry {
+                last_seen_run_id: 200,
+                active_runs: HashMap::new(),
+                failure_counts: HashMap::new(),
+                last_build: Some(crate::github::LastBuild {
+                    run_id: 200,
+                    conclusion: "failure".to_string(),
+                    workflow: "CI".to_string(),
+                    title: "Test PR".to_string(),
+                    head_sha: "abc1234".to_string(),
+                    event: "push".to_string(),
+                    failing_steps: Some("Build / Run tests".to_string()),
+                    completed_at: Some(1000),
+                    duration_secs: Some(60),
+                    attempt: 1,
+                }),
+            },
+        );
+    }
+
+    let poller = make_repo_poller("alice/app", &watches, &config, &rate_limit, &handle);
+    let changes = poller.check_for_new_runs_repo_wide().await;
+
+    // Should detect the re-run in progress and emit RunStarted.
+    assert_eq!(changes.len(), 1, "expected 1 change, got {changes:?}");
+    assert_eq!(changes[0].run_id(), 200);
+    match &changes[0] {
+        RunChange::Started { run } => assert_eq!(run.run_id, 200),
+        other => panic!("expected Started, got {other:?}"),
+    }
+
+    // Verify the run was added back to active_runs.
+    let w = watches.lock().await;
+    let entry = &w[&key];
+    assert!(
+        entry.active_runs.contains_key(&200),
+        "run 200 should be tracked as active"
+    );
+
+    handle.cancel.cancel();
+}
+
+#[tokio::test]
+async fn check_for_new_runs_ignores_rerun_with_same_conclusion() {
+    let key = WatchKey::new("alice/app", "main");
+    // The API returns run 200 as failure (same as what we already recorded).
+    let runs = vec![make_run(200, RunStatus::Completed, "failure")];
+    let gh = MockGitHub::with_runs(runs);
+    let watches: Watches = Arc::new(Mutex::new(HashMap::new()));
+    let config: SharedConfig = Arc::new(Mutex::new(Config::default()));
+    let rate_limit: RateLimitState = Arc::new(Mutex::new(None));
+    let handle = mock_handle(gh);
+
+    {
+        let mut w = watches.lock().await;
+        w.insert(
+            key.clone(),
+            WatchEntry {
+                last_seen_run_id: 200,
+                active_runs: HashMap::new(),
+                failure_counts: HashMap::new(),
+                last_build: Some(crate::github::LastBuild {
+                    run_id: 200,
+                    conclusion: "failure".to_string(),
+                    workflow: "CI".to_string(),
+                    title: "Test PR".to_string(),
+                    head_sha: "abc1234".to_string(),
+                    event: "push".to_string(),
+                    failing_steps: None,
+                    completed_at: Some(1000),
+                    duration_secs: None,
+                    attempt: 1,
+                }),
+            },
+        );
+    }
+
+    let poller = make_repo_poller("alice/app", &watches, &config, &rate_limit, &handle);
+    let changes = poller.check_for_new_runs_repo_wide().await;
+
+    // No changes — same conclusion, nothing to update.
+    assert!(changes.is_empty(), "expected no changes, got {changes:?}");
+
+    handle.cancel.cancel();
 }

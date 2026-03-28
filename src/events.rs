@@ -23,6 +23,13 @@ pub struct RunSnapshot {
     /// Allows TUI clients to populate `ActiveRunView.status` from a `RunStarted` event
     /// without re-fetching `/status`.
     pub status: RunStatus,
+    /// GitHub Actions attempt number. 1 for the original run, 2+ for re-runs.
+    #[serde(default = "default_attempt")]
+    pub attempt: u32,
+}
+
+fn default_attempt() -> u32 {
+    1
 }
 
 impl RunSnapshot {
@@ -35,6 +42,7 @@ impl RunSnapshot {
             title: run.title.clone(),
             event: run.event.clone(),
             status: run.status.clone(),
+            attempt: run.attempt,
         }
     }
 
@@ -126,6 +134,7 @@ mod tests {
             title: "Fix login bug".to_string(),
             event: "push".to_string(),
             status: RunStatus::InProgress,
+            attempt: 1,
         }
     }
 
@@ -161,6 +170,7 @@ mod tests {
             head_sha: "abc1234".to_string(),
             event: "pull_request".to_string(),
             head_branch: "feature/deps".to_string(),
+            attempt: 1,
         };
         let s = RunSnapshot::from_run_info(&run, "alice/app", "release");
         assert_eq!(s.repo, "alice/app");

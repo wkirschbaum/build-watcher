@@ -127,21 +127,15 @@ pub(crate) struct RerunRequest {
 pub(crate) async fn rerun_handler(
     State(state): State<AppState>,
     axum::Json(body): axum::Json<RerunRequest>,
-) -> axum::response::Response {
-    use axum::http::StatusCode;
-
+) -> axum::Json<serde_json::Value> {
     match state
         .handle
         .github
         .run_rerun(&body.repo, body.run_id, body.failed_only)
         .await
     {
-        Ok(_) => axum::Json(serde_json::json!({ "ok": true })).into_response(),
-        Err(e) => (
-            StatusCode::BAD_GATEWAY,
-            axum::Json(serde_json::json!({ "error": e.to_string() })),
-        )
-            .into_response(),
+        Ok(_) => axum::Json(serde_json::json!({ "ok": true })),
+        Err(e) => axum::Json(serde_json::json!({ "error": e.to_string() })),
     }
 }
 
@@ -586,6 +580,7 @@ mod tests {
             title: "Fix bug".to_string(),
             event: "push".to_string(),
             status: build_watcher::status::RunStatus::InProgress,
+            attempt: 1,
         }
     }
 
@@ -623,6 +618,7 @@ mod tests {
             failing_steps: Some("Build / Run tests".to_string()),
             completed_at: None,
             duration_secs: None,
+            attempt: 1,
         });
         watches.lock().await.insert(key, entry);
 
@@ -747,6 +743,7 @@ mod tests {
                 workflow: "CI".to_string(),
                 title: "Fix bug".to_string(),
                 event: "push".to_string(),
+                attempt: 1,
             },
         );
         watches.lock().await.insert(key, entry);

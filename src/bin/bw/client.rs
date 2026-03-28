@@ -106,6 +106,20 @@ impl DaemonClient {
         .await
     }
 
+    pub(crate) async fn set_repo_notifications(
+        &self,
+        repo: &str,
+        action: &str,
+    ) -> Result<(), String> {
+        #[derive(Serialize)]
+        struct Req<'a> {
+            repo: &'a str,
+            action: &'a str,
+        }
+        self.post_json("/notifications", &Req { repo, action })
+            .await
+    }
+
     pub(crate) async fn get_notifications(
         &self,
         repo: &str,
@@ -136,9 +150,9 @@ impl DaemonClient {
             repo: &'a str,
             branch: &'a str,
             action: &'static str,
-            build_started: String,
-            build_success: String,
-            build_failure: String,
+            build_started: NotificationLevel,
+            build_success: NotificationLevel,
+            build_failure: NotificationLevel,
         }
         self.post_json(
             "/notifications",
@@ -146,9 +160,9 @@ impl DaemonClient {
                 repo,
                 branch,
                 action: "set_levels",
-                build_started: started.to_string(),
-                build_success: success.to_string(),
-                build_failure: failure.to_string(),
+                build_started: started,
+                build_success: success,
+                build_failure: failure,
             },
         )
         .await

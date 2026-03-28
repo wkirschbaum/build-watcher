@@ -17,8 +17,8 @@ use build_watcher::watcher::{
 };
 
 use super::actions::{
-    apply_notification_levels, apply_notification_overrides, apply_pause, apply_quiet_hours,
-    do_configure_branches, do_stop_watches, do_watch_builds, persist_config, validate_hhmm,
+    apply_levels, apply_pause, apply_quiet_hours, do_configure_branches, do_stop_watches,
+    do_watch_builds, persist_config, validate_hhmm,
 };
 use super::build_watch_snapshot;
 use super::schema::{
@@ -720,9 +720,14 @@ impl BuildWatcher {
 
                 // Notification levels
                 let (scope, effective) = if has_levels {
+                    let levels = (
+                        params.build_started,
+                        params.build_success,
+                        params.build_failure,
+                    );
                     let scope = match (&params.repo, &params.branch) {
                         (None, _) => {
-                            apply_notification_levels(&mut config.notifications, &params);
+                            apply_levels(&mut config.notifications, levels.0, levels.1, levels.2);
                             "global".to_string()
                         }
                         (Some(repo), None) => {
@@ -731,7 +736,7 @@ impl BuildWatcher {
                                     "{repo} is not being watched — use watch_builds first"
                                 ))]));
                             };
-                            apply_notification_overrides(&mut rc.notifications, &params);
+                            apply_levels(&mut rc.notifications, levels.0, levels.1, levels.2);
                             repo.clone()
                         }
                         (Some(repo), Some(branch)) => {
@@ -741,7 +746,7 @@ impl BuildWatcher {
                                 ))]));
                             };
                             let bc = rc.branch_notifications.entry(branch.clone()).or_default();
-                            apply_notification_overrides(&mut bc.notifications, &params);
+                            apply_levels(&mut bc.notifications, levels.0, levels.1, levels.2);
                             format!("{repo} [{branch}]")
                         }
                     };

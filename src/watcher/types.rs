@@ -19,6 +19,7 @@ pub struct ActiveRun {
     pub workflow: String,
     pub title: String,
     pub event: String,
+    pub attempt: u32,
 }
 
 impl ActiveRun {
@@ -29,6 +30,7 @@ impl ActiveRun {
             workflow: run.workflow.clone(),
             title: run.title.clone(),
             event: run.event.clone(),
+            attempt: run.attempt,
         }
     }
 

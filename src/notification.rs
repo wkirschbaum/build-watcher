@@ -153,6 +153,7 @@ mod tests {
             title: "Fix login bug".to_string(),
             event: "push".to_string(),
             status: build_watcher::status::RunStatus::InProgress,
+            attempt: 1,
         }
     }
 

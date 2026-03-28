@@ -74,6 +74,7 @@ pub(crate) fn build_watch_snapshot(
                         title: run.display_title(),
                         event: run.event.clone(),
                         elapsed_secs,
+                        attempt: run.attempt,
                     }
                 })
                 .collect();
@@ -91,6 +92,7 @@ pub(crate) fn build_watch_snapshot(
                     title: lb.display_title(),
                     failing_steps: lb.failing_steps.clone(),
                     age_secs,
+                    attempt: lb.attempt,
                 }
             });
 

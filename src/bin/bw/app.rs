@@ -651,6 +651,9 @@ impl App {
             && !selected_display_idx
                 .map(|idx| flat.rows[idx].is_single_branch())
                 .unwrap_or(false);
+        let is_failed = selected_display_idx
+            .map(|idx| flat.rows[idx].is_failed())
+            .unwrap_or(false);
 
         match code {
             KeyCode::Char('q') => return QuitAction::Quit,
@@ -667,7 +670,9 @@ impl App {
                     self.selected = (self.selected + 1).min(sel_count - 1);
                 }
             }
-            KeyCode::Enter | KeyCode::Right if is_collapsible => {
+            KeyCode::Enter | KeyCode::Right | KeyCode::Tab | KeyCode::Char('e')
+                if is_collapsible =>
+            {
                 if let Some((repo, _, _, _)) = selected {
                     let repo = repo.to_string();
                     if self.collapsed.contains(&repo) {
@@ -689,17 +694,6 @@ impl App {
                             && flat.rows[idx].repo_branch_run().0 == repo
                     }) {
                         self.selected = pos;
-                    }
-                    self.save_prefs();
-                }
-            }
-            KeyCode::Tab | KeyCode::Char('e') if is_collapsible => {
-                if let Some((repo, _, _, _)) = selected {
-                    let repo = repo.to_string();
-                    if self.collapsed.contains(&repo) {
-                        self.collapsed.remove(&repo);
-                    } else {
-                        self.collapsed.insert(repo);
                     }
                     self.save_prefs();
                 }
@@ -767,20 +761,11 @@ impl App {
                     let action = if muted { "unmute" } else { "mute" };
                     let verb = if muted { "Unmuted" } else { "Muted" };
                     if is_repo_row {
-                        // Mute/unmute all branches for this repo
-                        let branches: Vec<String> = self
-                            .status
-                            .watches
-                            .iter()
-                            .filter(|w| w.repo == repo)
-                            .map(|w| w.branch.clone())
-                            .collect();
                         let label = repo.clone();
                         self.spawn_action(format!("{verb} {label}…"), true, async move {
-                            for b in &branches {
-                                d.set_notifications(&repo, b, action).await?;
-                            }
-                            Ok(format!("{verb} {label}"))
+                            d.set_repo_notifications(&repo, action)
+                                .await
+                                .map(|()| format!("{verb} {label}"))
                         });
                     } else {
                         let branch = branch.to_string();
@@ -840,7 +825,12 @@ impl App {
                 });
             }
             KeyCode::Char('o') => {
-                if is_repo_row {
+                if is_failed {
+                    // Open the specific failed run to see details
+                    if let Some((repo, _, Some(run_id), _)) = selected {
+                        open_browser(&run_url(repo, run_id));
+                    }
+                } else if is_repo_row {
                     // Open repo Actions page
                     if let Some((repo, _, _, _)) = selected {
                         open_browser(&format!("{}/actions", repo_url(repo)));
@@ -851,7 +841,7 @@ impl App {
             }
             KeyCode::Char('O') => {
                 if let Some((repo, _, _, _)) = selected {
-                    open_browser(&repo_url(repo));
+                    open_browser(&format!("{}/actions", repo_url(repo)));
                 }
             }
             KeyCode::Char('h') | KeyCode::Char('H') => {
@@ -1031,6 +1021,7 @@ mod tests {
             title: "Fix bug".to_string(),
             event: "push".to_string(),
             status: RunStatus::Queued,
+            attempt: 1,
         }
     }
 
@@ -1097,6 +1088,7 @@ mod tests {
                 title: "Fix bug".to_string(),
                 event: "push".to_string(),
                 elapsed_secs: Some(30.0),
+                attempt: 1,
             }],
             last_build: None,
             muted: false,
@@ -1159,6 +1151,7 @@ mod tests {
                 title: "Fix bug".to_string(),
                 event: "push".to_string(),
                 elapsed_secs: None,
+                attempt: 1,
             }],
             last_build: None,
             muted: false,
@@ -1188,6 +1181,7 @@ mod tests {
                 title: "Fix bug".to_string(),
                 event: "push".to_string(),
                 elapsed_secs: None,
+                attempt: 1,
             }],
             last_build: None,
             muted: false,
@@ -1248,6 +1242,7 @@ mod tests {
                 title: "Fix".to_string(),
                 failing_steps: Some("Build / tests".to_string()),
                 age_secs: Some(60.0),
+                attempt: 1,
             }),
             muted: false,
         }];
@@ -1273,6 +1268,7 @@ mod tests {
                     title: "Fix".to_string(),
                     failing_steps: Some("Build / tests".to_string()),
                     age_secs: Some(60.0),
+                    attempt: 1,
                 }),
                 muted: false,
             },
@@ -1303,6 +1299,7 @@ mod tests {
                 title: "Fix".to_string(),
                 failing_steps: None,
                 age_secs: Some(60.0),
+                attempt: 1,
             }),
             muted: false,
         }];
@@ -1367,6 +1364,7 @@ mod tests {
                 title: "Fix".to_string(),
                 event: "push".to_string(),
                 elapsed_secs: Some(10.0),
+                attempt: 1,
             }],
             last_build: None,
             muted: false,
@@ -1431,6 +1429,7 @@ mod tests {
                 title: "Fix".to_string(),
                 failing_steps: None,
                 age_secs: Some(age),
+                attempt: 1,
             }),
             muted: false,
         }
@@ -1447,6 +1446,7 @@ mod tests {
                 title: "Ship".to_string(),
                 event: "push".to_string(),
                 elapsed_secs: Some(elapsed),
+                attempt: 1,
             }],
             last_build: None,
             muted: false,

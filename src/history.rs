@@ -83,6 +83,7 @@ mod tests {
             failing_steps: None,
             completed_at,
             duration_secs: None,
+            attempt: 1,
         }
     }
 

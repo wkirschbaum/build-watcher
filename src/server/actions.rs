@@ -3,8 +3,6 @@ use build_watcher::watcher::{
     RateLimitState, SharedConfig, WatcherHandle, Watches, collect_persisted, start_watch,
 };
 
-use super::schema::UpdateNotificationsParams;
-
 /// Shared logic for adding repos to watch — used by both the MCP tool and REST endpoint.
 pub(crate) async fn do_watch_builds(
     watches: &Watches,
@@ -229,44 +227,6 @@ pub(crate) fn apply_levels<T: ApplyNotificationLevels>(
     }
 }
 
-/// Apply notification level params to a global `NotificationConfig`.
-pub(crate) fn apply_notification_levels(
-    notif: &mut build_watcher::config::NotificationConfig,
-    params: &UpdateNotificationsParams,
-) {
-    apply_levels(
-        notif,
-        params.build_started,
-        params.build_success,
-        params.build_failure,
-    );
-}
-
-/// Apply notification level params to an override struct.
-pub(crate) fn apply_notification_overrides(
-    overrides: &mut NotificationOverrides,
-    params: &UpdateNotificationsParams,
-) {
-    apply_levels(
-        overrides,
-        params.build_started,
-        params.build_success,
-        params.build_failure,
-    );
-}
-
-/// Apply optional per-event levels to a `NotificationOverrides` struct.
-///
-/// Only fields present (`Some`) are updated; `None` fields are left unchanged.
-pub(crate) fn apply_level_overrides(
-    overrides: &mut NotificationOverrides,
-    started: Option<NotificationLevel>,
-    success: Option<NotificationLevel>,
-    failure: Option<NotificationLevel>,
-) {
-    apply_levels(overrides, started, success, failure);
-}
-
 /// Mute, unmute, or set per-event notification levels for a repo/branch.
 ///
 /// Used by both the REST `POST /notifications` and the TUI daemon client.
@@ -329,11 +289,11 @@ pub(crate) fn do_notification_action(
                 .entry(branch.to_string())
                 .or_default()
                 .notifications;
-            apply_level_overrides(overrides, started, success, failure);
+            apply_levels(overrides, started, success, failure);
             Ok(format!("{target_label}: notification levels updated"))
         }
         ("set_levels", None) => {
-            apply_level_overrides(&mut rc.notifications, started, success, failure);
+            apply_levels(&mut rc.notifications, started, success, failure);
             Ok(format!("{target_label}: notification levels updated"))
         }
         (other, _) => Err(format!("unknown action: {other:?}")),
@@ -461,44 +421,29 @@ mod tests {
         );
     }
 
-    fn notif_params(
-        started: Option<NotificationLevel>,
-        success: Option<NotificationLevel>,
-        failure: Option<NotificationLevel>,
-    ) -> UpdateNotificationsParams {
-        UpdateNotificationsParams {
-            repo: None,
-            branch: None,
-            build_started: started,
-            build_success: success,
-            build_failure: failure,
-            quiet_start: None,
-            quiet_end: None,
-            quiet_clear: None,
-            pause: None,
-            pause_minutes: None,
-        }
-    }
-
     #[test]
-    fn apply_notification_levels_selective() {
+    fn apply_levels_to_notification_config() {
         let mut notif = build_watcher::config::NotificationConfig::default();
-        let params = notif_params(
+        apply_levels(
+            &mut notif,
             Some(NotificationLevel::Off),
             None,
             Some(NotificationLevel::Low),
         );
-        apply_notification_levels(&mut notif, &params);
         assert_eq!(notif.build_started, NotificationLevel::Off);
         assert_eq!(notif.build_success, NotificationLevel::Normal); // unchanged
         assert_eq!(notif.build_failure, NotificationLevel::Low);
     }
 
     #[test]
-    fn apply_notification_overrides_selective() {
+    fn apply_levels_to_overrides() {
         let mut overrides = NotificationOverrides::default();
-        let params = notif_params(None, Some(NotificationLevel::Critical), None);
-        apply_notification_overrides(&mut overrides, &params);
+        apply_levels(
+            &mut overrides,
+            None,
+            Some(NotificationLevel::Critical),
+            None,
+        );
         assert_eq!(overrides.build_started, None); // unchanged
         assert_eq!(overrides.build_success, Some(NotificationLevel::Critical));
         assert_eq!(overrides.build_failure, None); // unchanged

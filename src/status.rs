@@ -73,6 +73,13 @@ pub struct ActiveRunView {
     /// GitHub event type (e.g. `"push"`, `"pull_request"`).
     pub event: String,
     pub elapsed_secs: Option<f64>,
+    /// GitHub Actions attempt number. 1 for the original run, 2+ for re-runs.
+    #[serde(default = "default_attempt")]
+    pub attempt: u32,
+}
+
+fn default_attempt() -> u32 {
+    1
 }
 
 /// Summary of the last completed build as returned by `GET /status`.
@@ -88,6 +95,9 @@ pub struct LastBuildView {
     /// Seconds since the build completed (not available after daemon restart).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub age_secs: Option<f64>,
+    /// GitHub Actions attempt number. 1 for the original run, 2+ for re-runs.
+    #[serde(default = "default_attempt")]
+    pub attempt: u32,
 }
 
 /// One watched repo/branch as returned by `GET /status`.
@@ -175,6 +185,7 @@ impl StatusResponse {
                         title,
                         event: snap.event,
                         elapsed_secs: Some(0.0),
+                        attempt: snap.attempt,
                     });
                 }
             }
@@ -196,6 +207,7 @@ impl StatusResponse {
                     title,
                     failing_steps,
                     age_secs: Some(0.0),
+                    attempt: run.attempt,
                 });
             }
             WatchEvent::StatusChanged { run, to, .. } => {
@@ -238,6 +250,7 @@ mod tests {
             title: "Fix bug".to_string(),
             event: "push".to_string(),
             status: RunStatus::Queued,
+            attempt: 1,
         }
     }
 
@@ -334,6 +347,7 @@ mod tests {
                 title: "Fix bug".to_string(),
                 event: "push".to_string(),
                 elapsed_secs: Some(30.0),
+                attempt: 1,
             }],
             last_build: None,
             muted: false,

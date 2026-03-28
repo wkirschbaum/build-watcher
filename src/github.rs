@@ -6,7 +6,7 @@ use crate::status::RunStatus;
 
 const GH_TIMEOUT: Duration = Duration::from_secs(30);
 const GH_JSON_FIELDS: &str =
-    "databaseId,status,conclusion,displayTitle,workflowName,headSha,event,headBranch";
+    "databaseId,status,conclusion,displayTitle,workflowName,headSha,event,headBranch,attempt";
 /// Default limit for `recent_runs` (per-branch).
 const DEFAULT_BRANCH_LIMIT: u32 = 10;
 /// Upper limit for `in_progress_runs_for_repo`.
@@ -100,6 +100,9 @@ pub struct LastBuild {
     /// daemon was watching; `None` for already-completed runs detected on startup or mid-poll.
     #[serde(default)]
     pub duration_secs: Option<u64>,
+    /// GitHub Actions attempt number. 1 for the original run, 2+ for re-runs.
+    #[serde(default = "default_attempt")]
+    pub attempt: u32,
 }
 
 impl LastBuild {
@@ -128,6 +131,12 @@ struct GhRunJson {
     event: String,
     #[serde(default)]
     head_branch: String,
+    #[serde(default = "default_attempt")]
+    attempt: u32,
+}
+
+fn default_attempt() -> u32 {
+    1
 }
 
 /// A GitHub Actions run parsed for internal use.
@@ -141,6 +150,7 @@ pub struct RunInfo {
     pub head_sha: String,
     pub event: String,
     pub head_branch: String,
+    pub attempt: u32,
 }
 
 impl RunInfo {
@@ -176,6 +186,7 @@ impl RunInfo {
             head_sha: raw.head_sha,
             event: raw.event,
             head_branch: raw.head_branch,
+            attempt: raw.attempt,
         })
     }
 
@@ -217,6 +228,7 @@ impl RunInfo {
             failing_steps: None,
             completed_at: None,
             duration_secs: None,
+            attempt: self.attempt,
         }
     }
 }
