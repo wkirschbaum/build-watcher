@@ -47,7 +47,7 @@ fn make_entry() -> WatchEntry {
             (102, make_active(RunStatus::Queued)),
         ]),
         failure_counts: HashMap::new(),
-        last_build: None,
+        last_builds: HashMap::new(),
     }
 }
 
@@ -122,7 +122,7 @@ fn record_completion_removes_run_and_sets_last_build() {
 
     assert!(!entry.active_runs.contains_key(&101));
     assert!(entry.active_runs.contains_key(&102));
-    let lb = entry.last_build.unwrap();
+    let lb = entry.last_builds.get("CI").unwrap();
     assert_eq!(lb.run_id, 101);
     assert_eq!(lb.conclusion, "success");
 }
@@ -134,7 +134,7 @@ fn record_completion_stores_failing_steps() {
 
     entry.record_completion(&run, Some("Build / Run tests".to_string()), None, 0);
 
-    let lb = entry.last_build.unwrap();
+    let lb = entry.last_builds.get("CI").unwrap();
     assert_eq!(lb.failing_steps.as_deref(), Some("Build / Run tests"));
 }
 
@@ -229,7 +229,7 @@ fn incorporate_new_runs_tracks_in_progress() {
 
     assert_eq!(entry.last_seen_run_id, 200);
     assert_eq!(entry.active_runs[&200].status, RunStatus::InProgress);
-    assert!(entry.last_build.is_none());
+    assert!(entry.last_builds.is_empty());
 }
 
 #[test]
@@ -242,7 +242,7 @@ fn incorporate_new_runs_records_completed() {
 
     assert_eq!(entry.last_seen_run_id, 200);
     assert!(!entry.active_runs.contains_key(&200));
-    assert_eq!(entry.last_build.unwrap().run_id, 200);
+    assert_eq!(entry.last_builds.get("CI").unwrap().run_id, 200);
 }
 
 #[test]
@@ -255,7 +255,8 @@ fn incorporate_new_runs_newest_completed_wins_last_build() {
     entry.incorporate_new_runs(&new_runs, Instant::now(), 0);
 
     assert_eq!(entry.last_seen_run_id, 201);
-    let lb = entry.last_build.unwrap();
+    // Both have workflow "CI", so the newest (201) overwrites the older.
+    let lb = entry.last_builds.get("CI").unwrap();
     assert_eq!(lb.run_id, 201);
     assert_eq!(lb.conclusion, "success");
 }
@@ -272,7 +273,7 @@ fn incorporate_new_runs_mixed_statuses() {
     assert_eq!(entry.last_seen_run_id, 201);
     assert_eq!(entry.active_runs[&201].status, RunStatus::InProgress);
     assert!(!entry.active_runs.contains_key(&200));
-    assert_eq!(entry.last_build.unwrap().run_id, 200);
+    assert_eq!(entry.last_builds.get("CI").unwrap().run_id, 200);
 }
 
 #[test]
@@ -296,7 +297,7 @@ fn persisted_roundtrip_preserves_fields() {
     assert_eq!(restored.last_seen_run_id, entry.last_seen_run_id);
     assert!(restored.active_runs.is_empty());
     assert!(restored.failure_counts.is_empty());
-    assert_eq!(restored.last_build.unwrap().run_id, 101);
+    assert_eq!(restored.last_builds.get("CI").unwrap().run_id, 101);
 }
 
 // -- runs_for_branch tests --
@@ -452,13 +453,13 @@ fn count_api_calls_reflects_active_runs() {
         last_seen_run_id: 100,
         active_runs,
         failure_counts: HashMap::new(),
-        last_build: None,
+        last_builds: HashMap::new(),
     };
     let entry2 = WatchEntry {
         last_seen_run_id: 100,
         active_runs: HashMap::new(),
         failure_counts: HashMap::new(),
-        last_build: None,
+        last_builds: HashMap::new(),
     };
     watches.insert(WatchKey::new("owner/repo1", "main"), entry1);
     watches.insert(WatchKey::new("owner/repo2", "main"), entry2);
@@ -476,13 +477,13 @@ fn count_api_calls_same_repo_multiple_branches() {
         last_seen_run_id: 100,
         active_runs,
         failure_counts: HashMap::new(),
-        last_build: None,
+        last_builds: HashMap::new(),
     };
     let entry2 = WatchEntry {
         last_seen_run_id: 100,
         active_runs: HashMap::new(),
         failure_counts: HashMap::new(),
-        last_build: None,
+        last_builds: HashMap::new(),
     };
     watches.insert(WatchKey::new("owner/repo1", "main"), entry1);
     watches.insert(WatchKey::new("owner/repo1", "develop"), entry2);
@@ -574,6 +575,9 @@ impl crate::github::GitHubClient for MockGitHub {
             reset: crate::config::unix_now() + 3600,
             used: 0,
         })
+    }
+    async fn list_tags(&self, _: &str) -> Result<Vec<String>, GhError> {
+        Ok(vec![])
     }
 }
 
@@ -693,7 +697,7 @@ async fn check_for_new_runs_detects_new_builds() {
                 last_seen_run_id: 100,
                 active_runs: HashMap::new(),
                 failure_counts: HashMap::new(),
-                last_build: None,
+                last_builds: HashMap::new(),
             },
         );
     }
@@ -709,8 +713,8 @@ async fn check_for_new_runs_detects_new_builds() {
     assert_eq!(entry.last_seen_run_id, 102);
     // 101 is in_progress → tracked as active
     assert!(entry.active_runs.contains_key(&101));
-    // 102 is completed → last_build
-    assert_eq!(entry.last_build.as_ref().unwrap().run_id, 102);
+    // 102 is completed → last_builds
+    assert_eq!(entry.last_builds.get("CI").unwrap().run_id, 102);
     drop(w);
 
     // Verify returned changes: RunStarted for 101, RunCompleted for 102.
@@ -766,7 +770,7 @@ async fn check_for_new_runs_applies_workflow_filter() {
                 last_seen_run_id: 100,
                 active_runs: HashMap::new(),
                 failure_counts: HashMap::new(),
-                last_build: None,
+                last_builds: HashMap::new(),
             },
         );
     }
@@ -806,7 +810,7 @@ async fn poll_active_runs_detects_completion() {
             last_seen_run_id: 101,
             active_runs: HashMap::new(),
             failure_counts: HashMap::new(),
-            last_build: None,
+            last_builds: HashMap::new(),
         };
         entry
             .active_runs
@@ -821,10 +825,11 @@ async fn poll_active_runs_detects_completion() {
 
     let w = watches.lock().await;
     let entry = &w[&key];
-    // Run removed from active, recorded as last_build
+    // Run removed from active, recorded as last_builds
     assert!(!entry.active_runs.contains_key(&101));
-    assert_eq!(entry.last_build.as_ref().unwrap().run_id, 101);
-    assert_eq!(entry.last_build.as_ref().unwrap().conclusion, "success");
+    let lb = entry.last_builds.get("CI").unwrap();
+    assert_eq!(lb.run_id, 101);
+    assert_eq!(lb.conclusion, "success");
     drop(w);
 
     // RunCompleted change returned
@@ -859,7 +864,7 @@ async fn poll_active_runs_emits_status_change() {
             last_seen_run_id: 101,
             active_runs: HashMap::new(),
             failure_counts: HashMap::new(),
-            last_build: None,
+            last_builds: HashMap::new(),
         };
         entry
             .active_runs
@@ -910,7 +915,7 @@ async fn poll_active_runs_fetches_failing_steps() {
             last_seen_run_id: 101,
             active_runs: HashMap::new(),
             failure_counts: HashMap::new(),
-            last_build: None,
+            last_builds: HashMap::new(),
         };
         entry
             .active_runs
@@ -968,7 +973,7 @@ async fn check_for_new_runs_skips_already_active() {
                 last_seen_run_id: 100,
                 active_runs: HashMap::from([(101, make_active(RunStatus::InProgress))]),
                 failure_counts: HashMap::new(),
-                last_build: None,
+                last_builds: HashMap::new(),
             },
         );
     }
@@ -992,7 +997,7 @@ async fn record_completion_bumps_last_seen() {
         last_seen_run_id: 50,
         active_runs: HashMap::from([(100, make_active(RunStatus::InProgress))]),
         failure_counts: HashMap::new(),
-        last_build: None,
+        last_builds: HashMap::new(),
     };
     let run = make_run(100, RunStatus::Completed, "success");
     entry.record_completion(&run, None, None, 999);
@@ -1002,7 +1007,7 @@ async fn record_completion_bumps_last_seen() {
         "record_completion should bump last_seen_run_id"
     );
     assert!(entry.active_runs.is_empty());
-    assert!(entry.last_build.is_some());
+    assert!(!entry.last_builds.is_empty());
 }
 
 #[tokio::test]
@@ -1028,7 +1033,7 @@ async fn recover_existing_watches_recovers_active_runs() {
                 last_seen_run_id: 99,
                 active_runs: HashMap::new(),
                 failure_counts: HashMap::new(),
-                last_build: None,
+                last_builds: HashMap::new(),
             },
         );
     }
@@ -1111,7 +1116,7 @@ async fn check_for_new_runs_detects_rerun_with_different_conclusion() {
     let rate_limit: RateLimitState = Arc::new(Mutex::new(None));
     let handle = mock_handle(gh);
 
-    // Seed watch with last_seen=200 and last_build=200 (failure).
+    // Seed watch with last_seen=200 and last_builds=200 (failure).
     {
         let mut w = watches.lock().await;
         w.insert(
@@ -1120,19 +1125,22 @@ async fn check_for_new_runs_detects_rerun_with_different_conclusion() {
                 last_seen_run_id: 200,
                 active_runs: HashMap::new(),
                 failure_counts: HashMap::new(),
-                last_build: Some(crate::github::LastBuild {
-                    run_id: 200,
-                    conclusion: "failure".to_string(),
-                    workflow: "CI".to_string(),
-                    title: "Test PR".to_string(),
-                    head_sha: "abc1234".to_string(),
-                    event: "push".to_string(),
-                    failing_steps: Some("Build / Run tests".to_string()),
-                    failing_job_id: None,
-                    completed_at: Some(1000),
-                    duration_secs: Some(60),
-                    attempt: 1,
-                }),
+                last_builds: HashMap::from([(
+                    "CI".to_string(),
+                    crate::github::LastBuild {
+                        run_id: 200,
+                        conclusion: "failure".to_string(),
+                        workflow: "CI".to_string(),
+                        title: "Test PR".to_string(),
+                        head_sha: "abc1234".to_string(),
+                        event: "push".to_string(),
+                        failing_steps: Some("Build / Run tests".to_string()),
+                        failing_job_id: None,
+                        completed_at: Some(1000),
+                        duration_secs: Some(60),
+                        attempt: 1,
+                    },
+                )]),
             },
         );
     }
@@ -1152,10 +1160,10 @@ async fn check_for_new_runs_detects_rerun_with_different_conclusion() {
         other => panic!("expected Completed, got {other:?}"),
     }
 
-    // Verify last_build was updated to success.
+    // Verify last_builds was updated to success.
     let w = watches.lock().await;
     let entry = &w[&key];
-    let lb = entry.last_build.as_ref().unwrap();
+    let lb = entry.last_builds.get("CI").unwrap();
     assert_eq!(lb.run_id, 200);
     assert_eq!(lb.conclusion, "success");
 
@@ -1173,7 +1181,7 @@ async fn check_for_new_runs_detects_rerun_in_progress() {
     let rate_limit: RateLimitState = Arc::new(Mutex::new(None));
     let handle = mock_handle(gh);
 
-    // Seed watch with last_seen=200 and last_build=200 (failure).
+    // Seed watch with last_seen=200 and last_builds=200 (failure).
     {
         let mut w = watches.lock().await;
         w.insert(
@@ -1182,19 +1190,22 @@ async fn check_for_new_runs_detects_rerun_in_progress() {
                 last_seen_run_id: 200,
                 active_runs: HashMap::new(),
                 failure_counts: HashMap::new(),
-                last_build: Some(crate::github::LastBuild {
-                    run_id: 200,
-                    conclusion: "failure".to_string(),
-                    workflow: "CI".to_string(),
-                    title: "Test PR".to_string(),
-                    head_sha: "abc1234".to_string(),
-                    event: "push".to_string(),
-                    failing_steps: Some("Build / Run tests".to_string()),
-                    failing_job_id: None,
-                    completed_at: Some(1000),
-                    duration_secs: Some(60),
-                    attempt: 1,
-                }),
+                last_builds: HashMap::from([(
+                    "CI".to_string(),
+                    crate::github::LastBuild {
+                        run_id: 200,
+                        conclusion: "failure".to_string(),
+                        workflow: "CI".to_string(),
+                        title: "Test PR".to_string(),
+                        head_sha: "abc1234".to_string(),
+                        event: "push".to_string(),
+                        failing_steps: Some("Build / Run tests".to_string()),
+                        failing_job_id: None,
+                        completed_at: Some(1000),
+                        duration_secs: Some(60),
+                        attempt: 1,
+                    },
+                )]),
             },
         );
     }
@@ -1240,19 +1251,22 @@ async fn check_for_new_runs_ignores_rerun_with_same_conclusion() {
                 last_seen_run_id: 200,
                 active_runs: HashMap::new(),
                 failure_counts: HashMap::new(),
-                last_build: Some(crate::github::LastBuild {
-                    run_id: 200,
-                    conclusion: "failure".to_string(),
-                    workflow: "CI".to_string(),
-                    title: "Test PR".to_string(),
-                    head_sha: "abc1234".to_string(),
-                    event: "push".to_string(),
-                    failing_steps: None,
-                    failing_job_id: None,
-                    completed_at: Some(1000),
-                    duration_secs: None,
-                    attempt: 1,
-                }),
+                last_builds: HashMap::from([(
+                    "CI".to_string(),
+                    crate::github::LastBuild {
+                        run_id: 200,
+                        conclusion: "failure".to_string(),
+                        workflow: "CI".to_string(),
+                        title: "Test PR".to_string(),
+                        head_sha: "abc1234".to_string(),
+                        event: "push".to_string(),
+                        failing_steps: None,
+                        failing_job_id: None,
+                        completed_at: Some(1000),
+                        duration_secs: None,
+                        attempt: 1,
+                    },
+                )]),
             },
         );
     }

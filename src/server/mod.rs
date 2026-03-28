@@ -80,22 +80,27 @@ pub(crate) fn build_watch_snapshot(
                 .collect();
             active_runs.sort_by_key(|r| r.run_id);
 
-            let last_build = entry.last_build.as_ref().map(|lb| {
-                let age_secs = lb.completed_at.map(|t| unix_now().saturating_sub(t) as f64);
-                let conclusion =
-                    serde_json::from_value(serde_json::Value::String(lb.conclusion.clone()))
-                        .unwrap_or(RunConclusion::Unknown);
-                LastBuildView {
-                    run_id: lb.run_id,
-                    conclusion,
-                    workflow: lb.workflow.clone(),
-                    title: lb.display_title(),
-                    failing_steps: lb.failing_steps.clone(),
-                    age_secs,
-                    attempt: lb.attempt,
-                    failing_job_id: lb.failing_job_id,
-                }
-            });
+            let mut last_builds: Vec<LastBuildView> = entry
+                .last_builds
+                .values()
+                .map(|lb| {
+                    let age_secs = lb.completed_at.map(|t| unix_now().saturating_sub(t) as f64);
+                    let conclusion =
+                        serde_json::from_value(serde_json::Value::String(lb.conclusion.clone()))
+                            .unwrap_or(RunConclusion::Unknown);
+                    LastBuildView {
+                        run_id: lb.run_id,
+                        conclusion,
+                        workflow: lb.workflow.clone(),
+                        title: lb.display_title(),
+                        failing_steps: lb.failing_steps.clone(),
+                        age_secs,
+                        attempt: lb.attempt,
+                        failing_job_id: lb.failing_job_id,
+                    }
+                })
+                .collect();
+            last_builds.sort_by(|a, b| a.workflow.cmp(&b.workflow));
 
             let muted = config
                 .is_some_and(|cfg| cfg.notifications_for(&key.repo, &key.branch).is_all_off());
@@ -104,7 +109,7 @@ pub(crate) fn build_watch_snapshot(
                 repo: key.repo.clone(),
                 branch: key.branch.clone(),
                 active_runs,
-                last_build,
+                last_builds,
                 muted,
             }
         })

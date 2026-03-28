@@ -88,6 +88,10 @@ pub(crate) struct ConfigureBranchesParams {
     /// Branches to watch (e.g. `["main", "develop"]`)
     #[serde(deserialize_with = "deserialize_string_or_vec")]
     pub branches: Vec<String>,
+    /// Enable automatic discovery of branches with active runs. Global setting (ignored when repo is set).
+    pub auto_discover_branches: Option<bool>,
+    /// Regex pattern to filter discovered branches (e.g. `"^(main|develop)"` ). Global setting (ignored when repo is set). Pass empty string to clear.
+    pub branch_filter: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]

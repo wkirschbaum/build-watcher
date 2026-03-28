@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::time::Duration;
 
 use ratatui::layout::{Constraint, Direction, Layout};
@@ -9,10 +9,10 @@ use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table};
 use build_watcher::config::NotificationLevel;
 use build_watcher::format;
 use build_watcher::status::{
-    ActiveRunView, HistoryEntryView, LastBuildView, RunConclusion, RunStatus, WatchStatus,
+    ActiveRunView, HistoryEntryView, LastBuildView, RunConclusion, WatchStatus,
 };
 
-use super::app::{App, FormField, GroupBy, InputMode, SortColumn, SseState};
+use super::app::{App, ExpandLevel, FormField, GroupBy, InputMode, SortColumn, SseState};
 
 /// Inline info shown on the repo header when there's exactly one watched branch.
 pub(crate) struct SingleBranchInfo<'a> {
@@ -38,7 +38,7 @@ pub(crate) enum DisplayRow<'a> {
     RepoHeader {
         repo: &'a str,
         branch_count: usize,
-        collapsed: bool,
+        expand_level: ExpandLevel,
         failing: usize,
         active: usize,
         passing: usize,
@@ -138,7 +138,7 @@ fn group_watches_by_repo(watches: &[WatchStatus]) -> Vec<(&str, Vec<&WatchStatus
 pub(crate) fn flatten_rows<'a>(
     watches: &'a [WatchStatus],
     group_by: GroupBy,
-    collapsed: &HashSet<String>,
+    expand: &HashMap<String, ExpandLevel>,
 ) -> FlatRows<'a> {
     let mut rows = Vec::new();
     let mut selectable = Vec::new();
@@ -181,18 +181,27 @@ pub(crate) fn flatten_rows<'a>(
         for w in branches {
             if !w.active_runs.is_empty() {
                 active += 1;
-            } else if let Some(b) = &w.last_build {
-                match b.conclusion {
-                    RunConclusion::Success => passing += 1,
-                    _ => {
-                        failing += 1;
-                        if !failing_workflows.contains(&b.workflow) {
+            } else if !w.last_builds.is_empty() {
+                let has_failure = w
+                    .last_builds
+                    .iter()
+                    .any(|b| b.conclusion != RunConclusion::Success);
+                if has_failure {
+                    failing += 1;
+                    for b in &w.last_builds {
+                        if b.conclusion != RunConclusion::Success
+                            && !failing_workflows.contains(&b.workflow)
+                        {
                             failing_workflows.push(b.workflow.clone());
                         }
                     }
+                } else {
+                    passing += 1;
                 }
-                if let Some(age) = b.age_secs {
-                    newest_age = Some(newest_age.map_or(age, |cur: f64| cur.min(age)));
+                for b in &w.last_builds {
+                    if let Some(age) = b.age_secs {
+                        newest_age = Some(newest_age.map_or(age, |cur: f64| cur.min(age)));
+                    }
                 }
             } else {
                 idle += 1;
@@ -207,64 +216,86 @@ pub(crate) fn flatten_rows<'a>(
             }
         }
 
-        let is_collapsed = collapsed.contains(*repo);
+        let expand_level = expand.get(*repo).copied().unwrap_or(ExpandLevel::Full);
+        let is_collapsed = expand_level == ExpandLevel::Collapsed;
 
-        // For single-branch repos, collect workflow/title info for inline display.
+        // For single-branch repos with a single workflow, collect info for inline display.
+        // Multi-workflow branches expand into child rows instead.
         let single_branch = if branches.len() == 1 {
             let w = branches[0];
-            let (title, status_key, attempt, run_id, failed, failing_job_id) =
-                if let Some(run) = w.active_runs.first() {
-                    (
-                        run.title.clone(),
-                        run.status.as_str().to_string(),
-                        run.attempt,
-                        Some(run.run_id),
-                        false,
-                        None,
-                    )
-                } else if let Some(b) = &w.last_build {
-                    (
-                        b.title.clone(),
-                        b.conclusion.as_str().to_string(),
-                        b.attempt,
-                        Some(b.run_id),
-                        b.conclusion != RunConclusion::Success,
-                        b.failing_job_id,
-                    )
-                } else {
-                    (String::new(), String::new(), 1, None, false, None)
-                };
-            let mut wf_set: Vec<&str> = Vec::new();
-            for run in &w.active_runs {
-                if !wf_set.contains(&run.workflow.as_str()) {
-                    wf_set.push(&run.workflow);
+            let workflow_count = {
+                let mut wfs: Vec<&str> = Vec::new();
+                for run in &w.active_runs {
+                    if !wfs.contains(&run.workflow.as_str()) {
+                        wfs.push(&run.workflow);
+                    }
                 }
+                for b in &w.last_builds {
+                    if !wfs.contains(&b.workflow.as_str()) {
+                        wfs.push(&b.workflow);
+                    }
+                }
+                wfs.len()
+            };
+            if workflow_count <= 1 {
+                let (title, status_key, attempt, run_id, failed, failing_job_id) =
+                    if let Some(run) = w.active_runs.first() {
+                        (
+                            run.title.clone(),
+                            run.status.as_str().to_string(),
+                            run.attempt,
+                            Some(run.run_id),
+                            false,
+                            None,
+                        )
+                    } else if let Some(b) = newest_last_build(w) {
+                        (
+                            b.title.clone(),
+                            b.conclusion.as_str().to_string(),
+                            b.attempt,
+                            Some(b.run_id),
+                            b.conclusion != RunConclusion::Success,
+                            b.failing_job_id,
+                        )
+                    } else {
+                        (String::new(), String::new(), 1, None, false, None)
+                    };
+                let mut wf_set: Vec<&str> = Vec::new();
+                for run in &w.active_runs {
+                    if !wf_set.contains(&run.workflow.as_str()) {
+                        wf_set.push(&run.workflow);
+                    }
+                }
+                if wf_set.is_empty()
+                    && let Some(b) = newest_last_build(w)
+                {
+                    wf_set.push(&b.workflow);
+                }
+                Some(SingleBranchInfo {
+                    branch: &w.branch,
+                    workflows: wf_set.join(", "),
+                    attempt,
+                    title,
+                    status_key,
+                    run_id,
+                    failed,
+                    failing_job_id,
+                })
+            } else {
+                None // multi-workflow: will expand into child rows
             }
-            if wf_set.is_empty()
-                && let Some(b) = &w.last_build
-            {
-                wf_set.push(&b.workflow);
-            }
-            Some(SingleBranchInfo {
-                branch: &w.branch,
-                workflows: wf_set.join(", "),
-                attempt,
-                title,
-                status_key,
-                run_id,
-                failed,
-                failing_job_id,
-            })
         } else {
             None
         };
+
+        let is_single_branch_inline = single_branch.is_some();
 
         // Repo header row
         selectable.push(rows.len());
         rows.push(DisplayRow::RepoHeader {
             repo,
             branch_count: branches.len(),
-            collapsed: is_collapsed,
+            expand_level,
             failing,
             active,
             passing,
@@ -275,79 +306,191 @@ pub(crate) fn flatten_rows<'a>(
             failing_workflows,
         });
 
-        // Failing steps for single-branch repos (shown directly under the header)
-        if branches.len() == 1 {
+        // Failing steps for single-branch, single-workflow repos (shown directly under the header)
+        if is_single_branch_inline && branches.len() == 1 {
             let w = branches[0];
-            if w.active_runs.is_empty()
-                && let Some(b) = &w.last_build
-                && b.conclusion != RunConclusion::Success
-                && let Some(steps) = &b.failing_steps
-            {
-                rows.push(DisplayRow::FailingSteps {
-                    steps,
-                    tree_indent: "",
-                });
+            if w.active_runs.is_empty() {
+                for b in &w.last_builds {
+                    if b.conclusion != RunConclusion::Success
+                        && let Some(steps) = &b.failing_steps
+                    {
+                        rows.push(DisplayRow::FailingSteps {
+                            steps,
+                            tree_indent: "",
+                        });
+                    }
+                }
             }
         }
 
-        // Branch rows (only for multi-branch repos when expanded)
-        if !is_collapsed && branches.len() > 1 {
-            let last_idx = branches.len() - 1;
-            for (i, w) in branches.iter().enumerate() {
-                let is_last = i == last_idx;
-                let tree_prefix: &'static str = if is_last { "└─ " } else { "├─ " };
-                let tree_indent: &'static str = if is_last { "   " } else { "│  " };
+        // Expand child rows when not collapsed.
+        // For multi-branch repos: show branch rows (each may further expand into workflow rows).
+        // For single-branch, multi-workflow repos: show workflow rows directly under the header.
+        let show_workflows = expand_level == ExpandLevel::Full;
+        if !is_collapsed {
+            let expand_branches = branches.len() > 1;
+            let expand_single_branch_workflows = branches.len() == 1 && !is_single_branch_inline;
 
-                if w.active_runs.is_empty() {
-                    match &w.last_build {
-                        Some(b) => {
-                            selectable.push(rows.len());
-                            rows.push(DisplayRow::LastBuild {
-                                repo: &w.repo,
-                                branch: &w.branch,
-                                build: b,
-                                muted: w.muted,
-                                tree_prefix,
-                            });
-                            if b.conclusion != RunConclusion::Success
-                                && let Some(steps) = &b.failing_steps
-                            {
-                                rows.push(DisplayRow::FailingSteps { steps, tree_indent });
-                            }
-                        }
-                        None => {
-                            selectable.push(rows.len());
-                            rows.push(DisplayRow::NeverRan {
-                                repo: &w.repo,
-                                branch: &w.branch,
-                                muted: w.muted,
-                                tree_prefix,
-                            });
-                        }
-                    }
-                } else {
-                    let primary_idx = w
-                        .active_runs
-                        .iter()
-                        .rposition(|r| r.status == RunStatus::InProgress)
-                        .unwrap_or(w.active_runs.len() - 1);
-                    let primary = &w.active_runs[primary_idx];
-                    let extra_badge = extra_runs_badge(&w.active_runs, primary_idx);
-                    selectable.push(rows.len());
-                    rows.push(DisplayRow::ActiveRun {
-                        repo: &w.repo,
-                        branch: &w.branch,
-                        run: primary,
-                        extra_badge,
-                        muted: w.muted,
+            if expand_branches {
+                let last_idx = branches.len() - 1;
+                for (i, w) in branches.iter().enumerate() {
+                    let is_last = i == last_idx;
+                    let tree_prefix: &'static str = if is_last { "└─ " } else { "├─ " };
+                    let tree_indent: &'static str = if is_last { "   " } else { "│  " };
+
+                    emit_branch_workflow_rows(
+                        w,
                         tree_prefix,
-                    });
+                        tree_indent,
+                        show_workflows,
+                        &mut rows,
+                        &mut selectable,
+                    );
                 }
+            } else if expand_single_branch_workflows {
+                let w = branches[0];
+                emit_branch_workflow_rows(w, "", "", show_workflows, &mut rows, &mut selectable);
             }
         }
     }
 
     FlatRows { rows, selectable }
+}
+
+/// Emit rows for a single branch's workflows. Each active run gets its own row,
+/// and each last_build (not covered by an active run) gets its own row.
+/// When `show_workflows` is false or there's only one item, show a single branch row.
+fn emit_branch_workflow_rows<'a>(
+    w: &'a WatchStatus,
+    tree_prefix: &'static str,
+    tree_indent: &'static str,
+    show_workflows: bool,
+    rows: &mut Vec<DisplayRow<'a>>,
+    selectable: &mut Vec<usize>,
+) {
+    // Collect all workflow items: active runs first, then last_builds not covered by active runs.
+    let active_wfs: Vec<&str> = w.active_runs.iter().map(|r| r.workflow.as_str()).collect();
+
+    let has_multiple_items = w.active_runs.len()
+        + w.last_builds
+            .iter()
+            .filter(|b| !active_wfs.contains(&b.workflow.as_str()))
+            .count()
+        > 1;
+
+    if !show_workflows || !has_multiple_items {
+        // Single row for this branch: show the "primary" active run or newest last build.
+        if let Some(run) = w.active_runs.first() {
+            selectable.push(rows.len());
+            rows.push(DisplayRow::ActiveRun {
+                repo: &w.repo,
+                branch: &w.branch,
+                run,
+                extra_badge: String::new(),
+                muted: w.muted,
+                tree_prefix,
+            });
+        } else if let Some(b) = w.last_builds.first() {
+            selectable.push(rows.len());
+            rows.push(DisplayRow::LastBuild {
+                repo: &w.repo,
+                branch: &w.branch,
+                build: b,
+                muted: w.muted,
+                tree_prefix,
+            });
+            if b.conclusion != RunConclusion::Success
+                && let Some(steps) = &b.failing_steps
+            {
+                rows.push(DisplayRow::FailingSteps { steps, tree_indent });
+            }
+        } else {
+            selectable.push(rows.len());
+            rows.push(DisplayRow::NeverRan {
+                repo: &w.repo,
+                branch: &w.branch,
+                muted: w.muted,
+                tree_prefix,
+            });
+        }
+        return;
+    }
+
+    // Multiple workflows: emit one row per active run, then one per last_build
+    // for workflows without an active run.
+    let mut items: Vec<WorkflowItem<'a>> = Vec::new();
+
+    for run in &w.active_runs {
+        items.push(WorkflowItem::Active(run));
+    }
+    for b in &w.last_builds {
+        if !active_wfs.contains(&b.workflow.as_str()) {
+            items.push(WorkflowItem::Completed(b));
+        }
+    }
+
+    let last_idx = items.len().saturating_sub(1);
+    for (i, item) in items.iter().enumerate() {
+        let is_last = i == last_idx;
+        // Sub-tree prefixes: combine branch indent with workflow connector.
+        let wf_prefix: &'static str = match (tree_indent, is_last) {
+            ("", true) => "└─ ",
+            ("", false) => "├─ ",
+            ("│  ", true) => "│  └─ ",
+            ("│  ", false) => "│  ├─ ",
+            ("   ", true) => "   └─ ",
+            ("   ", false) => "   ├─ ",
+            (_, true) => "└─ ",
+            (_, false) => "├─ ",
+        };
+        let wf_indent: &'static str = match (tree_indent, is_last) {
+            ("", true) => "   ",
+            ("", false) => "│  ",
+            ("│  ", true) => "│     ",
+            ("│  ", false) => "│  │  ",
+            ("   ", true) => "      ",
+            ("   ", false) => "   │  ",
+            (_, true) => "   ",
+            (_, false) => "│  ",
+        };
+
+        match item {
+            WorkflowItem::Active(run) => {
+                selectable.push(rows.len());
+                rows.push(DisplayRow::ActiveRun {
+                    repo: &w.repo,
+                    branch: &w.branch,
+                    run,
+                    extra_badge: String::new(),
+                    muted: w.muted,
+                    tree_prefix: wf_prefix,
+                });
+            }
+            WorkflowItem::Completed(b) => {
+                selectable.push(rows.len());
+                rows.push(DisplayRow::LastBuild {
+                    repo: &w.repo,
+                    branch: &w.branch,
+                    build: b,
+                    muted: w.muted,
+                    tree_prefix: wf_prefix,
+                });
+                if b.conclusion != RunConclusion::Success
+                    && let Some(steps) = &b.failing_steps
+                {
+                    rows.push(DisplayRow::FailingSteps {
+                        steps,
+                        tree_indent: wf_indent,
+                    });
+                }
+            }
+        }
+    }
+}
+
+enum WorkflowItem<'a> {
+    Active(&'a ActiveRunView),
+    Completed(&'a LastBuildView),
 }
 
 impl DisplayRow<'_> {
@@ -518,45 +661,11 @@ pub(crate) fn sorted_watches(
         .collect()
 }
 
-/// Build a compact badge summarising the non-primary active runs.
-///
-/// Returns an empty string when there is only one run (primary_idx is the sole element).
-/// Examples: `"+2⏸"`, `"+1⏳ +2⏸"`.
-pub(crate) fn extra_runs_badge(runs: &[ActiveRunView], primary_idx: usize) -> String {
-    if runs.len() <= 1 {
-        return String::new();
-    }
-    let mut in_progress = 0usize;
-    let mut queued = 0usize;
-    let mut other = 0usize;
-    for (i, r) in runs.iter().enumerate() {
-        if i == primary_idx {
-            continue;
-        }
-        match r.status.as_str() {
-            "in_progress" => in_progress += 1,
-            "queued" | "waiting" | "requested" | "pending" => queued += 1,
-            _ => other += 1,
-        }
-    }
-    let mut parts = Vec::new();
-    if in_progress > 0 {
-        parts.push(format!("+{in_progress}⏳"));
-    }
-    if queued > 0 {
-        parts.push(format!("+{queued}⏸"));
-    }
-    if other > 0 {
-        parts.push(format!("+{other}·"));
-    }
-    parts.join(" ")
-}
-
 /// Status key: active runs (tier 0), completed (tier 1), idle (tier 2).
 pub(crate) fn watch_status(w: &WatchStatus) -> (u8, &'static str) {
     if let Some(run) = w.active_runs.first() {
         (0, run.status.as_str())
-    } else if let Some(b) = &w.last_build {
+    } else if let Some(b) = newest_last_build(w) {
         (1, b.conclusion.as_str())
     } else {
         (2, "")
@@ -566,7 +675,7 @@ pub(crate) fn watch_status(w: &WatchStatus) -> (u8, &'static str) {
 pub(crate) fn watch_workflow(w: &WatchStatus) -> &str {
     if let Some(run) = w.active_runs.first() {
         &run.workflow
-    } else if let Some(b) = &w.last_build {
+    } else if let Some(b) = newest_last_build(w) {
         &b.workflow
     } else {
         ""
@@ -577,11 +686,16 @@ pub(crate) fn watch_workflow(w: &WatchStatus) -> &str {
 pub(crate) fn watch_age(w: &WatchStatus) -> f64 {
     if let Some(run) = w.active_runs.first() {
         run.elapsed_secs.unwrap_or(f64::MAX)
-    } else if let Some(b) = &w.last_build {
+    } else if let Some(b) = newest_last_build(w) {
         b.age_secs.unwrap_or(f64::MAX)
     } else {
         f64::MAX
     }
+}
+
+/// The most recently completed build (by run_id) across all workflows.
+fn newest_last_build(w: &WatchStatus) -> Option<&LastBuildView> {
+    w.last_builds.iter().max_by_key(|b| b.run_id)
 }
 
 /// Extract just the repo name (after the '/') for display.
@@ -620,7 +734,7 @@ const COL_SPACING: u16 = 1;
 const NUM_GAPS: usize = 5; // 6 columns → 5 gaps
 
 // Fixed column widths (content is bounded, no truncation needed).
-const BRANCH_W: usize = 12;
+const BRANCH_W: usize = 16;
 const STATUS_W: usize = 15;
 const AGE_W: usize = 10;
 const FIXED_W: usize = BRANCH_W + STATUS_W + AGE_W + NUM_GAPS * COL_SPACING as usize;
@@ -756,7 +870,7 @@ pub(crate) fn render_header(frame: &mut ratatui::Frame, area: ratatui::layout::R
     }
     if let Some(version) = &app.update_available {
         left2_spans.push(Span::styled(
-            format!("  ↑ {version} available [U]"),
+            format!("  ↑ {version} available"),
             Style::default().fg(Color::Yellow),
         ));
     }
@@ -877,7 +991,7 @@ fn render_display_row<'a>(
         DisplayRow::RepoHeader {
             repo,
             branch_count,
-            collapsed,
+            expand_level,
             failing,
             active,
             passing,
@@ -890,25 +1004,20 @@ fn render_display_row<'a>(
             let name = if single_branch.is_some() {
                 format!("  {}{}", short_repo(repo), mute_indicator(*muted))
             } else {
-                let arrow = if *collapsed { "›" } else { "⌄" };
+                let arrow = match expand_level {
+                    ExpandLevel::Collapsed => "›",
+                    ExpandLevel::Branches => "⌄",
+                    ExpandLevel::Full => "⌄",
+                };
                 format!("{arrow} {}{}", short_repo(repo), mute_indicator(*muted))
             };
 
-            // Compact status summary
-            let mut parts = Vec::new();
-            if *failing > 0 {
-                parts.push(format!("✗ {failing}"));
-            }
-            if *active > 0 {
-                parts.push(format!("⏳ {active}"));
-            }
-            if *passing > 0 {
-                parts.push(format!("✓ {passing}"));
-            }
-            if *idle > 0 {
-                parts.push(format!("· {idle}"));
-            }
-            let status_text = parts.join("  ");
+            // Compact status summary: active / passing / failing (/ idle when present)
+            let status_text = if *idle > 0 {
+                format!("{active}/{passing}/{failing}/{idle}")
+            } else {
+                format!("{active}/{passing}/{failing}")
+            };
 
             let age = newest_age
                 .map(|s| format::age(s as u64))
@@ -940,7 +1049,7 @@ fn render_display_row<'a>(
                     Cell::from(age).style(style),
                 ])
             } else {
-                let branch_label = if *collapsed {
+                let branch_label = if *expand_level == ExpandLevel::Collapsed {
                     format!("{branch_count} branches")
                 } else {
                     String::new()
@@ -1131,7 +1240,7 @@ pub(crate) fn render_footer(frame: &mut ratatui::Frame, area: ratatui::layout::R
         | InputMode::History { .. } => Paragraph::new(""),
         InputMode::Normal => {
             let sep = Span::styled("  │  ", Style::default().fg(Color::DarkGray));
-            let mut spans = vec![
+            let spans = vec![
                 // ── Navigate ──────────────────────────────────────────────
                 Span::styled("[↑↓/jk]", key_style),
                 Span::raw(" nav  "),
@@ -1170,13 +1279,6 @@ pub(crate) fn render_footer(frame: &mut ratatui::Frame, area: ratatui::layout::R
                 Span::styled("[Q]", key_style),
                 Span::raw(" stop"),
             ];
-            if app.update_available.is_some() {
-                spans.extend([
-                    Span::raw("  "),
-                    Span::styled("[U]", key_style),
-                    Span::raw(" update"),
-                ]);
-            }
             Paragraph::new(Line::from(spans))
         }
         .style(Style::default().fg(Color::DarkGray)),
@@ -1202,7 +1304,7 @@ pub(crate) fn render(frame: &mut ratatui::Frame, app: &App) {
         app.sort_ascending,
         app.group_by,
     );
-    let flat = flatten_rows(&sorted, app.group_by, &app.collapsed);
+    let flat = flatten_rows(&sorted, app.group_by, &app.expand);
     let table_rows = flat.rows.len() as u16;
 
     let recent_count = app.recent_history.len();
@@ -1314,9 +1416,9 @@ pub(crate) fn render_form_popup(
     fields: &[FormField],
     active: usize,
 ) {
-    // 3 lines per field (label + input + blank) + blank separator + hint + 2 for borders
-    let inner_height = fields.len() as u16 * 3 + 2;
-    let popup_height = inner_height + 2; // borders
+    // 1 row per field + 1 blank top + 1 blank bottom + 1 hint + 2 borders
+    let inner_height = fields.len() as u16 + 3;
+    let popup_height = inner_height + 2;
     let popup = centered_rect(60, popup_height, frame.area());
 
     frame.render_widget(Clear, popup);
@@ -1334,13 +1436,15 @@ pub(crate) fn render_form_popup(
         .add_modifier(Modifier::BOLD);
     let cursor_style = Style::default().fg(Color::Cyan);
 
-    let mut constraints: Vec<Constraint> = Vec::new();
+    // Find the longest label for alignment
+    let label_width = fields.iter().map(|f| f.label.len()).max().unwrap_or(0);
+
+    let mut constraints: Vec<Constraint> = Vec::with_capacity(fields.len() + 3);
+    constraints.push(Constraint::Length(1)); // top padding
     for _ in fields {
-        constraints.push(Constraint::Length(1)); // label
-        constraints.push(Constraint::Length(1)); // input
-        constraints.push(Constraint::Length(1)); // spacing
+        constraints.push(Constraint::Length(1)); // field row
     }
-    constraints.push(Constraint::Length(1)); // blank separator before hint
+    constraints.push(Constraint::Length(1)); // bottom padding
     constraints.push(Constraint::Length(1)); // hint
 
     let rows = Layout::default()
@@ -1348,8 +1452,11 @@ pub(crate) fn render_form_popup(
         .constraints(constraints)
         .split(inner);
 
+    // Fixed label column width: longest label + 2 chars padding
+    let label_col = (label_width as u16) + 2;
+
     for (i, field) in fields.iter().enumerate() {
-        let base = i * 3;
+        let row = i + 1; // offset by top padding
         let is_active = i == active;
         let style = if is_active {
             active_label_style
@@ -1357,35 +1464,40 @@ pub(crate) fn render_form_popup(
             label_style
         };
 
-        // Label
-        let label = Paragraph::new(Line::from(Span::styled(&field.label, style)));
-        frame.render_widget(label, rows[base]);
+        // Split row into label column (fixed) and value column (fill)
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(label_col), Constraint::Min(1)])
+            .split(rows[row]);
 
-        // Input line — cycle fields show ◀ value ▶, text fields show buffer with cursor
-        let input_text = if !field.options.is_empty() {
+        // Right-aligned label
+        let label = Paragraph::new(Line::from(Span::styled(&field.label, style)))
+            .alignment(ratatui::layout::Alignment::Right);
+        frame.render_widget(label, cols[0]);
+
+        // Value with leading gap
+        let mut spans: Vec<Span> = vec![Span::raw("  ")];
+        if !field.options.is_empty() {
             let arrow_style = if is_active {
                 Style::default().fg(Color::Cyan)
             } else {
                 Style::default().fg(Color::DarkGray)
             };
-            Line::from(vec![
-                Span::styled("◀ ", arrow_style),
-                Span::raw(&field.buffer),
-                Span::styled(" ▶", arrow_style),
-            ])
+            spans.push(Span::styled("◀ ", arrow_style));
+            spans.push(Span::raw(&field.buffer));
+            spans.push(Span::styled(" ▶", arrow_style));
         } else if is_active {
-            Line::from(vec![
-                Span::raw(&field.buffer),
-                Span::styled("█", cursor_style),
-            ])
+            spans.push(Span::raw(&field.buffer));
+            spans.push(Span::styled("█", cursor_style));
         } else {
-            Line::from(Span::raw(&field.buffer))
-        };
-        frame.render_widget(Paragraph::new(input_text), rows[base + 1]);
+            spans.push(Span::raw(&field.buffer));
+        }
+
+        frame.render_widget(Paragraph::new(Line::from(spans)), cols[1]);
     }
 
-    // Footer hint — separated by a blank row from the last field
-    let hint_row = fields.len() * 3 + 1;
+    // Footer hint
+    let hint_row = fields.len() + 2;
     frame.render_widget(
         Paragraph::new(popup_hint(&[
             ("[Tab]", "next  "),

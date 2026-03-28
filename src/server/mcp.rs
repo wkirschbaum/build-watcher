@@ -120,18 +120,16 @@ impl BuildWatcher {
             .watches
             .iter()
             .map(|w| {
-                let last = w
-                    .last_build
-                    .as_ref()
-                    .map(|b| {
-                        format!(
-                            " (last: {} — {}: {})",
-                            b.conclusion.as_str(),
-                            b.workflow,
-                            b.title
-                        )
-                    })
-                    .unwrap_or_default();
+                let last = if w.last_builds.is_empty() {
+                    String::new()
+                } else {
+                    let parts: Vec<String> = w
+                        .last_builds
+                        .iter()
+                        .map(|b| format!("{}: {} — {}", b.workflow, b.conclusion.as_str(), b.title))
+                        .collect();
+                    format!(" (last: {})", parts.join("; "))
+                };
 
                 if w.active_runs.is_empty() {
                     format!("- {} [{}] — idle{last}", w.repo, w.branch)
@@ -189,16 +187,48 @@ impl BuildWatcher {
 
         match params.repo {
             None => {
-                let (snapshot, mut msg) = {
+                // Validate branch_filter regex before applying.
+                if let Some(ref filter) = params.branch_filter
+                    && !filter.is_empty()
+                    && let Err(e) = regex::Regex::new(filter)
+                {
+                    return Ok(CallToolResult::error(vec![Content::text(format!(
+                        "invalid branch_filter regex: {e}"
+                    ))]));
+                }
+
+                let (snapshot, mut msgs) = {
                     let mut config = self.config.lock().await;
+                    let mut msgs = Vec::new();
                     config.default_branches = params.branches;
-                    let msg = format!("Default branches set to {:?}", config.default_branches);
-                    (config.clone(), msg)
+                    msgs.push(format!(
+                        "Default branches set to {:?}",
+                        config.default_branches
+                    ));
+                    if let Some(enabled) = params.auto_discover_branches {
+                        config.auto_discover_branches = enabled;
+                        msgs.push(format!(
+                            "Auto-discover branches: {}",
+                            if enabled { "on" } else { "off" }
+                        ));
+                    }
+                    if let Some(filter) = params.branch_filter {
+                        if filter.is_empty() {
+                            config.branch_filter = None;
+                            msgs.push("Branch filter cleared".to_string());
+                        } else {
+                            config.branch_filter = Some(filter.clone());
+                            msgs.push(format!("Branch filter: {filter}"));
+                        }
+                    }
+                    (config.clone(), msgs)
                 };
                 if let Err(warning) = persist_config(snapshot).await {
-                    msg.push_str(&warning);
+                    msgs.push(warning);
                 }
-                Ok(CallToolResult::success(vec![Content::text(msg)]))
+                Ok(CallToolResult::success(vec![Content::text(
+                    msgs.join("\n"),
+                )]))
             }
             Some(repo) => {
                 if let Err(e) = validate_repo(&repo) {

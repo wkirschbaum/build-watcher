@@ -104,10 +104,6 @@ fn reset_state() -> Result<(), Box<dyn std::error::Error>> {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    if std::env::args().any(|a| a == "--update") {
-        return update::run();
-    }
-
     if std::env::args().any(|a| a == "--reset-state") {
         return reset_state();
     }
@@ -136,12 +132,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Check for a newer release at startup (10s delay), then every hour.
     tokio::spawn({
-        let client = daemon.client.clone();
         let tx = sse_tx.clone();
         async move {
             tokio::time::sleep(Duration::from_secs(10)).await;
             loop {
-                if let Some(version) = update::check_latest(&client).await {
+                if let Some(version) = update::check_latest().await {
                     let _ = tx.send(SseUpdate::UpdateAvailable(version)).await;
                     break;
                 }
@@ -182,7 +177,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     resync_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-    let mut do_update = false;
     let result = async {
         loop {
             execute!(terminal.backend_mut(), SetTitle(app.terminal_title()))?;
@@ -262,10 +256,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     let _ = daemon.shutdown().await;
                                     break;
                                 }
-                                QuitAction::Update => {
-                                    do_update = true;
-                                    break;
-                                }
                                 QuitAction::None => {}
                             }
                         }
@@ -286,11 +276,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .backend_mut()
         .execute(SetTitle(""))
         .and_then(|s| s.execute(LeaveAlternateScreen))?;
-
-    if do_update {
-        update::run()?;
-        return Ok(());
-    }
 
     result
 }

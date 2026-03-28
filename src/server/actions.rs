@@ -1,4 +1,7 @@
+use std::collections::HashSet;
+
 use build_watcher::config::{self, NotificationLevel, NotificationOverrides};
+use build_watcher::github::DEFAULT_REPO_LIMIT;
 use build_watcher::watcher::{
     RateLimitState, SharedConfig, WatcherHandle, Watches, collect_persisted, start_watch,
 };
@@ -32,6 +35,15 @@ pub(crate) async fn do_watch_builds(
                 Err(msg) => results.push(msg),
             }
         }
+
+        // Auto-discover additional branches from recent runs.
+        for branch in discover_branches(config, handle, repo, branches).await {
+            if let Ok(msg) = start_watch(watches, config, handle, rate_limit, repo, &branch).await {
+                any_started = true;
+                results.push(msg);
+            }
+        }
+
         if any_started {
             started_repos.push(repo.clone());
         }
@@ -52,6 +64,65 @@ pub(crate) async fn do_watch_builds(
     }
 
     results
+}
+
+/// Discover branches with recent GitHub Actions runs that aren't already being watched.
+/// Returns an empty vec when auto-discover is disabled or no new branches are found.
+async fn discover_branches(
+    config: &SharedConfig,
+    handle: &WatcherHandle,
+    repo: &str,
+    already_watching: &[String],
+) -> Vec<String> {
+    let (enabled, filter_re) = {
+        let cfg = config.lock().await;
+        (cfg.auto_discover_branches, cfg.branch_filter_regex())
+    };
+    if !enabled {
+        return Vec::new();
+    }
+
+    let all_runs = match handle
+        .github
+        .recent_runs_for_repo(repo, DEFAULT_REPO_LIMIT)
+        .await
+    {
+        Ok(runs) => runs,
+        Err(e) => {
+            tracing::warn!(repo = %repo, error = %e, "Auto-discover: failed to fetch runs");
+            return Vec::new();
+        }
+    };
+
+    // Fetch tags so we can exclude them from discovered "branches".
+    let tags: HashSet<String> = handle
+        .github
+        .list_tags(repo)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+
+    let watching: HashSet<&str> = already_watching.iter().map(|b| b.as_str()).collect();
+    let discovered: Vec<String> = all_runs
+        .iter()
+        .map(|r| r.head_branch.as_str())
+        .filter(|b| !watching.contains(b))
+        .filter(|b| !tags.contains(*b))
+        .filter(|b| filter_re.as_ref().is_none_or(|re| re.is_match(b)))
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .map(|b| b.to_string())
+        .collect();
+
+    if !discovered.is_empty() {
+        tracing::info!(
+            repo = %repo,
+            branches = ?discovered,
+            "Auto-discovered branches"
+        );
+    }
+    discovered
 }
 
 /// Shared logic for removing repos from watch — used by both the MCP tool and REST endpoint.

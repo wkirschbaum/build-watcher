@@ -105,7 +105,7 @@ impl<'de> Deserialize<'de> for WatchKey {
 pub struct PersistedWatch {
     pub(crate) last_seen_run_id: u64,
     #[serde(default)]
-    pub(crate) last_build: Option<LastBuild>,
+    pub(crate) last_builds: HashMap<String, LastBuild>,
 }
 
 pub(crate) type PersistedWatches = HashMap<WatchKey, PersistedWatch>;
@@ -137,7 +137,8 @@ pub struct WatchEntry {
     pub(super) last_seen_run_id: u64,
     pub active_runs: HashMap<u64, ActiveRun>,
     pub(super) failure_counts: HashMap<u64, u8>,
-    pub last_build: Option<LastBuild>,
+    /// Last completed build per workflow name.
+    pub last_builds: HashMap<String, LastBuild>,
 }
 
 impl WatchEntry {
@@ -146,15 +147,20 @@ impl WatchEntry {
             last_seen_run_id: p.last_seen_run_id,
             active_runs: HashMap::new(),
             failure_counts: HashMap::new(),
-            last_build: p.last_build,
+            last_builds: p.last_builds,
         }
     }
 
     pub(crate) fn to_persisted(&self) -> PersistedWatch {
         PersistedWatch {
             last_seen_run_id: self.last_seen_run_id,
-            last_build: self.last_build.clone(),
+            last_builds: self.last_builds.clone(),
         }
+    }
+
+    /// The most recently completed build across all workflows, if any.
+    pub fn newest_last_build(&self) -> Option<&LastBuild> {
+        self.last_builds.values().max_by_key(|lb| lb.run_id)
     }
 
     pub(super) fn has_active_runs(&self) -> bool {
@@ -181,7 +187,8 @@ impl WatchEntry {
         last_build.failing_job_id = failing_job_id;
         last_build.completed_at = Some(now_unix);
         last_build.duration_secs = elapsed.map(|d| d.as_secs());
-        self.last_build = Some(last_build);
+        self.last_builds
+            .insert(last_build.workflow.clone(), last_build);
         elapsed
     }
 
@@ -236,7 +243,7 @@ impl WatchEntry {
             if run.is_completed() {
                 let mut lb = run.to_last_build();
                 lb.completed_at = Some(now_unix);
-                self.last_build = Some(lb);
+                self.last_builds.insert(lb.workflow.clone(), lb);
             } else {
                 self.active_runs
                     .insert(run.id, ActiveRun::from_run(run, now));
@@ -245,7 +252,7 @@ impl WatchEntry {
     }
 }
 
-/// Find the most recent failed build across all branches of a repo.
+/// Find the most recent failed build across all branches and workflows of a repo.
 pub fn last_failed_build<'a>(
     watches: &'a HashMap<WatchKey, WatchEntry>,
     repo: &str,
@@ -253,12 +260,12 @@ pub fn last_failed_build<'a>(
     watches
         .iter()
         .filter(|(k, _)| k.matches_repo(repo))
-        .filter_map(|(k, entry)| {
+        .flat_map(|(k, entry)| {
             entry
-                .last_build
-                .as_ref()
+                .last_builds
+                .values()
                 .filter(|b| b.conclusion != "success")
-                .map(|b| (k, b))
+                .map(move |b| (k, b))
         })
         .max_by_key(|(_, b)| b.run_id)
 }

@@ -112,8 +112,6 @@ pub async fn start_watch(
         .filter(|r| !r.is_completed())
         .map(|r| (r.id, ActiveRun::from_run(r, now)))
         .collect();
-    let last_completed = runs.iter().find(|r| r.is_completed());
-
     let msg = if active.is_empty() {
         let latest = runs[0];
         format!(
@@ -130,16 +128,21 @@ pub async fn start_watch(
         )
     };
 
-    let last_build = last_completed.map(|r| {
-        let mut lb = (*r).to_last_build();
-        lb.completed_at = Some(unix_now());
-        lb
-    });
+    // Seed one last build per workflow from all completed runs (newest-first).
+    let last_builds: HashMap<String, crate::github::LastBuild> = runs
+        .iter()
+        .filter(|r| r.is_completed())
+        .fold(HashMap::new(), |mut map, r| {
+            let mut lb = r.to_last_build();
+            lb.completed_at = Some(unix_now());
+            map.entry(lb.workflow.clone()).or_insert(lb);
+            map
+        });
     let entry = WatchEntry {
         last_seen_run_id: max_id,
         active_runs: active,
         failure_counts: HashMap::new(),
-        last_build: last_build.clone(),
+        last_builds: last_builds.clone(),
     };
 
     {
@@ -152,7 +155,7 @@ pub async fn start_watch(
     }
 
     // Seed history with the initial completed build (in-memory; caller persists).
-    if let Some(lb) = last_build {
+    for lb in last_builds.into_values() {
         let mut hist = handle.history.lock().await;
         push_build(&mut hist, &key, lb);
     }

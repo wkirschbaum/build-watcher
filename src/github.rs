@@ -261,6 +261,8 @@ pub trait GitHubClient: Send + Sync + 'static {
         limit: u32,
     ) -> Result<Vec<HistoryEntry>, GhError>;
     async fn rate_limit(&self) -> Result<RateLimit, GhError>;
+    /// Fetch tag names for a repo (used to exclude tags from branch discovery).
+    async fn list_tags(&self, repo: &str) -> Result<Vec<String>, GhError>;
 }
 
 /// Real GitHub client that shells out to the `gh` CLI.
@@ -392,6 +394,26 @@ impl GitHubClient for GhCliClient {
             repo: "rate_limit".into(),
             source: e,
         })
+    }
+
+    async fn list_tags(&self, repo: &str) -> Result<Vec<String>, GhError> {
+        let stdout = gh_exec(
+            repo,
+            &[
+                "api",
+                &format!("repos/{repo}/tags"),
+                "--jq",
+                ".[].name",
+                "--paginate",
+            ],
+        )
+        .await?;
+        let text = String::from_utf8_lossy(&stdout);
+        Ok(text
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| l.to_string())
+            .collect())
     }
 }
 
@@ -625,6 +647,11 @@ pub fn run_url(repo: &str, run_id: u64) -> String {
 /// URL for a specific job within a workflow run.
 pub fn job_url(repo: &str, run_id: u64, job_id: u64) -> String {
     format!("https://github.com/{repo}/actions/runs/{run_id}/job/{job_id}")
+}
+
+/// URL for the Actions tab of a repository, optionally filtered by branch.
+pub fn actions_url(repo: &str, branch: &str) -> String {
+    format!("https://github.com/{repo}/actions?query=branch%3A{branch}",)
 }
 
 /// URL for a repository.

@@ -109,7 +109,9 @@ pub struct WatchStatus {
     pub repo: String,
     pub branch: String,
     pub active_runs: Vec<ActiveRunView>,
-    pub last_build: Option<LastBuildView>,
+    /// Last completed build per workflow.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub last_builds: Vec<LastBuildView>,
     /// Whether notifications are muted for this repo (all levels set to off).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub muted: bool,
@@ -147,6 +149,10 @@ pub struct DefaultsConfig {
     pub ignored_workflows: Vec<String>,
     #[serde(default)]
     pub poll_aggression: String,
+    #[serde(default)]
+    pub auto_discover_branches: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch_filter: Option<String>,
 }
 
 /// Daemon stats returned by `GET /stats`.
@@ -204,16 +210,26 @@ impl StatusResponse {
                 };
                 watch.active_runs.retain(|r| r.run_id != run.run_id);
                 let title = run.display_title();
-                watch.last_build = Some(LastBuildView {
+                let new_build = LastBuildView {
                     run_id: run.run_id,
                     conclusion,
-                    workflow: run.workflow,
+                    workflow: run.workflow.clone(),
                     title,
                     failing_steps,
                     age_secs: Some(0.0),
                     attempt: run.attempt,
                     failing_job_id,
-                });
+                };
+                // Replace existing entry for this workflow, or append.
+                if let Some(existing) = watch
+                    .last_builds
+                    .iter_mut()
+                    .find(|b| b.workflow == run.workflow)
+                {
+                    *existing = new_build;
+                } else {
+                    watch.last_builds.push(new_build);
+                }
             }
             WatchEvent::StatusChanged { run, to, .. } => {
                 let Some(watch) = find_watch_mut(&mut self.watches, &run.repo, &run.branch) else {
@@ -264,7 +280,7 @@ mod tests {
             repo: repo.to_string(),
             branch: branch.to_string(),
             active_runs: vec![],
-            last_build: None,
+            last_builds: vec![],
             muted: false,
         }
     }
@@ -354,7 +370,7 @@ mod tests {
                 elapsed_secs: Some(30.0),
                 attempt: 1,
             }],
-            last_build: None,
+            last_builds: vec![],
             muted: false,
         }]);
 
@@ -367,7 +383,8 @@ mod tests {
         });
 
         assert!(status.watches[0].active_runs.is_empty());
-        let lb = status.watches[0].last_build.as_ref().unwrap();
+        assert_eq!(status.watches[0].last_builds.len(), 1);
+        let lb = &status.watches[0].last_builds[0];
         assert_eq!(lb.run_id, 7);
         assert_eq!(lb.conclusion, RunConclusion::Success);
     }

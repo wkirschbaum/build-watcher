@@ -282,6 +282,8 @@ pub(crate) async fn get_defaults_handler(
         default_branches: cfg.default_branches.clone(),
         ignored_workflows: cfg.ignored_workflows.clone(),
         poll_aggression: cfg.poll_aggression.to_string(),
+        auto_discover_branches: cfg.auto_discover_branches,
+        branch_filter: cfg.branch_filter.clone(),
     })
 }
 
@@ -293,6 +295,10 @@ pub(crate) struct SetDefaultsRequest {
     ignored_workflows: Option<Vec<String>>,
     #[serde(default)]
     poll_aggression: Option<String>,
+    #[serde(default)]
+    auto_discover_branches: Option<bool>,
+    #[serde(default)]
+    branch_filter: Option<String>,
 }
 
 /// `POST /defaults` — Update global default config fields.
@@ -331,6 +337,24 @@ pub(crate) async fn set_defaults_handler(
             };
             cfg.poll_aggression = aggression;
             messages.push(format!("poll aggression: {aggression}"));
+        }
+        if let Some(enabled) = body.auto_discover_branches {
+            cfg.auto_discover_branches = enabled;
+            messages.push(format!(
+                "auto-discover branches: {}",
+                if enabled { "on" } else { "off" }
+            ));
+        }
+        if let Some(filter) = body.branch_filter {
+            if filter.is_empty() {
+                cfg.branch_filter = None;
+                messages.push("branch filter cleared".to_string());
+            } else if let Err(e) = regex::Regex::new(&filter) {
+                return json_error(format!("invalid branch filter regex: {e}"));
+            } else {
+                cfg.branch_filter = Some(filter.clone());
+                messages.push(format!("branch filter: {filter}"));
+            }
         }
         (cfg.clone(), messages)
     };
@@ -505,6 +529,9 @@ mod tests {
         ) -> Option<build_watcher::github::FailureInfo> {
             None
         }
+        async fn list_tags(&self, _: &str) -> Result<Vec<String>, build_watcher::github::GhError> {
+            Ok(vec![])
+        }
     }
 
     fn stub_handle() -> build_watcher::watcher::WatcherHandle {
@@ -612,19 +639,22 @@ mod tests {
         let (watches, pause, events) = empty_state();
         let key = WatchKey::new("alice/app", "main");
         let mut entry = WatchEntry::default();
-        entry.last_build = Some(LastBuild {
-            run_id: 99,
-            conclusion: "failure".to_string(),
-            workflow: "CI".to_string(),
-            title: "Initial commit".to_string(),
-            head_sha: "abc1234".to_string(),
-            event: "push".to_string(),
-            failing_steps: Some("Build / Run tests".to_string()),
-            failing_job_id: None,
-            completed_at: None,
-            duration_secs: None,
-            attempt: 1,
-        });
+        entry.last_builds.insert(
+            "CI".to_string(),
+            LastBuild {
+                run_id: 99,
+                conclusion: "failure".to_string(),
+                workflow: "CI".to_string(),
+                title: "Initial commit".to_string(),
+                head_sha: "abc1234".to_string(),
+                event: "push".to_string(),
+                failing_steps: Some("Build / Run tests".to_string()),
+                failing_job_id: None,
+                completed_at: None,
+                duration_secs: None,
+                attempt: 1,
+            },
+        );
         watches.lock().await.insert(key, entry);
 
         let json = get_status_json(test_router(watches, pause, events)).await;
@@ -634,10 +664,11 @@ mod tests {
         assert_eq!(w["repo"], "alice/app");
         assert_eq!(w["branch"], "main");
         assert_eq!(w["active_runs"], serde_json::json!([]));
-        assert_eq!(w["last_build"]["run_id"], 99);
-        assert_eq!(w["last_build"]["conclusion"], "failure");
-        assert_eq!(w["last_build"]["title"], "Initial commit");
-        assert_eq!(w["last_build"]["failing_steps"], "Build / Run tests");
+        let lb = &w["last_builds"][0];
+        assert_eq!(lb["run_id"], 99);
+        assert_eq!(lb["conclusion"], "failure");
+        assert_eq!(lb["title"], "Initial commit");
+        assert_eq!(lb["failing_steps"], "Build / Run tests");
     }
 
     #[tokio::test]

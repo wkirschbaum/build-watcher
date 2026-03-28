@@ -265,6 +265,10 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quiet_hours: Option<QuietHours>,
     #[serde(default)]
+    pub auto_discover_branches: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch_filter: Option<String>,
+    #[serde(default)]
     pub repos: HashMap<String, RepoConfig>,
 }
 
@@ -281,6 +285,8 @@ impl Default for Config {
             notifications: NotificationConfig::default(),
             quiet_hours: None,
             poll_aggression: PollAggression::default(),
+            auto_discover_branches: false,
+            branch_filter: None,
             repos: HashMap::new(),
         }
     }
@@ -360,6 +366,14 @@ impl Config {
         is_in_quiet_hours_at(qh, cur_mins)
     }
 
+    /// Compile the `branch_filter` regex, if set and valid.
+    pub fn branch_filter_regex(&self) -> Option<regex::Regex> {
+        self.branch_filter
+            .as_ref()
+            .filter(|p| !p.is_empty())
+            .and_then(|p| regex::Regex::new(p).ok())
+    }
+
     pub fn add_repos(&mut self, repos: &[String]) {
         for repo in repos {
             self.repos.entry(repo.clone()).or_default();
@@ -422,8 +436,11 @@ fn load_config_lenient(path: &Path) -> Option<Config> {
 
     field!("default_branches", cfg.default_branches);
     field!("ignored_workflows", cfg.ignored_workflows);
+    field!("poll_aggression", cfg.poll_aggression);
     field!("notifications", cfg.notifications);
     field!("quiet_hours", cfg.quiet_hours);
+    field!("auto_discover_branches", cfg.auto_discover_branches);
+    field!("branch_filter", cfg.branch_filter);
 
     // Repos: load the map entry-by-entry so a single bad repo doesn't drop the rest.
     if let Some(serde_json::Value::Object(repos_obj)) = obj.get("repos") {

@@ -4,6 +4,11 @@ version = "0.3.1"
 edition = "2024"
 license = "MIT"
 
+[features]
+default = ["daemon", "tui"]
+daemon = ["dep:rmcp", "dep:axum", "tokio/net", "tokio/signal"]
+tui = ["dep:ratatui", "dep:crossterm", "dep:reqwest", "dep:semver"]
+
 [lib]
 name = "build_watcher"
 path = "src/lib.rs"
@@ -11,14 +16,16 @@ path = "src/lib.rs"
 [[bin]]
 name = "build-watcher"
 path = "src/main.rs"
+required-features = ["daemon"]
 
 [[bin]]
 name = "bw"
 path = "src/bin/bw/main.rs"
+required-features = ["tui"]
 
 [dependencies]
-rmcp = { version = "1", features = ["server", "transport-io", "transport-streamable-http-server", "macros"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "process", "time", "signal", "sync", "io-util"] }
+# Shared
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "time", "sync"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 serde = { version = "1", features = ["derive"] }
@@ -28,12 +35,18 @@ async-trait = "0.1"
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-axum = "0.8"
 chrono = "0.4"
-ratatui = "0.29"
-crossterm = { version = "0.28", features = ["event-stream"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
-self_update = { version = "0.41", default-features = false, features = ["archive-tar", "compression-flate2", "rustls"] }
+regex = "1"
+
+# Daemon-only
+rmcp = { version = "1", features = ["server", "transport-streamable-http-server", "macros"], optional = true }
+axum = { version = "0.8", optional = true }
+
+# TUI-only
+ratatui = { version = "0.29", optional = true }
+crossterm = { version = "0.28", features = ["event-stream"], optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream"], optional = true }
+semver = { version = "1", optional = true }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

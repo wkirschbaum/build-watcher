@@ -215,12 +215,16 @@ impl DaemonClient {
         default_branches: Option<Vec<String>>,
         ignored_workflows: Option<Vec<String>>,
         poll_aggression: Option<String>,
+        auto_discover_branches: Option<bool>,
+        branch_filter: Option<String>,
     ) -> Result<(), String> {
         #[derive(Serialize)]
         struct Req {
             default_branches: Option<Vec<String>>,
             ignored_workflows: Option<Vec<String>>,
             poll_aggression: Option<String>,
+            auto_discover_branches: Option<bool>,
+            branch_filter: Option<String>,
         }
         self.post_json(
             "/defaults",
@@ -228,6 +232,8 @@ impl DaemonClient {
                 default_branches,
                 ignored_workflows,
                 poll_aggression,
+                auto_discover_branches,
+                branch_filter,
             },
         )
         .await

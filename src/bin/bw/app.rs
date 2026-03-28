@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -30,8 +30,6 @@ pub(crate) enum QuitAction {
     None,
     Quit,
     QuitAndShutdown,
-    /// Exit and run the self-updater.
-    Update,
 }
 
 // -- App state --
@@ -163,6 +161,38 @@ impl_cycle!(
     ]
 );
 
+/// How far a repo is expanded in the tree view.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum ExpandLevel {
+    /// Show only the repo header row.
+    Collapsed,
+    /// Show repo + branch rows (but hide per-workflow detail).
+    Branches,
+    /// Show repo + branch + per-workflow rows (fully expanded).
+    #[default]
+    Full,
+}
+
+impl ExpandLevel {
+    /// Cycle to the next expand level: Collapsed → Branches → Full → Collapsed.
+    pub(crate) fn next(self) -> Self {
+        match self {
+            ExpandLevel::Collapsed => ExpandLevel::Branches,
+            ExpandLevel::Branches => ExpandLevel::Full,
+            ExpandLevel::Full => ExpandLevel::Collapsed,
+        }
+    }
+
+    /// Cycle to the previous expand level: Full → Branches → Collapsed → Full.
+    pub(crate) fn prev(self) -> Self {
+        match self {
+            ExpandLevel::Full => ExpandLevel::Branches,
+            ExpandLevel::Branches => ExpandLevel::Collapsed,
+            ExpandLevel::Collapsed => ExpandLevel::Full,
+        }
+    }
+}
+
 /// Persisted TUI preferences (sort/group/collapse state).
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -170,7 +200,9 @@ pub(crate) struct TuiPrefs {
     pub(crate) sort_column: SortColumn,
     pub(crate) sort_ascending: bool,
     pub(crate) group_by: GroupBy,
-    pub(crate) collapsed: HashSet<String>,
+    /// Per-repo expand level. Missing entries default to `Full`.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub(crate) expand: HashMap<String, ExpandLevel>,
 }
 
 impl Default for TuiPrefs {
@@ -179,7 +211,7 @@ impl Default for TuiPrefs {
             sort_column: SortColumn::default(),
             sort_ascending: true,
             group_by: GroupBy::default(),
-            collapsed: HashSet::new(),
+            expand: HashMap::new(),
         }
     }
 }
@@ -220,8 +252,8 @@ pub(crate) struct App {
     pub(crate) sort_column: SortColumn,
     pub(crate) sort_ascending: bool,
     pub(crate) group_by: GroupBy,
-    /// Repos whose branches are collapsed (hidden) in the tree view.
-    pub(crate) collapsed: HashSet<String>,
+    /// Per-repo expand level in the tree view.
+    pub(crate) expand: HashMap<String, ExpandLevel>,
     /// Tag name of a newer release, if one was found by the background checker.
     pub(crate) update_available: Option<String>,
 }
@@ -248,7 +280,7 @@ impl App {
             sort_column: prefs.sort_column,
             sort_ascending: prefs.sort_ascending,
             group_by: prefs.group_by,
-            collapsed: prefs.collapsed,
+            expand: prefs.expand,
             update_available: None,
         }
     }
@@ -272,7 +304,7 @@ impl App {
         let mut failed = 0usize;
 
         for w in &self.status.watches {
-            if let Some(lb) = &w.last_build {
+            for lb in &w.last_builds {
                 match &lb.conclusion {
                     RunConclusion::Success => success += 1,
                     RunConclusion::Failure
@@ -283,7 +315,7 @@ impl App {
             }
         }
 
-        format!("builds: {active} / {success} / {failed}")
+        format!("builds: {active}/{success}/{failed}")
     }
 
     pub(crate) fn set_flash(&mut self, msg: impl Into<String>) {
@@ -291,23 +323,32 @@ impl App {
     }
 
     fn save_prefs(&self) {
-        // Prune collapsed repos no longer watched, but only when we have a
+        // Prune expand state for repos no longer watched, but only when we have a
         // non-empty watch list — avoids wiping state when the daemon is
         // unreachable and status.watches is temporarily empty.
-        let collapsed = if self.status.watches.is_empty() {
-            self.collapsed.clone()
+        let expand = if self.status.watches.is_empty() {
+            self.expand.clone()
         } else {
             let watched: HashSet<String> =
                 self.status.watches.iter().map(|w| w.repo.clone()).collect();
-            self.collapsed.intersection(&watched).cloned().collect()
+            self.expand
+                .iter()
+                .filter(|(k, _)| watched.contains(k.as_str()))
+                .map(|(k, v)| (k.clone(), *v))
+                .collect()
         };
         TuiPrefs {
             sort_column: self.sort_column,
             sort_ascending: self.sort_ascending,
             group_by: self.group_by,
-            collapsed,
+            expand,
         }
         .save();
+    }
+
+    /// Get the expand level for a repo (defaults to Full).
+    pub(crate) fn expand_level(&self, repo: &str) -> ExpandLevel {
+        self.expand.get(repo).copied().unwrap_or(ExpandLevel::Full)
     }
 
     pub(crate) async fn resync(&mut self, daemon: &DaemonClient) {
@@ -340,10 +381,10 @@ impl App {
                     *e += 1.0;
                 }
             }
-            if let Some(lb) = &mut watch.last_build
-                && let Some(a) = &mut lb.age_secs
-            {
-                *a += 1.0;
+            for lb in &mut watch.last_builds {
+                if let Some(a) = &mut lb.age_secs {
+                    *a += 1.0;
+                }
             }
         }
         for entry in &mut self.recent_history {
@@ -540,6 +581,14 @@ impl App {
             .iter()
             .find(|f| f.label == "Poll aggression")
             .map(|f| f.buffer.clone());
+        let auto_discover: Option<bool> = fields
+            .iter()
+            .find(|f| f.label == "Auto-discover branches")
+            .map(|f| f.buffer == "on");
+        let branch_filter: Option<String> = fields
+            .iter()
+            .find(|f| f.label == "Branch filter")
+            .map(|f| f.buffer.clone());
 
         if branches.is_empty() {
             self.set_flash("Default branches must not be empty");
@@ -552,12 +601,26 @@ impl App {
             }
         }
 
+        if let Some(ref filter) = branch_filter
+            && !filter.is_empty()
+            && let Err(e) = regex::Regex::new(filter)
+        {
+            self.set_flash(format!("Invalid branch filter regex: {e}"));
+            return;
+        }
+
         let d = daemon.clone();
         self.input_mode = InputMode::Normal;
         self.spawn_action("Saving config…", true, async move {
-            d.set_defaults(Some(branches), Some(workflows), aggression)
-                .await
-                .map(|()| "Config saved".to_string())
+            d.set_defaults(
+                Some(branches),
+                Some(workflows),
+                aggression,
+                auto_discover,
+                branch_filter,
+            )
+            .await
+            .map(|()| "Config saved".to_string())
         });
     }
 
@@ -640,7 +703,7 @@ impl App {
             self.sort_ascending,
             self.group_by,
         );
-        let flat = flatten_rows(&sorted, self.group_by, &self.collapsed);
+        let flat = flatten_rows(&sorted, self.group_by, &self.expand);
         let sel_count = flat.selectable.len();
         let selected_display_idx = flat.selectable.get(self.selected).copied();
         let selected = selected_display_idx.map(|idx| flat.rows[idx].repo_branch_run());
@@ -659,7 +722,6 @@ impl App {
         match code {
             KeyCode::Char('q') => return QuitAction::Quit,
             KeyCode::Char('Q') => return QuitAction::QuitAndShutdown,
-            KeyCode::Char('U') if self.update_available.is_some() => return QuitAction::Update,
             KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => {
                 return QuitAction::Quit;
             }
@@ -674,21 +736,30 @@ impl App {
             KeyCode::Enter | KeyCode::Right | KeyCode::Tab | KeyCode::Char('e')
                 if is_collapsible =>
             {
+                // Cycle expand level: Collapsed → Branches → Full → Collapsed
                 if let Some((repo, _, _, _)) = selected {
                     let repo = repo.to_string();
-                    if self.collapsed.contains(&repo) {
-                        self.collapsed.remove(&repo);
+                    let current = self.expand_level(&repo);
+                    let next = current.next();
+                    if next == ExpandLevel::Full {
+                        self.expand.remove(&repo);
                     } else {
-                        self.collapsed.insert(repo);
+                        self.expand.insert(repo, next);
                     }
                     self.save_prefs();
                 }
             }
             KeyCode::Left if !is_repo_row => {
-                // Collapse parent repo and move selection to it
+                // Collapse one level and move selection to parent repo
                 if let Some((repo, _, _, _)) = selected {
                     let repo = repo.to_string();
-                    self.collapsed.insert(repo.clone());
+                    let current = self.expand_level(&repo);
+                    let prev = current.prev();
+                    if prev == ExpandLevel::Full {
+                        self.expand.remove(&repo);
+                    } else {
+                        self.expand.insert(repo.clone(), prev);
+                    }
                     // Find the repo header's selectable index
                     if let Some(pos) = flat.selectable.iter().position(|&idx| {
                         flat.rows[idx].is_repo_header()
@@ -700,10 +771,10 @@ impl App {
                 }
             }
             KeyCode::BackTab | KeyCode::Char('E') => {
-                // Expand all if any collapsed, collapse all if all expanded.
-                // Only multi-branch repos are collapsible; single-branch repos
-                // are always inlined and unaffected by collapsed state.
-                let multi_branch_repos: HashSet<String> = {
+                // Cycle all repos: if any are not fully expanded → expand all.
+                // If all are fully expanded → collapse to branches.
+                // If all at branches → collapse fully. If all collapsed → expand all.
+                let expandable_repos: Vec<String> = {
                     let mut counts: std::collections::HashMap<&str, usize> =
                         std::collections::HashMap::new();
                     for w in &self.status.watches {
@@ -715,10 +786,37 @@ impl App {
                         .map(|(repo, _)| repo.to_string())
                         .collect()
                 };
-                if self.collapsed.is_empty() {
-                    self.collapsed = multi_branch_repos;
+                if expandable_repos.is_empty() {
+                    // nothing to toggle
                 } else {
-                    self.collapsed.clear();
+                    let all_full = expandable_repos
+                        .iter()
+                        .all(|r| self.expand_level(r) == ExpandLevel::Full);
+                    let all_branches = expandable_repos
+                        .iter()
+                        .all(|r| self.expand_level(r) == ExpandLevel::Branches);
+                    let all_collapsed = expandable_repos
+                        .iter()
+                        .all(|r| self.expand_level(r) == ExpandLevel::Collapsed);
+
+                    if all_full {
+                        for r in &expandable_repos {
+                            self.expand.insert(r.clone(), ExpandLevel::Branches);
+                        }
+                    } else if all_branches {
+                        for r in &expandable_repos {
+                            self.expand.insert(r.clone(), ExpandLevel::Collapsed);
+                        }
+                    } else if all_collapsed {
+                        for r in &expandable_repos {
+                            self.expand.remove(r);
+                        }
+                    } else {
+                        // Mixed state → expand all fully
+                        for r in &expandable_repos {
+                            self.expand.remove(r);
+                        }
+                    }
                 }
                 self.save_prefs();
             }
@@ -747,12 +845,38 @@ impl App {
                 }
             }
             KeyCode::Char('d') => {
-                if let Some((repo, _, _, _)) = selected {
+                if let Some((repo, branch, _, _)) = selected {
                     let d = daemon.clone();
                     let repo = repo.to_string();
-                    self.spawn_action(format!("Removing {repo}…"), true, async move {
-                        d.unwatch(&repo).await.map(|()| format!("Removed {repo}"))
-                    });
+                    if is_repo_row || branch.is_empty() {
+                        // On repo row: remove the entire repo
+                        self.spawn_action(format!("Removing {repo}…"), true, async move {
+                            d.unwatch(&repo).await.map(|()| format!("Removed {repo}"))
+                        });
+                    } else {
+                        // On branch row: remove just this branch
+                        let branch = branch.to_string();
+                        let remaining: Vec<String> = self
+                            .status
+                            .watches
+                            .iter()
+                            .filter(|w| w.repo == repo && w.branch != branch)
+                            .map(|w| w.branch.clone())
+                            .collect();
+                        if remaining.is_empty() {
+                            // Last branch — remove the whole repo
+                            self.spawn_action(format!("Removing {repo}…"), true, async move {
+                                d.unwatch(&repo).await.map(|()| format!("Removed {repo}"))
+                            });
+                        } else {
+                            let label = format!("{repo} [{branch}]");
+                            self.spawn_action(format!("Removing {label}…"), true, async move {
+                                d.set_branches(&repo, &remaining)
+                                    .await
+                                    .map(|()| format!("Removed {label}"))
+                            });
+                        }
+                    }
                 }
             }
             KeyCode::Char('n') => {
@@ -939,6 +1063,20 @@ impl App {
                                     buffer: defaults.poll_aggression,
                                     options: vec!["low", "medium", "high"],
                                 },
+                                FormField {
+                                    label: "Auto-discover branches".to_string(),
+                                    buffer: if defaults.auto_discover_branches {
+                                        "on".to_string()
+                                    } else {
+                                        "off".to_string()
+                                    },
+                                    options: vec!["off", "on"],
+                                },
+                                FormField {
+                                    label: "Branch filter".to_string(),
+                                    buffer: defaults.branch_filter.unwrap_or_default(),
+                                    options: vec![],
+                                },
                             ],
                         })
                         .await;
@@ -1011,10 +1149,9 @@ mod tests {
         ActiveRunView, LastBuildView, RunConclusion, RunStatus, StatusResponse, WatchStatus,
     };
     use ratatui::style::Color;
-    use std::collections::HashSet;
 
-    fn no_collapsed() -> HashSet<String> {
-        HashSet::new()
+    fn no_collapsed() -> HashMap<String, ExpandLevel> {
+        HashMap::new()
     }
 
     fn snap(repo: &str, branch: &str, run_id: u64) -> RunSnapshot {
@@ -1035,7 +1172,7 @@ mod tests {
             repo: repo.to_string(),
             branch: branch.to_string(),
             active_runs: vec![],
-            last_build: None,
+            last_builds: vec![],
             muted: false,
         }
     }
@@ -1095,7 +1232,7 @@ mod tests {
                 elapsed_secs: Some(30.0),
                 attempt: 1,
             }],
-            last_build: None,
+            last_builds: vec![],
             muted: false,
         }]);
 
@@ -1108,7 +1245,8 @@ mod tests {
         });
 
         assert!(status.watches[0].active_runs.is_empty());
-        let lb = status.watches[0].last_build.as_ref().unwrap();
+        assert_eq!(status.watches[0].last_builds.len(), 1);
+        let lb = &status.watches[0].last_builds[0];
         assert_eq!(lb.run_id, 7);
         assert_eq!(lb.conclusion, RunConclusion::Success);
         assert_eq!(lb.workflow, "CI");
@@ -1127,7 +1265,8 @@ mod tests {
             failing_job_id: None,
         });
 
-        let lb = status.watches[0].last_build.as_ref().unwrap();
+        assert_eq!(status.watches[0].last_builds.len(), 1);
+        let lb = &status.watches[0].last_builds[0];
         assert_eq!(lb.failing_steps.as_deref(), Some("Build / tests"));
     }
 
@@ -1142,7 +1281,7 @@ mod tests {
             failing_job_id: None,
         });
 
-        assert!(status.watches[0].last_build.is_none());
+        assert!(status.watches[0].last_builds.is_empty());
     }
 
     // -- StatusChanged --
@@ -1161,7 +1300,7 @@ mod tests {
                 elapsed_secs: None,
                 attempt: 1,
             }],
-            last_build: None,
+            last_builds: vec![],
             muted: false,
         }]);
 
@@ -1191,7 +1330,7 @@ mod tests {
                 elapsed_secs: None,
                 attempt: 1,
             }],
-            last_build: None,
+            last_builds: vec![],
             muted: false,
         }]);
 
@@ -1243,7 +1382,7 @@ mod tests {
             repo: "alice/app".to_string(),
             branch: "main".to_string(),
             active_runs: vec![],
-            last_build: Some(LastBuildView {
+            last_builds: vec![LastBuildView {
                 run_id: 1,
                 conclusion: RunConclusion::Failure,
                 workflow: "CI".to_string(),
@@ -1252,7 +1391,7 @@ mod tests {
                 age_secs: Some(60.0),
                 attempt: 1,
                 failing_job_id: None,
-            }),
+            }],
             muted: false,
         }];
         let flat = flatten_rows(&watches, GroupBy::Org, &no_collapsed());
@@ -1270,7 +1409,7 @@ mod tests {
                 repo: "alice/app".to_string(),
                 branch: "main".to_string(),
                 active_runs: vec![],
-                last_build: Some(LastBuildView {
+                last_builds: vec![LastBuildView {
                     run_id: 1,
                     conclusion: RunConclusion::Failure,
                     workflow: "CI".to_string(),
@@ -1279,14 +1418,14 @@ mod tests {
                     age_secs: Some(60.0),
                     attempt: 1,
                     failing_job_id: None,
-                }),
+                }],
                 muted: false,
             },
             WatchStatus {
                 repo: "alice/app".to_string(),
                 branch: "develop".to_string(),
                 active_runs: vec![],
-                last_build: None,
+                last_builds: vec![],
                 muted: false,
             },
         ];
@@ -1302,7 +1441,7 @@ mod tests {
             repo: "alice/app".to_string(),
             branch: "main".to_string(),
             active_runs: vec![],
-            last_build: Some(LastBuildView {
+            last_builds: vec![LastBuildView {
                 run_id: 1,
                 conclusion: RunConclusion::Success,
                 workflow: "CI".to_string(),
@@ -1311,7 +1450,7 @@ mod tests {
                 age_secs: Some(60.0),
                 attempt: 1,
                 failing_job_id: None,
-            }),
+            }],
             muted: false,
         }];
         let flat = flatten_rows(&watches, GroupBy::Org, &no_collapsed());
@@ -1380,7 +1519,7 @@ mod tests {
                 elapsed_secs: Some(10.0),
                 attempt: 1,
             }],
-            last_build: None,
+            last_builds: vec![],
             muted: false,
         }];
         let flat = flatten_rows(&watches, GroupBy::Org, &no_collapsed());
@@ -1406,7 +1545,8 @@ mod tests {
             failing_job_id: None,
         });
 
-        let lb = status.watches[0].last_build.as_ref().unwrap();
+        assert_eq!(status.watches[0].last_builds.len(), 1);
+        let lb = &status.watches[0].last_builds[0];
         assert_eq!(lb.title, "PR: Add feature");
     }
 
@@ -1437,7 +1577,7 @@ mod tests {
             repo: repo.to_string(),
             branch: branch.to_string(),
             active_runs: vec![],
-            last_build: Some(LastBuildView {
+            last_builds: vec![LastBuildView {
                 run_id: 1,
                 conclusion,
                 workflow: "CI".to_string(),
@@ -1446,7 +1586,7 @@ mod tests {
                 age_secs: Some(age),
                 attempt: 1,
                 failing_job_id: None,
-            }),
+            }],
             muted: false,
         }
     }
@@ -1464,7 +1604,7 @@ mod tests {
                 elapsed_secs: Some(elapsed),
                 attempt: 1,
             }],
-            last_build: None,
+            last_builds: vec![],
             muted: false,
         }
     }
@@ -1678,15 +1818,18 @@ mod tests {
             sort_column: SortColumn::Workflow,
             sort_ascending: false,
             group_by: GroupBy::Status,
-            collapsed: HashSet::from(["alice/app".to_string(), "bob/lib".to_string()]),
+            expand: HashMap::from([
+                ("alice/app".to_string(), ExpandLevel::Collapsed),
+                ("bob/lib".to_string(), ExpandLevel::Branches),
+            ]),
         };
         save_json(&path, &prefs).unwrap();
         let loaded: TuiPrefs = load_json(&path).unwrap();
         assert_eq!(loaded.sort_column, SortColumn::Workflow);
         assert!(!loaded.sort_ascending);
         assert_eq!(loaded.group_by, GroupBy::Status);
-        assert_eq!(loaded.collapsed.len(), 2);
-        assert!(loaded.collapsed.contains("alice/app"));
+        assert_eq!(loaded.expand.len(), 2);
+        assert_eq!(loaded.expand["alice/app"], ExpandLevel::Collapsed);
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 
@@ -1701,7 +1844,7 @@ mod tests {
         assert_eq!(prefs.sort_column, SortColumn::Repo);
         assert!(prefs.sort_ascending);
         assert_eq!(prefs.group_by, GroupBy::Org);
-        assert!(prefs.collapsed.is_empty());
+        assert!(prefs.expand.is_empty());
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 
@@ -1717,9 +1860,9 @@ mod tests {
     }
 
     #[test]
-    fn tui_prefs_old_format_without_collapsed() {
+    fn tui_prefs_old_format_without_expand() {
         let path = temp_prefs_path("old-format");
-        // Simulate a prefs file written before the collapsed field existed.
+        // Simulate a prefs file written before the expand field existed.
         std::fs::write(
             &path,
             r#"{"sort_column":"Branch","sort_ascending":false,"group_by":"Workflow"}"#,
@@ -1729,7 +1872,7 @@ mod tests {
         assert_eq!(loaded.sort_column, SortColumn::Branch);
         assert!(!loaded.sort_ascending);
         assert_eq!(loaded.group_by, GroupBy::Workflow);
-        assert!(loaded.collapsed.is_empty());
+        assert!(loaded.expand.is_empty());
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 
@@ -1742,7 +1885,7 @@ mod tests {
         assert_eq!(loaded.sort_column, SortColumn::Age);
         assert!(loaded.sort_ascending); // default: true
         assert_eq!(loaded.group_by, GroupBy::Org); // default
-        assert!(loaded.collapsed.is_empty()); // default
+        assert!(loaded.expand.is_empty()); // default
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 
@@ -1768,7 +1911,7 @@ mod tests {
             sort_column: SortColumn::Status,
             sort_ascending: false,
             group_by: GroupBy::Branch,
-            collapsed: HashSet::from(["repo/x".to_string()]),
+            expand: HashMap::from([("repo/x".to_string(), ExpandLevel::Collapsed)]),
         };
         // Write valid backup, corrupt primary.
         std::fs::write(&bak, serde_json::to_string(&prefs).unwrap()).unwrap();
@@ -1777,7 +1920,7 @@ mod tests {
         assert_eq!(loaded.sort_column, SortColumn::Status);
         assert!(!loaded.sort_ascending);
         assert_eq!(loaded.group_by, GroupBy::Branch);
-        assert!(loaded.collapsed.contains("repo/x"));
+        assert_eq!(loaded.expand["repo/x"], ExpandLevel::Collapsed);
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 }
