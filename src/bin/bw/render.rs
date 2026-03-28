@@ -733,29 +733,35 @@ pub(crate) fn status_emoji(conclusion_or_status: &str) -> &'static str {
 const COL_SPACING: u16 = 1;
 const NUM_GAPS: usize = 5; // 6 columns → 5 gaps
 
-// Fixed column widths (content is bounded, no truncation needed).
-const BRANCH_W: usize = 16;
-const STATUS_W: usize = 15;
 const AGE_W: usize = 10;
-const FIXED_W: usize = BRANCH_W + STATUS_W + AGE_W + NUM_GAPS * COL_SPACING as usize;
+const FIXED_W: usize = AGE_W + NUM_GAPS * COL_SPACING as usize;
 
-/// Variable column widths computed from terminal width.
+/// Column widths computed from terminal width.
 pub(crate) struct ColWidths {
     pub(crate) repo: usize,
+    pub(crate) branch: usize,
+    pub(crate) status: usize,
     pub(crate) workflow: usize,
     pub(crate) title: usize,
 }
 
 impl ColWidths {
     pub(crate) fn from_terminal_width(w: u16) -> Self {
-        // Remaining space split among repo, workflow, title (20% / 25% / 55%).
+        // All non-age columns share the remaining space proportionally:
+        // repo 18%, branch 12%, status 10%, workflow 20%, title 40%.
         let remaining = (w as usize).saturating_sub(FIXED_W);
-        let repo = (remaining * 20 / 100).max(10);
-        let workflow = (remaining * 25 / 100).max(8);
-        let title = remaining.saturating_sub(repo + workflow).max(8);
+        let repo = (remaining * 18 / 100).max(10);
+        let branch = (remaining * 12 / 100).max(10);
+        let status = (remaining * 10 / 100).max(8);
+        let workflow = (remaining * 20 / 100).max(8);
+        let title = remaining
+            .saturating_sub(repo + branch + status + workflow)
+            .max(8);
 
         Self {
             repo,
+            branch,
+            status,
             workflow,
             title,
         }
@@ -764,8 +770,8 @@ impl ColWidths {
     fn constraints(&self) -> [Constraint; 6] {
         [
             Constraint::Length(self.repo as u16),
-            Constraint::Length(BRANCH_W as u16),
-            Constraint::Length(STATUS_W as u16),
+            Constraint::Length(self.branch as u16),
+            Constraint::Length(self.status as u16),
             Constraint::Length(self.workflow as u16),
             Constraint::Min(self.title as u16),
             Constraint::Length(AGE_W as u16),
@@ -962,8 +968,8 @@ fn branch_row<'a>(
     let tree_name = format!("  {tree_prefix}{}{}", branch, mute_indicator(muted));
     Row::new(vec![
         Cell::from(format::truncate(&tree_name, cw.repo)),
-        Cell::from(format::truncate(branch, BRANCH_W)),
-        Cell::from(format::truncate(status_text, STATUS_W)).style(style),
+        Cell::from(format::truncate(branch, cw.branch)),
+        Cell::from(format::truncate(status_text, cw.status)).style(style),
         Cell::from(format::truncate(workflow, cw.workflow)),
         Cell::from(format::truncate(title, cw.title)),
         Cell::from(age_or_elapsed.to_string()).style(style),
@@ -1031,7 +1037,7 @@ fn render_display_row<'a>(
                 let emoji = status_emoji(&sb.status_key);
                 let style = status_style(&sb.status_key);
                 let attempt_suffix = if sb.attempt > 1 {
-                    format!(" (attempt {})", sb.attempt)
+                    format!(" (r:{})", sb.attempt)
                 } else {
                     String::new()
                 };
@@ -1042,8 +1048,8 @@ fn render_display_row<'a>(
                 };
                 Row::new(vec![
                     Cell::from(format::truncate(&name, cw.repo)).style(repo_style),
-                    Cell::from(format::truncate(sb.branch, BRANCH_W)),
-                    Cell::from(format::truncate(&inline_status, STATUS_W)).style(style),
+                    Cell::from(format::truncate(sb.branch, cw.branch)),
+                    Cell::from(format::truncate(&inline_status, cw.status)).style(style),
                     Cell::from(format::truncate(&sb.workflows, cw.workflow)),
                     Cell::from(format::truncate(&sb.title, cw.title)),
                     Cell::from(age).style(style),
@@ -1061,8 +1067,8 @@ fn render_display_row<'a>(
                 };
                 Row::new(vec![
                     Cell::from(format::truncate(&name, cw.repo)).style(repo_style),
-                    Cell::from(format::truncate(&branch_label, BRANCH_W)),
-                    Cell::from(format::truncate(&status_text, STATUS_W)),
+                    Cell::from(format::truncate(&branch_label, cw.branch)),
+                    Cell::from(format::truncate(&status_text, cw.status)),
                     Cell::from(format::truncate(&wf_label, cw.workflow)),
                     Cell::from(""),
                     Cell::from(age),
@@ -1085,7 +1091,7 @@ fn render_display_row<'a>(
                 .map(|s| format::duration(Duration::from_secs_f64(s)))
                 .unwrap_or_default();
             let attempt_suffix = if run.attempt > 1 {
-                format!(" (attempt {})", run.attempt)
+                format!(" (r:{})", run.attempt)
             } else {
                 String::new()
             };
@@ -1134,7 +1140,7 @@ fn render_display_row<'a>(
                 .map(|s| format::age(s as u64))
                 .unwrap_or_default();
             let attempt_suffix = if build.attempt > 1 {
-                format!(" (attempt {})", build.attempt)
+                format!(" (r:{})", build.attempt)
             } else {
                 String::new()
             };
@@ -1200,7 +1206,7 @@ pub(crate) fn render_recent_panel(
             let style = status_style(&entry.conclusion);
             let emoji = status_emoji(&entry.conclusion);
             let repo = format::truncate(&entry.repo, cw.repo);
-            let branch = format::truncate(&entry.branch, BRANCH_W);
+            let branch = format::truncate(&entry.branch, cw.branch);
             let status_cell = format!("{emoji} {}", format::status(&entry.conclusion));
             let workflow = format::truncate(&entry.workflow, cw.workflow);
             let title = format::truncate(&entry.title, cw.title);
