@@ -93,6 +93,7 @@ pub(crate) fn build_watch_snapshot(
                     failing_steps: lb.failing_steps.clone(),
                     age_secs,
                     attempt: lb.attempt,
+                    failing_job_id: lb.failing_job_id,
                 }
             });
 

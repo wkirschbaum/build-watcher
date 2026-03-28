@@ -27,6 +27,8 @@ pub(crate) struct SingleBranchInfo<'a> {
     pub run_id: Option<u64>,
     /// Whether the last build was a failure (used for `o` key behavior).
     pub failed: bool,
+    /// Database ID of the first failed job (for opening the job URL directly).
+    pub failing_job_id: Option<u64>,
 }
 
 pub(crate) enum DisplayRow<'a> {
@@ -45,6 +47,8 @@ pub(crate) enum DisplayRow<'a> {
         newest_age: Option<f64>,
         /// When there's exactly 1 branch: its name, workflow(s), and title for inline display.
         single_branch: Option<SingleBranchInfo<'a>>,
+        /// Workflow names of failing builds (for multi-branch repo headers).
+        failing_workflows: Vec<String>,
     },
     ActiveRun {
         repo: &'a str,
@@ -172,6 +176,7 @@ pub(crate) fn flatten_rows<'a>(
         let mut idle = 0usize;
         let mut newest_age: Option<f64> = None;
         let mut all_muted = true;
+        let mut failing_workflows: Vec<String> = Vec::new();
 
         for w in branches {
             if !w.active_runs.is_empty() {
@@ -179,7 +184,12 @@ pub(crate) fn flatten_rows<'a>(
             } else if let Some(b) = &w.last_build {
                 match b.conclusion {
                     RunConclusion::Success => passing += 1,
-                    _ => failing += 1,
+                    _ => {
+                        failing += 1;
+                        if !failing_workflows.contains(&b.workflow) {
+                            failing_workflows.push(b.workflow.clone());
+                        }
+                    }
                 }
                 if let Some(age) = b.age_secs {
                     newest_age = Some(newest_age.map_or(age, |cur: f64| cur.min(age)));
@@ -202,7 +212,7 @@ pub(crate) fn flatten_rows<'a>(
         // For single-branch repos, collect workflow/title info for inline display.
         let single_branch = if branches.len() == 1 {
             let w = branches[0];
-            let (title, status_key, attempt, run_id, failed) =
+            let (title, status_key, attempt, run_id, failed, failing_job_id) =
                 if let Some(run) = w.active_runs.first() {
                     (
                         run.title.clone(),
@@ -210,6 +220,7 @@ pub(crate) fn flatten_rows<'a>(
                         run.attempt,
                         Some(run.run_id),
                         false,
+                        None,
                     )
                 } else if let Some(b) = &w.last_build {
                     (
@@ -218,9 +229,10 @@ pub(crate) fn flatten_rows<'a>(
                         b.attempt,
                         Some(b.run_id),
                         b.conclusion != RunConclusion::Success,
+                        b.failing_job_id,
                     )
                 } else {
-                    (String::new(), String::new(), 1, None, false)
+                    (String::new(), String::new(), 1, None, false, None)
                 };
             let mut wf_set: Vec<&str> = Vec::new();
             for run in &w.active_runs {
@@ -241,6 +253,7 @@ pub(crate) fn flatten_rows<'a>(
                 status_key,
                 run_id,
                 failed,
+                failing_job_id,
             })
         } else {
             None
@@ -259,6 +272,7 @@ pub(crate) fn flatten_rows<'a>(
             muted: all_muted && !branches.is_empty(),
             newest_age,
             single_branch,
+            failing_workflows,
         });
 
         // Failing steps for single-branch repos (shown directly under the header)
@@ -388,6 +402,18 @@ impl DisplayRow<'_> {
             } => sb.failed,
             DisplayRow::LastBuild { build, .. } => build.conclusion != RunConclusion::Success,
             _ => false,
+        }
+    }
+
+    /// Returns the failing job ID if this row represents a failed build with a known job.
+    pub(crate) fn failing_job_id(&self) -> Option<u64> {
+        match self {
+            DisplayRow::RepoHeader {
+                single_branch: Some(sb),
+                ..
+            } => sb.failing_job_id,
+            DisplayRow::LastBuild { build, .. } => build.failing_job_id,
+            _ => None,
         }
     }
 
@@ -567,9 +593,9 @@ pub(crate) fn short_repo(repo: &str) -> &str {
 
 pub(crate) fn status_style(conclusion_or_status: &str) -> Style {
     match conclusion_or_status {
-        "success" => Style::default().fg(Color::Green),
+        "success" => Style::default().fg(Color::Rgb(100, 180, 100)),
         "failure" | "cancelled" | "timed_out" | "startup_failure" => {
-            Style::default().fg(Color::Red)
+            Style::default().fg(Color::Rgb(220, 100, 100))
         }
         "in_progress" | "queued" | "waiting" | "requested" | "pending" => {
             Style::default().fg(Color::Yellow)
@@ -580,8 +606,8 @@ pub(crate) fn status_style(conclusion_or_status: &str) -> Style {
 
 pub(crate) fn status_emoji(conclusion_or_status: &str) -> &'static str {
     match conclusion_or_status {
-        "success" => "✅",
-        "failure" | "cancelled" | "timed_out" | "startup_failure" => "❌",
+        "success" => "✓",
+        "failure" | "cancelled" | "timed_out" | "startup_failure" => "✗",
         "in_progress" => "⏳",
         "queued" | "waiting" | "requested" | "pending" => "⏸",
         _ => "·",
@@ -717,7 +743,7 @@ pub(crate) fn render_header(frame: &mut ratatui::Frame, area: ratatui::layout::R
         let stale_secs = app.last_fetch.elapsed().as_secs();
         left2_spans.push(Span::styled(
             format!("  ⚠ {err} ({stale_secs}s stale)"),
-            Style::default().fg(Color::Red),
+            Style::default().fg(Color::Rgb(220, 100, 100)),
         ));
     }
     if let Some((msg, at)) = &app.flash
@@ -859,6 +885,7 @@ fn render_display_row<'a>(
             muted,
             newest_age,
             single_branch,
+            failing_workflows,
         } => {
             let name = if single_branch.is_some() {
                 format!("  {}{}", short_repo(repo), mute_indicator(*muted))
@@ -870,13 +897,13 @@ fn render_display_row<'a>(
             // Compact status summary
             let mut parts = Vec::new();
             if *failing > 0 {
-                parts.push(format!("❌ {failing}"));
+                parts.push(format!("✗ {failing}"));
             }
             if *active > 0 {
                 parts.push(format!("⏳ {active}"));
             }
             if *passing > 0 {
-                parts.push(format!("✅ {passing}"));
+                parts.push(format!("✓ {passing}"));
             }
             if *idle > 0 {
                 parts.push(format!("· {idle}"));
@@ -913,12 +940,21 @@ fn render_display_row<'a>(
                     Cell::from(age).style(style),
                 ])
             } else {
-                let count_label = format!("{branch_count} branches");
+                let branch_label = if *collapsed {
+                    format!("{branch_count} branches")
+                } else {
+                    String::new()
+                };
+                let wf_label = if !failing_workflows.is_empty() {
+                    failing_workflows.join(", ")
+                } else {
+                    String::new()
+                };
                 Row::new(vec![
                     Cell::from(format::truncate(&name, cw.repo)).style(repo_style),
-                    Cell::from(format::truncate(&count_label, BRANCH_W)),
+                    Cell::from(format::truncate(&branch_label, BRANCH_W)),
                     Cell::from(format::truncate(&status_text, STATUS_W)),
-                    Cell::from(""),
+                    Cell::from(format::truncate(&wf_label, cw.workflow)),
                     Cell::from(""),
                     Cell::from(age),
                 ])
@@ -971,7 +1007,7 @@ fn render_display_row<'a>(
             Cell::from(""),
             Cell::from(""),
             Cell::from(format!("↳ {}", format::truncate(steps, cw.title)))
-                .style(Style::default().fg(Color::Red)),
+                .style(Style::default().fg(Color::Rgb(220, 100, 100))),
             Cell::from(""),
         ]),
         DisplayRow::LastBuild {

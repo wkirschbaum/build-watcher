@@ -98,6 +98,9 @@ pub struct LastBuildView {
     /// GitHub Actions attempt number. 1 for the original run, 2+ for re-runs.
     #[serde(default = "default_attempt")]
     pub attempt: u32,
+    /// Database ID of the first failed job (for constructing job URLs).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failing_job_id: Option<u64>,
 }
 
 /// One watched repo/branch as returned by `GET /status`.
@@ -193,6 +196,7 @@ impl StatusResponse {
                 run,
                 conclusion,
                 failing_steps,
+                failing_job_id,
                 ..
             } => {
                 let Some(watch) = find_watch_mut(&mut self.watches, &run.repo, &run.branch) else {
@@ -208,6 +212,7 @@ impl StatusResponse {
                     failing_steps,
                     age_secs: Some(0.0),
                     attempt: run.attempt,
+                    failing_job_id,
                 });
             }
             WatchEvent::StatusChanged { run, to, .. } => {
@@ -358,6 +363,7 @@ mod tests {
             conclusion: RunConclusion::Success,
             elapsed: Some(35.0),
             failing_steps: None,
+            failing_job_id: None,
         });
 
         assert!(status.watches[0].active_runs.is_empty());

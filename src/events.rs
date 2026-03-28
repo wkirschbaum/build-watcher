@@ -73,6 +73,9 @@ pub enum WatchEvent {
         /// `None` for runs that were already completed when first detected.
         elapsed: Option<f64>,
         failing_steps: Option<String>,
+        /// Database ID of the first failed job (for constructing job URLs).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        failing_job_id: Option<u64>,
     },
 
     /// A build's status changed (e.g. queued -> `in_progress`).
@@ -144,6 +147,7 @@ mod tests {
             conclusion,
             elapsed: None,
             failing_steps: None,
+            failing_job_id: None,
         }
     }
 
@@ -192,6 +196,7 @@ mod tests {
             conclusion: RunConclusion::Success,
             elapsed: Some(134.5),
             failing_steps: None,
+            failing_job_id: None,
         };
         let json = serde_json::to_value(&event).unwrap();
         assert_eq!(json["RunCompleted"]["elapsed"], 134.5);
@@ -204,6 +209,7 @@ mod tests {
             conclusion: RunConclusion::Failure,
             elapsed: Some(42.0),
             failing_steps: Some("Build / Run tests".to_string()),
+            failing_job_id: None,
         };
         let json = serde_json::to_string(&event).unwrap();
         let decoded: WatchEvent = serde_json::from_str(&json).unwrap();

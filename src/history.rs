@@ -81,6 +81,7 @@ mod tests {
             head_sha: String::new(),
             event: "push".to_string(),
             failing_steps: None,
+            failing_job_id: None,
             completed_at,
             duration_secs: None,
             attempt: 1,

@@ -165,6 +165,7 @@ impl WatchEntry {
         &mut self,
         run: &RunInfo,
         failing_steps: Option<String>,
+        failing_job_id: Option<u64>,
         now_unix: u64,
     ) -> Option<Duration> {
         let elapsed = self
@@ -177,6 +178,7 @@ impl WatchEntry {
         self.last_seen_run_id = self.last_seen_run_id.max(run.id);
         let mut last_build = run.to_last_build();
         last_build.failing_steps = failing_steps;
+        last_build.failing_job_id = failing_job_id;
         last_build.completed_at = Some(now_unix);
         last_build.duration_secs = elapsed.map(|d| d.as_secs());
         self.last_build = Some(last_build);

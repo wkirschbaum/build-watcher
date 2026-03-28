@@ -95,7 +95,7 @@ fn record_completion_returns_elapsed() {
     let mut entry = make_entry();
     let run = make_run(101, RunStatus::Completed, "success");
 
-    let elapsed = entry.record_completion(&run, None, 0);
+    let elapsed = entry.record_completion(&run, None, None, 0);
 
     // Active run was present, so elapsed should be Some
     assert!(elapsed.is_some());
@@ -108,7 +108,7 @@ fn record_completion_returns_none_for_unknown_run() {
     let mut entry = make_entry();
     let run = make_run(999, RunStatus::Completed, "success");
 
-    let elapsed = entry.record_completion(&run, None, 0);
+    let elapsed = entry.record_completion(&run, None, None, 0);
 
     assert!(elapsed.is_none());
 }
@@ -118,7 +118,7 @@ fn record_completion_removes_run_and_sets_last_build() {
     let mut entry = make_entry();
     let run = make_run(101, RunStatus::Completed, "success");
 
-    entry.record_completion(&run, None, 0);
+    entry.record_completion(&run, None, None, 0);
 
     assert!(!entry.active_runs.contains_key(&101));
     assert!(entry.active_runs.contains_key(&102));
@@ -132,7 +132,7 @@ fn record_completion_stores_failing_steps() {
     let mut entry = make_entry();
     let run = make_run(101, RunStatus::Completed, "failure");
 
-    entry.record_completion(&run, Some("Build / Run tests".to_string()), 0);
+    entry.record_completion(&run, Some("Build / Run tests".to_string()), None, 0);
 
     let lb = entry.last_build.unwrap();
     assert_eq!(lb.failing_steps.as_deref(), Some("Build / Run tests"));
@@ -144,7 +144,7 @@ fn record_completion_clears_failure_count() {
     entry.failure_counts.insert(101, 3);
     let run = make_run(101, RunStatus::Completed, "failure");
 
-    entry.record_completion(&run, None, 0);
+    entry.record_completion(&run, None, None, 0);
 
     assert!(!entry.failure_counts.contains_key(&101));
 }
@@ -288,7 +288,7 @@ fn has_active_runs_reflects_state() {
 fn persisted_roundtrip_preserves_fields() {
     let mut entry = make_entry();
     let run = make_run(101, RunStatus::Completed, "success");
-    entry.record_completion(&run, None, 0);
+    entry.record_completion(&run, None, None, 0);
 
     let persisted = entry.to_persisted();
     let restored = WatchEntry::from_persisted(persisted);
@@ -387,7 +387,7 @@ fn last_failed_build_finds_failure() {
     let mut watches = HashMap::new();
     let mut entry = make_entry();
     let run = make_run(200, RunStatus::Completed, "failure");
-    entry.record_completion(&run, None, 0);
+    entry.record_completion(&run, None, None, 0);
     watches.insert(WatchKey::new("alice/app", "main"), entry);
 
     let result = last_failed_build(&watches, "alice/app");
@@ -403,7 +403,7 @@ fn last_failed_build_ignores_success() {
     let mut watches = HashMap::new();
     let mut entry = make_entry();
     let run = make_run(200, RunStatus::Completed, "success");
-    entry.record_completion(&run, None, 0);
+    entry.record_completion(&run, None, None, 0);
     watches.insert(WatchKey::new("alice/app", "main"), entry);
 
     assert!(last_failed_build(&watches, "alice/app").is_none());
@@ -415,12 +415,12 @@ fn last_failed_build_picks_most_recent() {
 
     let mut entry1 = make_entry();
     let run1 = make_run(100, RunStatus::Completed, "failure");
-    entry1.record_completion(&run1, None, 0);
+    entry1.record_completion(&run1, None, None, 0);
     watches.insert(WatchKey::new("alice/app", "main"), entry1);
 
     let mut entry2 = make_entry();
     let run2 = make_run(200, RunStatus::Completed, "failure");
-    entry2.record_completion(&run2, None, 0);
+    entry2.record_completion(&run2, None, None, 0);
     watches.insert(WatchKey::new("alice/app", "develop"), entry2);
 
     let (_, build) = last_failed_build(&watches, "alice/app").unwrap();
@@ -432,7 +432,7 @@ fn last_failed_build_ignores_other_repos() {
     let mut watches = HashMap::new();
     let mut entry = make_entry();
     let run = make_run(200, RunStatus::Completed, "failure");
-    entry.record_completion(&run, None, 0);
+    entry.record_completion(&run, None, None, 0);
     watches.insert(WatchKey::new("bob/other", "main"), entry);
 
     assert!(last_failed_build(&watches, "alice/app").is_none());
@@ -548,8 +548,13 @@ impl crate::github::GitHubClient for MockGitHub {
                 repo: "mock".into(),
             })
     }
-    async fn failing_steps(&self, _: &str, _: u64) -> Option<String> {
-        self.failure_msg.clone()
+    async fn failing_steps(&self, _: &str, _: u64) -> Option<crate::github::FailureInfo> {
+        self.failure_msg
+            .clone()
+            .map(|steps| crate::github::FailureInfo {
+                steps,
+                first_job_id: None,
+            })
     }
     async fn run_rerun(&self, _: &str, _: u64, _: bool) -> Result<String, GhError> {
         Ok(String::new())
@@ -990,7 +995,7 @@ async fn record_completion_bumps_last_seen() {
         last_build: None,
     };
     let run = make_run(100, RunStatus::Completed, "success");
-    entry.record_completion(&run, None, 999);
+    entry.record_completion(&run, None, None, 999);
 
     assert_eq!(
         entry.last_seen_run_id, 100,
@@ -1063,6 +1068,7 @@ fn run_change_dedup_keeps_first() {
             conclusion: RunConclusion::Success,
             elapsed: Some(42.0),
             failing_steps: None,
+            failing_job_id: None,
         },
         RunChange::Started { run: snap(102) },
         // Duplicate of 101 — should be suppressed
@@ -1071,6 +1077,7 @@ fn run_change_dedup_keeps_first() {
             conclusion: RunConclusion::Success,
             elapsed: None,
             failing_steps: None,
+            failing_job_id: None,
         },
     ];
 
@@ -1121,6 +1128,7 @@ async fn check_for_new_runs_detects_rerun_with_different_conclusion() {
                     head_sha: "abc1234".to_string(),
                     event: "push".to_string(),
                     failing_steps: Some("Build / Run tests".to_string()),
+                    failing_job_id: None,
                     completed_at: Some(1000),
                     duration_secs: Some(60),
                     attempt: 1,
@@ -1182,6 +1190,7 @@ async fn check_for_new_runs_detects_rerun_in_progress() {
                     head_sha: "abc1234".to_string(),
                     event: "push".to_string(),
                     failing_steps: Some("Build / Run tests".to_string()),
+                    failing_job_id: None,
                     completed_at: Some(1000),
                     duration_secs: Some(60),
                     attempt: 1,
@@ -1239,6 +1248,7 @@ async fn check_for_new_runs_ignores_rerun_with_same_conclusion() {
                     head_sha: "abc1234".to_string(),
                     event: "push".to_string(),
                     failing_steps: None,
+                    failing_job_id: None,
                     completed_at: Some(1000),
                     duration_secs: None,
                     attempt: 1,

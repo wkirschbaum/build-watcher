@@ -93,6 +93,9 @@ pub struct LastBuild {
     /// Populated when the run failed; `None` for successful builds or older persisted state.
     #[serde(default)]
     pub failing_steps: Option<String>,
+    /// Database ID of the first failed job (for constructing job URLs).
+    #[serde(default)]
+    pub failing_job_id: Option<u64>,
     /// Unix timestamp (seconds) when this build completed. Persisted so age survives restarts.
     #[serde(default)]
     pub completed_at: Option<u64>,
@@ -226,6 +229,7 @@ impl RunInfo {
             head_sha: self.head_sha.clone(),
             event: self.event.clone(),
             failing_steps: None,
+            failing_job_id: None,
             completed_at: None,
             duration_secs: None,
             attempt: self.attempt,
@@ -243,7 +247,7 @@ pub trait GitHubClient: Send + Sync + 'static {
     /// Fetch all in-progress runs for a repo (no branch filter, `--status in_progress`).
     async fn in_progress_runs_for_repo(&self, repo: &str) -> Result<Vec<RunInfo>, GhError>;
     async fn run_status(&self, repo: &str, run_id: u64) -> Result<RunInfo, GhError>;
-    async fn failing_steps(&self, repo: &str, run_id: u64) -> Option<String>;
+    async fn failing_steps(&self, repo: &str, run_id: u64) -> Option<FailureInfo>;
     async fn run_rerun(
         &self,
         repo: &str,
@@ -330,7 +334,7 @@ impl GitHubClient for GhCliClient {
         RunInfo::from_gh_json(raw, repo)
     }
 
-    async fn failing_steps(&self, repo: &str, run_id: u64) -> Option<String> {
+    async fn failing_steps(&self, repo: &str, run_id: u64) -> Option<FailureInfo> {
         let id_str = run_id.to_string();
         let stdout = match gh_exec(
             repo,
@@ -409,6 +413,8 @@ struct GhStep {
 
 #[derive(Debug, Deserialize)]
 struct GhJob {
+    #[serde(default)]
+    database_id: Option<u64>,
     name: String,
     conclusion: String,
     steps: Vec<GhStep>,
@@ -419,11 +425,29 @@ struct GhJobsResponse {
     jobs: Vec<GhJob>,
 }
 
+/// Result of extracting failure info from a run's jobs.
+#[derive(Debug)]
+pub struct FailureInfo {
+    /// Comma-separated list of "job / step" names that failed.
+    pub steps: String,
+    /// Database ID of the first failed job (for constructing job URLs).
+    pub first_job_id: Option<u64>,
+}
+
 /// Pure extraction of failing job/step names from parsed GitHub API response.
-fn extract_failing_steps(jobs: &[GhJob]) -> Option<String> {
-    let failures: Vec<String> = jobs
+fn extract_failing_steps(jobs: &[GhJob]) -> Option<FailureInfo> {
+    let failed_jobs: Vec<&GhJob> = jobs
         .iter()
         .filter(|job| job.conclusion == "failure")
+        .collect();
+
+    if failed_jobs.is_empty() {
+        return None;
+    }
+
+    let first_job_id = failed_jobs.first().and_then(|j| j.database_id);
+    let steps: Vec<String> = failed_jobs
+        .iter()
         .map(|job| {
             job.steps
                 .iter()
@@ -435,11 +459,10 @@ fn extract_failing_steps(jobs: &[GhJob]) -> Option<String> {
         })
         .collect();
 
-    if failures.is_empty() {
-        None
-    } else {
-        Some(failures.join(", "))
-    }
+    Some(FailureInfo {
+        steps: steps.join(", "),
+        first_job_id,
+    })
 }
 
 /// A build history entry with timestamps for duration/age calculation.
@@ -597,6 +620,11 @@ pub fn validate_repo(repo: &str) -> Result<(), String> {
 /// URL for a specific workflow run.
 pub fn run_url(repo: &str, run_id: u64) -> String {
     format!("https://github.com/{repo}/actions/runs/{run_id}")
+}
+
+/// URL for a specific job within a workflow run.
+pub fn job_url(repo: &str, run_id: u64, job_id: u64) -> String {
+    format!("https://github.com/{repo}/actions/runs/{run_id}/job/{job_id}")
 }
 
 /// URL for a repository.
@@ -828,6 +856,7 @@ mod tests {
 
     fn job(name: &str, conclusion: &str, steps: Vec<(&str, &str)>) -> GhJob {
         GhJob {
+            database_id: None,
             name: name.to_string(),
             conclusion: conclusion.to_string(),
             steps: steps
@@ -854,16 +883,15 @@ mod tests {
                 vec![("Checkout", "success"), ("Run tests", "failure")],
             ),
         ];
-        assert_eq!(
-            extract_failing_steps(&jobs),
-            Some("Test / Run tests".to_string())
-        );
+        let info = extract_failing_steps(&jobs).unwrap();
+        assert_eq!(info.steps, "Test / Run tests");
     }
 
     #[test]
     fn extract_failing_steps_job_failed_no_step() {
         let jobs = vec![job("Deploy", "failure", vec![("Setup", "success")])];
-        assert_eq!(extract_failing_steps(&jobs), Some("Deploy".to_string()));
+        let info = extract_failing_steps(&jobs).unwrap();
+        assert_eq!(info.steps, "Deploy");
     }
 
     #[test]
@@ -872,20 +900,18 @@ mod tests {
             job("Lint", "failure", vec![("Check", "failure")]),
             job("Test", "failure", vec![("Run", "failure")]),
         ];
-        assert_eq!(
-            extract_failing_steps(&jobs),
-            Some("Lint / Check, Test / Run".to_string())
-        );
+        let info = extract_failing_steps(&jobs).unwrap();
+        assert_eq!(info.steps, "Lint / Check, Test / Run");
     }
 
     #[test]
     fn extract_failing_steps_none_when_all_pass() {
         let jobs = vec![job("Build", "success", vec![("Compile", "success")])];
-        assert_eq!(extract_failing_steps(&jobs), None);
+        assert!(extract_failing_steps(&jobs).is_none());
     }
 
     #[test]
     fn extract_failing_steps_empty_jobs() {
-        assert_eq!(extract_failing_steps(&[]), None);
+        assert!(extract_failing_steps(&[]).is_none());
     }
 }

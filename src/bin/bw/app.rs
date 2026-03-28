@@ -10,7 +10,7 @@ use tokio::sync::mpsc;
 use build_watcher::config::{NOTIFICATION_EVENT_COUNT, NotificationLevel};
 use build_watcher::dirs::state_dir;
 use build_watcher::events::WatchEvent;
-use build_watcher::github::{repo_url, run_url, validate_branch, validate_repo};
+use build_watcher::github::{job_url, repo_url, run_url, validate_branch, validate_repo};
 use build_watcher::persistence::{load_json, save_json};
 use build_watcher::status::{HistoryEntryView, RunConclusion, StatsResponse, StatusResponse};
 
@@ -654,6 +654,7 @@ impl App {
         let is_failed = selected_display_idx
             .map(|idx| flat.rows[idx].is_failed())
             .unwrap_or(false);
+        let failing_job_id = selected_display_idx.and_then(|idx| flat.rows[idx].failing_job_id());
 
         match code {
             KeyCode::Char('q') => return QuitAction::Quit,
@@ -826,9 +827,13 @@ impl App {
             }
             KeyCode::Char('o') => {
                 if is_failed {
-                    // Open the specific failed run to see details
+                    // Open the specific failed job/run to see details
                     if let Some((repo, _, Some(run_id), _)) = selected {
-                        open_browser(&run_url(repo, run_id));
+                        if let Some(job_id) = failing_job_id {
+                            open_browser(&job_url(repo, run_id, job_id));
+                        } else {
+                            open_browser(&run_url(repo, run_id));
+                        }
                     }
                 } else if is_repo_row {
                     // Open repo Actions page
@@ -1099,6 +1104,7 @@ mod tests {
             conclusion: RunConclusion::Success,
             elapsed: Some(35.0),
             failing_steps: None,
+            failing_job_id: None,
         });
 
         assert!(status.watches[0].active_runs.is_empty());
@@ -1118,6 +1124,7 @@ mod tests {
             conclusion: RunConclusion::Failure,
             elapsed: None,
             failing_steps: Some("Build / tests".to_string()),
+            failing_job_id: None,
         });
 
         let lb = status.watches[0].last_build.as_ref().unwrap();
@@ -1132,6 +1139,7 @@ mod tests {
             conclusion: RunConclusion::Success,
             elapsed: None,
             failing_steps: None,
+            failing_job_id: None,
         });
 
         assert!(status.watches[0].last_build.is_none());
@@ -1243,6 +1251,7 @@ mod tests {
                 failing_steps: Some("Build / tests".to_string()),
                 age_secs: Some(60.0),
                 attempt: 1,
+                failing_job_id: None,
             }),
             muted: false,
         }];
@@ -1269,6 +1278,7 @@ mod tests {
                     failing_steps: Some("Build / tests".to_string()),
                     age_secs: Some(60.0),
                     attempt: 1,
+                    failing_job_id: None,
                 }),
                 muted: false,
             },
@@ -1300,6 +1310,7 @@ mod tests {
                 failing_steps: None,
                 age_secs: Some(60.0),
                 attempt: 1,
+                failing_job_id: None,
             }),
             muted: false,
         }];
@@ -1313,9 +1324,12 @@ mod tests {
 
     #[test]
     fn status_style_colors() {
-        assert_eq!(status_style("success").fg, Some(Color::Green));
-        assert_eq!(status_style("failure").fg, Some(Color::Red));
-        assert_eq!(status_style("cancelled").fg, Some(Color::Red));
+        assert_eq!(status_style("success").fg, Some(Color::Rgb(100, 180, 100)));
+        assert_eq!(status_style("failure").fg, Some(Color::Rgb(220, 100, 100)));
+        assert_eq!(
+            status_style("cancelled").fg,
+            Some(Color::Rgb(220, 100, 100))
+        );
         assert_eq!(status_style("in_progress").fg, Some(Color::Yellow));
         assert_eq!(status_style("queued").fg, Some(Color::Yellow));
         assert_eq!(status_style("unknown").fg, None);
@@ -1323,8 +1337,8 @@ mod tests {
 
     #[test]
     fn status_emoji_variants() {
-        assert_eq!(status_emoji("success"), "✅");
-        assert_eq!(status_emoji("failure"), "❌");
+        assert_eq!(status_emoji("success"), "✓");
+        assert_eq!(status_emoji("failure"), "✗");
         assert_eq!(status_emoji("in_progress"), "⏳");
         assert_eq!(status_emoji("queued"), "⏸");
         assert_eq!(status_emoji("something_else"), "·");
@@ -1389,6 +1403,7 @@ mod tests {
             conclusion: RunConclusion::Success,
             elapsed: None,
             failing_steps: None,
+            failing_job_id: None,
         });
 
         let lb = status.watches[0].last_build.as_ref().unwrap();
@@ -1430,6 +1445,7 @@ mod tests {
                 failing_steps: None,
                 age_secs: Some(age),
                 attempt: 1,
+                failing_job_id: None,
             }),
             muted: false,
         }

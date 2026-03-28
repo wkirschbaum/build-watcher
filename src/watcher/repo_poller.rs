@@ -44,6 +44,7 @@ pub(super) enum RunChange {
         conclusion: RunConclusion,
         elapsed: Option<f64>,
         failing_steps: Option<String>,
+        failing_job_id: Option<u64>,
     },
     StatusChanged {
         run: RunSnapshot,
@@ -69,11 +70,13 @@ impl RunChange {
                 conclusion,
                 elapsed,
                 failing_steps,
+                failing_job_id,
             } => WatchEvent::RunCompleted {
                 run,
                 conclusion,
                 elapsed,
                 failing_steps,
+                failing_job_id,
             },
             Self::StatusChanged { run, from, to } => WatchEvent::StatusChanged { run, from, to },
         }
@@ -355,17 +358,20 @@ impl RepoPoller {
                         .map(|a| a.started_at.elapsed().as_secs_f64())
                 };
 
-                let failing_steps = if run.succeeded() {
+                let failure_info = if run.succeeded() {
                     None
                 } else {
                     self.github.failing_steps(&self.repo, run.id).await
                 };
+                let failing_steps = failure_info.as_ref().map(|f| f.steps.clone());
+                let failing_job_id = failure_info.as_ref().and_then(|f| f.first_job_id);
 
                 changes.push(RunChange::Completed {
                     run: RunSnapshot::from_run_info(run, &self.repo, &key.branch),
                     conclusion: run.run_conclusion(),
                     elapsed,
                     failing_steps: failing_steps.clone(),
+                    failing_job_id,
                 });
 
                 tracing::info!(
@@ -377,7 +383,7 @@ impl RepoPoller {
                 let new_build = {
                     let mut w = self.watches.lock().await;
                     if let Some(entry) = w.get_mut(key) {
-                        entry.record_completion(run, failing_steps, unix_now());
+                        entry.record_completion(run, failing_steps, failing_job_id, unix_now());
                         entry.last_build.clone()
                     } else {
                         None
@@ -473,8 +479,9 @@ impl RepoPoller {
                 continue;
             }
 
-            // Collect failing_steps for already-completed runs.
-            let mut failing_steps_by_id: HashMap<u64, Option<String>> = HashMap::new();
+            // Collect failure info for already-completed runs.
+            // Maps run_id → (failing_steps, failing_job_id).
+            let mut failure_by_id: HashMap<u64, (Option<String>, Option<u64>)> = HashMap::new();
 
             for run in &new_runs {
                 let snapshot = RunSnapshot::from_run_info(run, &self.repo, &key.branch);
@@ -482,11 +489,13 @@ impl RepoPoller {
                 if run.is_completed() {
                     // Run completed before we saw it — emit only RunCompleted,
                     // not a spurious RunStarted that would cause a double notification.
-                    let failing_steps = if run.succeeded() {
+                    let failure_info = if run.succeeded() {
                         None
                     } else {
                         self.github.failing_steps(&self.repo, run.id).await
                     };
+                    let failing_steps = failure_info.as_ref().map(|f| f.steps.clone());
+                    let failing_job_id = failure_info.as_ref().and_then(|f| f.first_job_id);
                     tracing::info!(
                         key = %key, run_id = run.id,
                         sha = run.short_sha(), conclusion = %run.conclusion,
@@ -497,8 +506,9 @@ impl RepoPoller {
                         conclusion: run.run_conclusion(),
                         elapsed: None,
                         failing_steps: failing_steps.clone(),
+                        failing_job_id,
                     });
-                    failing_steps_by_id.insert(run.id, failing_steps);
+                    failure_by_id.insert(run.id, (failing_steps, failing_job_id));
                 } else {
                     tracing::info!(
                         key = %key, run_id = run.id,
@@ -527,11 +537,13 @@ impl RepoPoller {
                     rerun_detected = true;
                 } else if rerun.conclusion != lb.conclusion {
                     // Re-run completed with a different conclusion.
-                    let failing_steps = if rerun.succeeded() {
+                    let failure_info = if rerun.succeeded() {
                         None
                     } else {
                         self.github.failing_steps(&self.repo, rerun.id).await
                     };
+                    let failing_steps = failure_info.as_ref().map(|f| f.steps.clone());
+                    let failing_job_id = failure_info.as_ref().and_then(|f| f.first_job_id);
                     tracing::info!(
                         key = %key, run_id = rerun.id,
                         old_conclusion = %lb.conclusion, new_conclusion = %rerun.conclusion,
@@ -543,8 +555,9 @@ impl RepoPoller {
                         conclusion: rerun.run_conclusion(),
                         elapsed: None,
                         failing_steps: failing_steps.clone(),
+                        failing_job_id,
                     });
-                    failing_steps_by_id.insert(rerun.id, failing_steps);
+                    failure_by_id.insert(rerun.id, (failing_steps, failing_job_id));
                     rerun_detected = true;
                 }
             }
@@ -569,16 +582,19 @@ impl RepoPoller {
                             // Update last_build with new conclusion.
                             let mut new_lb = rerun.to_last_build();
                             new_lb.completed_at = Some(unix_now());
-                            new_lb.failing_steps =
-                                failing_steps_by_id.get(&rerun.id).and_then(|s| s.clone());
+                            if let Some((steps, job_id)) = failure_by_id.get(&rerun.id) {
+                                new_lb.failing_steps = steps.clone();
+                                new_lb.failing_job_id = *job_id;
+                            }
                             entry.last_build = Some(new_lb);
                         }
                     }
 
                     if let Some(ref mut lb) = entry.last_build
-                        && let Some(steps) = failing_steps_by_id.get(&lb.run_id)
+                        && let Some((steps, job_id)) = failure_by_id.get(&lb.run_id)
                     {
                         lb.failing_steps = steps.clone();
+                        lb.failing_job_id = *job_id;
                     }
                     // Bump the high-water mark for ALL unseen runs (including filtered-out
                     // ones) so ignored workflows don't re-trigger on the next poll.
@@ -600,7 +616,10 @@ impl RepoPoller {
                 .map(|r| {
                     let mut lb = r.to_last_build();
                     lb.completed_at = Some(now_unix);
-                    lb.failing_steps = failing_steps_by_id.get(&r.id).and_then(|s| s.clone());
+                    if let Some((steps, job_id)) = failure_by_id.get(&r.id) {
+                        lb.failing_steps = steps.clone();
+                        lb.failing_job_id = *job_id;
+                    }
                     lb
                 })
                 .collect();
@@ -613,7 +632,10 @@ impl RepoPoller {
             {
                 let mut new_lb = rerun.to_last_build();
                 new_lb.completed_at = Some(now_unix);
-                new_lb.failing_steps = failing_steps_by_id.get(&rerun.id).and_then(|s| s.clone());
+                if let Some((steps, job_id)) = failure_by_id.get(&rerun.id) {
+                    new_lb.failing_steps = steps.clone();
+                    new_lb.failing_job_id = *job_id;
+                }
                 completed.push(new_lb);
             }
             if !completed.is_empty() {
@@ -637,14 +659,15 @@ impl RepoPoller {
                         .and_then(|e| e.last_build.as_ref().map(|lb| lb.run_id))
                 };
                 if let Some(run_id) = run_id {
-                    let steps = self.github.failing_steps(&self.repo, run_id).await;
-                    if steps.is_some() {
+                    let info = self.github.failing_steps(&self.repo, run_id).await;
+                    if let Some(info) = info {
                         let mut w = self.watches.lock().await;
                         if let Some(entry) = w.get_mut(key)
                             && let Some(ref mut lb) = entry.last_build
                         {
                             tracing::info!(key = %key, run_id, "Backfilled failing steps");
-                            lb.failing_steps = steps;
+                            lb.failing_steps = Some(info.steps);
+                            lb.failing_job_id = info.first_job_id;
                             any_changed = true;
                         }
                     }

@@ -498,7 +498,11 @@ mod tests {
                 repo: "stub".to_string(),
             })
         }
-        async fn failing_steps(&self, _: &str, _: u64) -> Option<String> {
+        async fn failing_steps(
+            &self,
+            _: &str,
+            _: u64,
+        ) -> Option<build_watcher::github::FailureInfo> {
             None
         }
     }
@@ -616,6 +620,7 @@ mod tests {
             head_sha: "abc1234".to_string(),
             event: "push".to_string(),
             failing_steps: Some("Build / Run tests".to_string()),
+            failing_job_id: None,
             completed_at: None,
             duration_secs: None,
             attempt: 1,

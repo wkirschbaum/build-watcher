@@ -102,6 +102,7 @@ async fn handle_notification(event: WatchEvent, repo_label: &str, level: Notific
             conclusion,
             elapsed,
             failing_steps,
+            ..
         } => {
             let succeeded = conclusion == RunConclusion::Success;
 
@@ -163,6 +164,7 @@ mod tests {
             conclusion,
             elapsed: None,
             failing_steps: None,
+            failing_job_id: None,
         }
     }
 
