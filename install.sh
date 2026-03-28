@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# install.sh — Install build-watcher from a GitHub release.
+# install.sh — Install build-watcher from a GitHub release or local build.
 #
 # Downloads the pre-built binaries for the current platform from the latest
 # GitHub release, installs the daemon and CLI to ~/.local/bin/, sets up the
@@ -11,10 +11,11 @@
 # release), it safely stops the running service before overwriting the binaries.
 #
 # Requirements:
-#   - gh (GitHub CLI), authenticated: https://cli.github.com
+#   - gh (GitHub CLI), authenticated (unless --local): https://cli.github.com
 #   - This script must be run from the repository root (needs src/platform/)
 #
-# Usage: ./install.sh
+# Usage: ./install.sh            # install from latest GitHub release
+#        ./install.sh --local    # build from source and install
 
 set -euo pipefail
 
@@ -27,46 +28,61 @@ CLAUDE_CONFIG="$HOME/.claude.json"
 PORT=8417
 OS="$(uname -s)"
 ARCH="$(uname -m)"
+LOCAL=false
 
-# -- Pre-flight checks --------------------------------------------------------
+for arg in "$@"; do
+  case "$arg" in
+    --local) LOCAL=true ;;
+    *) echo "Unknown option: $arg"; exit 1 ;;
+  esac
+done
 
-command -v gh >/dev/null 2>&1 || {
-  echo "Error: gh (GitHub CLI) is required but not found."
-  echo "Install it from https://cli.github.com and run 'gh auth login'."
-  exit 1
-}
+# -- Acquire binaries ---------------------------------------------------------
 
-# -- Detect target triple -----------------------------------------------------
-# Maps uname output to the Rust target triple used when naming release assets.
-
-case "$OS/$ARCH" in
-  Linux/x86_64)   TARGET="x86_64-unknown-linux-gnu" ;;
-  Linux/aarch64)  TARGET="aarch64-unknown-linux-gnu" ;;
-  Darwin/x86_64)  TARGET="x86_64-apple-darwin" ;;
-  Darwin/arm64)   TARGET="aarch64-apple-darwin" ;;
-  *)
-    echo "Error: unsupported platform $OS/$ARCH"
-    exit 1
-    ;;
-esac
-
-# -- Download release binaries ------------------------------------------------
-# Fetches the two .tar.gz archives from the latest GitHub release and extracts
-# them into a temp directory. The archives each contain a single binary named
-# after the crate (build-watcher or bw, without the target suffix).
-
-echo "==> Downloading latest release for $TARGET..."
 TMPDIR="$(mktemp -d)"
 trap 'rm -rf "$TMPDIR"' EXIT
 
-gh release download \
-  --repo wkirschbaum/build-watcher \
-  --pattern "bw-${TARGET}.tar.gz" \
-  --pattern "build-watcher-${TARGET}.tar.gz" \
-  --dir "$TMPDIR"
+if [ "$LOCAL" = true ]; then
+  # -- Build from source ------------------------------------------------------
+  command -v cargo >/dev/null 2>&1 || {
+    echo "Error: cargo is required for --local builds."
+    exit 1
+  }
 
-tar -xzf "$TMPDIR/bw-${TARGET}.tar.gz" -C "$TMPDIR"
-tar -xzf "$TMPDIR/build-watcher-${TARGET}.tar.gz" -C "$TMPDIR"
+  echo "==> Building from source (release)..."
+  cargo build --release
+
+  cp target/release/build-watcher "$TMPDIR/$BINARY_NAME"
+  cp target/release/bw "$TMPDIR/bw"
+else
+  # -- Download release binaries ----------------------------------------------
+  command -v gh >/dev/null 2>&1 || {
+    echo "Error: gh (GitHub CLI) is required but not found."
+    echo "Install it from https://cli.github.com and run 'gh auth login'."
+    exit 1
+  }
+
+  case "$OS/$ARCH" in
+    Linux/x86_64)   TARGET="x86_64-unknown-linux-gnu" ;;
+    Linux/aarch64)  TARGET="aarch64-unknown-linux-gnu" ;;
+    Darwin/x86_64)  TARGET="x86_64-apple-darwin" ;;
+    Darwin/arm64)   TARGET="aarch64-apple-darwin" ;;
+    *)
+      echo "Error: unsupported platform $OS/$ARCH"
+      exit 1
+      ;;
+  esac
+
+  echo "==> Downloading latest release for $TARGET..."
+  gh release download \
+    --repo wkirschbaum/build-watcher \
+    --pattern "bw-${TARGET}.tar.gz" \
+    --pattern "build-watcher-${TARGET}.tar.gz" \
+    --dir "$TMPDIR"
+
+  tar -xzf "$TMPDIR/bw-${TARGET}.tar.gz" -C "$TMPDIR"
+  tar -xzf "$TMPDIR/build-watcher-${TARGET}.tar.gz" -C "$TMPDIR"
+fi
 
 # -- Stop any running instance ------------------------------------------------
 # The daemon binary must not be running when we overwrite it (Linux raises

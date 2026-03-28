@@ -1094,6 +1094,13 @@ pub(crate) fn render_footer(frame: &mut ratatui::Frame, area: ratatui::layout::R
         .style(Style::default().fg(Color::DarkGray)),
     };
     frame.render_widget(footer, area);
+
+    let version = Paragraph::new(Line::from(Span::styled(
+        concat!("v", env!("CARGO_PKG_VERSION")),
+        Style::default().fg(Color::DarkGray),
+    )))
+    .alignment(ratatui::layout::Alignment::Right);
+    frame.render_widget(version, area);
 }
 
 pub(crate) fn render(frame: &mut ratatui::Frame, app: &App) {

@@ -79,10 +79,37 @@ fn discover_or_start_daemon() -> Result<u16, Box<dyn std::error::Error>> {
     Err("Timed out waiting for daemon to start".into())
 }
 
+/// Delete watches and history state files, leaving config intact.
+fn reset_state() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = state_dir();
+    let mut removed = 0;
+    for name in ["watches.json", "history.json"] {
+        let path = dir.join(name);
+        match std::fs::remove_file(&path) {
+            Ok(()) => {
+                eprintln!("Removed {}", path.display());
+                removed += 1;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => eprintln!("Failed to remove {}: {e}", path.display()),
+        }
+    }
+    if removed == 0 {
+        eprintln!("No state files to remove.");
+    } else {
+        eprintln!("State reset. Restart the daemon to pick up changes.");
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if std::env::args().any(|a| a == "--update") {
         return update::run();
+    }
+
+    if std::env::args().any(|a| a == "--reset-state") {
+        return reset_state();
     }
 
     let port = discover_or_start_daemon()?;

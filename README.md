@@ -45,6 +45,22 @@ curl -fsSL https://raw.githubusercontent.com/wkirschbaum/build-watcher/main/inst
 
 Or clone the repo and run `./install.sh` manually. The script downloads pre-built binaries from the latest GitHub release for your platform (Linux x86_64/aarch64, macOS x86_64/aarch64), installs them to `~/.local/bin/`, creates a default config, registers a system service, and configures the MCP server in `~/.claude.json`.
 
+To install from source without cloning the repo:
+
+```sh
+cargo install --git https://github.com/wkirschbaum/build-watcher.git
+```
+
+This builds and installs both binaries to `~/.cargo/bin/`. Note: this skips service registration and MCP setup — run `build-watcher --register --port 8417` afterwards to configure the MCP server.
+
+To build and install from a local checkout (useful during development):
+
+```sh
+./install.sh --local
+```
+
+This runs `cargo build --release` and installs the resulting binaries with full service and MCP setup.
+
 ## Usage
 
 ### TUI Dashboard
@@ -207,6 +223,12 @@ bw --update
 ```
 
 This downloads and installs the latest release. Alternatively, re-run `./install.sh` to upgrade from a GitHub release.
+
+To reset watch state (clears active runs and build history, keeps config):
+
+```sh
+bw --reset-state
+```
 
 ## Uninstalling
 
