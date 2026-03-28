@@ -12,25 +12,15 @@
 #
 # Requirements:
 #   - gh (GitHub CLI), authenticated (unless --local): https://cli.github.com
-#   - This script must be run from the repository root (needs src/platform/)
 #
-# Usage: ./install.sh            # install from latest GitHub release
-#        ./install.sh --local    # build from source and install
+# Usage: curl -fsSL https://raw.githubusercontent.com/wkirschbaum/build-watcher/main/install.sh | bash
+#        ./install.sh            # install from latest GitHub release (from repo checkout)
+#        ./install.sh --local    # build from source and install (from repo checkout)
 
 set -euo pipefail
 
-# When piped (curl | bash), $0 is "bash" — not a path to this script.
-# Detect this so we generate service files inline instead of reading repo templates.
-case "$0" in
-  */install.sh)
-    SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-    PLATFORM_DIR="$SCRIPT_DIR/src/platform"
-    ;;
-  *)
-    SCRIPT_DIR=""
-    PLATFORM_DIR=""
-    ;;
-esac
+REPO="wkirschbaum/build-watcher"
+RAW_URL="https://raw.githubusercontent.com/$REPO/main"
 BINARY_NAME="build-watcher"
 INSTALL_DIR="$HOME/.local/bin"
 BINARY_PATH="$INSTALL_DIR/$BINARY_NAME"
@@ -149,23 +139,9 @@ if [ "$OS" != "Darwin" ]; then
   echo "==> Installing desktop entry..."
   DESKTOP_DIR="$HOME/.local/share/applications"
   mkdir -p "$DESKTOP_DIR"
-  DESKTOP_FILE="$DESKTOP_DIR/build-watcher.desktop"
-  if [ -n "$SCRIPT_DIR" ] && [ -f "$SCRIPT_DIR/build-watcher.desktop" ]; then
-    cp "$SCRIPT_DIR/build-watcher.desktop" "$DESKTOP_FILE"
-  else
-    cat > "$DESKTOP_FILE" <<'DESKTOP'
-[Desktop Entry]
-Type=Application
-Name=Build Watcher
-Comment=GitHub Actions build monitor with desktop notifications
-Icon=emblem-synchronizing
-Exec=build-watcher
-NoDisplay=true
-Categories=Development;
-DESKTOP
-  fi
+  curl -fsSL "$RAW_URL/build-watcher.desktop" -o "$DESKTOP_DIR/build-watcher.desktop"
   command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database "$DESKTOP_DIR" 2>/dev/null || true
-  echo "  Desktop:  $DESKTOP_FILE"
+  echo "  Desktop:  $DESKTOP_DIR/build-watcher.desktop"
 fi
 
 # -- Platform-specific service install ----------------------------------------
@@ -179,41 +155,10 @@ if [ "$OS" = "Darwin" ]; then
   PLIST_PATH="$PLIST_DIR/com.build-watcher.plist"
   mkdir -p "$PLIST_DIR"
 
-  if [ -n "$PLATFORM_DIR" ] && [ -f "$PLATFORM_DIR/macos/com.build-watcher.plist" ]; then
-    sed -e "s|@@BINARY_PATH@@|$BINARY_PATH|g" \
-        -e "s|@@HOME@@|$HOME|g" \
-        "$PLATFORM_DIR/macos/com.build-watcher.plist" > "$PLIST_PATH"
-  else
-    cat > "$PLIST_PATH" <<PLIST
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key>
-  <string>com.build-watcher</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>$BINARY_PATH</string>
-  </array>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>RUST_LOG</key>
-    <string>build_watcher=info</string>
-    <key>PATH</key>
-    <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
-  </dict>
-  <key>RunAtLoad</key>
-  <true/>
-  <key>KeepAlive</key>
-  <true/>
-  <key>StandardOutPath</key>
-  <string>$HOME/Library/Logs/build-watcher.log</string>
-  <key>StandardErrorPath</key>
-  <string>$HOME/Library/Logs/build-watcher.log</string>
-</dict>
-</plist>
-PLIST
-  fi
+  curl -fsSL "$RAW_URL/src/platform/macos/com.build-watcher.plist" \
+    | sed -e "s|@@BINARY_PATH@@|$BINARY_PATH|g" \
+          -e "s|@@HOME@@|$HOME|g" \
+    > "$PLIST_PATH"
 
   launchctl bootout "gui/$(id -u)" "$PLIST_PATH" 2>/dev/null || true
   launchctl bootstrap "gui/$(id -u)" "$PLIST_PATH"
@@ -224,26 +169,9 @@ else
   SYSTEMD_DIR="$HOME/.config/systemd/user"
   mkdir -p "$SYSTEMD_DIR"
 
-  if [ -n "$PLATFORM_DIR" ] && [ -f "$PLATFORM_DIR/linux/build-watcher.service" ]; then
-    sed -e "s|@@BINARY_PATH@@|$BINARY_PATH|g" \
-        "$PLATFORM_DIR/linux/build-watcher.service" > "$SYSTEMD_DIR/$BINARY_NAME.service"
-  else
-    cat > "$SYSTEMD_DIR/$BINARY_NAME.service" <<SERVICE
-[Unit]
-Description=Build Watcher MCP Server
-After=network.target
-
-[Service]
-Type=simple
-ExecStart=$BINARY_PATH
-Restart=on-failure
-RestartSec=5
-Environment=RUST_LOG=build_watcher=info
-
-[Install]
-WantedBy=default.target
-SERVICE
-  fi
+  curl -fsSL "$RAW_URL/src/platform/linux/build-watcher.service" \
+    | sed -e "s|@@BINARY_PATH@@|$BINARY_PATH|g" \
+    > "$SYSTEMD_DIR/$BINARY_NAME.service"
 
   systemctl --user daemon-reload
   systemctl --user enable --now "$BINARY_NAME.service"
