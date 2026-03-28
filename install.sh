@@ -19,8 +19,15 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PLATFORM_DIR="$SCRIPT_DIR/src/platform"
+# When piped (curl | bash), BASH_SOURCE is unset. Detect this so we can
+# generate service files inline instead of reading templates from the repo.
+if [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "${BASH_SOURCE[0]}" ]; then
+  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  PLATFORM_DIR="$SCRIPT_DIR/src/platform"
+else
+  SCRIPT_DIR=""
+  PLATFORM_DIR=""
+fi
 BINARY_NAME="build-watcher"
 INSTALL_DIR="$HOME/.local/bin"
 BINARY_PATH="$INSTALL_DIR/$BINARY_NAME"
@@ -139,9 +146,23 @@ if [ "$OS" != "Darwin" ]; then
   echo "==> Installing desktop entry..."
   DESKTOP_DIR="$HOME/.local/share/applications"
   mkdir -p "$DESKTOP_DIR"
-  cp "$SCRIPT_DIR/build-watcher.desktop" "$DESKTOP_DIR/build-watcher.desktop"
+  DESKTOP_FILE="$DESKTOP_DIR/build-watcher.desktop"
+  if [ -n "$SCRIPT_DIR" ] && [ -f "$SCRIPT_DIR/build-watcher.desktop" ]; then
+    cp "$SCRIPT_DIR/build-watcher.desktop" "$DESKTOP_FILE"
+  else
+    cat > "$DESKTOP_FILE" <<'DESKTOP'
+[Desktop Entry]
+Type=Application
+Name=Build Watcher
+Comment=GitHub Actions build monitor with desktop notifications
+Icon=emblem-synchronizing
+Exec=build-watcher
+NoDisplay=true
+Categories=Development;
+DESKTOP
+  fi
   command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database "$DESKTOP_DIR" 2>/dev/null || true
-  echo "  Desktop:  $DESKTOP_DIR/build-watcher.desktop"
+  echo "  Desktop:  $DESKTOP_FILE"
 fi
 
 # -- Platform-specific service install ----------------------------------------
@@ -155,9 +176,41 @@ if [ "$OS" = "Darwin" ]; then
   PLIST_PATH="$PLIST_DIR/com.build-watcher.plist"
   mkdir -p "$PLIST_DIR"
 
-  sed -e "s|@@BINARY_PATH@@|$BINARY_PATH|g" \
-      -e "s|@@HOME@@|$HOME|g" \
-      "$PLATFORM_DIR/macos/com.build-watcher.plist" > "$PLIST_PATH"
+  if [ -n "$PLATFORM_DIR" ] && [ -f "$PLATFORM_DIR/macos/com.build-watcher.plist" ]; then
+    sed -e "s|@@BINARY_PATH@@|$BINARY_PATH|g" \
+        -e "s|@@HOME@@|$HOME|g" \
+        "$PLATFORM_DIR/macos/com.build-watcher.plist" > "$PLIST_PATH"
+  else
+    cat > "$PLIST_PATH" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.build-watcher</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$BINARY_PATH</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>RUST_LOG</key>
+    <string>build_watcher=info</string>
+    <key>PATH</key>
+    <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>$HOME/Library/Logs/build-watcher.log</string>
+  <key>StandardErrorPath</key>
+  <string>$HOME/Library/Logs/build-watcher.log</string>
+</dict>
+</plist>
+PLIST
+  fi
 
   launchctl bootout "gui/$(id -u)" "$PLIST_PATH" 2>/dev/null || true
   launchctl bootstrap "gui/$(id -u)" "$PLIST_PATH"
@@ -168,8 +221,26 @@ else
   SYSTEMD_DIR="$HOME/.config/systemd/user"
   mkdir -p "$SYSTEMD_DIR"
 
-  sed -e "s|@@BINARY_PATH@@|$BINARY_PATH|g" \
-      "$PLATFORM_DIR/linux/build-watcher.service" > "$SYSTEMD_DIR/$BINARY_NAME.service"
+  if [ -n "$PLATFORM_DIR" ] && [ -f "$PLATFORM_DIR/linux/build-watcher.service" ]; then
+    sed -e "s|@@BINARY_PATH@@|$BINARY_PATH|g" \
+        "$PLATFORM_DIR/linux/build-watcher.service" > "$SYSTEMD_DIR/$BINARY_NAME.service"
+  else
+    cat > "$SYSTEMD_DIR/$BINARY_NAME.service" <<SERVICE
+[Unit]
+Description=Build Watcher MCP Server
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=$BINARY_PATH
+Restart=on-failure
+RestartSec=5
+Environment=RUST_LOG=build_watcher=info
+
+[Install]
+WantedBy=default.target
+SERVICE
+  fi
 
   systemctl --user daemon-reload
   systemctl --user enable --now "$BINARY_NAME.service"
