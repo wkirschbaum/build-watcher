@@ -1227,7 +1227,12 @@ pub(crate) fn render_recent_panel(
     frame.render_widget(table, body_area);
 }
 
-/// Render a 1-line detail bar showing contextual info for the currently selected row.
+/// Separator span used between detail bar fields.
+fn detail_sep() -> Span<'static> {
+    Span::styled("  ·  ", Style::default().fg(Color::DarkGray))
+}
+
+/// Render a detail bar with a border showing contextual info for the currently selected row.
 fn render_detail_bar(
     frame: &mut ratatui::Frame,
     area: ratatui::layout::Rect,
@@ -1255,49 +1260,54 @@ fn render_detail_bar(
             single_branch,
             ..
         }) => {
-            let mut s = vec![Span::styled("repo ", label_style), Span::styled(*repo, dim)];
+            let mut s = vec![Span::styled(*repo, dim)];
             if let Some(sb) = single_branch {
-                s.push(Span::styled("  branch ", label_style));
+                s.push(detail_sep());
                 s.push(Span::styled(sb.branch, dim));
-                if let Some(run_id) = sb.run_id {
-                    s.push(Span::styled("  run ", label_style));
-                    s.push(Span::styled(run_id.to_string(), dim));
-                }
                 if !sb.status_key.is_empty() {
-                    s.push(Span::raw("  "));
+                    s.push(detail_sep());
                     s.push(Span::styled(
                         format::status(&sb.status_key),
                         status_style(&sb.status_key),
                     ));
                 }
+                if let Some(run_id) = sb.run_id {
+                    s.push(detail_sep());
+                    s.push(Span::styled("run ", label_style));
+                    s.push(Span::styled(run_id.to_string(), dim));
+                }
                 if sb.attempt > 1 {
-                    s.push(Span::styled(format!("  attempt {}", sb.attempt), dim));
+                    s.push(detail_sep());
+                    s.push(Span::styled(format!("attempt {}", sb.attempt), dim));
                 }
             } else {
-                s.push(Span::styled(format!("  {} branches", branch_count), dim));
-                let mut counts = Vec::new();
+                s.push(detail_sep());
+                s.push(Span::styled(format!("{} branches", branch_count), dim));
                 if *failing > 0 {
-                    counts.push(Span::styled(
-                        format!("  {} failing", failing),
+                    s.push(detail_sep());
+                    s.push(Span::styled(
+                        format!("{} failing", failing),
                         Style::default().fg(Color::Rgb(220, 100, 100)),
                     ));
                 }
                 if *active > 0 {
-                    counts.push(Span::styled(
-                        format!("  {} active", active),
+                    s.push(detail_sep());
+                    s.push(Span::styled(
+                        format!("{} active", active),
                         Style::default().fg(Color::Yellow),
                     ));
                 }
                 if *passing > 0 {
-                    counts.push(Span::styled(
-                        format!("  {} passing", passing),
+                    s.push(detail_sep());
+                    s.push(Span::styled(
+                        format!("{} passing", passing),
                         Style::default().fg(Color::Rgb(100, 180, 100)),
                     ));
                 }
                 if *idle > 0 {
-                    counts.push(Span::styled(format!("  {} idle", idle), dim));
+                    s.push(detail_sep());
+                    s.push(Span::styled(format!("{} idle", idle), dim));
                 }
-                s.extend(counts);
             }
             s
         }
@@ -1305,26 +1315,27 @@ fn render_detail_bar(
             repo, branch, run, ..
         }) => {
             let mut s = vec![
-                Span::styled("run ", label_style),
-                Span::styled(run.run_id.to_string(), dim),
-                Span::styled("  ", dim),
                 Span::styled(
                     format::status(run.status.as_str()),
                     status_style(run.status.as_str()),
                 ),
-                Span::styled(format!("  {} / {} / {}", repo, branch, run.workflow), dim),
+                detail_sep(),
+                Span::styled(format!("{} / {} / {}", repo, branch, run.workflow), dim),
+                detail_sep(),
+                Span::styled("run ", label_style),
+                Span::styled(run.run_id.to_string(), dim),
             ];
             if !run.event.is_empty() {
-                s.push(Span::styled(format!("  event={}", run.event), dim));
+                s.push(detail_sep());
+                s.push(Span::styled(&run.event, dim));
             }
             if run.attempt > 1 {
-                s.push(Span::styled(format!("  attempt {}", run.attempt), dim));
+                s.push(detail_sep());
+                s.push(Span::styled(format!("attempt {}", run.attempt), dim));
             }
             if let Some(elapsed) = run.elapsed_secs {
-                s.push(Span::styled(
-                    format!("  {}", format::age(elapsed as u64)),
-                    dim,
-                ));
+                s.push(detail_sep());
+                s.push(Span::styled(format::age(elapsed as u64), dim));
             }
             s
         }
@@ -1335,28 +1346,32 @@ fn render_detail_bar(
             ..
         }) => {
             let mut s = vec![
-                Span::styled("run ", label_style),
-                Span::styled(build.run_id.to_string(), dim),
-                Span::styled("  ", dim),
                 Span::styled(
                     format::status(build.conclusion.as_str()),
                     status_style(build.conclusion.as_str()),
                 ),
-                Span::styled(format!("  {} / {} / {}", repo, branch, build.workflow), dim),
+                detail_sep(),
+                Span::styled(format!("{} / {} / {}", repo, branch, build.workflow), dim),
+                detail_sep(),
+                Span::styled("run ", label_style),
+                Span::styled(build.run_id.to_string(), dim),
             ];
             if build.attempt > 1 {
-                s.push(Span::styled(format!("  attempt {}", build.attempt), dim));
+                s.push(detail_sep());
+                s.push(Span::styled(format!("attempt {}", build.attempt), dim));
             }
             if let Some(steps) = &build.failing_steps {
-                s.push(Span::styled("  failed: ", label_style));
+                s.push(detail_sep());
+                s.push(Span::styled("failed: ", label_style));
                 s.push(Span::styled(
                     steps.as_str(),
                     Style::default().fg(Color::Rgb(220, 100, 100)),
                 ));
             }
             if let Some(age) = build.age_secs {
+                s.push(detail_sep());
                 s.push(Span::styled(
-                    format!("  {} ago", format::age(age as u64)),
+                    format!("{} ago", format::age(age as u64)),
                     dim,
                 ));
             }
@@ -1364,9 +1379,9 @@ fn render_detail_bar(
         }
         Some(DisplayRow::NeverRan { repo, branch, .. }) => {
             vec![
-                Span::styled("repo ", label_style),
                 Span::styled(format!("{} / {}", repo, branch), dim),
-                Span::styled("  no builds yet", dim),
+                detail_sep(),
+                Span::styled("no builds yet", dim),
             ]
         }
         Some(DisplayRow::GroupHeader { label }) => {
@@ -1378,9 +1393,15 @@ fn render_detail_bar(
         Some(DisplayRow::FailingSteps { .. }) | None => vec![],
     };
 
+    let block = Block::default()
+        .borders(Borders::TOP | Borders::BOTTOM)
+        .border_style(Style::default().fg(Color::DarkGray));
+
     if !spans.is_empty() {
-        let bar = Paragraph::new(Line::from(spans));
+        let bar = Paragraph::new(Line::from(spans)).block(block);
         frame.render_widget(bar, area);
+    } else {
+        frame.render_widget(block, area);
     }
 }
 
@@ -1481,10 +1502,10 @@ pub(crate) fn render(frame: &mut ratatui::Frame, app: &App) {
                 Constraint::Length(3),             // header
                 Constraint::Length(1),             // column headings
                 Constraint::Length(table_rows),    // table body (exact)
-                Constraint::Length(1),             // detail bar
+                Constraint::Length(3),             // detail bar (border + content + border)
+                Constraint::Min(0),                // remaining space (pushes recent down)
                 Constraint::Length(1),             // recent separator
                 Constraint::Length(recent_height), // recent panel
-                Constraint::Min(0),                // remaining space
                 Constraint::Length(1),             // footer
             ])
             .split(area)
@@ -1495,7 +1516,7 @@ pub(crate) fn render(frame: &mut ratatui::Frame, app: &App) {
                 Constraint::Length(3),          // header
                 Constraint::Length(1),          // column headings
                 Constraint::Length(table_rows), // table body (exact)
-                Constraint::Length(1),          // detail bar
+                Constraint::Length(3),          // detail bar (border + content + border)
                 Constraint::Min(0),             // remaining space
                 Constraint::Length(1),          // footer
             ])
@@ -1506,7 +1527,7 @@ pub(crate) fn render(frame: &mut ratatui::Frame, app: &App) {
     render_body(frame, chunks[1], chunks[2], app, &flat, &cw);
     render_detail_bar(frame, chunks[3], app, &flat);
     if show_recent {
-        render_recent_panel(frame, chunks[4], chunks[5], app, &cw);
+        render_recent_panel(frame, chunks[5], chunks[6], app, &cw);
         render_footer(frame, chunks[7], app);
     } else {
         render_footer(frame, chunks[5], app);

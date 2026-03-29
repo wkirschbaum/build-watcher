@@ -258,7 +258,10 @@ impl DaemonClient {
             .map_err(|e| e.to_string())?;
         if !resp.status().is_success() {
             let body = resp.text().await.unwrap_or_default();
-            return Err(format!("history: {body}"));
+            return Err(format!(
+                "history: {}",
+                build_watcher::format::truncate(&body, 200)
+            ));
         }
         resp.json::<Vec<HistoryEntryView>>()
             .await
@@ -283,7 +286,10 @@ async fn stream_sse(
 ) -> bool {
     let response = match daemon.client.get(daemon.url("/events")).send().await {
         Ok(r) => r,
-        Err(_) => return false,
+        Err(e) => {
+            tracing::debug!("SSE connect failed: {e}");
+            return false;
+        }
     };
 
     *connected = true;
@@ -298,7 +304,10 @@ async fn stream_sse(
     while let Some(chunk) = stream.next().await {
         let bytes = match chunk {
             Ok(b) => b,
-            Err(_) => return false,
+            Err(e) => {
+                tracing::debug!("SSE stream error: {e}");
+                return false;
+            }
         };
         buf.push_str(&String::from_utf8_lossy(&bytes));
 
@@ -308,11 +317,17 @@ async fn stream_sse(
 
             if line.is_empty() {
                 // End of SSE frame — dispatch accumulated data.
-                if let Some(data) = pending_data.take()
-                    && let Ok(event) = serde_json::from_str::<WatchEvent>(&data)
-                    && tx.send(SseUpdate::Event(Box::new(event))).await.is_err()
-                {
-                    return true;
+                if let Some(data) = pending_data.take() {
+                    match serde_json::from_str::<WatchEvent>(&data) {
+                        Ok(event) => {
+                            if tx.send(SseUpdate::Event(Box::new(event))).await.is_err() {
+                                return true;
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("SSE parse error: {e}");
+                        }
+                    }
                 }
             } else if let Some(data) = line.strip_prefix("data: ") {
                 pending_data = Some(data.to_string());

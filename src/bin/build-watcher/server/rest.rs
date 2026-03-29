@@ -320,8 +320,13 @@ pub(crate) async fn set_defaults_handler(
         if let Some(level) = body.poll_aggression {
             let aggression = match level.to_lowercase().as_str() {
                 "low" => PollAggression::Low,
+                "medium" => PollAggression::Medium,
                 "high" => PollAggression::High,
-                _ => PollAggression::Medium,
+                other => {
+                    return json_error(format!(
+                        "unknown poll aggression: {other:?} (expected low/medium/high)"
+                    ));
+                }
             };
             cfg.poll_aggression = aggression;
             messages.push(format!("poll aggression: {aggression}"));

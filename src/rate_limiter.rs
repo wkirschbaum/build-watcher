@@ -78,7 +78,8 @@ pub fn compute_intervals(
     // Throttle zone: project external usage forward and compute effective budget.
     let secs_to_reset = rl.reset.saturating_sub(now).max(1);
     let external_used = rl.used.saturating_sub(own_calls_so_far);
-    let projected_external = (external_used as f64 / elapsed as f64 * secs_to_reset as f64) as u64;
+    let projected_external =
+        (external_used as f64 / elapsed as f64 * secs_to_reset as f64).min(rl.limit as f64) as u64;
 
     let available_to_us = rl.remaining.saturating_sub(projected_external);
     let our_remaining_quota = target_calls.saturating_sub(own_calls_so_far);

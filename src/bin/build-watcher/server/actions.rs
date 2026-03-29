@@ -7,28 +7,19 @@ use build_watcher::watcher::{SharedConfig, WatcherHandle, collect_persisted, sta
 use super::DaemonState;
 
 /// Result of a single action on a repo or branch.
-pub(crate) struct ActionOutcome {
-    pub target: String,
-    pub result: Result<String, String>,
-}
+pub(crate) struct ActionOutcome(Result<String, String>);
 
 impl ActionOutcome {
-    fn ok(target: impl Into<String>, msg: impl Into<String>) -> Self {
-        Self {
-            target: target.into(),
-            result: Ok(msg.into()),
-        }
+    pub fn ok(msg: impl Into<String>) -> Self {
+        Self(Ok(msg.into()))
     }
 
-    fn err(target: impl Into<String>, msg: impl Into<String>) -> Self {
-        Self {
-            target: target.into(),
-            result: Err(msg.into()),
-        }
+    pub fn err(msg: impl Into<String>) -> Self {
+        Self(Err(msg.into()))
     }
 
     pub fn message(&self) -> &str {
-        match &self.result {
+        match &self.0 {
             Ok(msg) | Err(msg) => msg,
         }
     }
@@ -58,7 +49,6 @@ pub(crate) async fn do_watch_builds(state: &DaemonState, repos: &[String]) -> Ve
     for (repo, branches) in &repo_branches {
         let mut any_started = false;
         for branch in branches {
-            let target = format!("{repo} [{branch}]");
             match start_watch(
                 &state.watches,
                 &state.config,
@@ -71,15 +61,14 @@ pub(crate) async fn do_watch_builds(state: &DaemonState, repos: &[String]) -> Ve
             {
                 Ok(msg) => {
                     any_started = true;
-                    results.push(ActionOutcome::ok(&target, msg));
+                    results.push(ActionOutcome::ok(msg));
                 }
-                Err(msg) => results.push(ActionOutcome::err(&target, msg)),
+                Err(msg) => results.push(ActionOutcome::err(msg)),
             }
         }
 
         // Auto-discover additional branches from recent runs.
         for branch in discover_branches(&state.config, &state.handle, repo, branches).await {
-            let target = format!("{repo} [{branch}]");
             if let Ok(msg) = start_watch(
                 &state.watches,
                 &state.config,
@@ -91,7 +80,7 @@ pub(crate) async fn do_watch_builds(state: &DaemonState, repos: &[String]) -> Ve
             .await
             {
                 any_started = true;
-                results.push(ActionOutcome::ok(&target, msg));
+                results.push(ActionOutcome::ok(msg));
             }
         }
 
@@ -110,7 +99,7 @@ pub(crate) async fn do_watch_builds(state: &DaemonState, repos: &[String]) -> Ve
             cfg.clone()
         };
         if let Err(warning) = persist_config(snapshot).await {
-            results.push(ActionOutcome::err("config", warning));
+            results.push(ActionOutcome::err(warning));
         }
     }
 
@@ -208,21 +197,19 @@ pub(crate) async fn do_stop_watches(state: &DaemonState, repos: &[String]) -> Ve
             let was_in_config = cfg.repos.contains_key(&repo);
             cfg.repos.remove(&repo);
             match (branch_count, was_in_config) {
-                (n, _) if n > 0 => results.push(ActionOutcome::ok(
-                    &repo,
-                    format!("Stopped watching {repo} ({n} branches)"),
-                )),
-                (_, true) => results.push(ActionOutcome::ok(
-                    &repo,
-                    format!("{repo}: removed from config (was not actively polling)"),
-                )),
-                _ => results.push(ActionOutcome::err(&repo, format!("{repo}: not found"))),
+                (n, _) if n > 0 => results.push(ActionOutcome::ok(format!(
+                    "Stopped watching {repo} ({n} branches)"
+                ))),
+                (_, true) => results.push(ActionOutcome::ok(format!(
+                    "{repo}: removed from config (was not actively polling)"
+                ))),
+                _ => results.push(ActionOutcome::err(format!("{repo}: not found"))),
             }
         }
         (cfg.clone(), results)
     };
     if let Err(warning) = persist_config(snapshot).await {
-        results.push(ActionOutcome::err("config", warning));
+        results.push(ActionOutcome::err(warning));
     }
 
     results
@@ -255,10 +242,9 @@ pub(crate) async fn do_configure_branches(
             if !new_branches.contains(branch) {
                 let key = build_watcher::watcher::WatchKey::new(repo, branch);
                 if w.remove(&key).is_some() {
-                    results.push(ActionOutcome::ok(
-                        format!("{repo} [{branch}]"),
-                        format!("Stopped watching {repo} [{branch}]"),
-                    ));
+                    results.push(ActionOutcome::ok(format!(
+                        "Stopped watching {repo} [{branch}]"
+                    )));
                 }
             }
         }
@@ -267,7 +253,6 @@ pub(crate) async fn do_configure_branches(
     // Start watches for new branches.
     for branch in &new_branches {
         if !current_branches.contains(branch) {
-            let target = format!("{repo} [{branch}]");
             match start_watch(
                 &state.watches,
                 &state.config,
@@ -278,8 +263,8 @@ pub(crate) async fn do_configure_branches(
             )
             .await
             {
-                Ok(msg) => results.push(ActionOutcome::ok(&target, msg)),
-                Err(msg) => results.push(ActionOutcome::err(&target, msg)),
+                Ok(msg) => results.push(ActionOutcome::ok(msg)),
+                Err(msg) => results.push(ActionOutcome::err(msg)),
             }
         }
     }
@@ -296,7 +281,7 @@ pub(crate) async fn do_configure_branches(
     }
     let snapshot = state.config.lock().await.clone();
     if let Err(warning) = persist_config(snapshot).await {
-        results.push(ActionOutcome::err("config", warning));
+        results.push(ActionOutcome::err(warning));
     }
 
     results

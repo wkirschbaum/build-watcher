@@ -303,7 +303,7 @@ async fn dispatch_coalesced(
 
     // Single event: dispatch normally (unchanged behavior).
     if events.len() == 1 {
-        let e = events.into_iter().next().unwrap();
+        let e = events.into_iter().next().expect("checked len == 1 above");
         let is_critical = e.level == NotificationLevel::Critical;
         if !throttle.allows(Instant::now(), is_critical) {
             tracing::warn!("Throttled notification for {} (budget exhausted)", key.repo);

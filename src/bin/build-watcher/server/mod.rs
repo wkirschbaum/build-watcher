@@ -151,11 +151,11 @@ fn acquire_instance_lock() -> Result<std::fs::File, ServerError> {
 
     let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     if rc != 0 {
-        return Err(ServerError::Other(
-            "Another build-watcher instance is already running. \
+        let os_err = std::io::Error::last_os_error();
+        return Err(ServerError::Other(format!(
+            "Another build-watcher instance is already running ({os_err}). \
              Stop it first, or set BUILD_WATCHER_PORT to run a separate instance."
-                .to_string(),
-        ));
+        )));
     }
 
     // Write our PID for observability (not used for locking).

@@ -55,12 +55,13 @@ pub(super) fn runs_for_branch<'a>(runs: &'a [RunInfo], branch: &str) -> Vec<&'a 
 }
 
 /// Filter runs by workflow allow-list and ignore-list. Case-insensitive matching.
-fn filter_runs<'a>(
-    runs: &'a [RunInfo],
+fn filter_runs<'a, R: std::borrow::Borrow<RunInfo> + 'a>(
+    runs: &'a [R],
     workflows: &[String],
     ignored: &[String],
 ) -> Vec<&'a RunInfo> {
     runs.iter()
+        .map(|r| r.borrow())
         .filter(|r| !ignored.iter().any(|i| r.workflow.eq_ignore_ascii_case(i)))
         .filter(|r| {
             workflows.is_empty() || workflows.iter().any(|w| r.workflow.eq_ignore_ascii_case(w))

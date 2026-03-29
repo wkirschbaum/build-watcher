@@ -65,9 +65,12 @@ impl Notifier for TerminalNotifier {
     fn send(&self, n: &Notification) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         let sound = notification_sound(n.level);
         let mut cmd = Command::new("terminal-notifier");
-        cmd.args([
-            "-title", &n.title, "-message", &n.body, "-sound", sound, "-group", &n.group,
-        ]);
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .args([
+                "-title", &n.title, "-message", &n.body, "-sound", sound, "-group", &n.group,
+            ]);
         if let Some(url) = &n.url {
             cmd.args(["-open", url]);
         }
@@ -96,7 +99,13 @@ impl Notifier for AppleScriptNotifier {
         let body = escape_applescript(&n.body);
         let script =
             format!(r#"display notification "{body}" with title "{title}" sound name "{sound}""#);
-        match Command::new("osascript").args(["-e", &script]).spawn() {
+        match Command::new("osascript")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .args(["-e", &script])
+            .spawn()
+        {
             Ok(child) => reap_with_timeout(child, "osascript"),
             Err(e) => tracing::warn!("Failed to spawn osascript: {e}"),
         }

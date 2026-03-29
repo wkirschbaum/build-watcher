@@ -506,8 +506,7 @@ impl RepoPoller {
                 .filter(|r| r.id > last_seen && !active_ids.contains(&r.id))
                 .copied()
                 .collect();
-            let unseen_as_owned: Vec<RunInfo> = unseen.iter().map(|r| (*r).clone()).collect();
-            let new_runs = filter_runs(&unseen_as_owned, &bpcfg.workflows, &bpcfg.ignored);
+            let new_runs = filter_runs(&unseen, &bpcfg.workflows, &bpcfg.ignored);
             // Check for re-runs: any last_build's run_id appears in the API response
             // but with a different conclusion or back to in-progress.
             let may_have_rerun = prev_last_builds.values().any(|lb| {

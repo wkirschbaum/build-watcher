@@ -151,8 +151,9 @@ impl Notifier for DbusNotifier {
                 vec![]
             };
 
-            match proxy
-                .notify(
+            let notify_result = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                proxy.notify(
                     &app_name,
                     replaces_id,
                     icon,
@@ -161,10 +162,11 @@ impl Notifier for DbusNotifier {
                     actions,
                     hints,
                     expire_ms,
-                )
-                .await
-            {
-                Ok(id) => {
+                ),
+            )
+            .await;
+            match notify_result {
+                Ok(Ok(id)) => {
                     ids.lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .insert(group, id);
@@ -173,8 +175,11 @@ impl Notifier for DbusNotifier {
                         spawn_action_listener(proxy, id, url);
                     }
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     tracing::warn!("D-Bus notification failed: {e}");
+                }
+                Err(_) => {
+                    tracing::warn!("D-Bus notification timed out after 5s");
                 }
             }
         })
