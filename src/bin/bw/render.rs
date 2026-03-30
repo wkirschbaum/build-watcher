@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use ratatui::layout::{Constraint, Direction, Layout};
@@ -77,6 +77,24 @@ pub(crate) enum DisplayRow<'a> {
         muted: bool,
         tree_prefix: &'static str,
     },
+    /// Branch header for multi-workflow branches. Shows aggregate status and
+    /// can be toggled to expand/collapse individual workflow rows.
+    BranchHeader {
+        repo: &'a str,
+        branch: &'a str,
+        muted: bool,
+        tree_prefix: &'static str,
+        /// Number of workflow items underneath.
+        workflow_count: usize,
+        /// Whether the workflow children are currently visible.
+        expanded: bool,
+        /// Aggregate: worst status text (e.g. "✗ failure") for display.
+        status_text: String,
+        /// Aggregate: most recent age/elapsed string.
+        age_or_elapsed: String,
+        /// Style matching the worst status.
+        style: Style,
+    },
 }
 
 /// Result of flattening watches into display rows.
@@ -139,6 +157,7 @@ pub(crate) fn flatten_rows<'a>(
     watches: &'a [WatchStatus],
     group_by: GroupBy,
     expand: &HashMap<String, ExpandLevel>,
+    workflow_collapsed: &HashSet<String>,
 ) -> FlatRows<'a> {
     let mut rows = Vec::new();
     let mut selectable = Vec::new();
@@ -326,7 +345,7 @@ pub(crate) fn flatten_rows<'a>(
         // Expand child rows when not collapsed.
         // For multi-branch repos: show branch rows (each may further expand into workflow rows).
         // For single-branch, multi-workflow repos: show workflow rows directly under the header.
-        let show_workflows = expand_level == ExpandLevel::Full;
+        let repo_allows_workflows = expand_level == ExpandLevel::Full;
         if !is_collapsed {
             let expand_branches = branches.len() > 1;
             let expand_single_branch_workflows = branches.len() == 1 && !is_single_branch_inline;
@@ -338,18 +357,23 @@ pub(crate) fn flatten_rows<'a>(
                     let tree_prefix: &'static str = if is_last { "└─ " } else { "├─ " };
                     let tree_indent: &'static str = if is_last { "   " } else { "│  " };
 
+                    let branch_key = format!("{}#{}", repo, w.branch);
+                    let show_wf =
+                        repo_allows_workflows && !workflow_collapsed.contains(&branch_key);
                     emit_branch_workflow_rows(
                         w,
                         tree_prefix,
                         tree_indent,
-                        show_workflows,
+                        show_wf,
                         &mut rows,
                         &mut selectable,
                     );
                 }
             } else if expand_single_branch_workflows {
                 let w = branches[0];
-                emit_branch_workflow_rows(w, "", "", show_workflows, &mut rows, &mut selectable);
+                let branch_key = format!("{}#{}", repo, w.branch);
+                let show_wf = repo_allows_workflows && !workflow_collapsed.contains(&branch_key);
+                emit_branch_workflow_rows(w, "", "", show_wf, &mut rows, &mut selectable);
             }
         }
     }
@@ -359,7 +383,8 @@ pub(crate) fn flatten_rows<'a>(
 
 /// Emit rows for a single branch's workflows. Each active run gets its own row,
 /// and each last_build (not covered by an active run) gets its own row.
-/// When `show_workflows` is false or there's only one item, show a single branch row.
+/// When there are multiple workflow items, a `BranchHeader` is emitted first,
+/// followed by per-workflow children when `show_workflows` is true.
 fn emit_branch_workflow_rows<'a>(
     w: &'a WatchStatus,
     tree_prefix: &'static str,
@@ -371,15 +396,23 @@ fn emit_branch_workflow_rows<'a>(
     // Collect all workflow items: active runs first, then last_builds not covered by active runs.
     let active_wfs: Vec<&str> = w.active_runs.iter().map(|r| r.workflow.as_str()).collect();
 
-    let has_multiple_items = w.active_runs.len()
-        + w.last_builds
-            .iter()
-            .filter(|b| !active_wfs.contains(&b.workflow.as_str()))
-            .count()
-        > 1;
+    let items: Vec<WorkflowItem<'a>> = {
+        let mut v = Vec::new();
+        for run in &w.active_runs {
+            v.push(WorkflowItem::Active(run));
+        }
+        for b in &w.last_builds {
+            if !active_wfs.contains(&b.workflow.as_str()) {
+                v.push(WorkflowItem::Completed(b));
+            }
+        }
+        v
+    };
 
-    if !show_workflows || !has_multiple_items {
-        // Single row for this branch: show the "primary" active run or newest last build.
+    let has_multiple_items = items.len() > 1;
+
+    if !has_multiple_items {
+        // Single workflow — show a single row (no branch header needed).
         if let Some(run) = w.active_runs.first() {
             selectable.push(rows.len());
             rows.push(DisplayRow::ActiveRun {
@@ -416,19 +449,26 @@ fn emit_branch_workflow_rows<'a>(
         return;
     }
 
-    // Multiple workflows: emit one row per active run, then one per last_build
-    // for workflows without an active run.
-    let mut items: Vec<WorkflowItem<'a>> = Vec::new();
+    // Multiple workflows: emit a BranchHeader, then conditionally workflow children.
+    let (status_text, age_or_elapsed, style) = branch_aggregate_status(w);
+    selectable.push(rows.len());
+    rows.push(DisplayRow::BranchHeader {
+        repo: &w.repo,
+        branch: &w.branch,
+        muted: w.muted,
+        tree_prefix,
+        workflow_count: items.len(),
+        expanded: show_workflows,
+        status_text,
+        age_or_elapsed,
+        style,
+    });
 
-    for run in &w.active_runs {
-        items.push(WorkflowItem::Active(run));
-    }
-    for b in &w.last_builds {
-        if !active_wfs.contains(&b.workflow.as_str()) {
-            items.push(WorkflowItem::Completed(b));
-        }
+    if !show_workflows {
+        return;
     }
 
+    // Emit one child row per workflow item, indented under the branch header.
     let last_idx = items.len().saturating_sub(1);
     for (i, item) in items.iter().enumerate() {
         let is_last = i == last_idx;
@@ -488,6 +528,58 @@ fn emit_branch_workflow_rows<'a>(
     }
 }
 
+/// Compute aggregate status for a branch header from its active runs and last builds.
+/// Returns `(status_text, age_or_elapsed, style)`.
+fn branch_aggregate_status(w: &WatchStatus) -> (String, String, Style) {
+    use std::time::Duration;
+    if let Some(run) = w.active_runs.first() {
+        let status_str = run.status.as_str();
+        let emoji = status_emoji(status_str);
+        let elapsed = run
+            .elapsed_secs
+            .map(|s| format::duration(Duration::from_secs_f64(s)))
+            .unwrap_or_default();
+        let extra = if w.active_runs.len() > 1 {
+            format!(" +{}", w.active_runs.len() - 1)
+        } else {
+            String::new()
+        };
+        (
+            format!("{emoji} {}{extra}", format::status(status_str)),
+            elapsed,
+            status_style(status_str),
+        )
+    } else if let Some(b) = worst_last_build(w) {
+        let conclusion_str = b.conclusion.as_str();
+        let emoji = status_emoji(conclusion_str);
+        let age = b
+            .age_secs
+            .map(|s| format::age(s as u64))
+            .unwrap_or_default();
+        (
+            format!("{emoji} {}", format::status(conclusion_str)),
+            age,
+            status_style(conclusion_str),
+        )
+    } else {
+        (
+            "· idle".to_string(),
+            String::new(),
+            Style::default().fg(Color::DarkGray),
+        )
+    }
+}
+
+/// Find the "worst" last build (failure > other > success) for branch aggregate display.
+fn worst_last_build(w: &WatchStatus) -> Option<&LastBuildView> {
+    w.last_builds.iter().min_by_key(|b| match b.conclusion {
+        RunConclusion::Failure | RunConclusion::TimedOut | RunConclusion::StartupFailure => 0u8,
+        RunConclusion::Cancelled => 1,
+        RunConclusion::Success => 3,
+        _ => 2,
+    })
+}
+
 enum WorkflowItem<'a> {
     Active(&'a ActiveRunView),
     Completed(&'a LastBuildView),
@@ -525,6 +617,12 @@ impl DisplayRow<'_> {
                 muted,
                 ..
             } => (repo, branch, None, *muted),
+            DisplayRow::BranchHeader {
+                repo,
+                branch,
+                muted,
+                ..
+            } => (repo, branch, None, *muted),
             DisplayRow::GroupHeader { .. } | DisplayRow::FailingSteps { .. } => {
                 unreachable!("not selectable")
             }
@@ -534,6 +632,11 @@ impl DisplayRow<'_> {
     /// Returns `true` if this is a `RepoHeader` row.
     pub(crate) fn is_repo_header(&self) -> bool {
         matches!(self, DisplayRow::RepoHeader { .. })
+    }
+
+    /// Returns `true` if this is a `BranchHeader` row (multi-workflow branch).
+    pub(crate) fn is_branch_header(&self) -> bool {
+        matches!(self, DisplayRow::BranchHeader { .. })
     }
 
     /// Returns `true` if the selected row represents a failed build.
@@ -1175,6 +1278,32 @@ fn render_display_row<'a>(
             cw,
             mute_indicator,
         ),
+        DisplayRow::BranchHeader {
+            branch,
+            muted,
+            tree_prefix,
+            workflow_count,
+            expanded,
+            status_text,
+            age_or_elapsed,
+            style,
+            ..
+        } => {
+            let expand_indicator = if *expanded { "▾" } else { "▸" };
+            let wf_label = format!("{expand_indicator} {workflow_count} workflows");
+            branch_row(
+                branch,
+                *muted,
+                tree_prefix,
+                status_text,
+                &wf_label,
+                "",
+                age_or_elapsed,
+                *style,
+                cw,
+                mute_indicator,
+            )
+        }
     }
 }
 
@@ -1390,6 +1519,20 @@ fn render_detail_bar(
                 Span::styled(label.as_str(), dim),
             ]
         }
+        Some(DisplayRow::BranchHeader {
+            repo,
+            branch,
+            workflow_count,
+            expanded,
+            ..
+        }) => {
+            let state = if *expanded { "expanded" } else { "collapsed" };
+            vec![
+                Span::styled(format!("{repo} / {branch}"), dim),
+                detail_sep(),
+                Span::styled(format!("{workflow_count} workflows ({state})"), dim),
+            ]
+        }
         Some(DisplayRow::FailingSteps { .. }) | None => vec![],
     };
 
@@ -1502,7 +1645,7 @@ pub(crate) fn render(frame: &mut ratatui::Frame, app: &App) {
         app.sort_ascending,
         app.group_by,
     );
-    let flat = flatten_rows(&sorted, app.group_by, &app.expand);
+    let flat = flatten_rows(&sorted, app.group_by, &app.expand, &app.workflow_collapsed);
     let table_rows = flat.rows.len() as u16;
 
     let recent_count = app.recent_history.len();

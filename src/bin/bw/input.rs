@@ -168,7 +168,12 @@ impl App {
             self.sort_ascending,
             self.group_by,
         );
-        let flat = flatten_rows(&sorted, self.group_by, &self.expand);
+        let flat = flatten_rows(
+            &sorted,
+            self.group_by,
+            &self.expand,
+            &self.workflow_collapsed,
+        );
         let sel_count = flat.selectable.len();
         let selected_display_idx = flat.selectable.get(self.selected).copied();
         let selected = selected_display_idx.map(|idx| flat.rows[idx].repo_branch_run());
@@ -179,6 +184,9 @@ impl App {
             && !selected_display_idx
                 .map(|idx| flat.rows[idx].is_single_branch())
                 .unwrap_or(false);
+        let is_branch_header = selected_display_idx
+            .map(|idx| flat.rows[idx].is_branch_header())
+            .unwrap_or(false);
         let is_failed = selected_display_idx
             .map(|idx| flat.rows[idx].is_failed())
             .unwrap_or(false);
@@ -214,8 +222,20 @@ impl App {
                     self.save_prefs();
                 }
             }
-            KeyCode::Left if !is_repo_row => {
-                // Collapse one level and move selection to parent repo
+            KeyCode::Enter | KeyCode::Right | KeyCode::Tab | KeyCode::Char('e')
+                if is_branch_header =>
+            {
+                // Toggle workflow expansion for this branch.
+                if let Some((repo, branch, _, _)) = selected {
+                    let key = format!("{repo}#{branch}");
+                    if !self.workflow_collapsed.remove(&key) {
+                        self.workflow_collapsed.insert(key);
+                    }
+                    self.save_prefs();
+                }
+            }
+            KeyCode::Left if is_branch_header => {
+                // Collapse from branch header up to repo level.
                 if let Some((repo, _, _, _)) = selected {
                     let repo = repo.to_string();
                     let current = self.expand_level(&repo);
@@ -225,12 +245,55 @@ impl App {
                     } else {
                         self.expand.insert(repo.clone(), prev);
                     }
-                    // Find the repo header's selectable index
                     if let Some(pos) = flat.selectable.iter().position(|&idx| {
                         flat.rows[idx].is_repo_header()
                             && flat.rows[idx].repo_branch_run().0 == repo
                     }) {
                         self.selected = pos;
+                    }
+                    self.save_prefs();
+                }
+            }
+            KeyCode::Left if !is_repo_row => {
+                // On a workflow child row: collapse workflows to branch header.
+                // On a plain branch row: collapse to repo level.
+                if let Some((repo, branch, _, _)) = selected {
+                    let repo = repo.to_string();
+                    let branch = branch.to_string();
+                    let key = format!("{repo}#{branch}");
+                    // If this branch has a BranchHeader (i.e. workflows are expanded),
+                    // collapse workflows first and move to the branch header.
+                    if !self.workflow_collapsed.contains(&key)
+                        && flat.selectable.iter().any(|&idx| {
+                            flat.rows[idx].is_branch_header()
+                                && flat.rows[idx].repo_branch_run().0 == repo
+                                && flat.rows[idx].repo_branch_run().1 == branch
+                        })
+                    {
+                        self.workflow_collapsed.insert(key);
+                        // Move selection to the branch header
+                        if let Some(pos) = flat.selectable.iter().position(|&idx| {
+                            flat.rows[idx].is_branch_header()
+                                && flat.rows[idx].repo_branch_run().0 == repo
+                                && flat.rows[idx].repo_branch_run().1 == branch
+                        }) {
+                            self.selected = pos;
+                        }
+                    } else {
+                        // No expandable branch header — collapse repo level.
+                        let current = self.expand_level(&repo);
+                        let prev = current.prev();
+                        if prev == ExpandLevel::Full {
+                            self.expand.remove(&repo);
+                        } else {
+                            self.expand.insert(repo.clone(), prev);
+                        }
+                        if let Some(pos) = flat.selectable.iter().position(|&idx| {
+                            flat.rows[idx].is_repo_header()
+                                && flat.rows[idx].repo_branch_run().0 == repo
+                        }) {
+                            self.selected = pos;
+                        }
                     }
                     self.save_prefs();
                 }

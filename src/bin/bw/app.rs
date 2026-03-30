@@ -147,6 +147,9 @@ pub(crate) struct TuiPrefs {
     /// Per-repo expand level. Missing entries default to `Full`.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub(crate) expand: HashMap<String, ExpandLevel>,
+    /// Branches with workflows collapsed (key: "repo#branch"). Absent = expanded.
+    #[serde(default, skip_serializing_if = "HashSet::is_empty")]
+    pub(crate) workflow_collapsed: HashSet<String>,
     /// Whether the help bar is visible at the bottom.
     #[serde(default = "default_true")]
     pub(crate) show_help: bool,
@@ -163,6 +166,7 @@ impl Default for TuiPrefs {
             sort_ascending: true,
             group_by: GroupBy::default(),
             expand: HashMap::new(),
+            workflow_collapsed: HashSet::new(),
             show_help: true,
         }
     }
@@ -206,6 +210,8 @@ pub(crate) struct App {
     pub(crate) group_by: GroupBy,
     /// Per-repo expand level in the tree view.
     pub(crate) expand: HashMap<String, ExpandLevel>,
+    /// Branches with workflows collapsed (key: "repo#branch"). Absent = expanded.
+    pub(crate) workflow_collapsed: HashSet<String>,
     /// Tag name of a newer release, if one was found by the background checker.
     pub(crate) update_available: Option<String>,
     /// Whether to show the help bar at the bottom.
@@ -235,6 +241,7 @@ impl App {
             sort_ascending: prefs.sort_ascending,
             group_by: prefs.group_by,
             expand: prefs.expand,
+            workflow_collapsed: prefs.workflow_collapsed,
             update_available: None,
             show_help: prefs.show_help,
         }
@@ -297,6 +304,7 @@ impl App {
             sort_ascending: self.sort_ascending,
             group_by: self.group_by,
             expand,
+            workflow_collapsed: self.workflow_collapsed.clone(),
             show_help: self.show_help,
         }
         .save();
@@ -430,6 +438,10 @@ mod tests {
 
     fn no_collapsed() -> HashMap<String, ExpandLevel> {
         HashMap::new()
+    }
+
+    fn no_wf_collapsed() -> HashSet<String> {
+        HashSet::new()
     }
 
     fn snap(repo: &str, branch: &str, run_id: u64) -> RunSnapshot {
@@ -637,7 +649,7 @@ mod tests {
 
     #[test]
     fn flatten_rows_empty() {
-        let flat = flatten_rows(&[], GroupBy::Org, &no_collapsed());
+        let flat = flatten_rows(&[], GroupBy::Org, &no_collapsed(), &no_wf_collapsed());
         assert!(flat.rows.is_empty());
         assert!(flat.selectable.is_empty());
     }
@@ -645,7 +657,7 @@ mod tests {
     #[test]
     fn flatten_rows_idle_watch() {
         let watches = vec![watch("alice/app", "main")];
-        let flat = flatten_rows(&watches, GroupBy::Org, &no_collapsed());
+        let flat = flatten_rows(&watches, GroupBy::Org, &no_collapsed(), &no_wf_collapsed());
         // Single-branch: GroupHeader + RepoHeader (no child row)
         assert_eq!(flat.rows.len(), 2);
         assert_eq!(flat.selectable.len(), 1); // RepoHeader only
@@ -672,7 +684,7 @@ mod tests {
             }],
             muted: false,
         }];
-        let flat = flatten_rows(&watches, GroupBy::Org, &no_collapsed());
+        let flat = flatten_rows(&watches, GroupBy::Org, &no_collapsed(), &no_wf_collapsed());
         assert_eq!(flat.rows.len(), 3);
         assert_eq!(flat.selectable.len(), 1); // FailingSteps is not selectable
         assert!(matches!(flat.rows[1], DisplayRow::RepoHeader { .. }));
@@ -707,7 +719,7 @@ mod tests {
                 muted: false,
             },
         ];
-        let flat = flatten_rows(&watches, GroupBy::Org, &no_collapsed());
+        let flat = flatten_rows(&watches, GroupBy::Org, &no_collapsed(), &no_wf_collapsed());
         // GroupHeader + RepoHeader + LastBuild + FailingSteps + NeverRan
         assert_eq!(flat.rows.len(), 5);
         assert!(matches!(flat.rows[3], DisplayRow::FailingSteps { .. }));
@@ -731,10 +743,69 @@ mod tests {
             }],
             muted: false,
         }];
-        let flat = flatten_rows(&watches, GroupBy::Org, &no_collapsed());
+        let flat = flatten_rows(&watches, GroupBy::Org, &no_collapsed(), &no_wf_collapsed());
         // Single-branch: GroupHeader + RepoHeader (no child row)
         assert_eq!(flat.rows.len(), 2);
         assert!(matches!(flat.rows[1], DisplayRow::RepoHeader { .. }));
+    }
+
+    #[test]
+    fn flatten_rows_workflow_collapsed_hides_workflow_children() {
+        // Multi-branch repo where one branch has 2 workflows → should expand.
+        // When that branch is in workflow_collapsed, it should collapse to one row.
+        let watches = vec![
+            WatchStatus {
+                repo: "alice/app".to_string(),
+                branch: "main".to_string(),
+                active_runs: vec![],
+                last_builds: vec![
+                    LastBuildView {
+                        run_id: 1,
+                        conclusion: RunConclusion::Success,
+                        workflow: "CI".to_string(),
+                        title: "Fix".to_string(),
+                        failing_steps: None,
+                        age_secs: Some(60.0),
+                        attempt: 1,
+                        failing_job_id: None,
+                    },
+                    LastBuildView {
+                        run_id: 2,
+                        conclusion: RunConclusion::Success,
+                        workflow: "Deploy".to_string(),
+                        title: "Fix".to_string(),
+                        failing_steps: None,
+                        age_secs: Some(30.0),
+                        attempt: 1,
+                        failing_job_id: None,
+                    },
+                ],
+                muted: false,
+            },
+            WatchStatus {
+                repo: "alice/app".to_string(),
+                branch: "develop".to_string(),
+                active_runs: vec![],
+                last_builds: vec![],
+                muted: false,
+            },
+        ];
+
+        // Without collapse: should have expanded workflow rows for main
+        let flat_expanded =
+            flatten_rows(&watches, GroupBy::Org, &no_collapsed(), &no_wf_collapsed());
+        // With collapse: main's workflows should be collapsed to one row
+        let mut wf_collapsed = HashSet::new();
+        wf_collapsed.insert("alice/app#main".to_string());
+        let flat_collapsed = flatten_rows(&watches, GroupBy::Org, &no_collapsed(), &wf_collapsed);
+
+        // Collapsed should have fewer rows than expanded
+        assert!(
+            flat_collapsed.rows.len() < flat_expanded.rows.len(),
+            "collapsed {} should be less than expanded {}",
+            flat_collapsed.rows.len(),
+            flat_expanded.rows.len(),
+        );
     }
 
     // -- status_style / status_emoji --
@@ -800,7 +871,7 @@ mod tests {
             last_builds: vec![],
             muted: false,
         }];
-        let flat = flatten_rows(&watches, GroupBy::Org, &no_collapsed());
+        let flat = flatten_rows(&watches, GroupBy::Org, &no_collapsed(), &no_wf_collapsed());
         // Single-branch: Row 0: GroupHeader, Row 1: RepoHeader (inline)
         assert_eq!(flat.rows.len(), 2);
         let (repo, branch, _run_id, _muted) = flat.rows[1].repo_branch_run();
@@ -1002,7 +1073,7 @@ mod tests {
             watch_with_build("alice/lib", "main", RunConclusion::Success, 20.0),
             watch_with_build("bob/api", "main", RunConclusion::Failure, 30.0),
         ];
-        let flat = flatten_rows(&watches, GroupBy::Org, &no_collapsed());
+        let flat = flatten_rows(&watches, GroupBy::Org, &no_collapsed(), &no_wf_collapsed());
         assert_eq!(group_header_labels(&flat), vec!["alice", "bob"]);
     }
 
@@ -1014,7 +1085,12 @@ mod tests {
             watch_with_build("bob/lib", "main", RunConclusion::Failure, 30.0),
         ];
         let sorted = sorted_watches(&watches, SortColumn::Branch, true, GroupBy::Branch);
-        let flat = flatten_rows(&sorted, GroupBy::Branch, &no_collapsed());
+        let flat = flatten_rows(
+            &sorted,
+            GroupBy::Branch,
+            &no_collapsed(),
+            &no_wf_collapsed(),
+        );
         // "develop" group has alice/app, "main" group has alice/app and bob/lib
         assert_eq!(group_header_labels(&flat), vec!["develop", "main"]);
     }
@@ -1027,7 +1103,12 @@ mod tests {
             watch_with_active("carol/api", "main", RunStatus::InProgress, 5.0),
         ];
         let sorted = sorted_watches(&watches, SortColumn::Status, true, GroupBy::None);
-        let flat = flatten_rows(&sorted, GroupBy::Status, &no_collapsed());
+        let flat = flatten_rows(
+            &sorted,
+            GroupBy::Status,
+            &no_collapsed(),
+            &no_wf_collapsed(),
+        );
         let labels = group_header_labels(&flat);
         assert_eq!(labels.len(), 3);
         assert_eq!(labels[0], "in progress"); // active tier
@@ -1041,7 +1122,7 @@ mod tests {
             watch_with_build("alice/app", "main", RunConclusion::Success, 10.0),
             watch_with_build("bob/lib", "main", RunConclusion::Failure, 20.0),
         ];
-        let flat = flatten_rows(&watches, GroupBy::None, &no_collapsed());
+        let flat = flatten_rows(&watches, GroupBy::None, &no_collapsed(), &no_wf_collapsed());
         assert_eq!(count_group_headers(&flat), 0);
         // 2 single-branch RepoHeaders (no group headers, no child rows)
         assert_eq!(flat.rows.len(), 2);
@@ -1054,7 +1135,12 @@ mod tests {
             watch_with_active("bob/lib", "main", RunStatus::InProgress, 5.0),    // Deploy
             watch("carol/api", "main"),                                          // no workflow
         ];
-        let flat = flatten_rows(&watches, GroupBy::Workflow, &no_collapsed());
+        let flat = flatten_rows(
+            &watches,
+            GroupBy::Workflow,
+            &no_collapsed(),
+            &no_wf_collapsed(),
+        );
         let labels = group_header_labels(&flat);
         assert_eq!(labels, vec!["CI", "Deploy", "(none)"]);
     }
@@ -1100,6 +1186,7 @@ mod tests {
                 ("alice/app".to_string(), ExpandLevel::Collapsed),
                 ("bob/lib".to_string(), ExpandLevel::Branches),
             ]),
+            workflow_collapsed: HashSet::from(["alice/app#main".to_string()]),
             show_help: false,
         };
         save_json(&path, &prefs).unwrap();
@@ -1109,6 +1196,7 @@ mod tests {
         assert_eq!(loaded.group_by, GroupBy::Status);
         assert_eq!(loaded.expand.len(), 2);
         assert_eq!(loaded.expand["alice/app"], ExpandLevel::Collapsed);
+        assert!(loaded.workflow_collapsed.contains("alice/app#main"));
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 
@@ -1191,6 +1279,7 @@ mod tests {
             sort_ascending: false,
             group_by: GroupBy::Branch,
             expand: HashMap::from([("repo/x".to_string(), ExpandLevel::Collapsed)]),
+            workflow_collapsed: HashSet::new(),
             show_help: true,
         };
         // Write valid backup, corrupt primary.
