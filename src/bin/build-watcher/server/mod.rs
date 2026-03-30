@@ -235,11 +235,17 @@ pub async fn serve(state: DaemonState, ct: CancellationToken) -> Result<(), Serv
 
     tracing::info!("build-watcher listening on http://127.0.0.1:{port}/mcp");
 
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .expect("failed to register SIGTERM handler");
+
     axum::serve(listener, router)
         .with_graceful_shutdown(async move {
             tokio::select! {
                 _ = tokio::signal::ctrl_c() => {
                     tracing::info!("Ctrl-C received, shutting down...");
+                }
+                _ = sigterm.recv() => {
+                    tracing::info!("SIGTERM received, shutting down...");
                 }
                 _ = ct.cancelled() => {
                     tracing::info!("Shutdown requested, shutting down...");
