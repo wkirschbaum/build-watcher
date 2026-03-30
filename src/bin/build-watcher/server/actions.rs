@@ -388,9 +388,7 @@ pub(crate) fn do_notification_action(
 ) -> Result<String, String> {
     use build_watcher::config::BranchConfig;
 
-    let Some(rc) = config.repos.get_mut(repo) else {
-        return Err(format!("{repo}: not being watched"));
-    };
+    let rc = config.repos.entry(repo.to_string()).or_default();
     let all_off = NotificationOverrides {
         build_started: Some(NotificationLevel::Off),
         build_success: Some(NotificationLevel::Off),
@@ -593,5 +591,69 @@ mod tests {
         assert_eq!(overrides.build_started, None); // unchanged
         assert_eq!(overrides.build_success, Some(NotificationLevel::Critical));
         assert_eq!(overrides.build_failure, None); // unchanged
+    }
+
+    #[test]
+    fn mute_auto_creates_config_entry() {
+        // Repo is not in config.repos — muting should create the entry, not error.
+        let mut config = build_watcher::config::Config::default();
+        assert!(!config.repos.contains_key("alice/app"));
+
+        let result =
+            do_notification_action(&mut config, "alice/app", None, "mute", None, None, None);
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
+        assert!(config.repos.contains_key("alice/app"));
+        let rc = &config.repos["alice/app"];
+        assert_eq!(rc.notifications.build_started, Some(NotificationLevel::Off));
+        assert_eq!(rc.notifications.build_success, Some(NotificationLevel::Off));
+        assert_eq!(rc.notifications.build_failure, Some(NotificationLevel::Off));
+    }
+
+    #[test]
+    fn unmute_auto_creates_config_entry() {
+        let mut config = build_watcher::config::Config::default();
+        let result =
+            do_notification_action(&mut config, "alice/app", None, "unmute", None, None, None);
+        assert!(result.is_ok());
+        // Entry is created but with default (empty) overrides — no harm.
+        assert!(config.repos.contains_key("alice/app"));
+    }
+
+    #[test]
+    fn mute_branch_auto_creates_config_entry() {
+        let mut config = build_watcher::config::Config::default();
+        let result = do_notification_action(
+            &mut config,
+            "alice/app",
+            Some("main"),
+            "mute",
+            None,
+            None,
+            None,
+        );
+        assert!(result.is_ok());
+        let rc = &config.repos["alice/app"];
+        let bc = &rc.branch_notifications["main"];
+        assert_eq!(bc.notifications.build_started, Some(NotificationLevel::Off));
+    }
+
+    #[test]
+    fn set_levels_auto_creates_config_entry() {
+        let mut config = build_watcher::config::Config::default();
+        let result = do_notification_action(
+            &mut config,
+            "alice/app",
+            None,
+            "set_levels",
+            Some(NotificationLevel::Critical),
+            None,
+            None,
+        );
+        assert!(result.is_ok());
+        let rc = &config.repos["alice/app"];
+        assert_eq!(
+            rc.notifications.build_started,
+            Some(NotificationLevel::Critical)
+        );
     }
 }

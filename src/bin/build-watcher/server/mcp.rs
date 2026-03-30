@@ -352,12 +352,7 @@ impl BuildWatcher {
 
         let (snapshot, mut msgs) = {
             let mut config = self.state.config.lock().await;
-            let Some(rc) = config.repos.get_mut(&params.repo) else {
-                return Ok(CallToolResult::error(vec![Content::text(format!(
-                    "{} is not being watched — use watch_builds first",
-                    params.repo
-                ))]));
-            };
+            let rc = config.repos.entry(params.repo.clone()).or_default();
             let mut msgs = Vec::new();
             if let Some(workflows) = &params.workflows {
                 rc.workflows.clone_from(workflows);
@@ -728,20 +723,12 @@ impl BuildWatcher {
                             "global".to_string()
                         }
                         (Some(repo), None) => {
-                            let Some(rc) = config.repos.get_mut(repo) else {
-                                return Ok(CallToolResult::error(vec![Content::text(format!(
-                                    "{repo} is not being watched — use watch_builds first"
-                                ))]));
-                            };
+                            let rc = config.repos.entry(repo.clone()).or_default();
                             apply_levels(&mut rc.notifications, levels.0, levels.1, levels.2);
                             repo.clone()
                         }
                         (Some(repo), Some(branch)) => {
-                            let Some(rc) = config.repos.get_mut(repo) else {
-                                return Ok(CallToolResult::error(vec![Content::text(format!(
-                                    "{repo} is not being watched — use watch_builds first"
-                                ))]));
-                            };
+                            let rc = config.repos.entry(repo.clone()).or_default();
                             let bc = rc.branch_notifications.entry(branch.clone()).or_default();
                             apply_levels(&mut bc.notifications, levels.0, levels.1, levels.2);
                             format!("{repo} [{branch}]")
