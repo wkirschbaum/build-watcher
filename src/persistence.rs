@@ -106,8 +106,25 @@ pub fn save_json<T: Serialize>(path: &Path, value: &T) -> Result<(), PersistErro
 
     // Verify the draft parses back as valid JSON before committing
     match std::fs::read_to_string(&draft) {
-        Ok(readback) if serde_json::from_str::<serde_json::Value>(&readback).is_ok() => {}
-        _ => {
+        Ok(readback) => {
+            if let Err(e) = serde_json::from_str::<serde_json::Value>(&readback) {
+                tracing::error!(
+                    path = %draft.display(),
+                    written_bytes = data.len(),
+                    readback_bytes = readback.len(),
+                    error = %e,
+                    "Draft readback is not valid JSON"
+                );
+                let _ = std::fs::remove_file(&draft);
+                return Err(PersistError::Verify(draft));
+            }
+        }
+        Err(e) => {
+            tracing::error!(
+                path = %draft.display(),
+                error = %e,
+                "Failed to read draft back for verification"
+            );
             let _ = std::fs::remove_file(&draft);
             return Err(PersistError::Verify(draft));
         }

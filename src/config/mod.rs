@@ -68,7 +68,8 @@ fn load_config() -> (Config, bool) {
     let path = config_dir().join("config.json");
 
     if let Some(val) = try_parse_file::<Config>(&path) {
-        return (val, true);
+        // Only re-save if a migration or correction is needed (checked by caller).
+        return (val, false);
     }
 
     // Strict parse failed — try field-by-field recovery before falling back to backup.
