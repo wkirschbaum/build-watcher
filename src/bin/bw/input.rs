@@ -231,13 +231,8 @@ impl App {
                 // Cycle expand level: Full → Branches → Collapsed → Full
                 if let Some((repo, _, _, _)) = selected {
                     let repo = repo.to_string();
-                    let current = self.expand_level(&repo);
-                    let next = current.next();
-                    if next == ExpandLevel::Full {
-                        self.expand.remove(&repo);
-                    } else {
-                        self.expand.insert(repo, next);
-                    }
+                    let next = self.expand_level(&repo).next();
+                    self.set_expand_level(&repo, next);
                     self.save_prefs();
                 }
             }
@@ -267,13 +262,8 @@ impl App {
                 // Collapse from branch header up to repo level.
                 if let Some((repo, _, _, _)) = selected {
                     let repo = repo.to_string();
-                    let current = self.expand_level(&repo);
-                    let prev = current.prev();
-                    if prev == ExpandLevel::Full {
-                        self.expand.remove(&repo);
-                    } else {
-                        self.expand.insert(repo.clone(), prev);
-                    }
+                    let prev = self.expand_level(&repo).prev();
+                    self.set_expand_level(&repo, prev);
                     if let Some(pos) = flat.selectable.iter().position(|&idx| {
                         flat.rows[idx].is_repo_header()
                             && flat.rows[idx].repo_branch_run().0 == repo
@@ -310,13 +300,8 @@ impl App {
                         }
                     } else {
                         // No expandable branch header — collapse repo level.
-                        let current = self.expand_level(&repo);
-                        let prev = current.prev();
-                        if prev == ExpandLevel::Full {
-                            self.expand.remove(&repo);
-                        } else {
-                            self.expand.insert(repo.clone(), prev);
-                        }
+                        let prev = self.expand_level(&repo).prev();
+                        self.set_expand_level(&repo, prev);
                         if let Some(pos) = flat.selectable.iter().position(|&idx| {
                             flat.rows[idx].is_repo_header()
                                 && flat.rows[idx].repo_branch_run().0 == repo
@@ -356,23 +341,16 @@ impl App {
                         .iter()
                         .all(|r| self.expand_level(r) == ExpandLevel::Collapsed);
 
-                    if all_full {
-                        for r in &expandable_repos {
-                            self.expand.insert(r.clone(), ExpandLevel::Branches);
-                        }
+                    let target = if all_full {
+                        ExpandLevel::Branches
                     } else if all_branches {
-                        for r in &expandable_repos {
-                            self.expand.insert(r.clone(), ExpandLevel::Collapsed);
-                        }
-                    } else if all_collapsed {
-                        for r in &expandable_repos {
-                            self.expand.remove(r);
-                        }
+                        ExpandLevel::Collapsed
                     } else {
-                        // Mixed state → expand all fully
-                        for r in &expandable_repos {
-                            self.expand.remove(r);
-                        }
+                        // all_collapsed or mixed → expand all fully
+                        ExpandLevel::Full
+                    };
+                    for r in &expandable_repos {
+                        self.set_expand_level(r, target);
                     }
                 }
                 self.save_prefs();

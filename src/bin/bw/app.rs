@@ -325,6 +325,16 @@ impl App {
         self.expand.get(repo).copied().unwrap_or(ExpandLevel::Full)
     }
 
+    /// Set the expand level for a repo. Full is the implicit default so it is
+    /// removed from the map rather than stored explicitly.
+    pub(crate) fn set_expand_level(&mut self, repo: &str, level: ExpandLevel) {
+        if level == ExpandLevel::Full {
+            self.expand.remove(repo);
+        } else {
+            self.expand.insert(repo.to_string(), level);
+        }
+    }
+
     pub(crate) async fn resync(&mut self, daemon: &DaemonClient) {
         let (status_result, stats_result, history_result) = tokio::join!(
             daemon.get_json::<StatusResponse>("/status"),

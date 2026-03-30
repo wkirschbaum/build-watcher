@@ -818,16 +818,31 @@ pub(crate) fn short_repo(repo: &str) -> &str {
     repo.rsplit_once('/').map_or(repo, |(_, name)| name)
 }
 
+// -- Status colours --
+
+const COLOR_SUCCESS: Color = Color::Rgb(100, 180, 100);
+const COLOR_FAILURE: Color = Color::Rgb(220, 100, 100);
+const COLOR_ACTIVE: Color = Color::Yellow;
+
 // -- Event application --
+
+/// Append `" (N)"` when attempt > 1, otherwise an empty string.
+fn attempt_suffix(attempt: u32) -> String {
+    if attempt > 1 {
+        format!(" ({attempt})")
+    } else {
+        String::new()
+    }
+}
 
 pub(crate) fn status_style(conclusion_or_status: &str) -> Style {
     match conclusion_or_status {
-        "success" => Style::default().fg(Color::Rgb(100, 180, 100)),
+        "success" => Style::default().fg(COLOR_SUCCESS),
         "failure" | "cancelled" | "timed_out" | "startup_failure" => {
-            Style::default().fg(Color::Rgb(220, 100, 100))
+            Style::default().fg(COLOR_FAILURE)
         }
         "in_progress" | "queued" | "waiting" | "requested" | "pending" => {
-            Style::default().fg(Color::Yellow)
+            Style::default().fg(COLOR_ACTIVE)
         }
         _ => Style::default(),
     }
@@ -980,10 +995,7 @@ pub(crate) fn render_header(frame: &mut ratatui::Frame, area: ratatui::layout::R
                 }),
         ),
         sep2.clone(),
-        Span::styled(
-            format!("✓ {n_passing}"),
-            Style::default().fg(Color::Rgb(100, 180, 100)),
-        ),
+        Span::styled(format!("✓ {n_passing}"), Style::default().fg(COLOR_SUCCESS)),
         sep2.clone(),
         Span::styled(format!("· {n_idle}"), dim),
     ];
@@ -1014,7 +1026,7 @@ pub(crate) fn render_header(frame: &mut ratatui::Frame, area: ratatui::layout::R
         let stale_secs = app.last_fetch.elapsed().as_secs();
         left2_spans.push(Span::styled(
             format!("  ⚠ {err} ({stale_secs}s stale)"),
-            Style::default().fg(Color::Rgb(220, 100, 100)),
+            Style::default().fg(COLOR_FAILURE),
         ));
     }
     if let Some((msg, at)) = &app.flash
@@ -1241,15 +1253,11 @@ fn render_display_row<'a>(
             if let Some(sb) = single_branch {
                 let emoji = status_emoji(&sb.status_key);
                 let style = status_style(&sb.status_key);
-                let attempt_suffix = if sb.attempt > 1 {
-                    format!(" ({})", sb.attempt)
-                } else {
-                    String::new()
-                };
+                let sfx = attempt_suffix(sb.attempt);
                 let inline_status = if sb.status_key.is_empty() {
                     "· idle".to_string()
                 } else {
-                    format!("{emoji} {}{attempt_suffix}", format::status(&sb.status_key))
+                    format!("{emoji} {}{sfx}", format::status(&sb.status_key))
                 };
                 Row::new(vec![
                     Cell::from(format::truncate(&name, cw.repo)).style(repo_style),
@@ -1281,21 +1289,21 @@ fn render_display_row<'a>(
                             Style::default().fg(Color::DarkGray)
                         }
                     };
-                    let sep = Span::styled("/", Style::default().fg(Color::DarkGray));
+                    let sep = Span::styled("·", Style::default().fg(Color::DarkGray));
                     let mut spans = vec![
                         Span::styled(
                             format!("{active}"),
-                            dim(*active, Style::default().fg(Color::Yellow)),
+                            dim(*active, Style::default().fg(COLOR_ACTIVE)),
                         ),
                         sep.clone(),
                         Span::styled(
                             format!("{passing}"),
-                            dim(*passing, Style::default().fg(Color::Rgb(100, 180, 100))),
+                            dim(*passing, Style::default().fg(COLOR_SUCCESS)),
                         ),
                         sep.clone(),
                         Span::styled(
                             format!("{failing}"),
-                            dim(*failing, Style::default().fg(Color::Rgb(220, 100, 100))),
+                            dim(*failing, Style::default().fg(COLOR_FAILURE)),
                         ),
                     ];
                     if *idle > 0 {
@@ -1334,18 +1342,11 @@ fn render_display_row<'a>(
                 .elapsed_secs
                 .map(|s| format::duration(Duration::from_secs_f64(s)))
                 .unwrap_or_default();
-            let attempt_suffix = if run.attempt > 1 {
-                format!(" ({})", run.attempt)
-            } else {
-                String::new()
-            };
+            let sfx = attempt_suffix(run.attempt);
             let status_text = if extra_badge.is_empty() {
-                format!("{emoji} {}{attempt_suffix}", format::status(status_str))
+                format!("{emoji} {}{sfx}", format::status(status_str))
             } else {
-                format!(
-                    "{emoji} {}{attempt_suffix} {extra_badge}",
-                    format::status(status_str)
-                )
+                format!("{emoji} {}{sfx} {extra_badge}", format::status(status_str))
             };
             if *is_workflow_child {
                 // Show workflow name in tree, suppress branch/workflow columns.
@@ -1384,7 +1385,7 @@ fn render_display_row<'a>(
             Cell::from(""),
             Cell::from(""),
             Cell::from(format!("↳ {}", format::truncate(steps, cw.title)))
-                .style(Style::default().fg(Color::Rgb(220, 100, 100))),
+                .style(Style::default().fg(COLOR_FAILURE)),
             Cell::from(""),
         ]),
         DisplayRow::LastBuild {
@@ -1402,12 +1403,8 @@ fn render_display_row<'a>(
                 .age_secs
                 .map(|s| format::age(s as u64))
                 .unwrap_or_default();
-            let attempt_suffix = if build.attempt > 1 {
-                format!(" ({})", build.attempt)
-            } else {
-                String::new()
-            };
-            let status_text = format!("{emoji} {}{attempt_suffix}", format::status(conclusion_str));
+            let sfx = attempt_suffix(build.attempt);
+            let status_text = format!("{emoji} {}{sfx}", format::status(conclusion_str));
             if *is_workflow_child {
                 branch_row(
                     &build.workflow,
@@ -1591,7 +1588,7 @@ fn render_detail_bar(
                     s.push(detail_sep());
                     s.push(Span::styled(
                         format!("{} failing", failing),
-                        Style::default().fg(Color::Rgb(220, 100, 100)),
+                        Style::default().fg(COLOR_FAILURE),
                     ));
                 }
                 if *active > 0 {
@@ -1605,7 +1602,7 @@ fn render_detail_bar(
                     s.push(detail_sep());
                     s.push(Span::styled(
                         format!("{} passing", passing),
-                        Style::default().fg(Color::Rgb(100, 180, 100)),
+                        Style::default().fg(COLOR_SUCCESS),
                     ));
                 }
                 if *idle > 0 {
@@ -1669,7 +1666,7 @@ fn render_detail_bar(
                 s.push(Span::styled("failed: ", label_style));
                 s.push(Span::styled(
                     steps.as_str(),
-                    Style::default().fg(Color::Rgb(220, 100, 100)),
+                    Style::default().fg(COLOR_FAILURE),
                 ));
             }
             if let Some(age) = build.age_secs {
