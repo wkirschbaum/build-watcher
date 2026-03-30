@@ -939,7 +939,7 @@ pub(crate) fn render_header(frame: &mut ratatui::Frame, area: ratatui::layout::R
     let mut indicators: Vec<Span> = Vec::new();
     if app.status.paused {
         indicators.push(Span::styled(
-            "  · NOTIFS PAUSED",
+            "  · NOTIFICATIONS PAUSED",
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),

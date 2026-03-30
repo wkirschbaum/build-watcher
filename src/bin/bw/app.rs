@@ -254,14 +254,6 @@ impl App {
         }
     }
 
-    pub(crate) fn active_count(&self) -> usize {
-        self.status
-            .watches
-            .iter()
-            .map(|w| w.active_runs.len())
-            .sum()
-    }
-
     /// Per-branch status bucket counts used by both the header and the terminal title.
     /// Each branch is placed in exactly one bucket: active, failing, passing, or idle.
     pub(crate) fn branch_status_counts(&self) -> (usize, usize, usize, usize) {
