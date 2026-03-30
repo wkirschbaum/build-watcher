@@ -74,31 +74,37 @@ bw
 ```
 build-watcher — up 2h 15m                    poll 15s/60s  API 4521/5000 (90%)  reset 42m
 7 repos, 3 active
-────────────────────────────────────────────────────────────────────────────────
-REPO ↑               BRANCH    STATUS          WORKFLOW       TITLE              ELAPSED / AGE
-floatpays/benefits   main      ⏳ in progress  CI             Fix login bug      1m 12s
-floatpays/moneyclub  main      ❌ failure      CI             Update deps        3m ago
-wkirschbaum/build…   main      ✅ success      CI             Add TUI            2h ago
-────────────────────────────────────────────────────────────────────────────────
-[↑↓] select  [a] add  [b] branches  [d] remove  [o/O] open  [n/N] mute/levels  [p] pause  [s/S] sort  [g/G] group  [C] config  [q] quit  [Q] quit+stop
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ REPO ↑              BRANCH    STATUS          WORKFLOW       TITLE           ELAPSED / AGE │
+│ floatpays/benefits  main      ⏳ in_progress  CI             Fix login bug   1m 12s        │
+│ floatpays/moneyclub main      ✗ failure       CI             Update deps     3m ago        │
+│ wkirschbaum/build…  main      ✓ success       CI             Add TUI         2h ago        │
+└──────────────────────────────────────────────────────────────────────────────────────────▼┘
+ floatpays/moneyclub  ·  main  ·  failure  ·  run 12345  ·  failed: Build / Run tests
+─[↑↓/jk] nav  [e/E] expand  │  [a] add  [b] branch  [d] del  [o/O] open  [r/R] rerun  │  [n/N] mute  [p] pause  [h] hist  [H] recent  │  [s/S] sort  [g/G] group  [C] config  │  [q] quit  [Q] stop  [?] hide
 ```
 
 #### Keybindings
 
 | Key | Action |
 | --- | --- |
-| `↑`/`↓` or `j`/`k` | Select row |
+| `↑`/`↓` or `j`/`k` | Navigate rows |
+| `e` / `E` | Expand/collapse selected repo / all repos |
 | `a` | Add a repo to watch |
-| `d` | Remove selected repo |
+| `d` | Remove selected repo or branch |
 | `b` | Set branches for selected repo |
-| `o` | Open current build run in browser |
-| `O` | Open repo page in browser |
+| `r` / `R` | Rerun failed jobs / all jobs for selected build |
+| `o` | Open failed job or current run in browser |
+| `O` | Open repo Actions page in browser |
 | `n` | Toggle mute for selected repo/branch |
-| `N` | Open notification level picker (set per-event levels) |
+| `N` | Open notification level picker (per-event levels) |
+| `h` | Open build history popup for selected item |
+| `H` | Toggle the Recent builds panel |
 | `p` | Toggle global notification pause |
 | `s` / `S` | Cycle sort column forward / backward |
 | `g` / `G` | Cycle group-by forward / backward |
 | `C` | Edit global config (default branches, ignored workflows) |
+| `?` | Toggle help bar |
 | `q` | Quit |
 | `Q` | Quit and shut down daemon |
 | `U` | Quit and run self-update (shown when update available) |

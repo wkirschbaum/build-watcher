@@ -153,6 +153,9 @@ pub(crate) struct TuiPrefs {
     /// Whether the help bar is visible at the bottom.
     #[serde(default = "default_true")]
     pub(crate) show_help: bool,
+    /// Whether the recent builds panel is visible at the bottom.
+    #[serde(default = "default_true")]
+    pub(crate) show_recent_panel: bool,
 }
 
 fn default_true() -> bool {
@@ -168,6 +171,7 @@ impl Default for TuiPrefs {
             expand: HashMap::new(),
             workflow_collapsed: HashSet::new(),
             show_help: true,
+            show_recent_panel: true,
         }
     }
 }
@@ -216,6 +220,8 @@ pub(crate) struct App {
     pub(crate) update_available: Option<String>,
     /// Whether to show the help bar at the bottom.
     pub(crate) show_help: bool,
+    /// Whether to show the recent builds panel at the bottom.
+    pub(crate) show_recent_panel: bool,
 }
 
 impl App {
@@ -244,6 +250,7 @@ impl App {
             workflow_collapsed: prefs.workflow_collapsed,
             update_available: None,
             show_help: prefs.show_help,
+            show_recent_panel: prefs.show_recent_panel,
         }
     }
 
@@ -308,6 +315,7 @@ impl App {
             expand,
             workflow_collapsed: self.workflow_collapsed.clone(),
             show_help: self.show_help,
+            show_recent_panel: self.show_recent_panel,
         }
         .save();
     }
@@ -1192,6 +1200,7 @@ mod tests {
             ]),
             workflow_collapsed: HashSet::from(["alice/app#main".to_string()]),
             show_help: false,
+            show_recent_panel: false,
         };
         save_json(&path, &prefs).unwrap();
         let loaded: TuiPrefs = load_json(&path).unwrap();
@@ -1285,6 +1294,7 @@ mod tests {
             expand: HashMap::from([("repo/x".to_string(), ExpandLevel::Collapsed)]),
             workflow_collapsed: HashSet::new(),
             show_help: true,
+            show_recent_panel: true,
         };
         // Write valid backup, corrupt primary.
         std::fs::write(&bak, serde_json::to_string(&prefs).unwrap()).unwrap();

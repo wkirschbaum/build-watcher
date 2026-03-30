@@ -530,12 +530,15 @@ impl App {
                     open_browser(&format!("{}/actions", repo_url(repo)));
                 }
             }
-            KeyCode::Char('h') | KeyCode::Char('H') => {
+            KeyCode::Char('h') => {
                 if let Some((repo, branch, _, _)) = selected {
-                    // h on branch row = branch-scoped; h on repo row or H = all branches
-                    let all_branches = code == KeyCode::Char('H') || is_repo_row;
-                    self.open_history(daemon, repo, if all_branches { None } else { Some(branch) });
+                    // h on branch row = branch-scoped; h on repo row = all branches
+                    self.open_history(daemon, repo, if is_repo_row { None } else { Some(branch) });
                 }
+            }
+            KeyCode::Char('H') => {
+                self.show_recent_panel = !self.show_recent_panel;
+                self.save_prefs();
             }
             KeyCode::Char('s') | KeyCode::Char('S') => {
                 self.cycle_sort(code == KeyCode::Char('S'));

@@ -997,20 +997,17 @@ pub(crate) fn render_header(frame: &mut ratatui::Frame, area: ratatui::layout::R
     }
     let line2 = Line::from(left2_spans);
 
-    // Line 3: separator
-    let line3 = Line::from(Span::styled("─".repeat(w), dim));
-
-    frame.render_widget(Paragraph::new(vec![line1, line2, line3]), area);
+    frame.render_widget(Paragraph::new(vec![line1, line2]), area);
 }
 
 pub(crate) fn render_body<'a>(
     frame: &mut ratatui::Frame,
-    heading_area: ratatui::layout::Rect,
-    body_area: ratatui::layout::Rect,
+    area: ratatui::layout::Rect,
     app: &App,
     flat: &FlatRows<'a>,
     cw: &ColWidths,
 ) {
+    let border_style = Style::default().fg(Color::DarkGray);
     let header_style = Style::default()
         .fg(Color::DarkGray)
         .add_modifier(Modifier::BOLD);
@@ -1034,11 +1031,50 @@ pub(crate) fn render_body<'a>(
         hdr("ELAPSED / AGE", SortColumn::Age),
     ]);
 
+    // Bordered panel wrapping both column headings and the scrollable table.
+    // Show non-default group-by in the title so it's always visible.
+    let dim = Style::default().fg(Color::DarkGray);
+    let mut panel = Block::default()
+        .borders(Borders::ALL)
+        .border_style(border_style);
+    if app.group_by != GroupBy::None && app.group_by != GroupBy::Org {
+        panel = panel.title_top(
+            Line::from(Span::styled(
+                format!(" group: {} ", app.group_by.label()),
+                dim,
+            ))
+            .right_aligned(),
+        );
+    }
+    let inner = panel.inner(area);
+    frame.render_widget(panel, area);
+
+    // Split the inner area: 1 row for column headings, rest for table rows.
+    let inner_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Fill(1)])
+        .split(inner);
+    let heading_area = inner_chunks[0];
+    let body_area = inner_chunks[1];
+
     let selected_display_idx = flat
         .selectable
         .get(app.selected)
         .copied()
         .unwrap_or(usize::MAX);
+
+    let total_rows = flat.rows.len();
+    let body_height = body_area.height as usize;
+
+    // Compute scroll offset so the selected row stays visible, centered when possible.
+    let scroll_offset = if total_rows <= body_height {
+        0
+    } else {
+        selected_display_idx
+            .saturating_sub(body_height / 2)
+            .min(total_rows - body_height)
+    };
+
     let highlight_style = Style::default().bg(Color::DarkGray);
 
     let mute_indicator = |muted: bool| -> &'static str { if muted { " 🔇" } else { "" } };
@@ -1047,6 +1083,8 @@ pub(crate) fn render_body<'a>(
         .rows
         .iter()
         .enumerate()
+        .skip(scroll_offset)
+        .take(body_height)
         .map(|(i, dr)| {
             let row = render_display_row(dr, cw, &mute_indicator);
             if i == selected_display_idx {
@@ -1064,6 +1102,25 @@ pub(crate) fn render_body<'a>(
 
     let body_table = Table::new(rows, widths).column_spacing(COL_SPACING);
     frame.render_widget(body_table, body_area);
+
+    // Overlay scroll indicators on the panel border when content overflows.
+    // Rendered last so they appear on top of the border characters.
+    if total_rows > body_height {
+        let indicator_style = Style::default().fg(Color::DarkGray);
+        let right_col = area.x + area.width.saturating_sub(2);
+        if scroll_offset > 0 {
+            frame.render_widget(
+                Paragraph::new("▲").style(indicator_style),
+                ratatui::layout::Rect::new(right_col, area.y, 1, 1),
+            );
+        }
+        if scroll_offset + body_height < total_rows {
+            frame.render_widget(
+                Paragraph::new("▼").style(indicator_style),
+                ratatui::layout::Rect::new(right_col, area.y + area.height.saturating_sub(1), 1, 1),
+            );
+        }
+    }
 }
 
 /// Build a 6-cell Row for a branch-level entry (ActiveRun, LastBuild, NeverRan).
@@ -1098,18 +1155,21 @@ fn render_display_row<'a>(
     mute_indicator: &dyn Fn(bool) -> &'static str,
 ) -> Row<'a> {
     match dr {
-        DisplayRow::GroupHeader { label } => Row::new(vec![
-            Cell::from(label.clone()).style(
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Cell::from(""),
-            Cell::from(""),
-            Cell::from(""),
-            Cell::from(""),
-            Cell::from(""),
-        ]),
+        DisplayRow::GroupHeader { label } => {
+            let group_style = Style::default()
+                .fg(Color::Cyan)
+                .bg(Color::Rgb(25, 30, 40))
+                .add_modifier(Modifier::BOLD);
+            Row::new(vec![
+                Cell::from(format!("  {label}")).style(group_style),
+                Cell::from(""),
+                Cell::from(""),
+                Cell::from(""),
+                Cell::from(""),
+                Cell::from(""),
+            ])
+            .style(Style::default().bg(Color::Rgb(25, 30, 40)))
+        }
         DisplayRow::RepoHeader {
             repo,
             branch_count,
@@ -1146,7 +1206,7 @@ fn render_display_row<'a>(
                 let emoji = status_emoji(&sb.status_key);
                 let style = status_style(&sb.status_key);
                 let attempt_suffix = if sb.attempt > 1 {
-                    format!(" (r:{})", sb.attempt)
+                    format!(" ({})", sb.attempt)
                 } else {
                     String::new()
                 };
@@ -1239,7 +1299,7 @@ fn render_display_row<'a>(
                 .map(|s| format::duration(Duration::from_secs_f64(s)))
                 .unwrap_or_default();
             let attempt_suffix = if run.attempt > 1 {
-                format!(" (r:{})", run.attempt)
+                format!(" ({})", run.attempt)
             } else {
                 String::new()
             };
@@ -1307,7 +1367,7 @@ fn render_display_row<'a>(
                 .map(|s| format::age(s as u64))
                 .unwrap_or_default();
             let attempt_suffix = if build.attempt > 1 {
-                format!(" (r:{})", build.attempt)
+                format!(" ({})", build.attempt)
             } else {
                 String::new()
             };
@@ -1392,28 +1452,24 @@ fn render_display_row<'a>(
 
 pub(crate) fn render_recent_panel(
     frame: &mut ratatui::Frame,
-    sep_area: ratatui::layout::Rect,
-    body_area: ratatui::layout::Rect,
+    area: ratatui::layout::Rect,
     app: &App,
     cw: &ColWidths,
 ) {
-    let w = sep_area.width as usize;
     let dim = Style::default().fg(Color::DarkGray);
-    let label = " Recent ";
-    let dashes = w.saturating_sub(label.len());
-    let left = dashes / 2;
-    let right = dashes - left;
-    let sep_line = Line::from(vec![
-        Span::styled("─".repeat(left), dim),
-        Span::styled(label, dim),
-        Span::styled("─".repeat(right), dim),
-    ]);
-    frame.render_widget(Paragraph::new(sep_line), sep_area);
+    let border_style = Style::default().fg(Color::DarkGray);
+
+    let panel = Block::default()
+        .borders(Borders::ALL)
+        .border_style(border_style)
+        .title(Span::styled(" Recent ", dim));
+    let inner = panel.inner(area);
+    frame.render_widget(panel, area);
 
     let rows: Vec<Row> = app
         .recent_history
         .iter()
-        .take(body_area.height as usize)
+        .take(inner.height as usize)
         .map(|entry| {
             let style = status_style(&entry.conclusion);
             let emoji = status_emoji(&entry.conclusion);
@@ -1436,7 +1492,7 @@ pub(crate) fn render_recent_panel(
         .collect();
 
     let table = Table::new(rows, cw.constraints());
-    frame.render_widget(table, body_area);
+    frame.render_widget(table, inner);
 }
 
 /// Separator span used between detail bar fields.
@@ -1490,7 +1546,7 @@ fn render_detail_bar(
                 }
                 if sb.attempt > 1 {
                     s.push(detail_sep());
-                    s.push(Span::styled(format!("attempt {}", sb.attempt), dim));
+                    s.push(Span::styled(format!("({})", sb.attempt), dim));
                 }
             } else {
                 s.push(detail_sep());
@@ -1543,7 +1599,7 @@ fn render_detail_bar(
             }
             if run.attempt > 1 {
                 s.push(detail_sep());
-                s.push(Span::styled(format!("attempt {}", run.attempt), dim));
+                s.push(Span::styled(format!("({})", run.attempt), dim));
             }
             if let Some(elapsed) = run.elapsed_secs {
                 s.push(detail_sep());
@@ -1570,7 +1626,7 @@ fn render_detail_bar(
             ];
             if build.attempt > 1 {
                 s.push(detail_sep());
-                s.push(Span::styled(format!("attempt {}", build.attempt), dim));
+                s.push(Span::styled(format!("({})", build.attempt), dim));
             }
             if let Some(steps) = &build.failing_steps {
                 s.push(detail_sep());
@@ -1619,16 +1675,10 @@ fn render_detail_bar(
         Some(DisplayRow::FailingSteps { .. }) | None => vec![],
     };
 
-    let block = Block::default()
-        .borders(Borders::TOP | Borders::BOTTOM)
-        .border_style(Style::default().fg(Color::DarkGray));
-
-    if !spans.is_empty() {
-        let bar = Paragraph::new(Line::from(spans)).block(block);
-        frame.render_widget(bar, area);
-    } else {
-        frame.render_widget(block, area);
-    }
+    // Pad with a leading space to align with the body panel's inner content.
+    let mut all_spans = vec![Span::raw(" ")];
+    all_spans.extend(spans);
+    frame.render_widget(Paragraph::new(Line::from(all_spans)), area);
 }
 
 pub(crate) fn render_footer(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &App) {
@@ -1674,8 +1724,10 @@ pub(crate) fn render_footer(frame: &mut ratatui::Frame, area: ratatui::layout::R
                 Span::raw(" mute  "),
                 Span::styled("[p]", key_style),
                 Span::raw(" pause  "),
-                Span::styled("[h/H]", key_style),
-                Span::raw(" hist"),
+                Span::styled("[h]", key_style),
+                Span::raw(" hist  "),
+                Span::styled("[H]", key_style),
+                Span::raw(" recent"),
                 sep.clone(),
                 // ── View ──────────────────────────────────────────────────
                 Span::styled("[s/S]", key_style),
@@ -1721,7 +1773,8 @@ pub(crate) fn render_footer(frame: &mut ratatui::Frame, area: ratatui::layout::R
 
 pub(crate) fn render(frame: &mut ratatui::Frame, app: &App) {
     let area = frame.area();
-    let cw = ColWidths::from_terminal_width(area.width);
+    // Subtract 2 for the left/right border of the body and recent panels.
+    let cw = ColWidths::from_terminal_width(area.width.saturating_sub(2));
 
     // Sort and flatten watches once for the entire render pass.
     let sorted = sorted_watches(
@@ -1731,59 +1784,60 @@ pub(crate) fn render(frame: &mut ratatui::Frame, app: &App) {
         app.group_by,
     );
     let flat = flatten_rows(&sorted, app.group_by, &app.expand, &app.workflow_collapsed);
-    let table_rows = flat.rows.len() as u16;
 
     let recent_count = app.recent_history.len();
+    // recent panel height: recent_height rows of content + 2 for top/bottom borders
     let recent_height = recent_count.min(10) as u16;
-    let show_recent = recent_height > 0;
+    let recent_panel_height = recent_height + 2;
+    let show_recent = app.show_recent_panel && recent_height > 0;
 
     let needs_input_line = matches!(app.input_mode, InputMode::TextInput { .. });
     let footer_height = if app.show_help {
-        3 // top border + content + bottom border
+        2 // top border + content line
     } else if needs_input_line {
         1 // just the text input prompt
     } else {
         0
     };
 
+    // Layout: header, then body panel fills available space, then optional recent panel,
+    // then detail bar (1 row) and footer snap to the bottom.
     let chunks = if show_recent {
         Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(3),             // header
-                Constraint::Length(1),             // column headings
-                Constraint::Length(table_rows),    // table body (exact)
-                Constraint::Length(3),             // detail bar (border + content + border)
-                Constraint::Min(0),                // remaining space (pushes recent down)
-                Constraint::Length(1),             // recent separator
-                Constraint::Length(recent_height), // recent panel
-                Constraint::Length(footer_height), // footer
+                Constraint::Length(2),                   // [0] header (title + status)
+                Constraint::Fill(1),                     // [1] body panel (bordered, scrollable)
+                Constraint::Length(recent_panel_height), // [2] recent panel (bordered)
+                Constraint::Length(1),                   // [3] detail bar (1 plain row)
+                Constraint::Length(footer_height),       // [4] footer
             ])
             .split(area)
     } else {
         Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(3),             // header
-                Constraint::Length(1),             // column headings
-                Constraint::Length(table_rows),    // table body (exact)
-                Constraint::Length(3),             // detail bar (border + content + border)
-                Constraint::Min(0),                // remaining space
-                Constraint::Length(footer_height), // footer
+                Constraint::Length(2),             // [0] header (title + status)
+                Constraint::Fill(1),               // [1] body panel (bordered, scrollable)
+                Constraint::Length(1),             // [2] detail bar (1 plain row)
+                Constraint::Length(footer_height), // [3] footer
             ])
             .split(area)
     };
 
     render_header(frame, chunks[0], app);
-    render_body(frame, chunks[1], chunks[2], app, &flat, &cw);
-    render_detail_bar(frame, chunks[3], app, &flat);
+    render_body(frame, chunks[1], app, &flat, &cw);
     if show_recent {
-        render_recent_panel(frame, chunks[5], chunks[6], app, &cw);
+        render_recent_panel(frame, chunks[2], app, &cw);
+        render_detail_bar(frame, chunks[3], app, &flat);
         if footer_height > 0 {
-            render_footer(frame, chunks[7], app);
+            render_footer(frame, chunks[4], app);
         }
-    } else if footer_height > 0 {
-        render_footer(frame, chunks[5], app);
+    } else {
+        render_detail_bar(frame, chunks[2], app, &flat);
+        if footer_height > 0 {
+            render_footer(frame, chunks[3], app);
+        }
     }
 
     // Overlay the form popup if active.

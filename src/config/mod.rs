@@ -8,53 +8,69 @@ use std::path::Path;
 use crate::dirs::config_dir;
 use crate::persistence::{PersistError, save_json, save_json_async, try_parse_file};
 
-/// Attempt to load a Config by deserializing each top-level field individually,
-/// using the field's default when it is missing or has an invalid value.
-/// Also recovers individual repo entries, skipping those that cannot be parsed.
+/// Attempt to load a Config by merging each top-level field from the file into
+/// `Config::default()`, falling back to the default when a field is missing or
+/// has an invalid value.
+///
+/// Works automatically for any field on `Config` — no manual field list to
+/// maintain. The `repos` map gets special treatment: entries are loaded
+/// individually so a single bad repo doesn't drop the rest.
+///
 /// Returns `None` only when the file cannot be read or is not a JSON object.
 fn load_config_lenient(path: &Path) -> Option<Config> {
     let data = std::fs::read_to_string(path).ok()?;
-    let value: serde_json::Value = serde_json::from_str(&data).ok()?;
-    let obj = value.as_object()?;
+    let file_obj: serde_json::Value = serde_json::from_str(&data).ok()?;
+    let file_map = file_obj.as_object()?;
 
-    let mut cfg = Config::default();
+    // Start from a serialized default so every field is present.
+    let mut base: serde_json::Map<String, serde_json::Value> =
+        serde_json::to_value(Config::default())
+            .ok()?
+            .as_object()
+            .cloned()?;
 
-    macro_rules! field {
-        ($key:literal, $field:expr) => {
-            if let Some(v) = obj.get($key) {
-                match serde_json::from_value(v.clone()) {
-                    Ok(val) => $field = val,
-                    Err(e) => {
-                        tracing::warn!("config: invalid field {:?}: {e}, using default", $key)
+    for (key, file_val) in file_map {
+        if key == "repos" {
+            // Repos: load entry-by-entry so one bad repo doesn't drop the rest.
+            let mut repos = serde_json::Map::new();
+            if let Some(repos_obj) = file_val.as_object() {
+                for (repo, repo_val) in repos_obj {
+                    match serde_json::from_value::<RepoConfig>(repo_val.clone()) {
+                        Ok(_) => {
+                            repos.insert(repo.clone(), repo_val.clone());
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "config: invalid entry for repo {repo:?}: {e}, skipping"
+                            );
+                        }
                     }
                 }
             }
-        };
-    }
+            base.insert("repos".to_string(), serde_json::Value::Object(repos));
+            continue;
+        }
 
-    field!("default_branches", cfg.default_branches);
-    field!("ignored_workflows", cfg.ignored_workflows);
-    field!("poll_aggression", cfg.poll_aggression);
-    field!("notifications", cfg.notifications);
-    field!("quiet_hours", cfg.quiet_hours);
-    field!("auto_discover_branches", cfg.auto_discover_branches);
-    field!("branch_filter", cfg.branch_filter);
-
-    // Repos: load the map entry-by-entry so a single bad repo doesn't drop the rest.
-    if let Some(serde_json::Value::Object(repos_obj)) = obj.get("repos") {
-        for (repo, repo_val) in repos_obj {
-            match serde_json::from_value::<RepoConfig>(repo_val.clone()) {
-                Ok(rc) => {
-                    cfg.repos.insert(repo.clone(), rc);
-                }
-                Err(e) => {
-                    tracing::warn!("config: invalid entry for repo {repo:?}: {e}, skipping");
-                }
-            }
+        // For all other fields: try inserting the file's value. If the result
+        // still deserializes into a valid Config, keep it; otherwise revert.
+        let old = base.insert(key.clone(), file_val.clone());
+        let candidate = serde_json::Value::Object(base.clone());
+        if serde_json::from_value::<Config>(candidate).is_err() {
+            tracing::warn!("config: invalid field {key:?}, using default");
+            match old {
+                Some(v) => base.insert(key.clone(), v),
+                None => base.remove(key),
+            };
         }
     }
 
-    Some(cfg)
+    match serde_json::from_value::<Config>(serde_json::Value::Object(base)) {
+        Ok(cfg) => Some(cfg),
+        Err(e) => {
+            tracing::error!("config: lenient merge produced invalid Config: {e}");
+            None
+        }
+    }
 }
 
 /// Load config from disk.
