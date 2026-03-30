@@ -284,7 +284,7 @@ impl App {
             }
         }
 
-        format!("builds: {active}/{success}/{failed}")
+        format!("builds: {active} · {success} · {failed}")
     }
 
     pub(crate) fn set_flash(&mut self, msg: impl Into<String>) {

@@ -908,7 +908,7 @@ pub(crate) fn render_header(frame: &mut ratatui::Frame, area: ratatui::layout::R
     } else {
         format!(" [{}]", s.poll_aggression)
     };
-    let poll = format!("poll {}s/{}s{aggr}", s.active_poll_secs, s.idle_poll_secs);
+    let poll = format!("poll {}s · {}s{aggr}", s.active_poll_secs, s.idle_poll_secs);
     let api = match (s.rate_remaining, s.rate_limit) {
         (Some(rem), Some(lim)) => {
             let pct = if lim > 0 { rem * 100 / lim } else { 0 };
@@ -916,7 +916,7 @@ pub(crate) fn render_header(frame: &mut ratatui::Frame, area: ratatui::layout::R
                 .rate_reset_mins
                 .map(|m| format!("  reset {m}m"))
                 .unwrap_or_default();
-            format!("API {rem}/{lim} ({pct}%){reset}")
+            format!("API {rem} · {lim} ({pct}%){reset}")
         }
         _ => "API —".to_string(),
     };
@@ -1624,7 +1624,7 @@ fn render_detail_bar(
                     status_style(run.status.as_str()),
                 ),
                 detail_sep(),
-                Span::styled(format!("{} / {} / {}", repo, branch, run.workflow), dim),
+                Span::styled(format!("{} · {} · {}", repo, branch, run.workflow), dim),
                 detail_sep(),
                 Span::styled("run ", label_style),
                 Span::styled(run.run_id.to_string(), dim),
@@ -1655,7 +1655,7 @@ fn render_detail_bar(
                     status_style(build.conclusion.as_str()),
                 ),
                 detail_sep(),
-                Span::styled(format!("{} / {} / {}", repo, branch, build.workflow), dim),
+                Span::styled(format!("{} · {} · {}", repo, branch, build.workflow), dim),
                 detail_sep(),
                 Span::styled("run ", label_style),
                 Span::styled(build.run_id.to_string(), dim),
@@ -1683,7 +1683,7 @@ fn render_detail_bar(
         }
         Some(DisplayRow::NeverRan { repo, branch, .. }) => {
             vec![
-                Span::styled(format!("{} / {}", repo, branch), dim),
+                Span::styled(format!("{} · {}", repo, branch), dim),
                 detail_sep(),
                 Span::styled("no builds yet", dim),
             ]
@@ -1703,7 +1703,7 @@ fn render_detail_bar(
         }) => {
             let state = if *expanded { "expanded" } else { "collapsed" };
             vec![
-                Span::styled(format!("{repo} / {branch}"), dim),
+                Span::styled(format!("{repo} · {branch}"), dim),
                 detail_sep(),
                 Span::styled(format!("{workflow_count} workflows ({state})"), dim),
             ]
