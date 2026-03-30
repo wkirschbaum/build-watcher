@@ -94,11 +94,14 @@ if [ "$OS" = "Darwin" ]; then
   PLIST_PATH="$HOME/Library/LaunchAgents/com.build-watcher.plist"
   [ -f "$PLIST_PATH" ] && launchctl bootout "gui/$(id -u)" "$PLIST_PATH" 2>/dev/null || true
 else
-  systemctl --user disable --now "$BINARY_NAME.service" 2>/dev/null || true
+  systemctl --user stop "$BINARY_NAME.service" 2>/dev/null || true
+  systemctl --user disable "$BINARY_NAME.service" 2>/dev/null || true
 fi
-# Kill orphan processes not managed by the service manager.
+# Kill ALL build-watcher processes (service-managed AND orphans started by MCP
+# clients or manual runs). Use the binary name so it works even if the path changed.
+pkill -x "$BINARY_NAME" 2>/dev/null || true
 pkill -f "$BINARY_PATH" 2>/dev/null || true
-sleep 0.5
+sleep 1
 
 # -- Install binaries ---------------------------------------------------------
 
