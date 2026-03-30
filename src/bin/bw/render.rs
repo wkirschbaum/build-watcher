@@ -915,7 +915,6 @@ pub(crate) fn render_header(frame: &mut ratatui::Frame, area: ratatui::layout::R
     let w = area.width as usize;
     let dim = Style::default().fg(Color::DarkGray);
 
-    // Line 1: title + stats
     let s = &app.stats;
     let uptime = format::seconds(s.uptime_secs);
     let aggr = if s.poll_aggression.is_empty() {
@@ -936,54 +935,11 @@ pub(crate) fn render_header(frame: &mut ratatui::Frame, area: ratatui::layout::R
         _ => "API —".to_string(),
     };
 
-    let left1_suffix = format!(" — up {uptime}");
-    let right1 = format!("{poll}  {api}");
-    let left1_len = "build-watcher".len() + left1_suffix.len();
-    let gap1 = w.saturating_sub(left1_len + right1.len());
-    let line1 = Line::from(vec![
-        Span::styled(
-            "build-watcher",
-            Style::default().add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(left1_suffix),
-        Span::raw(" ".repeat(gap1)),
-        Span::styled(right1, dim),
-    ]);
-
-    // Line 2: status summary + state indicators
-    let repo_count = {
-        let mut repos: Vec<&str> = app.status.watches.iter().map(|w| w.repo.as_str()).collect();
-        repos.sort_unstable();
-        repos.dedup();
-        repos.len()
-    };
-    let branch_count = app.status.watches.len();
-    let (n_active, n_failing, n_passing, n_idle) = app.branch_status_counts();
-
-    let sep2 = Span::styled("  ", dim);
-    let mut left2_spans: Vec<Span> = vec![
-        Span::styled(format!("{repo_count}r · {branch_count}b"), dim),
-        sep2.clone(),
-        Span::styled(format!("⏳ {n_active}"), Style::default().fg(Color::Yellow)),
-        sep2.clone(),
-        Span::styled(
-            format!("✗ {n_failing}"),
-            Style::default()
-                .fg(Color::Rgb(220, 100, 100))
-                .add_modifier(if n_failing > 0 {
-                    Modifier::BOLD
-                } else {
-                    Modifier::DIM
-                }),
-        ),
-        sep2.clone(),
-        Span::styled(format!("✓ {n_passing}"), Style::default().fg(COLOR_SUCCESS)),
-        sep2.clone(),
-        Span::styled(format!("· {n_idle}"), dim),
-    ];
+    // State indicators appended after stats (paused, SSE issues, errors, flash, update).
+    let mut indicators: Vec<Span> = Vec::new();
     if app.status.paused {
-        left2_spans.push(Span::styled(
-            "  ⏸ NOTIFS PAUSED",
+        indicators.push(Span::styled(
+            "  · NOTIFS PAUSED",
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
@@ -991,14 +947,14 @@ pub(crate) fn render_header(frame: &mut ratatui::Frame, area: ratatui::layout::R
     }
     match &app.sse_state {
         SseState::Connecting => {
-            left2_spans.push(Span::styled(
-                "  ⚡ connecting…",
+            indicators.push(Span::styled(
+                "  · connecting…",
                 Style::default().fg(Color::Yellow),
             ));
         }
         SseState::Disconnected { since } => {
-            left2_spans.push(Span::styled(
-                format!("  ⚡ reconnecting ({}s)", since.elapsed().as_secs()),
+            indicators.push(Span::styled(
+                format!("  · reconnecting ({}s)", since.elapsed().as_secs()),
                 Style::default().fg(Color::Yellow),
             ));
         }
@@ -1006,28 +962,44 @@ pub(crate) fn render_header(frame: &mut ratatui::Frame, area: ratatui::layout::R
     }
     if let Some(err) = &app.fetch_error {
         let stale_secs = app.last_fetch.elapsed().as_secs();
-        left2_spans.push(Span::styled(
-            format!("  ⚠ {err} ({stale_secs}s stale)"),
+        indicators.push(Span::styled(
+            format!("  · {err} ({stale_secs}s stale)"),
             Style::default().fg(COLOR_FAILURE),
         ));
     }
     if let Some((msg, at)) = &app.flash
         && at.elapsed() < FLASH_DURATION
     {
-        left2_spans.push(Span::styled(
+        indicators.push(Span::styled(
             format!("  {msg}"),
             Style::default().fg(Color::Cyan),
         ));
     }
     if let Some(version) = &app.update_available {
-        left2_spans.push(Span::styled(
-            format!("  ↑ {version} available"),
+        indicators.push(Span::styled(
+            format!("  · {version} available"),
             Style::default().fg(Color::Yellow),
         ));
     }
-    let line2 = Line::from(left2_spans);
 
-    frame.render_widget(Paragraph::new(vec![line1, line2]), area);
+    let left_suffix = format!(" — up {uptime}");
+    let right = format!("{poll}  {api}");
+    let indicators_len: usize = indicators.iter().map(|s| s.content.len()).sum();
+    let left_len = "build-watcher".len() + left_suffix.len();
+    let gap = w.saturating_sub(left_len + right.len() + indicators_len);
+
+    let mut spans = vec![
+        Span::styled(
+            "build-watcher",
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(left_suffix),
+        Span::raw(" ".repeat(gap)),
+        Span::styled(right, dim),
+    ];
+    spans.extend(indicators);
+
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 pub(crate) fn render_body<'a>(
@@ -1821,7 +1793,7 @@ pub(crate) fn render(frame: &mut ratatui::Frame, app: &App) {
         Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(2),                   // [0] header (title + status)
+                Constraint::Length(1),                   // [0] header
                 Constraint::Fill(1),                     // [1] body panel (bordered, scrollable)
                 Constraint::Length(recent_panel_height), // [2] recent panel (bordered)
                 Constraint::Length(1),                   // [3] detail bar (1 plain row)
@@ -1832,7 +1804,7 @@ pub(crate) fn render(frame: &mut ratatui::Frame, app: &App) {
         Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(2),             // [0] header (title + status)
+                Constraint::Length(1),             // [0] header
                 Constraint::Fill(1),               // [1] body panel (bordered, scrollable)
                 Constraint::Length(1),             // [2] detail bar (1 plain row)
                 Constraint::Length(footer_height), // [3] footer
