@@ -64,7 +64,7 @@ pub(crate) fn build_watch_snapshot(
                 .active_runs
                 .iter()
                 .filter(|(_, run)| {
-                    config.map_or(true, |cfg| {
+                    config.is_none_or(|cfg| {
                         !cfg.ignored_workflows
                             .iter()
                             .any(|i| run.workflow.eq_ignore_ascii_case(i))
@@ -91,7 +91,7 @@ pub(crate) fn build_watch_snapshot(
                 .last_builds
                 .values()
                 .filter(|lb| {
-                    config.map_or(true, |cfg| {
+                    config.is_none_or(|cfg| {
                         !cfg.ignored_workflows
                             .iter()
                             .any(|i| lb.workflow.eq_ignore_ascii_case(i))

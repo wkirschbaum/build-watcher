@@ -337,16 +337,13 @@ impl App {
                     let all_branches = expandable_repos
                         .iter()
                         .all(|r| self.expand_level(r) == ExpandLevel::Branches);
-                    let all_collapsed = expandable_repos
-                        .iter()
-                        .all(|r| self.expand_level(r) == ExpandLevel::Collapsed);
 
                     let target = if all_full {
                         ExpandLevel::Branches
                     } else if all_branches {
                         ExpandLevel::Collapsed
                     } else {
-                        // all_collapsed or mixed → expand all fully
+                        // all collapsed or mixed → expand all fully
                         ExpandLevel::Full
                     };
                     for r in &expandable_repos {
