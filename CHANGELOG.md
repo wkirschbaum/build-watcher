@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.8.5] - 2026-03-30
+
+### Fixed
+
+- Ignored workflows (e.g. `Semgrep`) now hidden from TUI — snapshot builder filters `active_runs` and `last_builds` against `ignored_workflows` config at serve time, so stale entries are never displayed
+
+### Changed
+
+- **Poll aggression**: Medium target raised from 30% → 40% of rate-limit budget (interval multiplier 2.0× → 1.5×); High target raised from 70% → 80% (unchanged 1.0× multiplier)
+- **Header status summary** — line 2 shows `{N}r/{N}b  ✗ {N}  ⏳ {N}  ✓ {N}  · {N}` with colour coding (red failures, yellow active, green passing)
+
 ## [0.8.4] - 2026-03-30
 
 ### Changed
@@ -33,6 +44,7 @@
 
 - Avoid unnecessary config re-save on reads; improve persistence error logging
 
+[0.8.5]: https://github.com/wkirschbaum/build-watcher/releases/tag/v0.8.5
 [0.8.4]: https://github.com/wkirschbaum/build-watcher/releases/tag/v0.8.4
 [0.8.3]: https://github.com/wkirschbaum/build-watcher/releases/tag/v0.8.3
 [0.8.2]: https://github.com/wkirschbaum/build-watcher/releases/tag/v0.8.2

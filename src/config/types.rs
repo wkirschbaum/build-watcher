@@ -128,8 +128,8 @@ impl PollAggression {
     pub fn target_fraction(self) -> f64 {
         match self {
             Self::Low => 0.10,
-            Self::Medium => 0.30,
-            Self::High => 0.70,
+            Self::Medium => 0.40,
+            Self::High => 0.80,
         }
     }
 
@@ -139,12 +139,12 @@ impl PollAggression {
     }
 
     /// Multiplier applied to poll intervals in the free zone.
-    /// High = 1.0 (floor speed), Medium = 2×, Low = 7×.
+    /// High = 1.0 (floor speed), Medium = 1.5×, Low = 5×.
     pub fn interval_multiplier(self) -> f64 {
         match self {
             Self::High => 1.0,
-            Self::Medium => 2.0,
-            Self::Low => 7.0,
+            Self::Medium => 1.5,
+            Self::Low => 5.0,
         }
     }
 }

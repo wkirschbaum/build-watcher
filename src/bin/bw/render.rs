@@ -935,22 +935,69 @@ pub(crate) fn render_header(frame: &mut ratatui::Frame, area: ratatui::layout::R
         Span::styled(right1, dim),
     ]);
 
-    // Line 2: watches + state
+    // Line 2: status summary + state indicators
     let repo_count = {
         let mut repos: Vec<&str> = app.status.watches.iter().map(|w| w.repo.as_str()).collect();
         repos.sort_unstable();
         repos.dedup();
         repos.len()
     };
-    let active_count = app.active_count();
-    let group_label = if app.group_by != GroupBy::Org {
-        format!("  group: {}", app.group_by.label())
-    } else {
-        String::new()
-    };
-    let mut left2_spans: Vec<Span> = vec![Span::raw(format!(
-        "{repo_count} repos, {active_count} active{group_label}"
-    ))];
+    let branch_count = app.status.watches.len();
+    let mut n_active = 0usize;
+    let mut n_failing = 0usize;
+    let mut n_passing = 0usize;
+    let mut n_idle = 0usize;
+    for w in &app.status.watches {
+        if !w.active_runs.is_empty() {
+            n_active += 1;
+        } else if w.last_builds.is_empty() {
+            n_idle += 1;
+        } else if w
+            .last_builds
+            .iter()
+            .any(|b| b.conclusion != RunConclusion::Success)
+        {
+            n_failing += 1;
+        } else {
+            n_passing += 1;
+        }
+    }
+
+    let sep2 = Span::styled("  ", dim);
+    let mut left2_spans: Vec<Span> = vec![
+        Span::styled(format!("{repo_count}r/{branch_count}b"), dim),
+        sep2.clone(),
+        Span::styled(
+            format!("✗ {n_failing}"),
+            if n_failing > 0 {
+                Style::default()
+                    .fg(Color::Rgb(220, 100, 100))
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                dim
+            },
+        ),
+        sep2.clone(),
+        Span::styled(
+            format!("⏳ {n_active}"),
+            if n_active > 0 {
+                Style::default().fg(Color::Yellow)
+            } else {
+                dim
+            },
+        ),
+        sep2.clone(),
+        Span::styled(
+            format!("✓ {n_passing}"),
+            if n_passing > 0 {
+                Style::default().fg(Color::Rgb(100, 180, 100))
+            } else {
+                dim
+            },
+        ),
+        sep2.clone(),
+        Span::styled(format!("· {n_idle}"), dim),
+    ];
     if app.status.paused {
         left2_spans.push(Span::styled(
             "  ⏸ NOTIFS PAUSED",

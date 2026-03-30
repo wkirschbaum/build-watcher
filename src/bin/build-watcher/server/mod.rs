@@ -63,6 +63,13 @@ pub(crate) fn build_watch_snapshot(
             let mut active_runs: Vec<ActiveRunView> = entry
                 .active_runs
                 .iter()
+                .filter(|(_, run)| {
+                    config.map_or(true, |cfg| {
+                        !cfg.ignored_workflows
+                            .iter()
+                            .any(|i| run.workflow.eq_ignore_ascii_case(i))
+                    })
+                })
                 .map(|(run_id, run)| {
                     let elapsed_secs = now
                         .checked_duration_since(run.started_at)
@@ -83,6 +90,13 @@ pub(crate) fn build_watch_snapshot(
             let mut last_builds: Vec<LastBuildView> = entry
                 .last_builds
                 .values()
+                .filter(|lb| {
+                    config.map_or(true, |cfg| {
+                        !cfg.ignored_workflows
+                            .iter()
+                            .any(|i| lb.workflow.eq_ignore_ascii_case(i))
+                    })
+                })
                 .map(|lb| {
                     let age_secs = lb.completed_at.map(|t| unix_now().saturating_sub(t) as f64);
                     let conclusion =

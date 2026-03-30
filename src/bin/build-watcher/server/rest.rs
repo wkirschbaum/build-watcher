@@ -723,9 +723,12 @@ mod tests {
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert!(json["uptime_secs"].as_u64().unwrap() < 5);
-        // Default aggression is Medium (mult=2.0): fallback = (15×2, 30×2) = (30, 60)
-        assert_eq!(json["active_poll_secs"], MIN_ACTIVE_SECS * 2);
-        assert_eq!(json["idle_poll_secs"], 60u64);
+        // Default aggression is Medium (mult=1.5): fallback = (15×1.5, 30×1.5) = (22, 45)
+        assert_eq!(
+            json["active_poll_secs"],
+            (MIN_ACTIVE_SECS as f64 * 1.5) as u64
+        );
+        assert_eq!(json["idle_poll_secs"], (30f64 * 1.5) as u64);
         assert!(json["rate_remaining"].is_null());
     }
 
