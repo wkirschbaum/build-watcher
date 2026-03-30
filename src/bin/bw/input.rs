@@ -480,6 +480,10 @@ impl App {
             KeyCode::Char('C') => {
                 self.open_config_form(daemon);
             }
+            KeyCode::Char('?') => {
+                self.show_help = !self.show_help;
+                self.save_prefs();
+            }
             _ => {}
         }
         QuitAction::None

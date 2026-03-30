@@ -1461,20 +1461,34 @@ pub(crate) fn render_footer(frame: &mut ratatui::Frame, area: ratatui::layout::R
                 Span::styled("[q]", key_style),
                 Span::raw(" quit  "),
                 Span::styled("[Q]", key_style),
-                Span::raw(" stop"),
+                Span::raw(" stop  "),
+                Span::styled("[?]", key_style),
+                Span::raw(" hide"),
             ];
             Paragraph::new(Line::from(spans))
         }
         .style(Style::default().fg(Color::DarkGray)),
     };
-    frame.render_widget(footer, area);
 
-    let version = Paragraph::new(Line::from(Span::styled(
-        concat!("v", env!("CARGO_PKG_VERSION")),
-        Style::default().fg(Color::DarkGray),
-    )))
-    .alignment(ratatui::layout::Alignment::Right);
-    frame.render_widget(version, area);
+    let use_border = app.show_help && matches!(app.input_mode, InputMode::Normal);
+    if use_border {
+        let border_style = Style::default().fg(Color::DarkGray);
+        let block = Block::default()
+            .borders(Borders::TOP)
+            .border_style(border_style);
+        let inner = block.inner(area);
+        let footer = footer.block(block);
+        frame.render_widget(footer, area);
+
+        let version = Paragraph::new(Line::from(Span::styled(
+            concat!("v", env!("CARGO_PKG_VERSION")),
+            Style::default().fg(Color::DarkGray),
+        )))
+        .alignment(ratatui::layout::Alignment::Right);
+        frame.render_widget(version, inner);
+    } else {
+        frame.render_widget(footer, area);
+    }
 }
 
 pub(crate) fn render(frame: &mut ratatui::Frame, app: &App) {
@@ -1495,6 +1509,15 @@ pub(crate) fn render(frame: &mut ratatui::Frame, app: &App) {
     let recent_height = recent_count.min(10) as u16;
     let show_recent = recent_height > 0;
 
+    let needs_input_line = matches!(app.input_mode, InputMode::TextInput { .. });
+    let footer_height = if app.show_help {
+        3 // top border + content + bottom border
+    } else if needs_input_line {
+        1 // just the text input prompt
+    } else {
+        0
+    };
+
     let chunks = if show_recent {
         Layout::default()
             .direction(Direction::Vertical)
@@ -1506,19 +1529,19 @@ pub(crate) fn render(frame: &mut ratatui::Frame, app: &App) {
                 Constraint::Min(0),                // remaining space (pushes recent down)
                 Constraint::Length(1),             // recent separator
                 Constraint::Length(recent_height), // recent panel
-                Constraint::Length(1),             // footer
+                Constraint::Length(footer_height), // footer
             ])
             .split(area)
     } else {
         Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(3),          // header
-                Constraint::Length(1),          // column headings
-                Constraint::Length(table_rows), // table body (exact)
-                Constraint::Length(3),          // detail bar (border + content + border)
-                Constraint::Min(0),             // remaining space
-                Constraint::Length(1),          // footer
+                Constraint::Length(3),             // header
+                Constraint::Length(1),             // column headings
+                Constraint::Length(table_rows),    // table body (exact)
+                Constraint::Length(3),             // detail bar (border + content + border)
+                Constraint::Min(0),                // remaining space
+                Constraint::Length(footer_height), // footer
             ])
             .split(area)
     };
@@ -1528,8 +1551,10 @@ pub(crate) fn render(frame: &mut ratatui::Frame, app: &App) {
     render_detail_bar(frame, chunks[3], app, &flat);
     if show_recent {
         render_recent_panel(frame, chunks[5], chunks[6], app, &cw);
-        render_footer(frame, chunks[7], app);
-    } else {
+        if footer_height > 0 {
+            render_footer(frame, chunks[7], app);
+        }
+    } else if footer_height > 0 {
         render_footer(frame, chunks[5], app);
     }
 

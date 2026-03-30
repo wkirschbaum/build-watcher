@@ -147,6 +147,13 @@ pub(crate) struct TuiPrefs {
     /// Per-repo expand level. Missing entries default to `Full`.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub(crate) expand: HashMap<String, ExpandLevel>,
+    /// Whether the help bar is visible at the bottom.
+    #[serde(default = "default_true")]
+    pub(crate) show_help: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for TuiPrefs {
@@ -156,6 +163,7 @@ impl Default for TuiPrefs {
             sort_ascending: true,
             group_by: GroupBy::default(),
             expand: HashMap::new(),
+            show_help: true,
         }
     }
 }
@@ -200,6 +208,8 @@ pub(crate) struct App {
     pub(crate) expand: HashMap<String, ExpandLevel>,
     /// Tag name of a newer release, if one was found by the background checker.
     pub(crate) update_available: Option<String>,
+    /// Whether to show the help bar at the bottom.
+    pub(crate) show_help: bool,
 }
 
 impl App {
@@ -226,6 +236,7 @@ impl App {
             group_by: prefs.group_by,
             expand: prefs.expand,
             update_available: None,
+            show_help: prefs.show_help,
         }
     }
 
@@ -286,6 +297,7 @@ impl App {
             sort_ascending: self.sort_ascending,
             group_by: self.group_by,
             expand,
+            show_help: self.show_help,
         }
         .save();
     }
@@ -1088,6 +1100,7 @@ mod tests {
                 ("alice/app".to_string(), ExpandLevel::Collapsed),
                 ("bob/lib".to_string(), ExpandLevel::Branches),
             ]),
+            show_help: false,
         };
         save_json(&path, &prefs).unwrap();
         let loaded: TuiPrefs = load_json(&path).unwrap();
@@ -1178,6 +1191,7 @@ mod tests {
             sort_ascending: false,
             group_by: GroupBy::Branch,
             expand: HashMap::from([("repo/x".to_string(), ExpandLevel::Collapsed)]),
+            show_help: true,
         };
         // Write valid backup, corrupt primary.
         std::fs::write(&bak, serde_json::to_string(&prefs).unwrap()).unwrap();
