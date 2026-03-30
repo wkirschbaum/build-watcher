@@ -38,7 +38,53 @@ pub enum PersistError {
     },
 }
 
+/// Complete an interrupted `save_json` by promoting a valid `.draft` file.
+///
+/// `save_json` writes data to a `.draft`, then renames `primary → .bak`,
+/// then renames `.draft → primary`. If the process is killed between the two
+/// renames, the primary is gone and the newest data sits in `.draft`.
+///
+/// This function checks for that state and finishes the rename so that the
+/// subsequent `try_parse_file(path)` sees the latest data instead of falling
+/// back to the (older) backup.
+pub(crate) fn recover_draft(path: &Path) {
+    let draft = path.with_extension("json.draft");
+    if !draft.exists() {
+        return;
+    }
+
+    // If primary exists and parses as valid JSON, the draft is stale — remove it.
+    if path.exists()
+        && let Ok(data) = std::fs::read_to_string(path)
+        && serde_json::from_str::<serde_json::Value>(&data).is_ok()
+    {
+        tracing::debug!("Removing stale draft {}", draft.display());
+        let _ = std::fs::remove_file(&draft);
+        return;
+    }
+
+    // Primary is missing or corrupt — try to promote the draft.
+    match std::fs::read_to_string(&draft) {
+        Ok(data) if serde_json::from_str::<serde_json::Value>(&data).is_ok() => {
+            tracing::warn!(
+                "Recovering interrupted save: promoting {} to {}",
+                draft.display(),
+                path.display()
+            );
+            if let Err(e) = std::fs::rename(&draft, path) {
+                tracing::error!("Failed to promote draft: {e}");
+            }
+        }
+        _ => {
+            tracing::warn!("Removing corrupt draft {}", draft.display());
+            let _ = std::fs::remove_file(&draft);
+        }
+    }
+}
+
 pub fn load_json<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
+    recover_draft(path);
+
     if let Some(val) = try_parse_file::<T>(path) {
         return Some(val);
     }

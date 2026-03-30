@@ -29,40 +29,49 @@ cargo clippy                # Lint
 
 ### Key files
 
-- `src/main.rs` — Entry point, wires up config, watches, event bus, and server
-- `src/server/` — Server module directory:
-  - `mod.rs` — App state, axum router setup, snapshot building
-  - `mcp.rs` — MCP tool handlers (`BuildWatcher` struct)
-  - `rest.rs` — REST/SSE endpoints (`/status`, `/stats`, `/events`, `/pause`, `/rerun`)
-  - `actions.rs` — MCP tool action implementations
+- `src/bin/build-watcher/main.rs` — Daemon entry point, wires up config, watches, event bus, and server
+- `src/bin/build-watcher/server/` — Server module directory:
+  - `mod.rs` — `DaemonState`, axum router setup, `build_watch_snapshot()`, instance lock, `serve()`
+  - `mcp.rs` — MCP tool handlers (`BuildWatcher` struct, 11 tools)
+  - `rest.rs` — REST/SSE endpoints (`/status`, `/stats`, `/events`, `/pause`, `/rerun`, etc.)
+  - `actions.rs` — MCP tool action implementations, `persist_config()`
   - `schema.rs` — JSON schema definitions for tool parameters
-- `src/watcher/` — Watch lifecycle module directory:
+- `src/bin/build-watcher/notification.rs` — Notification handler; subscribes to event bus, debounces, coalesces, throttles, and dispatches desktop notifications
+- `src/bin/build-watcher/register.rs` — MCP server registration in `~/.claude.json` (invoked via `--register` flag)
+- `src/bin/build-watcher/platform/` — `Notifier` trait + backends:
+  - `mod.rs` — Platform detection, `Notification` struct, `send()` singleton
+  - `linux/mod.rs` — D-Bus via `zbus` (`org.freedesktop.Notifications`)
+  - `macos/mod.rs` — `terminal-notifier` (preferred, clickable links) → `osascript` fallback (URL in body)
+- `src/bin/bw/` — `bw` TUI dashboard:
+  - `main.rs` — Entry point, terminal setup, event loop, daemon discovery
+  - `app.rs` — App state, event application, sort/group enums, terminal title
+  - `input.rs` — Keyboard input handling
+  - `render.rs` — TUI rendering, display rows, sorting, grouping, detail bar, history popup
+  - `client.rs` — HTTP client for daemon communication, SSE streaming
+  - `forms.rs` — Form/picker UI components
+  - `update.rs` — Background update checker, self-update via GitHub releases
+- `src/config/` — Configuration module:
+  - `mod.rs` — `load_and_normalize()`, `save_config()`, lenient recovery, draft promotion
+  - `types.rs` — `Config`, `RepoConfig`, `NotificationLevel`, `PollAggression`, `QuietHours`
+  - `resolve.rs` — `notifications_for()` resolution (global → repo → branch), quiet hours check
+- `src/watcher/` — Watch lifecycle module:
   - `mod.rs` — Type aliases (`Watches`, `SharedConfig`, etc.), `is_paused()`, `count_api_calls()`, `filter_runs()`, re-exports
   - `types.rs` — `WatchKey`, `ActiveRun`, `WatchEntry`, `PersistedWatch`, persistence helpers, `last_failed_build()`
-  - `poller.rs` — `Poller` async task, poll loop, active run tracking, new run detection
+  - `repo_poller.rs` — `RepoPoller` async task, poll loop, active run tracking, new run detection, dead repo removal
   - `startup.rs` — `WatcherHandle`, `start_watch()`, `startup_watches()`, recovery logic
   - `tests.rs` — Mock GitHub client, unit and integration tests
 - `src/events.rs` — `EventBus` (broadcast channel), `WatchEvent` and `RunSnapshot` types (pure, no I/O)
-- `src/config.rs` — Config structs, crash-safe JSON persistence helpers
 - `src/github.rs` — `gh` CLI wrappers, `RunInfo`/`HistoryEntry` types, input validation, GitHub URL helpers
 - `src/format.rs` — Duration, age, and truncation formatting
 - `src/rate_limiter.rs` — API rate-limit budget computation and poll interval scaling
 - `src/history.rs` — Build history management (per repo/branch, capped ring buffer)
-- `src/persistence.rs` — `Persistence` trait abstraction (file I/O vs. null for tests)
-- `src/register.rs` — MCP server registration in `~/.claude.json` (invoked via `--register` flag)
-- `src/notification.rs` — Daemon-only notification handler; subscribes to the event bus and dispatches platform notifications
+- `src/persistence.rs` — `Persistence` trait, crash-safe `save_json`/`load_json`, draft recovery (`recover_draft`)
 - `src/status.rs` — Shared HTTP response types (`StatusResponse`, `StatsResponse`) used by both daemon and TUI
-- `src/bin/bw/` — `bw` TUI dashboard module directory:
-  - `main.rs` — Entry point, terminal setup, event loop, daemon discovery
-  - `app.rs` — App state, input handling, event application
-  - `client.rs` — HTTP client for daemon communication, SSE streaming
-  - `render.rs` — TUI rendering, display rows, sorting, grouping
-  - `update.rs` — Background update checker, self-update via GitHub releases
-- `src/platform/` — `Notifier` trait + backends (Linux: D-Bus via `zbus`; macOS: `terminal-notifier` → `osascript` fallback)
+- `src/dirs.rs` — `config_dir()` and `state_dir()` helpers
 
 ### How it works
 
-The `BuildWatcher` struct implements 10 MCP tools. When a repo is watched, it spawns an async tokio task per repo/branch that polls GitHub via the `gh` CLI. Events are emitted onto a broadcast `EventBus`; a notification handler subscribes and dispatches desktop notifications based on config and pause/quiet-hours state.
+The `BuildWatcher` struct implements 11 MCP tools. When a repo is watched, it spawns an async tokio task per repo that polls GitHub via the `gh` CLI. Events are emitted onto a broadcast `EventBus`; a notification handler subscribes, debounces (3s per repo/branch/kind), coalesces multiple workflows into summary notifications, throttles (10/60s), and dispatches desktop notifications based on config and pause/quiet-hours state.
 
 **Polling intervals:** Minimum 15s when builds are active, 60s when idle. Intervals scale dynamically based on the GitHub API rate limit. The `gh` CLI must be authenticated (`gh auth login`).
 
@@ -71,9 +80,9 @@ The `BuildWatcher` struct implements 10 MCP tools. When a repo is watched, it sp
 - Watch state: `~/.local/state/build-watcher/watches.json` — last seen run IDs and completed builds
 - Actual port: `~/.local/state/build-watcher/port`
 
-**Safe JSON writes:** Config and state are written via draft → verify → rename with automatic backups to prevent corruption.
+**Safe JSON writes:** Config and state are written via draft → fsync → verify → rename with automatic backups to prevent corruption. On load, orphaned `.draft` files from interrupted saves are automatically promoted before falling back to `.bak` backups.
 
-**Crate layout:** `src/lib.rs` exports `config`, `events`, `format`, `github`, `history`, `persistence`, `rate_limiter`, `status`, `watcher` as the `build_watcher` library crate. The `build-watcher` daemon binary and the `bw` CLI binary both depend on this lib. Daemon-only code (`platform/`, `notification.rs`, `server/`, `register.rs`) stays alongside `main.rs`.
+**Crate layout:** `src/lib.rs` exports `config`, `dirs`, `events`, `format`, `github`, `history`, `persistence`, `rate_limiter`, `status`, `watcher` as the `build_watcher` library crate. The `build-watcher` daemon binary and the `bw` CLI binary both depend on this lib. Daemon-only code (`platform/`, `notification.rs`, `server/`, `register.rs`) lives under `src/bin/build-watcher/`.
 
 ## Design Principles
 

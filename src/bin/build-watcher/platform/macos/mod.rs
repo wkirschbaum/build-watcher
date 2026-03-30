@@ -85,7 +85,9 @@ impl Notifier for TerminalNotifier {
 // -- osascript fallback --
 
 /// Fallback when `terminal-notifier` is not installed.
-/// URL and group are not supported by AppleScript notifications.
+/// Group is not supported by AppleScript notifications.
+/// The "Open" button on `display notification` opens Script Editor by default,
+/// so we append the URL to the body text as a workaround.
 struct AppleScriptNotifier;
 
 impl Notifier for AppleScriptNotifier {
@@ -96,7 +98,10 @@ impl Notifier for AppleScriptNotifier {
     fn send(&self, n: &Notification) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         let sound = notification_sound(n.level);
         let title = escape_applescript(&n.title);
-        let body = escape_applescript(&n.body);
+        let mut body = escape_applescript(&n.body);
+        if let Some(url) = &n.url {
+            body = format!("{body}\n{}", escape_applescript(url));
+        }
         let script =
             format!(r#"display notification "{body}" with title "{title}" sound name "{sound}""#);
         match Command::new("osascript")
@@ -119,6 +124,11 @@ pub async fn detect() -> Box<dyn Notifier> {
     if TerminalNotifier::is_available() {
         Box::new(TerminalNotifier)
     } else {
+        tracing::info!(
+            "terminal-notifier not found; using osascript fallback. \
+             Install terminal-notifier (`brew install terminal-notifier`) \
+             for clickable notification links."
+        );
         Box::new(AppleScriptNotifier)
     }
 }

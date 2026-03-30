@@ -34,7 +34,8 @@ A background daemon that monitors GitHub Actions builds and sends desktop notifi
 
 #### macOS
 
-- `osascript` — pre-installed. Optionally install `terminal-notifier` for richer notifications.
+- `osascript` — pre-installed. Notifications are sent via AppleScript; the GitHub link is shown in the notification body.
+- Optionally install [`terminal-notifier`](https://github.com/julienXX/terminal-notifier) (`brew install terminal-notifier`) for clickable notification links that open directly in the browser.
 - The installer sets up a launchd service.
 
 ## Installation
@@ -72,14 +73,13 @@ bw
 ```
 
 ```
-build-watcher — up 2h 15m                    poll 15s/60s  API 4521/5000 (90%)  reset 42m
-7 repos, 3 active
-┌──────────────────────────────────────────────────────────────────────────────┐
-│ REPO ↑              BRANCH    STATUS          WORKFLOW       TITLE           ELAPSED / AGE │
-│ floatpays/benefits  main      ⏳ in_progress  CI             Fix login bug   1m 12s        │
-│ floatpays/moneyclub main      ✗ failure       CI             Update deps     3m ago        │
-│ wkirschbaum/build…  main      ✓ success       CI             Add TUI         2h ago        │
-└──────────────────────────────────────────────────────────────────────────────────────────▼┘
+build-watcher — up 2h 15m                    poll 15s · 60s [medium]  API 4521 · 5000 (90%)  reset 42m
+┌──────────────────────────────────────────────────────────────────────────────────────────────┐
+│ REPO ↑              BRANCH    STATUS          WORKFLOW       TITLE             ELAPSED / AGE │
+│ floatpays/benefits  main      ⏳ in_progress  CI             Fix login bug     1m 12s        │
+│ floatpays/moneyclub main      ✗ failure       CI             Update deps       3m ago        │
+│ wkirschbaum/build…  main      ✓ success       CI             Add TUI           2h ago        │
+└──────────────────────────────────────────────────────────────────────────────────────────────▼┘
  floatpays/moneyclub  ·  main  ·  failure  ·  run 12345  ·  failed: Build / Run tests
 ─[↑↓/jk] nav  [e/E] expand  │  [a] add  [b] branch  [d] del  [o/O] open  [r/R] rerun  │  [n/N] mute  [p] pause  [h] hist  [H] recent  │  [s/S] sort  [g/G] group  [C] config  │  [q] quit  [Q] stop  [?] hide
 ```
@@ -130,6 +130,7 @@ From an MCP client, use natural language or call tools directly:
 | `rerun_build` | Rerun a failed build (specific ID or last failed) |
 | `build_history` | Show recent builds for a repo with duration and age |
 | `get_stats` | Show live stats (uptime, rate limit, polling, pause state, config path) |
+| `set_poll_aggression` | Set how much of the GitHub rate-limit budget the daemon uses per hour (`low`/`medium`/`high`) |
 
 ## Configuration
 
@@ -138,10 +139,15 @@ Config lives at `~/.config/build-watcher/config.json`:
 ```json
 {
   "default_branches": ["main"],
+  "poll_aggression": "medium",
   "notifications": {
     "build_started": "normal",
     "build_success": "normal",
     "build_failure": "critical"
+  },
+  "quiet_hours": {
+    "start": "22:00",
+    "end": "07:00"
   },
   "ignored_workflows": ["Semgrep"],
   "repos": {
@@ -150,6 +156,7 @@ Config lives at `~/.config/build-watcher/config.json`:
       "workflows": ["CI"]
     },
     "wkirschbaum/elixir-ts-mode": {
+      "alias": "ts-mode",
       "branches": ["main", "release"],
       "notifications": {
         "build_started": "off"
@@ -167,6 +174,15 @@ Config lives at `~/.config/build-watcher/config.json`:
   }
 }
 ```
+
+| Field | Description |
+| --- | --- |
+| `default_branches` | Branches watched when a repo has no explicit branch config (default: `["main"]`) |
+| `poll_aggression` | Rate-limit budget usage: `"low"` (≤10%), `"medium"` (≤25%, default), `"high"` (≤50%) |
+| `notifications` | Global per-event notification levels |
+| `quiet_hours` | Time window (local time, 24h format) during which non-critical notifications are suppressed |
+| `ignored_workflows` | Workflow names hidden from the TUI and excluded from notifications |
+| `repos` | Per-repo config: `branches`, `workflows` (allow-list), `alias` (display name), `notifications` (overrides), `branch_notifications` |
 
 Notification levels: `"off"`, `"low"`, `"normal"`, `"critical"`. Branch overrides take priority over repo overrides, which take priority over global settings.
 

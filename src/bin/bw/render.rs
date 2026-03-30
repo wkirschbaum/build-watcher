@@ -1233,8 +1233,7 @@ fn render_display_row<'a>(
                     String::new()
                 };
 
-                // Color-coded status: active/passing/failing — dimmed when zero.
-                // Idle count appended only when > 0.
+                // Color-coded status: active/passing/failing/idle — dimmed when zero.
                 let status_cell = {
                     let dim = |v: usize, s: Style| {
                         if v > 0 {
@@ -1244,7 +1243,7 @@ fn render_display_row<'a>(
                         }
                     };
                     let sep = Span::styled("·", Style::default().fg(Color::DarkGray));
-                    let mut spans = vec![
+                    let spans = vec![
                         Span::styled(
                             format!("{active}"),
                             dim(*active, Style::default().fg(COLOR_ACTIVE)),
@@ -1259,14 +1258,9 @@ fn render_display_row<'a>(
                             format!("{failing}"),
                             dim(*failing, Style::default().fg(COLOR_FAILURE)),
                         ),
+                        sep,
+                        Span::styled(format!("{idle}"), Style::default().fg(Color::DarkGray)),
                     ];
-                    if *idle > 0 {
-                        spans.push(sep);
-                        spans.push(Span::styled(
-                            format!("{idle}"),
-                            Style::default().fg(Color::DarkGray),
-                        ));
-                    }
                     Cell::from(Line::from(spans))
                 };
 
@@ -1538,31 +1532,35 @@ fn render_detail_bar(
             } else {
                 s.push(detail_sep());
                 s.push(Span::styled(format!("{} branches", branch_count), dim));
-                if *failing > 0 {
-                    s.push(detail_sep());
-                    s.push(Span::styled(
-                        format!("{} failing", failing),
-                        Style::default().fg(COLOR_FAILURE),
-                    ));
-                }
-                if *active > 0 {
-                    s.push(detail_sep());
-                    s.push(Span::styled(
-                        format!("{} active", active),
-                        Style::default().fg(Color::Yellow),
-                    ));
-                }
-                if *passing > 0 {
-                    s.push(detail_sep());
-                    s.push(Span::styled(
-                        format!("{} passing", passing),
-                        Style::default().fg(COLOR_SUCCESS),
-                    ));
-                }
-                if *idle > 0 {
-                    s.push(detail_sep());
-                    s.push(Span::styled(format!("{} idle", idle), dim));
-                }
+                s.push(detail_sep());
+                s.push(Span::styled(
+                    format!("{} pending", active),
+                    if *active > 0 {
+                        Style::default().fg(Color::Yellow)
+                    } else {
+                        dim
+                    },
+                ));
+                s.push(detail_sep());
+                s.push(Span::styled(
+                    format!("{} success", passing),
+                    if *passing > 0 {
+                        Style::default().fg(COLOR_SUCCESS)
+                    } else {
+                        dim
+                    },
+                ));
+                s.push(detail_sep());
+                s.push(Span::styled(
+                    format!("{} failure", failing),
+                    if *failing > 0 {
+                        Style::default().fg(COLOR_FAILURE)
+                    } else {
+                        dim
+                    },
+                ));
+                s.push(detail_sep());
+                s.push(Span::styled(format!("{} idle", idle), dim));
             }
             s
         }

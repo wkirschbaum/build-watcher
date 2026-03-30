@@ -6,7 +6,7 @@ pub use types::*;
 use std::path::Path;
 
 use crate::dirs::config_dir;
-use crate::persistence::{PersistError, save_json, save_json_async, try_parse_file};
+use crate::persistence::{PersistError, recover_draft, save_json, save_json_async, try_parse_file};
 
 /// Attempt to load a Config by merging each top-level field from the file into
 /// `Config::default()`, falling back to the default when a field is missing or
@@ -82,6 +82,7 @@ fn load_config_lenient(path: &Path) -> Option<Config> {
 /// primary with backup data until the user has verified it).
 fn load_config() -> (Config, bool) {
     let path = config_dir().join("config.json");
+    recover_draft(&path);
 
     if let Some(val) = try_parse_file::<Config>(&path) {
         // Only re-save if a migration or correction is needed (checked by caller).
@@ -188,7 +189,7 @@ pub async fn save_config_async(config: &Config) -> Result<(), PersistError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::persistence::{load_json, save_json};
+    use crate::persistence::{load_json, recover_draft, save_json};
 
     #[test]
     fn save_load_roundtrip() {
@@ -525,5 +526,96 @@ mod tests {
         let json = serde_json::to_string(&cfg).unwrap();
         let loaded: Config = serde_json::from_str(&json).unwrap();
         assert_eq!(loaded.schema_version, CURRENT_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn draft_promoted_when_primary_missing() {
+        let dir =
+            std::env::temp_dir().join(format!("bw-test-draft-recover-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        let draft = dir.join("config.json.draft");
+
+        // Simulate interrupted save: draft exists, primary does not.
+        let mut config = Config::default();
+        config
+            .repos
+            .insert("alice/app".to_string(), RepoConfig::default());
+        std::fs::write(&draft, serde_json::to_string_pretty(&config).unwrap()).unwrap();
+
+        recover_draft(&path);
+        assert!(path.exists(), "draft should be promoted to primary");
+        assert!(!draft.exists(), "draft should be removed after promotion");
+
+        let loaded: Config = load_json(&path).unwrap();
+        assert!(loaded.repos.contains_key("alice/app"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn draft_preferred_over_backup_when_primary_missing() {
+        let dir = std::env::temp_dir().join(format!("bw-test-draft-vs-bak-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        let draft = dir.join("config.json.draft");
+        let bak = dir.join("config.json.bak");
+
+        // Simulate interrupted save: draft has latest data, bak has older data.
+        let mut new_config = Config::default();
+        new_config
+            .repos
+            .insert("alice/app".to_string(), RepoConfig::default());
+        new_config
+            .repos
+            .insert("bob/lib".to_string(), RepoConfig::default());
+        std::fs::write(&draft, serde_json::to_string_pretty(&new_config).unwrap()).unwrap();
+
+        let old_config = Config::default(); // no repos
+        std::fs::write(&bak, serde_json::to_string_pretty(&old_config).unwrap()).unwrap();
+
+        let loaded: Config = load_json(&path).unwrap();
+        assert_eq!(loaded.repos.len(), 2, "should load from draft, not backup");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn stale_draft_removed_when_primary_valid() {
+        let dir = std::env::temp_dir().join(format!("bw-test-stale-draft-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        let draft = dir.join("config.json.draft");
+
+        // Primary is valid, draft is leftover from a completed save.
+        let config = Config::default();
+        std::fs::write(&path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
+        std::fs::write(&draft, r#"{"stale": true}"#).unwrap();
+
+        recover_draft(&path);
+        assert!(!draft.exists(), "stale draft should be removed");
+        assert!(path.exists());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn corrupt_draft_removed() {
+        let dir = std::env::temp_dir().join(format!("bw-test-bad-draft-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        let draft = dir.join("config.json.draft");
+
+        // No primary, corrupt draft — should fall through cleanly.
+        std::fs::write(&draft, "not json {{{").unwrap();
+
+        recover_draft(&path);
+        assert!(!draft.exists(), "corrupt draft should be removed");
+        assert!(
+            !path.exists(),
+            "no primary should be created from corrupt draft"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
