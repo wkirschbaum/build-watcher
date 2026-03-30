@@ -46,6 +46,11 @@ impl Config {
             .map_or(&self.default_branches, |r| r.branches.as_slice())
     }
 
+    /// Returns `true` if the repo has explicit branch configuration (not using global defaults).
+    pub fn has_explicit_branches(&self, repo: &str) -> bool {
+        self.repos.get(repo).is_some_and(|r| !r.branches.is_empty())
+    }
+
     /// Returns `true` if the current local time falls within the configured quiet hours.
     pub fn is_in_quiet_hours(&self) -> bool {
         let Some(qh) = &self.quiet_hours else {

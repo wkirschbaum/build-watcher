@@ -38,10 +38,38 @@ pub(crate) fn format_outcomes(outcomes: &[ActionOutcome], sep: &str) -> String {
 pub(crate) async fn do_watch_builds(state: &DaemonState, repos: &[String]) -> Vec<ActionOutcome> {
     let repo_branches: Vec<(String, Vec<String>)> = {
         let cfg = state.config.lock().await;
-        repos
-            .iter()
-            .map(|repo| (repo.clone(), cfg.branches_for(repo).to_vec()))
-            .collect()
+        let mut pairs = Vec::new();
+        for repo in repos {
+            let mut branches = Vec::new();
+
+            // Always resolve the GitHub default branch as the primary.
+            match state.handle.github.default_branch(repo).await {
+                Ok(gh_default) => {
+                    tracing::info!(repo = %repo, branch = %gh_default, "Resolved default branch");
+                    branches.push(gh_default);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        repo = %repo, error = %e,
+                        "Failed to resolve default branch, falling back to config"
+                    );
+                    // Fall back to configured defaults only when GitHub is unreachable.
+                    branches.extend(cfg.branches_for(repo).iter().cloned());
+                }
+            }
+
+            // Add any explicitly configured per-repo branches (they're intentional).
+            if cfg.has_explicit_branches(repo) {
+                for b in cfg.branches_for(repo) {
+                    if !branches.contains(b) {
+                        branches.push(b.clone());
+                    }
+                }
+            }
+
+            pairs.push((repo.clone(), branches));
+        }
+        pairs
     };
 
     let mut results = Vec::new();

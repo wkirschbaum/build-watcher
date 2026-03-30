@@ -263,6 +263,8 @@ pub trait GitHubClient: Send + Sync + 'static {
     async fn rate_limit(&self) -> Result<RateLimit, GhError>;
     /// Fetch tag names for a repo (used to exclude tags from branch discovery).
     async fn list_tags(&self, repo: &str) -> Result<Vec<String>, GhError>;
+    /// Fetch the default branch name for a repo (e.g. "main" or "master").
+    async fn default_branch(&self, repo: &str) -> Result<String, GhError>;
 }
 
 /// Real GitHub client that shells out to the `gh` CLI.
@@ -414,6 +416,31 @@ impl GitHubClient for GhCliClient {
             .filter(|l| !l.is_empty())
             .map(|l| l.to_string())
             .collect())
+    }
+
+    #[tracing::instrument(skip_all, fields(%repo))]
+    async fn default_branch(&self, repo: &str) -> Result<String, GhError> {
+        let stdout = gh_exec(
+            repo,
+            &[
+                "repo",
+                "view",
+                repo,
+                "--json",
+                "defaultBranchRef",
+                "--jq",
+                ".defaultBranchRef.name",
+            ],
+        )
+        .await?;
+        let name = String::from_utf8_lossy(&stdout).trim().to_string();
+        if name.is_empty() {
+            Err(GhError::MissingFields {
+                repo: repo.to_string(),
+            })
+        } else {
+            Ok(name)
+        }
     }
 }
 
