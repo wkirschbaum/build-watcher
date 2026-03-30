@@ -1,11 +1,10 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt::Write as _;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::sync::{Mutex, broadcast};
+use tokio::sync::broadcast;
 
-use build_watcher::config::{self, NotificationLevel};
+use build_watcher::config::{self, NotificationLevel, SharedConfigManager};
 use build_watcher::events::WatchEvent;
 use build_watcher::format;
 use build_watcher::github;
@@ -180,6 +179,67 @@ impl ThrottleWindow {
     }
 }
 
+// -- Transition tracking --
+
+/// Key for tracking per-workflow notification state.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct TransitionKey {
+    repo: String,
+    branch: String,
+    workflow: String,
+}
+
+/// Tracks the last conclusion we notified about per (repo, branch, workflow).
+/// Only fires a notification when the conclusion *changes* (or on first occurrence).
+struct TransitionTracker {
+    last: HashMap<TransitionKey, RunConclusion>,
+}
+
+impl TransitionTracker {
+    fn new() -> Self {
+        Self {
+            last: HashMap::new(),
+        }
+    }
+
+    /// Returns `true` if this event represents a status transition worth notifying about.
+    fn should_notify(&self, event: &WatchEvent) -> bool {
+        match event {
+            // RunStarted: suppress — the user only wants transition notifications.
+            WatchEvent::RunStarted(_) => false,
+            WatchEvent::RunCompleted {
+                run, conclusion, ..
+            } => {
+                let key = TransitionKey {
+                    repo: run.repo.clone(),
+                    branch: run.branch.clone(),
+                    workflow: run.workflow.clone(),
+                };
+                match self.last.get(&key) {
+                    Some(prev) => prev != conclusion,
+                    None => true,
+                }
+            }
+            WatchEvent::StatusChanged { .. } => false,
+        }
+    }
+
+    /// Record that we notified about this event's conclusion.
+    fn record(&mut self, event: &WatchEvent) {
+        if let WatchEvent::RunCompleted {
+            run, conclusion, ..
+        } = event
+        {
+            let key = TransitionKey {
+                repo: run.repo.clone(),
+                branch: run.branch.clone(),
+                workflow: run.workflow.clone(),
+            };
+            self.last.insert(key, conclusion.clone());
+        }
+    }
+}
+
 // -- Helpers --
 
 /// Numeric rank for comparing notification levels (higher = more urgent).
@@ -229,11 +289,11 @@ pub(crate) fn effective_level(event: &WatchEvent, cfg: &config::Config) -> Notif
 /// Check suppression (pause, quiet hours, level=Off) and return dispatch info if not suppressed.
 async fn check_suppression(
     event: &WatchEvent,
-    config: &Arc<Mutex<config::Config>>,
+    config: &SharedConfigManager,
     pause: &PauseState,
 ) -> Option<(String, NotificationLevel)> {
     let paused = is_paused(pause).await;
-    let cfg = config.lock().await;
+    let cfg = config.read().await;
     let level = effective_level(event, &cfg);
     let suppressed = level == NotificationLevel::Off
         || (level != NotificationLevel::Critical && (paused || cfg.is_in_quiet_hours()));
@@ -406,11 +466,12 @@ async fn handle_notification(event: WatchEvent, repo_label: &str, level: Notific
 /// with debounce (3s per repo/branch/kind) and throttle (10/60s).
 pub async fn run_notification_handler(
     mut rx: broadcast::Receiver<WatchEvent>,
-    config: Arc<Mutex<config::Config>>,
+    config: SharedConfigManager,
     pause: PauseState,
 ) {
     let mut buffer = DebounceBuffer::new();
     let mut throttle = ThrottleWindow::new();
+    let mut transitions = TransitionTracker::new();
 
     loop {
         // Determine sleep target: next deadline, or far future if buffer is empty.
@@ -422,7 +483,8 @@ pub async fn run_notification_handler(
             result = rx.recv() => {
                 match result {
                     Ok(event) => {
-                        if let Some((repo_label, level)) = check_suppression(&event, &config, &pause).await
+                        if transitions.should_notify(&event)
+                            && let Some((repo_label, level)) = check_suppression(&event, &config, &pause).await
                             && let Some(key) = DebounceKey::from_event(&event)
                         {
                             buffer.insert(
@@ -448,6 +510,9 @@ pub async fn run_notification_handler(
         // stream of recv events cannot starve pending deadlines.
         let expired = buffer.pop_expired(Instant::now());
         for (key, events) in expired {
+            for e in &events {
+                transitions.record(&e.event);
+            }
             dispatch_coalesced(key, events, &mut throttle).await;
         }
     }
@@ -456,6 +521,9 @@ pub async fn run_notification_handler(
     if !buffer.is_empty() {
         let expired = buffer.pop_expired(Instant::now() + DEBOUNCE_DELAY);
         for (key, events) in expired {
+            for e in &events {
+                transitions.record(&e.event);
+            }
             dispatch_coalesced(key, events, &mut throttle).await;
         }
     }
@@ -785,5 +853,61 @@ mod tests {
             to: RunStatus::InProgress,
         };
         assert_eq!(effective_level(&status, &cfg), Off);
+    }
+
+    // -- TransitionTracker tests --
+
+    #[test]
+    fn transition_suppresses_run_started() {
+        let tracker = TransitionTracker::new();
+        let event = WatchEvent::RunStarted(snap());
+        assert!(!tracker.should_notify(&event));
+    }
+
+    #[test]
+    fn transition_allows_first_completion() {
+        let tracker = TransitionTracker::new();
+        let event = completed(RunConclusion::Success);
+        assert!(tracker.should_notify(&event));
+    }
+
+    #[test]
+    fn transition_suppresses_same_conclusion() {
+        let mut tracker = TransitionTracker::new();
+        let event = completed(RunConclusion::Success);
+        assert!(tracker.should_notify(&event));
+        tracker.record(&event);
+        // Same conclusion again — suppress.
+        let event2 = completed(RunConclusion::Success);
+        assert!(!tracker.should_notify(&event2));
+    }
+
+    #[test]
+    fn transition_allows_changed_conclusion() {
+        let mut tracker = TransitionTracker::new();
+        let success = completed(RunConclusion::Success);
+        tracker.record(&success);
+        // Different conclusion — notify.
+        let failure = completed(RunConclusion::Failure);
+        assert!(tracker.should_notify(&failure));
+    }
+
+    #[test]
+    fn transition_tracks_per_workflow() {
+        let mut tracker = TransitionTracker::new();
+        let ci_success = completed(RunConclusion::Success);
+        tracker.record(&ci_success);
+
+        // Different workflow — should notify even with same conclusion.
+        let mut lint_snap = snap();
+        lint_snap.workflow = "Lint".to_string();
+        let lint_success = WatchEvent::RunCompleted {
+            run: lint_snap,
+            conclusion: RunConclusion::Success,
+            elapsed: None,
+            failing_steps: None,
+            failing_job_id: None,
+        };
+        assert!(tracker.should_notify(&lint_success));
     }
 }

@@ -14,7 +14,7 @@ use crate::history::{SharedHistory, push_build};
 use crate::persistence::Persistence;
 
 use super::repo_poller::RepoPoller;
-use super::types::{ActiveRun, WatchEntry, WatchKey};
+use super::types::{ActiveRun, PersistedWatches, WatchEntry, WatchKey};
 use super::{RateLimitState, SharedConfig, Watches, filter_runs};
 
 /// How often the centralized rate-limit refresh task runs.
@@ -44,6 +44,7 @@ impl WatcherHandle {
         github: Arc<dyn GitHubClient>,
         persistence: Arc<dyn Persistence>,
         history: SharedHistory,
+        config_changed: Arc<Notify>,
     ) -> Self {
         Self {
             tracker: TaskTracker::new(),
@@ -52,7 +53,7 @@ impl WatcherHandle {
             github,
             persistence,
             history,
-            config_changed: Arc::new(Notify::new()),
+            config_changed,
             active_repo_pollers: Arc::new(Mutex::new(HashSet::new())),
         }
     }
@@ -110,7 +111,7 @@ pub async fn start_watch(
     }
 
     let (workflow_filter, ignored_workflows): (Vec<String>, Vec<String>) = {
-        let cfg = config.lock().await;
+        let cfg = config.read().await;
         (
             cfg.workflows_for(repo).to_vec(),
             cfg.ignored_workflows.clone(),
@@ -232,19 +233,42 @@ pub(super) async fn spawn_repo_poller(
 
 // -- Startup --
 
+/// Start watches for all repos/branches defined in config.
+///
+/// Config is the single source of truth for what to watch. watches.json provides
+/// runtime state (last_seen_run_id, last_builds) for repos that exist in config;
+/// entries in watches.json that are not in config are ignored (stale state).
 pub async fn startup_watches(
     watches: &Watches,
     config: &SharedConfig,
     handle: &WatcherHandle,
     rate_limit: &RateLimitState,
+    persisted: PersistedWatches,
 ) {
+    // Build the set of WatchKeys from config, resolving branches via GitHub.
+    let config_keys = resolve_config_keys(config, handle).await;
+
+    // Seed in-memory watches from persisted state for keys that exist in config.
+    {
+        let mut w = watches.lock().await;
+        for key in &config_keys {
+            if w.contains_key(key) {
+                continue;
+            }
+            let entry = match persisted.get(key) {
+                Some(p) => WatchEntry::from_persisted(p.clone()),
+                None => WatchEntry::default(),
+            };
+            w.insert(key.clone(), entry);
+        }
+    }
+
+    // Recover active runs from GitHub and spawn pollers.
     let snapshot: Vec<WatchKey> = {
         let w = watches.lock().await;
         w.keys().cloned().collect()
     };
-
-    recover_existing_watches(watches, config, handle, rate_limit, &snapshot).await;
-    start_new_config_watches(watches, config, handle, rate_limit, &snapshot).await;
+    recover_watches(watches, config, handle, rate_limit, &snapshot).await;
     spawn_rate_limit_refresher(handle, rate_limit);
 }
 
@@ -277,15 +301,67 @@ fn spawn_rate_limit_refresher(handle: &WatcherHandle, rate_limit: &RateLimitStat
     });
 }
 
+/// Resolve the complete set of WatchKeys from config, querying GitHub for
+/// default branches where needed.
+async fn resolve_config_keys(config: &SharedConfig, handle: &WatcherHandle) -> Vec<WatchKey> {
+    let repos: Vec<(String, bool)> = {
+        let cfg = config.read().await;
+        cfg.watched_repos()
+            .into_iter()
+            .map(|repo| {
+                let has_explicit = cfg.has_explicit_branches(repo);
+                (repo.to_string(), has_explicit)
+            })
+            .collect()
+    };
+
+    let mut keys = Vec::new();
+    for (repo, has_explicit) in &repos {
+        let mut branches = Vec::new();
+
+        match handle.github.default_branch(repo).await {
+            Ok(gh_default) => {
+                branches.push(gh_default);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    repo = %repo, error = %e,
+                    "Failed to resolve default branch on startup, falling back to config"
+                );
+                let cfg = config.read().await;
+                branches.extend(cfg.branches_for(repo).iter().cloned());
+            }
+        }
+
+        if *has_explicit {
+            let cfg = config.read().await;
+            for b in cfg.branches_for(repo) {
+                if !branches.contains(b) {
+                    branches.push(b.clone());
+                }
+            }
+        }
+
+        for branch in &branches {
+            let key = WatchKey::new(repo, branch);
+            if !keys.contains(&key) {
+                keys.push(key);
+            }
+        }
+    }
+
+    keys
+}
+
 /// Maximum concurrent GitHub API requests during startup recovery.
 const MAX_CONCURRENT_RECOVERY: usize = 10;
 
-/// Resume persisted watches and recover any in-progress runs from GitHub.
+/// Recover active runs from GitHub for all watches and spawn pollers.
 ///
 /// Makes one `recent_runs_for_repo` call per unique repo (instead of one
 /// `recent_runs` per branch), then fans results to per-branch entries.
 /// With 500 branches across 5 repos this saves ~495 API calls at startup.
-pub(super) async fn recover_existing_watches(
+pub(super) async fn recover_watches(
     watches: &Watches,
     config: &SharedConfig,
     handle: &WatcherHandle,
@@ -328,7 +404,7 @@ pub(super) async fn recover_existing_watches(
         };
 
         let (workflow_filter, ignored_workflows) = {
-            let cfg = config.lock().await;
+            let cfg = config.read().await;
             (
                 cfg.workflows_for(&repo).to_vec(),
                 cfg.ignored_workflows.clone(),
@@ -367,94 +443,4 @@ pub(super) async fn recover_existing_watches(
     for repo in repos.keys() {
         spawn_repo_poller(watches, config, handle, rate_limit, repo).await;
     }
-}
-
-/// Start watches for config repos that don't have persisted state yet.
-///
-/// For repos without explicit branch config, also resolves the GitHub default
-/// branch so that repos using "master" (or other non-"main" defaults) are
-/// watched correctly.
-async fn start_new_config_watches(
-    watches: &Watches,
-    config: &SharedConfig,
-    handle: &WatcherHandle,
-    rate_limit: &RateLimitState,
-    snapshot: &[WatchKey],
-) {
-    // For each watched repo, resolve branches: GitHub default + explicit per-repo.
-    // Global default_branches are only used as a fallback when GitHub is unreachable.
-    let mut new_keys: Vec<WatchKey> = Vec::new();
-    let repos: Vec<(String, bool)> = {
-        let cfg = config.lock().await;
-        cfg.watched_repos()
-            .into_iter()
-            .map(|repo| {
-                let has_explicit = cfg.has_explicit_branches(repo);
-                (repo.to_string(), has_explicit)
-            })
-            .collect()
-    };
-
-    for (repo, has_explicit) in &repos {
-        let mut branches = Vec::new();
-
-        match handle.github.default_branch(repo).await {
-            Ok(gh_default) => {
-                branches.push(gh_default);
-            }
-            Err(e) => {
-                tracing::warn!(
-                    repo = %repo, error = %e,
-                    "Failed to resolve default branch on startup, falling back to config"
-                );
-                let cfg = config.lock().await;
-                branches.extend(cfg.branches_for(repo).iter().cloned());
-            }
-        }
-
-        if *has_explicit {
-            let cfg = config.lock().await;
-            for b in cfg.branches_for(repo) {
-                if !branches.contains(b) {
-                    branches.push(b.clone());
-                }
-            }
-        }
-
-        for branch in &branches {
-            let key = WatchKey::new(repo, branch);
-            if !snapshot.contains(&key) {
-                new_keys.push(key);
-            }
-        }
-    }
-
-    let mut set = tokio::task::JoinSet::new();
-    for key in new_keys {
-        tracing::info!(
-            repo = key.repo,
-            branch = key.branch,
-            "Starting new watch from config"
-        );
-        let watches = watches.clone();
-        let config = config.clone();
-        let handle = handle.clone();
-        let rate_limit = rate_limit.clone();
-        set.spawn(async move {
-            match start_watch(
-                &watches,
-                &config,
-                &handle,
-                &rate_limit,
-                &key.repo,
-                &key.branch,
-            )
-            .await
-            {
-                Ok(msg) | Err(msg) => tracing::info!("{msg}"),
-            }
-        });
-    }
-
-    while set.join_next().await.is_some() {}
 }

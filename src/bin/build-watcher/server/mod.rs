@@ -21,14 +21,14 @@ use rmcp::transport::streamable_http_server::{
 };
 use tokio_util::sync::CancellationToken;
 
+use build_watcher::config::SharedConfigManager;
 use build_watcher::config::unix_now;
 use build_watcher::dirs::state_dir;
 use build_watcher::status::{
     ActiveRunView, LastBuildView, RunConclusion, StatusResponse, WatchStatus,
 };
 use build_watcher::watcher::{
-    PauseState, RateLimitState, SharedConfig, WatchEntry, WatchKey, WatcherHandle, Watches,
-    collect_persisted,
+    PauseState, RateLimitState, WatchEntry, WatchKey, WatcherHandle, Watches, collect_persisted,
 };
 
 pub use mcp::BuildWatcher;
@@ -39,7 +39,7 @@ pub const DEFAULT_PORT: u16 = 8417;
 #[derive(Clone)]
 pub(crate) struct DaemonState {
     pub watches: Watches,
-    pub config: SharedConfig,
+    pub config: SharedConfigManager,
     pub handle: WatcherHandle,
     pub pause: PauseState,
     pub rate_limit: RateLimitState,

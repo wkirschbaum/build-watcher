@@ -110,13 +110,12 @@ pub struct PersistedWatch {
 
 pub(crate) type PersistedWatches = HashMap<WatchKey, PersistedWatch>;
 
-pub fn load_watches() -> HashMap<WatchKey, WatchEntry> {
-    let persisted: PersistedWatches =
-        load_json(&state_dir().join("watches.json")).unwrap_or_default();
-    persisted
-        .into_iter()
-        .map(|(k, v)| (k, WatchEntry::from_persisted(v)))
-        .collect()
+/// Load persisted watch state as a lookup table.
+///
+/// Used at startup so config-driven watches can recover runtime state
+/// (last_seen_run_id, last_builds) from the previous session.
+pub fn load_persisted_watches() -> PersistedWatches {
+    load_json(&state_dir().join("watches.json")).unwrap_or_default()
 }
 
 /// Collect the persisted representation of all watches (acquires the lock).

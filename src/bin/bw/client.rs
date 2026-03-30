@@ -226,33 +226,8 @@ impl DaemonClient {
         self.get_json("/defaults").await
     }
 
-    pub(crate) async fn set_defaults(
-        &self,
-        default_branches: Option<Vec<String>>,
-        ignored_workflows: Option<Vec<String>>,
-        poll_aggression: Option<String>,
-        auto_discover_branches: Option<bool>,
-        branch_filter: Option<String>,
-    ) -> Result<(), String> {
-        #[derive(Serialize)]
-        struct Req {
-            default_branches: Option<Vec<String>>,
-            ignored_workflows: Option<Vec<String>>,
-            poll_aggression: Option<String>,
-            auto_discover_branches: Option<bool>,
-            branch_filter: Option<String>,
-        }
-        self.post_json(
-            "/defaults",
-            &Req {
-                default_branches,
-                ignored_workflows,
-                poll_aggression,
-                auto_discover_branches,
-                branch_filter,
-            },
-        )
-        .await
+    pub(crate) async fn set_defaults(&self, defaults: &DefaultsConfig) -> Result<(), String> {
+        self.post_json("/defaults", defaults).await
     }
 
     pub(crate) async fn get_history(

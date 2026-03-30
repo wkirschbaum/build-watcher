@@ -142,15 +142,18 @@ pub struct HistoryEntryView {
     pub age_secs: Option<u64>,
 }
 
-/// Global config defaults returned by `GET /defaults` and accepted by the TUI client.
+/// Global config defaults used by both `GET /defaults` (all fields populated)
+/// and `POST /defaults` (only changed fields sent, `None` = no change).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DefaultsConfig {
-    pub default_branches: Vec<String>,
-    pub ignored_workflows: Vec<String>,
-    #[serde(default)]
-    pub poll_aggression: String,
-    #[serde(default)]
-    pub auto_discover_branches: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_branches: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ignored_workflows: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub poll_aggression: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_discover_branches: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch_filter: Option<String>,
 }

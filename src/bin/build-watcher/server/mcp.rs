@@ -16,7 +16,7 @@ use build_watcher::watcher::{count_api_calls, is_paused};
 use super::DaemonState;
 use super::actions::{
     apply_levels, apply_pause, apply_quiet_hours, do_configure_branches, do_rerun, do_stop_watches,
-    do_watch_builds, format_outcomes, persist_config, validate_hhmm,
+    do_watch_builds, format_outcomes, validate_hhmm,
 };
 use super::build_watch_snapshot;
 use super::schema::{
@@ -170,35 +170,44 @@ impl BuildWatcher {
                     ))]));
                 }
 
-                let mut msgs = {
-                    let mut config = self.state.config.lock().await;
-                    let mut msgs = Vec::new();
-                    config.default_branches = params.branches;
-                    msgs.push(format!(
-                        "Default branches set to {:?}",
-                        config.default_branches
-                    ));
-                    if let Some(enabled) = params.auto_discover_branches {
-                        config.auto_discover_branches = enabled;
+                let branches = params.branches;
+                let auto_discover = params.auto_discover_branches;
+                let filter = params.branch_filter;
+                let result = self
+                    .state
+                    .config
+                    .modify(|config| {
+                        let mut msgs = Vec::new();
+                        config.default_branches = branches;
                         msgs.push(format!(
-                            "Auto-discover branches: {}",
-                            if enabled { "on" } else { "off" }
+                            "Default branches set to {:?}",
+                            config.default_branches
                         ));
-                    }
-                    if let Some(filter) = params.branch_filter {
-                        if filter.is_empty() {
-                            config.branch_filter = None;
-                            msgs.push("Branch filter cleared".to_string());
-                        } else {
-                            config.branch_filter = Some(filter.clone());
-                            msgs.push(format!("Branch filter: {filter}"));
+                        if let Some(enabled) = auto_discover {
+                            config.auto_discover_branches = enabled;
+                            msgs.push(format!(
+                                "Auto-discover branches: {}",
+                                if enabled { "on" } else { "off" }
+                            ));
                         }
-                    }
-                    msgs
+                        if let Some(filter) = filter {
+                            if filter.is_empty() {
+                                config.branch_filter = None;
+                                msgs.push("Branch filter cleared".to_string());
+                            } else {
+                                config.branch_filter = Some(filter.clone());
+                                msgs.push(format!("Branch filter: {filter}"));
+                            }
+                        }
+                        msgs
+                    })
+                    .await;
+                let msgs = match result {
+                    Ok(m) => m,
+                    Err(e) => vec![format!(
+                        "\u{26a0}\u{fe0f} Warning: config could not be saved to disk: {e}"
+                    )],
                 };
-                if let Err(warning) = persist_config(&self.state.config).await {
-                    msgs.push(warning);
-                }
                 Ok(CallToolResult::success(vec![Content::text(
                     msgs.join("\n"),
                 )]))
@@ -232,14 +241,14 @@ impl BuildWatcher {
             let calls = count_api_calls(&w);
             (snap, calls)
         };
-        let aggression = self.state.config.lock().await.poll_aggression;
+        let aggression = self.state.config.read().await.poll_aggression;
         let (active_secs, idle_secs) =
             compute_intervals(rl.as_ref(), api_calls, now, aggression, 0);
         let throttled = active_secs > MIN_ACTIVE_SECS || idle_secs > MIN_IDLE_SECS;
 
         let paused = is_paused(&self.state.pause).await;
         let (quiet_hours_label, quiet_active, notif_levels, ignored_workflows, repo_count) = {
-            let cfg = self.state.config.lock().await;
+            let cfg = self.state.config.read().await;
             let label = cfg.quiet_hours.as_ref().map_or_else(
                 || "off".to_string(),
                 |qh| format!("{}–{}", qh.start, qh.end),
@@ -350,33 +359,40 @@ impl BuildWatcher {
             )]));
         }
 
-        let mut msgs = {
-            let mut config = self.state.config.lock().await;
-            let rc = config.repos.entry(params.repo.clone()).or_default();
-            let mut msgs = Vec::new();
-            if let Some(workflows) = &params.workflows {
-                rc.workflows.clone_from(workflows);
-                if workflows.is_empty() {
-                    msgs.push(format!("{}: watching all workflows", params.repo));
-                } else {
-                    msgs.push(format!(
-                        "{}: watching workflows {:?}",
-                        params.repo, workflows
-                    ));
+        let repo = params.repo;
+        let workflows = params.workflows;
+        let clear_alias = params.clear_alias;
+        let alias = params.alias;
+        let result = self
+            .state
+            .config
+            .modify(|config| {
+                let rc = config.repos.entry(repo.clone()).or_default();
+                let mut msgs = Vec::new();
+                if let Some(workflows) = &workflows {
+                    rc.workflows.clone_from(workflows);
+                    if workflows.is_empty() {
+                        msgs.push(format!("{repo}: watching all workflows"));
+                    } else {
+                        msgs.push(format!("{repo}: watching workflows {workflows:?}"));
+                    }
                 }
-            }
-            if params.clear_alias == Some(true) {
-                rc.alias = None;
-                msgs.push(format!("{}: alias cleared", params.repo));
-            } else if let Some(alias) = &params.alias {
-                rc.alias = Some(alias.clone());
-                msgs.push(format!("{}: alias set to \"{alias}\"", params.repo));
-            }
-            msgs
+                if clear_alias == Some(true) {
+                    rc.alias = None;
+                    msgs.push(format!("{repo}: alias cleared"));
+                } else if let Some(alias) = &alias {
+                    rc.alias = Some(alias.clone());
+                    msgs.push(format!("{repo}: alias set to \"{alias}\""));
+                }
+                msgs
+            })
+            .await;
+        let msgs = match result {
+            Ok(m) => m,
+            Err(e) => vec![format!(
+                "\u{26a0}\u{fe0f} Warning: config could not be saved to disk: {e}"
+            )],
         };
-        if let Err(warning) = persist_config(&self.state.config).await {
-            msgs.push(warning);
-        }
         Ok(CallToolResult::success(vec![Content::text(
             msgs.join("\n"),
         )]))
@@ -397,52 +413,58 @@ impl BuildWatcher {
             )]));
         }
 
-        let mut msgs = {
-            let mut config = self.state.config.lock().await;
-
-            let mut added = Vec::new();
-            for w in &params.add {
-                if !config
-                    .ignored_workflows
-                    .iter()
-                    .any(|existing| existing.eq_ignore_ascii_case(w))
-                {
-                    config.ignored_workflows.push(w.clone());
-                    added.push(w.as_str());
+        let add = params.add;
+        let remove = params.remove;
+        let result = self
+            .state
+            .config
+            .modify(|config| {
+                let mut added = Vec::new();
+                for w in &add {
+                    if !config
+                        .ignored_workflows
+                        .iter()
+                        .any(|existing| existing.eq_ignore_ascii_case(w))
+                    {
+                        config.ignored_workflows.push(w.clone());
+                        added.push(w.clone());
+                    }
                 }
-            }
 
-            let before = config.ignored_workflows.len();
-            config.ignored_workflows.retain(|existing| {
-                !params
-                    .remove
-                    .iter()
-                    .any(|w| w.eq_ignore_ascii_case(existing))
-            });
-            let removed = before - config.ignored_workflows.len();
+                let before = config.ignored_workflows.len();
+                config
+                    .ignored_workflows
+                    .retain(|existing| !remove.iter().any(|w| w.eq_ignore_ascii_case(existing)));
+                let removed = before - config.ignored_workflows.len();
 
-            let mut msgs = Vec::new();
-            if !added.is_empty() {
-                msgs.push(format!("Added to ignore list: {}", added.join(", ")));
-            } else if !params.add.is_empty() {
-                msgs.push("All specified workflows were already ignored".to_string());
-            }
-            if removed > 0 {
-                msgs.push(format!("Removed from ignore list: {removed} workflow(s)"));
-            } else if !params.remove.is_empty() {
-                msgs.push("None of the specified workflows were in the ignore list".to_string());
-            }
-            if config.ignored_workflows.is_empty() {
-                msgs.push("No workflows are globally ignored now.".to_string());
-            } else {
-                msgs.push(format!("Ignored: {:?}", config.ignored_workflows));
-            }
+                let mut msgs = Vec::new();
+                if !added.is_empty() {
+                    msgs.push(format!("Added to ignore list: {}", added.join(", ")));
+                } else if !add.is_empty() {
+                    msgs.push("All specified workflows were already ignored".to_string());
+                }
+                if removed > 0 {
+                    msgs.push(format!("Removed from ignore list: {removed} workflow(s)"));
+                } else if !remove.is_empty() {
+                    msgs.push(
+                        "None of the specified workflows were in the ignore list".to_string(),
+                    );
+                }
+                if config.ignored_workflows.is_empty() {
+                    msgs.push("No workflows are globally ignored now.".to_string());
+                } else {
+                    msgs.push(format!("Ignored: {:?}", config.ignored_workflows));
+                }
 
-            msgs
+                msgs
+            })
+            .await;
+        let msgs = match result {
+            Ok(m) => m,
+            Err(e) => vec![format!(
+                "\u{26a0}\u{fe0f} Warning: config could not be saved to disk: {e}"
+            )],
         };
-        if let Err(warning) = persist_config(&self.state.config).await {
-            msgs.push(warning);
-        }
 
         Ok(CallToolResult::success(vec![Content::text(
             msgs.join("\n"),
@@ -628,69 +650,80 @@ impl BuildWatcher {
 
         // Quiet hours + notification levels (both touch config)
         if has_levels || has_quiet {
-            let (scope, effective) = {
-                let mut config = self.state.config.lock().await;
+            let quiet_start = params.quiet_start;
+            let quiet_end = params.quiet_end;
+            let quiet_clear = params.quiet_clear == Some(true);
+            let build_started = params.build_started;
+            let build_success = params.build_success;
+            let build_failure = params.build_failure;
+            let repo = params.repo;
+            let branch = params.branch;
 
-                // Quiet hours
-                msgs.extend(apply_quiet_hours(
-                    &mut config,
-                    params.quiet_start.as_deref(),
-                    params.quiet_end.as_deref(),
-                    params.quiet_clear == Some(true),
-                ));
+            let result = self
+                .state
+                .config
+                .modify(|config| {
+                    let mut inner_msgs = Vec::new();
 
-                // Notification levels
-                let (scope, effective) = if has_levels {
-                    let levels = (
-                        params.build_started,
-                        params.build_success,
-                        params.build_failure,
-                    );
-                    let scope = match (&params.repo, &params.branch) {
-                        (None, _) => {
-                            apply_levels(&mut config.notifications, levels.0, levels.1, levels.2);
-                            "global".to_string()
-                        }
-                        (Some(repo), None) => {
-                            let rc = config.repos.entry(repo.clone()).or_default();
-                            apply_levels(&mut rc.notifications, levels.0, levels.1, levels.2);
-                            repo.clone()
-                        }
-                        (Some(repo), Some(branch)) => {
-                            let rc = config.repos.entry(repo.clone()).or_default();
-                            let bc = rc.branch_notifications.entry(branch.clone()).or_default();
-                            apply_levels(&mut bc.notifications, levels.0, levels.1, levels.2);
-                            format!("{repo} [{branch}]")
-                        }
-                    };
-                    let effective = match (&params.repo, &params.branch) {
-                        (Some(repo), Some(branch)) => config.notifications_for(repo, branch),
-                        (Some(repo), None) => config.notifications_for(
-                            repo,
-                            config
-                                .default_branches
-                                .first()
-                                .map_or("main", |s| s.as_str()),
-                        ),
-                        _ => config.notifications.clone(),
-                    };
-                    (scope, Some(effective))
-                } else {
-                    (String::new(), None)
-                };
+                    // Quiet hours
+                    inner_msgs.extend(apply_quiet_hours(
+                        config,
+                        quiet_start.as_deref(),
+                        quiet_end.as_deref(),
+                        quiet_clear,
+                    ));
 
-                (scope, effective)
-            };
+                    // Notification levels
+                    if has_levels {
+                        let levels = (build_started, build_success, build_failure);
+                        let scope = match (&repo, &branch) {
+                            (None, _) => {
+                                apply_levels(
+                                    &mut config.notifications,
+                                    levels.0,
+                                    levels.1,
+                                    levels.2,
+                                );
+                                "global".to_string()
+                            }
+                            (Some(repo), None) => {
+                                let rc = config.repos.entry(repo.clone()).or_default();
+                                apply_levels(&mut rc.notifications, levels.0, levels.1, levels.2);
+                                repo.clone()
+                            }
+                            (Some(repo), Some(branch)) => {
+                                let rc = config.repos.entry(repo.clone()).or_default();
+                                let bc =
+                                    rc.branch_notifications.entry(branch.clone()).or_default();
+                                apply_levels(&mut bc.notifications, levels.0, levels.1, levels.2);
+                                format!("{repo} [{branch}]")
+                            }
+                        };
+                        let effective = match (&repo, &branch) {
+                            (Some(repo), Some(branch)) => config.notifications_for(repo, branch),
+                            (Some(repo), None) => config.notifications_for(
+                                repo,
+                                config
+                                    .default_branches
+                                    .first()
+                                    .map_or("main", |s| s.as_str()),
+                            ),
+                            _ => config.notifications.clone(),
+                        };
+                        inner_msgs.push(format!(
+                            "Updated notifications for {scope}:\n  build_started: {}\n  build_success: {}\n  build_failure: {}",
+                            effective.build_started, effective.build_success, effective.build_failure,
+                        ));
+                    }
 
-            if let Some(eff) = effective {
-                msgs.push(format!(
-                    "Updated notifications for {scope}:\n  build_started: {}\n  build_success: {}\n  build_failure: {}",
-                    eff.build_started, eff.build_success, eff.build_failure,
-                ));
-            }
-
-            if let Err(warning) = persist_config(&self.state.config).await {
-                msgs.push(warning);
+                    inner_msgs
+                })
+                .await;
+            match result {
+                Ok(inner_msgs) => msgs.extend(inner_msgs),
+                Err(e) => msgs.push(format!(
+                    "\u{26a0}\u{fe0f} Warning: config could not be saved to disk: {e}"
+                )),
             }
         }
 
@@ -717,13 +750,17 @@ impl BuildWatcher {
                 ))]));
             }
         };
+        if let Err(e) = self
+            .state
+            .config
+            .modify(|cfg| {
+                cfg.poll_aggression = level;
+            })
+            .await
         {
-            let mut cfg = self.state.config.lock().await;
-            cfg.poll_aggression = level;
-        }
-        self.state.handle.config_changed.notify_waiters();
-        if let Err(w) = persist_config(&self.state.config).await {
-            return Ok(CallToolResult::success(vec![Content::text(w)]));
+            return Ok(CallToolResult::success(vec![Content::text(format!(
+                "\u{26a0}\u{fe0f} Warning: config could not be saved to disk: {e}"
+            ))]));
         }
         Ok(CallToolResult::success(vec![Content::text(format!(
             "Poll aggression set to {level}."

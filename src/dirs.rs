@@ -48,8 +48,12 @@ fn init_dir(dir: &Path) {
 
 pub fn state_dir() -> &'static Path {
     STATE_DIR.get_or_init(|| {
-        let dir =
-            PathBuf::from(std::env::var("STATE_DIRECTORY").unwrap_or_else(|_| default_state_dir()));
+        let dir = PathBuf::from(std::env::var("STATE_DIRECTORY").unwrap_or_else(|_| {
+            #[cfg(test)]
+            panic!("STATE_DIRECTORY must be set in tests to avoid writing to the real state dir");
+            #[cfg(not(test))]
+            default_state_dir()
+        }));
         init_dir(&dir);
         dir
     })
@@ -58,7 +62,14 @@ pub fn state_dir() -> &'static Path {
 pub fn config_dir() -> &'static Path {
     CONFIG_DIR.get_or_init(|| {
         let dir = PathBuf::from(
-            std::env::var("CONFIGURATION_DIRECTORY").unwrap_or_else(|_| default_config_dir()),
+            std::env::var("CONFIGURATION_DIRECTORY").unwrap_or_else(|_| {
+                #[cfg(test)]
+                panic!(
+                    "CONFIGURATION_DIRECTORY must be set in tests to avoid writing to the real config dir"
+                );
+                #[cfg(not(test))]
+                default_config_dir()
+            }),
         );
         init_dir(&dir);
         dir

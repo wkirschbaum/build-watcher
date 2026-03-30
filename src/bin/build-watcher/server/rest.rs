@@ -17,9 +17,7 @@ use build_watcher::status::{DefaultsConfig, HistoryEntryView, StatsResponse};
 use build_watcher::watcher::{count_api_calls, is_paused};
 
 use super::DaemonState;
-use super::actions::{
-    do_configure_branches, do_rerun, do_stop_watches, do_watch_builds, persist_config,
-};
+use super::actions::{do_configure_branches, do_rerun, do_stop_watches, do_watch_builds};
 use super::{build_watch_snapshot, json_error};
 
 /// `GET /status` — JSON snapshot of all current watches and their build state.
@@ -29,7 +27,7 @@ pub(crate) async fn status_handler(
     let now = tokio::time::Instant::now();
     let paused = is_paused(&state.pause).await;
     let watches = state.watches.lock().await;
-    let cfg = state.config.lock().await;
+    let cfg = state.config.read().await;
     axum::Json(build_watch_snapshot(&watches, Some(&cfg), paused, now))
 }
 
@@ -70,7 +68,7 @@ pub(crate) async fn stats_handler(State(state): State<DaemonState>) -> axum::Jso
     let uptime_secs = state.started_at.elapsed().as_secs();
     let api_calls = count_api_calls(&*state.watches.lock().await);
     let rl = state.rate_limit.lock().await;
-    let aggression = state.config.lock().await.poll_aggression;
+    let aggression = state.config.read().await.poll_aggression;
     let (active_poll_secs, idle_poll_secs) =
         compute_intervals(rl.as_ref(), api_calls, unix_now(), aggression, 0);
 
@@ -212,7 +210,7 @@ pub(crate) async fn get_notifications_handler(
     State(state): State<DaemonState>,
     Query(q): Query<NotificationsQuery>,
 ) -> axum::Json<NotificationConfig> {
-    let cfg = state.config.lock().await;
+    let cfg = state.config.read().await;
     axum::Json(cfg.notifications_for(&q.repo, &q.branch))
 }
 
@@ -239,126 +237,136 @@ pub(crate) async fn notifications_handler(
 ) -> axum::response::Response {
     use super::actions::do_notification_action;
 
-    let msg = {
-        let mut cfg = state.config.lock().await;
-        match do_notification_action(
-            &mut cfg,
-            &body.repo,
-            body.branch.as_deref(),
-            &body.action,
-            body.build_started,
-            body.build_success,
-            body.build_failure,
-        ) {
-            Ok(m) => m,
-            Err(e) => return json_error(e),
+    let result = state
+        .config
+        .modify(|cfg| {
+            do_notification_action(
+                cfg,
+                &body.repo,
+                body.branch.as_deref(),
+                &body.action,
+                body.build_started,
+                body.build_success,
+                body.build_failure,
+            )
+        })
+        .await;
+    match result {
+        Ok(Ok(msg)) => {
+            axum::Json(serde_json::json!({ "ok": true, "message": msg })).into_response()
         }
-    };
-    if let Err(warning) = persist_config(&state.config).await {
-        return axum::Json(serde_json::json!({ "ok": true, "message": msg, "warning": warning }))
-            .into_response();
+        Ok(Err(e)) => json_error(e),
+        Err(e) => {
+            let warning =
+                format!("\u{26a0}\u{fe0f} Warning: config could not be saved to disk: {e}");
+            axum::Json(serde_json::json!({ "ok": false, "warning": warning })).into_response()
+        }
     }
-    axum::Json(serde_json::json!({ "ok": true, "message": msg })).into_response()
 }
 
 /// `GET /defaults` — Read global default config (branches, ignored workflows, poll aggression).
 pub(crate) async fn get_defaults_handler(
     State(state): State<DaemonState>,
 ) -> axum::Json<DefaultsConfig> {
-    let cfg = state.config.lock().await;
+    let cfg = state.config.read().await;
     axum::Json(DefaultsConfig {
-        default_branches: cfg.default_branches.clone(),
-        ignored_workflows: cfg.ignored_workflows.clone(),
-        poll_aggression: cfg.poll_aggression.to_string(),
-        auto_discover_branches: cfg.auto_discover_branches,
+        default_branches: Some(cfg.default_branches.clone()),
+        ignored_workflows: Some(cfg.ignored_workflows.clone()),
+        poll_aggression: Some(cfg.poll_aggression.to_string()),
+        auto_discover_branches: Some(cfg.auto_discover_branches),
         branch_filter: cfg.branch_filter.clone(),
     })
 }
 
-#[derive(Deserialize)]
-pub(crate) struct SetDefaultsRequest {
-    #[serde(default)]
-    default_branches: Option<Vec<String>>,
-    #[serde(default)]
-    ignored_workflows: Option<Vec<String>>,
-    #[serde(default)]
-    poll_aggression: Option<String>,
-    #[serde(default)]
-    auto_discover_branches: Option<bool>,
-    #[serde(default)]
-    branch_filter: Option<String>,
-}
-
 /// `POST /defaults` — Update global default config fields.
+/// Accepts the same `DefaultsConfig` shape — `None` fields are left unchanged.
 pub(crate) async fn set_defaults_handler(
     State(state): State<DaemonState>,
-    axum::Json(body): axum::Json<SetDefaultsRequest>,
+    axum::Json(body): axum::Json<DefaultsConfig>,
 ) -> axum::response::Response {
-    let messages = {
-        let mut cfg = state.config.lock().await;
-        let mut messages = Vec::new();
-        if let Some(branches) = body.default_branches {
-            for b in &branches {
-                if let Err(e) = validate_branch(b) {
-                    return json_error(e);
-                }
-            }
-            if branches.is_empty() {
-                return json_error("default_branches must not be empty");
-            }
-            cfg.default_branches = branches.clone();
-            messages.push(format!("default branches: {}", branches.join(", ")));
-        }
-        if let Some(workflows) = body.ignored_workflows {
-            cfg.ignored_workflows = workflows.clone();
-            if workflows.is_empty() {
-                messages.push("ignored workflows cleared".to_string());
-            } else {
-                messages.push(format!("ignored workflows: {}", workflows.join(", ")));
+    // Validate inputs before taking the config lock.
+    if let Some(branches) = &body.default_branches {
+        for b in branches {
+            if let Err(e) = validate_branch(b) {
+                return json_error(e);
             }
         }
-        if let Some(level) = body.poll_aggression {
-            let aggression = match level.to_lowercase().as_str() {
-                "low" => PollAggression::Low,
-                "medium" => PollAggression::Medium,
-                "high" => PollAggression::High,
-                other => {
-                    return json_error(format!(
-                        "unknown poll aggression: {other:?} (expected low/medium/high)"
-                    ));
-                }
-            };
-            cfg.poll_aggression = aggression;
-            messages.push(format!("poll aggression: {aggression}"));
+        if branches.is_empty() {
+            return json_error("default_branches must not be empty");
         }
-        if let Some(enabled) = body.auto_discover_branches {
-            cfg.auto_discover_branches = enabled;
-            messages.push(format!(
-                "auto-discover branches: {}",
-                if enabled { "on" } else { "off" }
-            ));
-        }
-        if let Some(filter) = body.branch_filter {
-            if filter.is_empty() {
-                cfg.branch_filter = None;
-                messages.push("branch filter cleared".to_string());
-            } else if let Err(e) = regex::Regex::new(&filter) {
-                return json_error(format!("invalid branch filter regex: {e}"));
-            } else {
-                cfg.branch_filter = Some(filter.clone());
-                messages.push(format!("branch filter: {filter}"));
-            }
-        }
-        messages
-    };
-    state.handle.config_changed.notify_waiters();
-    if let Err(warning) = persist_config(&state.config).await {
-        return axum::Json(
-            serde_json::json!({ "ok": true, "messages": messages, "warning": warning }),
-        )
-        .into_response();
     }
-    axum::Json(serde_json::json!({ "ok": true, "messages": messages })).into_response()
+    if let Some(level) = &body.poll_aggression {
+        match level.to_lowercase().as_str() {
+            "low" | "medium" | "high" => {}
+            other => {
+                return json_error(format!(
+                    "unknown poll aggression: {other:?} (expected low/medium/high)"
+                ));
+            }
+        }
+    }
+    if let Some(filter) = &body.branch_filter
+        && !filter.is_empty()
+        && let Err(e) = regex::Regex::new(filter)
+    {
+        return json_error(format!("invalid branch filter regex: {e}"));
+    }
+
+    let result = state
+        .config
+        .modify(|cfg| {
+            let mut messages = Vec::new();
+            if let Some(branches) = body.default_branches {
+                cfg.default_branches = branches.clone();
+                messages.push(format!("default branches: {}", branches.join(", ")));
+            }
+            if let Some(workflows) = body.ignored_workflows {
+                cfg.ignored_workflows = workflows.clone();
+                if workflows.is_empty() {
+                    messages.push("ignored workflows cleared".to_string());
+                } else {
+                    messages.push(format!("ignored workflows: {}", workflows.join(", ")));
+                }
+            }
+            if let Some(level) = body.poll_aggression {
+                let aggression = match level.to_lowercase().as_str() {
+                    "low" => PollAggression::Low,
+                    "high" => PollAggression::High,
+                    _ => PollAggression::Medium,
+                };
+                cfg.poll_aggression = aggression;
+                messages.push(format!("poll aggression: {aggression}"));
+            }
+            if let Some(enabled) = body.auto_discover_branches {
+                cfg.auto_discover_branches = enabled;
+                messages.push(format!(
+                    "auto-discover branches: {}",
+                    if enabled { "on" } else { "off" }
+                ));
+            }
+            if let Some(filter) = body.branch_filter {
+                if filter.is_empty() {
+                    cfg.branch_filter = None;
+                    messages.push("branch filter cleared".to_string());
+                } else {
+                    cfg.branch_filter = Some(filter.clone());
+                    messages.push(format!("branch filter: {filter}"));
+                }
+            }
+            messages
+        })
+        .await;
+    match result {
+        Ok(messages) => {
+            axum::Json(serde_json::json!({ "ok": true, "messages": messages })).into_response()
+        }
+        Err(e) => {
+            let warning =
+                format!("\u{26a0}\u{fe0f} Warning: config could not be saved to disk: {e}");
+            axum::Json(serde_json::json!({ "ok": true, "messages": [], "warning": warning }))
+                .into_response()
+        }
+    }
 }
 
 /// `POST /shutdown` — Initiate graceful daemon shutdown.
@@ -443,13 +451,19 @@ fn to_history_view(
 
 #[cfg(test)]
 mod tests {
-    use build_watcher::config::NotificationLevel;
+    use build_watcher::config::{
+        ConfigManager, ConfigPersistence, NotificationLevel, SharedConfigManager,
+    };
     use build_watcher::events::{EventBus, RunSnapshot, WatchEvent};
     use build_watcher::rate_limiter::MIN_ACTIVE_SECS;
     use build_watcher::watcher::{PauseState, WatchEntry, WatchKey, Watches};
     use std::collections::HashMap;
     use std::sync::Arc;
     use tokio::sync::Mutex;
+
+    fn null_config(config: build_watcher::config::Config) -> SharedConfigManager {
+        Arc::new(ConfigManager::new(config, ConfigPersistence::Null))
+    }
 
     fn empty_state() -> (Watches, PauseState, EventBus) {
         let watches = Arc::new(Mutex::new(HashMap::new()));
@@ -537,6 +551,7 @@ mod tests {
             Arc::new(StubGitHub),
             Arc::new(build_watcher::persistence::NullPersistence),
             Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(tokio::sync::Notify::new()),
         )
     }
 
@@ -551,7 +566,7 @@ mod tests {
     ) -> axum::Router {
         let app_state = super::super::DaemonState {
             watches,
-            config: Arc::new(Mutex::new(build_watcher::config::Config::default())),
+            config: null_config(build_watcher::config::Config::default()),
             handle,
             pause,
             rate_limit: Arc::new(Mutex::new(None)),
@@ -563,9 +578,7 @@ mod tests {
             .with_state(app_state)
     }
 
-    fn notifications_test_router(
-        config: Arc<Mutex<build_watcher::config::Config>>,
-    ) -> axum::Router {
+    fn notifications_test_router(config: SharedConfigManager) -> axum::Router {
         let (watches, pause, _events) = empty_state();
         let handle = stub_handle();
         let app_state = super::super::DaemonState {
@@ -694,7 +707,7 @@ mod tests {
         let handle = stub_handle();
         let app_state = super::super::DaemonState {
             watches,
-            config: Arc::new(Mutex::new(build_watcher::config::Config::default())),
+            config: null_config(build_watcher::config::Config::default()),
             handle,
             pause,
             rate_limit: Arc::new(Mutex::new(None)),
@@ -872,7 +885,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let config = Arc::new(Mutex::new(config));
+        let config = null_config(config);
         let router = notifications_test_router(config);
 
         let req = http::Request::get("/notifications?repo=alice%2Fapp&branch=main")
@@ -897,7 +910,7 @@ mod tests {
             "alice/app".to_string(),
             build_watcher::config::RepoConfig::default(),
         );
-        let config = Arc::new(Mutex::new(config));
+        let config = null_config(config);
         let router = notifications_test_router(config.clone());
 
         let body = serde_json::json!({
@@ -917,7 +930,7 @@ mod tests {
         let resp_body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(resp_body["ok"], true);
 
-        let cfg = config.lock().await;
+        let cfg = config.read().await;
         let rc = cfg.repos.get("alice/app").unwrap();
         let bn = rc.branch_notifications.get("main").unwrap();
         assert_eq!(bn.notifications.build_started, Some(NotificationLevel::Off));

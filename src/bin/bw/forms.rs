@@ -1,6 +1,6 @@
 use build_watcher::config::NotificationLevel;
 use build_watcher::github::{validate_branch, validate_repo};
-use build_watcher::status::HistoryEntryView;
+use build_watcher::status::{DefaultsConfig, HistoryEntryView};
 
 use super::app::{App, SseUpdate};
 use super::client::DaemonClient;
@@ -110,16 +110,17 @@ impl App {
 
         let d = daemon.clone();
         self.input_mode = InputMode::Normal;
+        let defaults = DefaultsConfig {
+            default_branches: Some(branches),
+            ignored_workflows: Some(workflows),
+            poll_aggression: aggression,
+            auto_discover_branches: auto_discover,
+            branch_filter,
+        };
         self.spawn_action("Saving config…", true, async move {
-            d.set_defaults(
-                Some(branches),
-                Some(workflows),
-                aggression,
-                auto_discover,
-                branch_filter,
-            )
-            .await
-            .map(|()| "Config saved".to_string())
+            d.set_defaults(&defaults)
+                .await
+                .map(|()| "Config saved".to_string())
         });
     }
 
@@ -208,22 +209,28 @@ impl App {
                             fields: vec![
                                 FormField {
                                     label: "Default branches".to_string(),
-                                    buffer: defaults.default_branches.join(", "),
+                                    buffer: defaults
+                                        .default_branches
+                                        .unwrap_or_default()
+                                        .join(", "),
                                     options: vec![],
                                 },
                                 FormField {
                                     label: "Ignored workflows".to_string(),
-                                    buffer: defaults.ignored_workflows.join(", "),
+                                    buffer: defaults
+                                        .ignored_workflows
+                                        .unwrap_or_default()
+                                        .join(", "),
                                     options: vec![],
                                 },
                                 FormField {
                                     label: "Poll aggression".to_string(),
-                                    buffer: defaults.poll_aggression,
+                                    buffer: defaults.poll_aggression.unwrap_or_default(),
                                     options: vec!["low", "medium", "high"],
                                 },
                                 FormField {
                                     label: "Auto-discover branches".to_string(),
-                                    buffer: if defaults.auto_discover_branches {
+                                    buffer: if defaults.auto_discover_branches.unwrap_or(false) {
                                         "on".to_string()
                                     } else {
                                         "off".to_string()

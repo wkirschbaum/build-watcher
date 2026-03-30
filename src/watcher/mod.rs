@@ -11,10 +11,10 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::time::Instant;
 
-use crate::config::Config;
+use crate::config::SharedConfigManager;
 use crate::github::{RateLimit, RunInfo};
 
-pub type SharedConfig = Arc<Mutex<Config>>;
+pub type SharedConfig = SharedConfigManager;
 pub type Watches = Arc<Mutex<HashMap<WatchKey, WatchEntry>>>;
 pub type PauseState = Arc<Mutex<Option<Instant>>>;
 pub type RateLimitState = Arc<Mutex<Option<RateLimit>>>;
@@ -22,7 +22,7 @@ pub type RateLimitState = Arc<Mutex<Option<RateLimit>>>;
 pub use startup::{WatcherHandle, start_watch, startup_watches};
 pub use types::{
     ActiveRun, PersistedWatch, WatchEntry, WatchKey, collect_persisted, last_failed_build,
-    load_watches,
+    load_persisted_watches,
 };
 
 /// Returns `true` if notifications are currently paused (deadline is in the future).

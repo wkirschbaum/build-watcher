@@ -4,9 +4,66 @@ mod types;
 pub use types::*;
 
 use std::path::Path;
+use std::sync::Arc;
 
 use crate::dirs::config_dir;
 use crate::persistence::{PersistError, recover_draft, save_json, save_json_async, try_parse_file};
+
+/// Controls whether config changes are persisted to disk.
+pub enum ConfigPersistence {
+    /// Write to disk (production).
+    File,
+    /// No-op (tests).
+    Null,
+}
+
+/// Centralized config manager. All mutations go through `modify()`,
+/// which atomically updates the in-memory config and persists to disk.
+pub struct ConfigManager {
+    inner: tokio::sync::Mutex<Config>,
+    save_lock: tokio::sync::Mutex<()>,
+    changed: Arc<tokio::sync::Notify>,
+    persistence: ConfigPersistence,
+}
+
+pub type SharedConfigManager = Arc<ConfigManager>;
+
+impl ConfigManager {
+    pub fn new(config: Config, persistence: ConfigPersistence) -> Self {
+        Self {
+            inner: tokio::sync::Mutex::new(config),
+            save_lock: tokio::sync::Mutex::new(()),
+            changed: Arc::new(tokio::sync::Notify::new()),
+            persistence,
+        }
+    }
+
+    pub fn changed(&self) -> &Arc<tokio::sync::Notify> {
+        &self.changed
+    }
+
+    pub async fn read(&self) -> tokio::sync::MutexGuard<'_, Config> {
+        self.inner.lock().await
+    }
+
+    pub async fn modify<F, R>(&self, f: F) -> Result<R, PersistError>
+    where
+        F: FnOnce(&mut Config) -> R,
+    {
+        let _save_guard = self.save_lock.lock().await;
+        let (result, snapshot) = {
+            let mut cfg = self.inner.lock().await;
+            let r = f(&mut cfg);
+            let snap = cfg.clone();
+            (r, snap)
+        };
+        if matches!(self.persistence, ConfigPersistence::File) {
+            save_json_async(config_dir().join("config.json"), snapshot).await?;
+        }
+        self.changed.notify_waiters();
+        Ok(result)
+    }
+}
 
 /// Attempt to load a Config by merging each top-level field from the file into
 /// `Config::default()`, falling back to the default when a field is missing or
@@ -174,16 +231,6 @@ pub fn load_and_normalize() -> Config {
 
 pub fn save_config(config: &Config) -> Result<(), PersistError> {
     save_json(&config_dir().join("config.json"), config)
-}
-
-/// Mutex that serializes config writes so concurrent `save_config_async` calls
-/// don't race on the `.draft` temp file (which could cause an older snapshot to
-/// overwrite a newer one).
-static CONFIG_SAVE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-pub async fn save_config_async(config: &Config) -> Result<(), PersistError> {
-    let _guard = CONFIG_SAVE_LOCK.lock().await;
-    save_json_async(config_dir().join("config.json"), config.clone()).await
 }
 
 #[cfg(test)]

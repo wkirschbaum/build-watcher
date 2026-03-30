@@ -146,7 +146,7 @@ impl RepoPoller {
             let w = self.watches.lock().await;
             super::count_api_calls(&w)
         };
-        let aggression = self.config.lock().await.poll_aggression;
+        let aggression = self.config.read().await.poll_aggression;
         compute_intervals(
             rate_limit.as_ref(),
             api_calls,
@@ -158,7 +158,7 @@ impl RepoPoller {
 
     /// Read per-branch workflow config for a given repo.
     async fn branch_poll_config(&self) -> BranchPollConfig {
-        let cfg = self.config.lock().await;
+        let cfg = self.config.read().await;
         BranchPollConfig {
             workflows: cfg.workflows_for(&self.repo).to_vec(),
             ignored: cfg.ignored_workflows.clone(),
@@ -226,13 +226,14 @@ impl RepoPoller {
             tracing::error!(error = %e, "Failed to save watches after removing dead repo");
         }
 
+        let repo = self.repo.clone();
+        if let Err(e) = self
+            .config
+            .modify(|cfg| {
+                cfg.repos.remove(&repo);
+            })
+            .await
         {
-            let mut cfg = self.config.lock().await;
-            cfg.repos.remove(&self.repo);
-        }
-        // Re-read under the save lock so concurrent modifications aren't lost.
-        let snapshot = self.config.lock().await.clone();
-        if let Err(e) = crate::config::save_config_async(&snapshot).await {
             tracing::error!(error = %e, "Failed to save config after removing dead repo");
         }
     }
@@ -486,34 +487,55 @@ impl RepoPoller {
                 .copied()
                 .collect();
             let new_runs = filter_runs(&unseen, &bpcfg.workflows, &bpcfg.ignored);
-            // Check for re-runs: any last_build's run_id appears in the API response
-            // but with a different conclusion or back to in-progress.
-            let may_have_rerun = prev_last_builds.values().any(|lb| {
-                branch_runs.iter().any(|r| {
-                    r.id == lb.run_id && (!r.is_completed() || r.conclusion != lb.conclusion)
+            // Identify re-runs: last_build run_ids that reappear in the API with
+            // a changed state. Skip runs already tracked as active (those are
+            // handled by poll_active_runs_batch).
+            let reruns: Vec<(&RunInfo, &LastBuild)> = prev_last_builds
+                .values()
+                .filter_map(|lb| {
+                    let r = branch_runs.iter().find(|r| r.id == lb.run_id)?;
+                    let dominated = active_ids.contains(&r.id);
+                    let changed = !r.is_completed() || r.conclusion != lb.conclusion;
+                    (!dominated && changed).then_some((*r, lb))
                 })
-            });
-            if new_runs.is_empty() && unseen.is_empty() && !may_have_rerun {
+                .collect();
+
+            if new_runs.is_empty() && unseen.is_empty() && reruns.is_empty() {
                 continue;
             }
 
-            // Collect failure info for already-completed runs.
+            // -- Pre-fetch failure info outside the lock (async API calls). --
+
             // Maps run_id → (failing_steps, failing_job_id).
             let mut failure_by_id: HashMap<u64, (Option<String>, Option<u64>)> = HashMap::new();
 
+            // New runs that were already completed when discovered.
+            for run in &new_runs {
+                if run.is_completed()
+                    && !run.succeeded()
+                    && let Some(info) = self.github.failing_steps(&self.repo, run.id).await
+                {
+                    failure_by_id.insert(run.id, (Some(info.steps), info.first_job_id));
+                }
+            }
+
+            // Completed reruns with a changed conclusion.
+            for (rerun, _lb) in &reruns {
+                if rerun.is_completed()
+                    && !rerun.succeeded()
+                    && let Some(info) = self.github.failing_steps(&self.repo, rerun.id).await
+                {
+                    failure_by_id.insert(rerun.id, (Some(info.steps), info.first_job_id));
+                }
+            }
+
+            // -- Emit events for new runs. --
+
             for run in &new_runs {
                 let snapshot = RunSnapshot::from_run_info(run, &self.repo, &key.branch);
-
                 if run.is_completed() {
-                    // Run completed before we saw it — emit only RunCompleted,
-                    // not a spurious RunStarted that would cause a double notification.
-                    let failure_info = if run.succeeded() {
-                        None
-                    } else {
-                        self.github.failing_steps(&self.repo, run.id).await
-                    };
-                    let failing_steps = failure_info.as_ref().map(|f| f.steps.clone());
-                    let failing_job_id = failure_info.as_ref().and_then(|f| f.first_job_id);
+                    let (failing_steps, failing_job_id) =
+                        failure_by_id.get(&run.id).cloned().unwrap_or((None, None));
                     tracing::info!(
                         key = %key, run_id = run.id,
                         sha = run.short_sha(), conclusion = %run.conclusion,
@@ -523,10 +545,9 @@ impl RepoPoller {
                         run: snapshot,
                         conclusion: run.run_conclusion(),
                         elapsed: None,
-                        failing_steps: failing_steps.clone(),
+                        failing_steps,
                         failing_job_id,
                     });
-                    failure_by_id.insert(run.id, (failing_steps, failing_job_id));
                 } else {
                     tracing::info!(
                         key = %key, run_id = run.id,
@@ -537,77 +558,57 @@ impl RepoPoller {
                 }
             }
 
-            // Detect re-runs: if any last_build's run_id appears in the API response
-            // with a different status (back to in_progress) or different conclusion,
-            // the run was re-run on GitHub and we need to pick up the change.
-            let mut rerun_detected = false;
-            for lb in prev_last_builds.values() {
-                let Some(rerun) = branch_runs.iter().find(|r| r.id == lb.run_id) else {
-                    continue;
-                };
+            // -- Emit events for reruns. --
+
+            for (rerun, lb) in &reruns {
+                let snapshot = RunSnapshot::from_run_info(rerun, &self.repo, &key.branch);
                 if !rerun.is_completed() {
-                    // Re-run is in progress — track it as active again.
                     tracing::info!(
                         key = %key, run_id = rerun.id,
                         "Re-run detected (now in progress)"
                     );
-                    let snapshot = RunSnapshot::from_run_info(rerun, &self.repo, &key.branch);
                     changes.push(RunChange::Started { run: snapshot });
-                    rerun_detected = true;
-                } else if rerun.conclusion != lb.conclusion {
-                    // Re-run completed with a different conclusion.
-                    let failure_info = if rerun.succeeded() {
-                        None
-                    } else {
-                        self.github.failing_steps(&self.repo, rerun.id).await
-                    };
-                    let failing_steps = failure_info.as_ref().map(|f| f.steps.clone());
-                    let failing_job_id = failure_info.as_ref().and_then(|f| f.first_job_id);
+                } else {
+                    let (failing_steps, failing_job_id) = failure_by_id
+                        .get(&rerun.id)
+                        .cloned()
+                        .unwrap_or((None, None));
                     tracing::info!(
                         key = %key, run_id = rerun.id,
                         old_conclusion = %lb.conclusion, new_conclusion = %rerun.conclusion,
                         "Re-run completed with different conclusion"
                     );
-                    let snapshot = RunSnapshot::from_run_info(rerun, &self.repo, &key.branch);
                     changes.push(RunChange::Completed {
                         run: snapshot,
                         conclusion: rerun.run_conclusion(),
                         elapsed: None,
-                        failing_steps: failing_steps.clone(),
+                        failing_steps,
                         failing_job_id,
                     });
-                    failure_by_id.insert(rerun.id, (failing_steps, failing_job_id));
-                    rerun_detected = true;
                 }
             }
+
+            // -- Single lock: apply all state changes. --
 
             {
                 let mut w = self.watches.lock().await;
                 if let Some(entry) = w.get_mut(key) {
                     entry.incorporate_new_runs(&new_runs, Instant::now(), unix_now());
 
-                    // Apply re-run state changes.
-                    if rerun_detected {
-                        for lb in prev_last_builds.values() {
-                            let Some(rerun) = branch_runs.iter().find(|r| r.id == lb.run_id) else {
-                                continue;
-                            };
-                            if !rerun.is_completed() {
-                                // Add back to active runs for poll_active_runs_batch to track.
-                                entry.active_runs.insert(
-                                    rerun.id,
-                                    super::types::ActiveRun::from_run(rerun, Instant::now()),
-                                );
-                            } else {
-                                // Update last_builds with new conclusion.
-                                let mut new_lb = rerun.to_last_build();
-                                new_lb.completed_at = Some(unix_now());
-                                if let Some((steps, job_id)) = failure_by_id.get(&rerun.id) {
-                                    new_lb.failing_steps = steps.clone();
-                                    new_lb.failing_job_id = *job_id;
-                                }
-                                entry.last_builds.insert(new_lb.workflow.clone(), new_lb);
+                    for (rerun, _lb) in &reruns {
+                        if !rerun.is_completed() {
+                            entry.active_runs.insert(
+                                rerun.id,
+                                super::types::ActiveRun::from_run(rerun, Instant::now()),
+                            );
+                        } else {
+                            let mut new_lb = rerun.to_last_build();
+                            new_lb.completed_at = Some(unix_now());
+                            if let Some((steps, job_id)) = failure_by_id.get(&rerun.id) {
+                                new_lb.failing_steps = steps.clone();
+                                new_lb.failing_job_id = *job_id;
                             }
+                            entry.last_builds.insert(new_lb.workflow.clone(), new_lb);
                         }
                     }
 
@@ -623,14 +624,13 @@ impl RepoPoller {
                     if let Some(max_id) = unseen.iter().map(|r| r.id).max() {
                         entry.last_seen_run_id = entry.last_seen_run_id.max(max_id);
                     }
-                    any_changed = any_changed || rerun_detected;
-                    if !new_runs.is_empty() || !unseen.is_empty() {
+                    if !new_runs.is_empty() || !unseen.is_empty() || !reruns.is_empty() {
                         any_changed = true;
                     }
                 }
             }
 
-            // Push completed new runs (and re-run completions) into history.
+            // Push completed new runs and rerun completions into history.
             let now_unix = unix_now();
             let mut completed: Vec<LastBuild> = new_runs
                 .iter()
@@ -645,21 +645,15 @@ impl RepoPoller {
                     lb
                 })
                 .collect();
-            // Include re-run completions in history.
-            if rerun_detected {
-                for lb in prev_last_builds.values() {
-                    if let Some(rerun) = branch_runs.iter().find(|r| r.id == lb.run_id)
-                        && rerun.is_completed()
-                        && rerun.conclusion != lb.conclusion
-                    {
-                        let mut new_lb = rerun.to_last_build();
-                        new_lb.completed_at = Some(now_unix);
-                        if let Some((steps, job_id)) = failure_by_id.get(&rerun.id) {
-                            new_lb.failing_steps = steps.clone();
-                            new_lb.failing_job_id = *job_id;
-                        }
-                        completed.push(new_lb);
+            for (rerun, _lb) in &reruns {
+                if rerun.is_completed() {
+                    let mut new_lb = rerun.to_last_build();
+                    new_lb.completed_at = Some(now_unix);
+                    if let Some((steps, job_id)) = failure_by_id.get(&rerun.id) {
+                        new_lb.failing_steps = steps.clone();
+                        new_lb.failing_job_id = *job_id;
                     }
+                    completed.push(new_lb);
                 }
             }
             if !completed.is_empty() {

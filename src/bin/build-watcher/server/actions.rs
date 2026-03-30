@@ -1,10 +1,8 @@
 use std::collections::HashSet;
 
-use build_watcher::config::{self, NotificationLevel, NotificationOverrides};
+use build_watcher::config::{NotificationLevel, NotificationOverrides, SharedConfigManager};
 use build_watcher::github::{DEFAULT_REPO_LIMIT, run_url};
-use build_watcher::watcher::{
-    SharedConfig, WatcherHandle, collect_persisted, last_failed_build, start_watch,
-};
+use build_watcher::watcher::{WatcherHandle, collect_persisted, last_failed_build, start_watch};
 
 use super::DaemonState;
 
@@ -39,7 +37,7 @@ pub(crate) fn format_outcomes(outcomes: &[ActionOutcome], sep: &str) -> String {
 /// Shared logic for adding repos to watch — used by both the MCP tool and REST endpoint.
 pub(crate) async fn do_watch_builds(state: &DaemonState, repos: &[String]) -> Vec<ActionOutcome> {
     let repo_branches: Vec<(String, Vec<String>)> = {
-        let cfg = state.config.lock().await;
+        let cfg = state.config.read().await;
         let mut pairs = Vec::new();
         for repo in repos {
             let mut branches = Vec::new();
@@ -119,17 +117,20 @@ pub(crate) async fn do_watch_builds(state: &DaemonState, repos: &[String]) -> Ve
         }
     }
 
+    // Always add repos to config — even if all watches were already running
+    // (e.g. recovered from watches.json but missing from a corrupted config).
+    let all_repos: Vec<String> = repo_branches.iter().map(|(r, _)| r.clone()).collect();
+
     if !started_repos.is_empty() {
         let persisted = collect_persisted(&state.watches).await;
         let hist = state.handle.history.lock().await.clone();
         state.handle.persistence.save_state(&persisted, &hist).await;
-        {
-            let mut cfg = state.config.lock().await;
-            cfg.add_repos(&started_repos);
-        }
-        if let Err(warning) = persist_config(&state.config).await {
-            results.push(ActionOutcome::err(warning));
-        }
+    }
+
+    if let Err(e) = state.config.modify(|cfg| cfg.add_repos(&all_repos)).await {
+        results.push(ActionOutcome::err(format!(
+            "\n\u{26a0}\u{fe0f} Warning: config could not be saved to disk: {e}"
+        )));
     }
 
     results
@@ -138,13 +139,13 @@ pub(crate) async fn do_watch_builds(state: &DaemonState, repos: &[String]) -> Ve
 /// Discover branches with recent GitHub Actions runs that aren't already being watched.
 /// Returns an empty vec when auto-discover is disabled or no new branches are found.
 async fn discover_branches(
-    config: &SharedConfig,
+    config: &SharedConfigManager,
     handle: &WatcherHandle,
     repo: &str,
     already_watching: &[String],
 ) -> Vec<String> {
     let (enabled, filter_re) = {
-        let cfg = config.lock().await;
+        let cfg = config.read().await;
         (cfg.auto_discover_branches, cfg.branch_filter_regex())
     };
     if !enabled {
@@ -219,29 +220,32 @@ pub(crate) async fn do_stop_watches(state: &DaemonState, repos: &[String]) -> Ve
         tracing::error!(error = %e, "Failed to persist watches");
     }
 
-    let mut results = {
-        let mut cfg = state.config.lock().await;
-        let mut results: Vec<ActionOutcome> = Vec::new();
-        for (repo, branch_count) in removed_counts {
-            let was_in_config = cfg.repos.contains_key(&repo);
-            cfg.repos.remove(&repo);
-            match (branch_count, was_in_config) {
-                (n, _) if n > 0 => results.push(ActionOutcome::ok(format!(
-                    "Stopped watching {repo} ({n} branches)"
-                ))),
-                (_, true) => results.push(ActionOutcome::ok(format!(
-                    "{repo}: removed from config (was not actively polling)"
-                ))),
-                _ => results.push(ActionOutcome::err(format!("{repo}: not found"))),
+    let result = state
+        .config
+        .modify(|cfg| {
+            let mut results: Vec<ActionOutcome> = Vec::new();
+            for (repo, branch_count) in removed_counts {
+                let was_in_config = cfg.repos.contains_key(&repo);
+                cfg.repos.remove(&repo);
+                match (branch_count, was_in_config) {
+                    (n, _) if n > 0 => results.push(ActionOutcome::ok(format!(
+                        "Stopped watching {repo} ({n} branches)"
+                    ))),
+                    (_, true) => results.push(ActionOutcome::ok(format!(
+                        "{repo}: removed from config (was not actively polling)"
+                    ))),
+                    _ => results.push(ActionOutcome::err(format!("{repo}: not found"))),
+                }
             }
-        }
-        results
-    };
-    if let Err(warning) = persist_config(&state.config).await {
-        results.push(ActionOutcome::err(warning));
+            results
+        })
+        .await;
+    match result {
+        Ok(results) => results,
+        Err(e) => vec![ActionOutcome::err(format!(
+            "\n\u{26a0}\u{fe0f} Warning: config could not be saved to disk: {e}"
+        ))],
     }
-
-    results
 }
 
 /// Shared logic for updating which branches are watched for a repo.
@@ -299,17 +303,22 @@ pub(crate) async fn do_configure_branches(
     }
 
     // Update config and persist.
-    {
-        let mut cfg = state.config.lock().await;
-        let rc = cfg.repos.entry(repo.to_string()).or_default();
-        rc.branches = new_branches;
-    }
     let persisted = collect_persisted(&state.watches).await;
     if let Err(e) = state.handle.persistence.save_watches(&persisted).await {
         tracing::error!(error = %e, "Failed to persist watches");
     }
-    if let Err(warning) = persist_config(&state.config).await {
-        results.push(ActionOutcome::err(warning));
+    let repo_owned = repo.to_string();
+    if let Err(e) = state
+        .config
+        .modify(|cfg| {
+            let rc = cfg.repos.entry(repo_owned).or_default();
+            rc.branches = new_branches;
+        })
+        .await
+    {
+        results.push(ActionOutcome::err(format!(
+            "\n\u{26a0}\u{fe0f} Warning: config could not be saved to disk: {e}"
+        )));
     }
 
     results
@@ -380,11 +389,11 @@ pub(crate) async fn do_rerun(
         .map_err(|e| e.to_string())?;
 
     // Burst-poll at 1s, 5s, 10s so the poller picks up the rerun quickly.
-    let notify = state.handle.config_changed.clone();
+    let changed = state.config.changed().clone();
     tokio::spawn(async move {
         for delay in [1, 5, 10] {
             tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
-            notify.notify_waiters();
+            changed.notify_waiters();
         }
     });
 
@@ -395,19 +404,6 @@ pub(crate) async fn do_rerun(
         "all jobs"
     };
     Ok(format!("Rerunning {kind} for run {run_id}\n{url}"))
-}
-
-/// Persist the current in-memory config to disk.
-///
-/// Re-reads the shared config under the save lock so concurrent modifications
-/// (e.g. poll_aggression changed while watch_builds is in flight) are never
-/// lost due to a stale snapshot winning the I/O race.
-pub(crate) async fn persist_config(config: &SharedConfig) -> Result<(), String> {
-    let snapshot = config.lock().await.clone();
-    config::save_config_async(&snapshot).await.map_err(|e| {
-        tracing::error!("Failed to save config: {e}");
-        format!("\n⚠️ Warning: config could not be saved to disk: {e}")
-    })
 }
 
 /// Types that can have notification levels applied to them field-by-field.

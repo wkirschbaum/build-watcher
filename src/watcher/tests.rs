@@ -7,7 +7,7 @@ use tokio::sync::Mutex;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-use crate::config::Config;
+use crate::config::{Config, ConfigManager, ConfigPersistence};
 use crate::events::WatchEvent;
 use crate::github::{GhError, RunInfo};
 use crate::status::{RunConclusion, RunStatus};
@@ -618,6 +618,7 @@ fn mock_handle(github: Arc<dyn crate::github::GitHubClient>) -> WatcherHandle {
         github,
         Arc::new(crate::persistence::NullPersistence),
         Arc::new(Mutex::new(HashMap::new())),
+        Arc::new(tokio::sync::Notify::new()),
     )
 }
 
@@ -651,7 +652,10 @@ async fn start_watch_with_mock_github() {
     ];
     let gh = MockGitHub::with_runs(runs);
     let watches: Watches = Arc::new(Mutex::new(HashMap::new()));
-    let config: SharedConfig = Arc::new(Mutex::new(Config::default()));
+    let config: SharedConfig = Arc::new(ConfigManager::new(
+        Config::default(),
+        ConfigPersistence::Null,
+    ));
     let rate_limit: RateLimitState = Arc::new(Mutex::new(None));
     let handle = mock_handle(gh);
 
@@ -673,7 +677,10 @@ async fn start_watch_with_mock_github() {
 async fn start_watch_registers_idle_watch_for_empty_runs() {
     let gh = MockGitHub::with_runs(vec![]);
     let watches: Watches = Arc::new(Mutex::new(HashMap::new()));
-    let config: SharedConfig = Arc::new(Mutex::new(Config::default()));
+    let config: SharedConfig = Arc::new(ConfigManager::new(
+        Config::default(),
+        ConfigPersistence::Null,
+    ));
     let rate_limit: RateLimitState = Arc::new(Mutex::new(None));
     let handle = mock_handle(gh);
 
@@ -689,7 +696,10 @@ async fn start_watch_deduplicates() {
     let runs = vec![make_run(100, RunStatus::Completed, "success")];
     let gh = MockGitHub::with_runs(runs);
     let watches: Watches = Arc::new(Mutex::new(HashMap::new()));
-    let config: SharedConfig = Arc::new(Mutex::new(Config::default()));
+    let config: SharedConfig = Arc::new(ConfigManager::new(
+        Config::default(),
+        ConfigPersistence::Null,
+    ));
     let rate_limit: RateLimitState = Arc::new(Mutex::new(None));
     let handle = mock_handle(gh);
 
@@ -716,7 +726,10 @@ async fn check_for_new_runs_detects_new_builds() {
     ];
     let gh = MockGitHub::with_runs_and_failures(runs, "Build / Run tests");
     let watches: Watches = Arc::new(Mutex::new(HashMap::new()));
-    let config: SharedConfig = Arc::new(Mutex::new(Config::default()));
+    let config: SharedConfig = Arc::new(ConfigManager::new(
+        Config::default(),
+        ConfigPersistence::Null,
+    ));
     let rate_limit: RateLimitState = Arc::new(Mutex::new(None));
     let handle = mock_handle(gh);
 
@@ -790,7 +803,7 @@ async fn check_for_new_runs_applies_workflow_filter() {
     // Set ignored_workflows via config so the RepoPoller picks them up.
     let mut cfg = Config::default();
     cfg.ignored_workflows = vec!["Semgrep".to_string()];
-    let config: SharedConfig = Arc::new(Mutex::new(cfg));
+    let config: SharedConfig = Arc::new(ConfigManager::new(cfg, ConfigPersistence::Null));
     let rate_limit: RateLimitState = Arc::new(Mutex::new(None));
     let handle = mock_handle(gh);
 
@@ -831,7 +844,10 @@ async fn poll_active_runs_detects_completion() {
     let runs = vec![make_run(101, RunStatus::Completed, "success")];
     let gh = MockGitHub::with_runs(runs);
     let watches: Watches = Arc::new(Mutex::new(HashMap::new()));
-    let config: SharedConfig = Arc::new(Mutex::new(Config::default()));
+    let config: SharedConfig = Arc::new(ConfigManager::new(
+        Config::default(),
+        ConfigPersistence::Null,
+    ));
     let rate_limit: RateLimitState = Arc::new(Mutex::new(None));
     let handle = mock_handle(gh);
 
@@ -886,7 +902,10 @@ async fn poll_active_runs_emits_status_change() {
     let runs = vec![make_run(101, RunStatus::InProgress, "")];
     let gh = MockGitHub::with_runs(runs);
     let watches: Watches = Arc::new(Mutex::new(HashMap::new()));
-    let config: SharedConfig = Arc::new(Mutex::new(Config::default()));
+    let config: SharedConfig = Arc::new(ConfigManager::new(
+        Config::default(),
+        ConfigPersistence::Null,
+    ));
     let rate_limit: RateLimitState = Arc::new(Mutex::new(None));
     let handle = mock_handle(gh);
 
@@ -937,7 +956,10 @@ async fn poll_active_runs_fetches_failing_steps() {
     let runs = vec![make_run(101, RunStatus::Completed, "failure")];
     let gh = MockGitHub::with_runs_and_failures(runs, "Build / Run tests");
     let watches: Watches = Arc::new(Mutex::new(HashMap::new()));
-    let config: SharedConfig = Arc::new(Mutex::new(Config::default()));
+    let config: SharedConfig = Arc::new(ConfigManager::new(
+        Config::default(),
+        ConfigPersistence::Null,
+    ));
     let rate_limit: RateLimitState = Arc::new(Mutex::new(None));
     let handle = mock_handle(gh);
 
@@ -992,7 +1014,10 @@ async fn check_for_new_runs_skips_already_active() {
     ];
     let gh = MockGitHub::with_runs(runs);
     let watches: Watches = Arc::new(Mutex::new(HashMap::new()));
-    let config: SharedConfig = Arc::new(Mutex::new(Config::default()));
+    let config: SharedConfig = Arc::new(ConfigManager::new(
+        Config::default(),
+        ConfigPersistence::Null,
+    ));
     let rate_limit: RateLimitState = Arc::new(Mutex::new(None));
     let handle = mock_handle(gh);
 
@@ -1043,7 +1068,7 @@ async fn record_completion_bumps_last_seen() {
 }
 
 #[tokio::test]
-async fn recover_existing_watches_recovers_active_runs() {
+async fn recover_watches_recovers_active_runs() {
     let key = WatchKey::new("alice/app", "main");
     // Mock returns a mix: 100 completed, 101 in_progress
     let runs = vec![
@@ -1052,7 +1077,10 @@ async fn recover_existing_watches_recovers_active_runs() {
     ];
     let gh = MockGitHub::with_runs(runs);
     let watches: Watches = Arc::new(Mutex::new(HashMap::new()));
-    let config: SharedConfig = Arc::new(Mutex::new(Config::default()));
+    let config: SharedConfig = Arc::new(ConfigManager::new(
+        Config::default(),
+        ConfigPersistence::Null,
+    ));
     let rate_limit: RateLimitState = Arc::new(Mutex::new(None));
     let handle = mock_handle(gh);
 
@@ -1071,7 +1099,7 @@ async fn recover_existing_watches_recovers_active_runs() {
     }
 
     let snapshot = vec![key.clone()];
-    startup::recover_existing_watches(&watches, &config, &handle, &rate_limit, &snapshot).await;
+    startup::recover_watches(&watches, &config, &handle, &rate_limit, &snapshot).await;
 
     let w = watches.lock().await;
     let entry = &w[&key];
@@ -1144,7 +1172,10 @@ async fn check_for_new_runs_detects_rerun_with_different_conclusion() {
     let runs = vec![make_run(200, RunStatus::Completed, "success")];
     let gh = MockGitHub::with_runs(runs);
     let watches: Watches = Arc::new(Mutex::new(HashMap::new()));
-    let config: SharedConfig = Arc::new(Mutex::new(Config::default()));
+    let config: SharedConfig = Arc::new(ConfigManager::new(
+        Config::default(),
+        ConfigPersistence::Null,
+    ));
     let rate_limit: RateLimitState = Arc::new(Mutex::new(None));
     let handle = mock_handle(gh);
 
@@ -1209,7 +1240,10 @@ async fn check_for_new_runs_detects_rerun_in_progress() {
     let runs = vec![make_run(200, RunStatus::InProgress, "")];
     let gh = MockGitHub::with_runs(runs);
     let watches: Watches = Arc::new(Mutex::new(HashMap::new()));
-    let config: SharedConfig = Arc::new(Mutex::new(Config::default()));
+    let config: SharedConfig = Arc::new(ConfigManager::new(
+        Config::default(),
+        ConfigPersistence::Null,
+    ));
     let rate_limit: RateLimitState = Arc::new(Mutex::new(None));
     let handle = mock_handle(gh);
 
@@ -1254,11 +1288,22 @@ async fn check_for_new_runs_detects_rerun_in_progress() {
     }
 
     // Verify the run was added back to active_runs.
-    let w = watches.lock().await;
-    let entry = &w[&key];
+    {
+        let w = watches.lock().await;
+        let entry = &w[&key];
+        assert!(
+            entry.active_runs.contains_key(&200),
+            "run 200 should be tracked as active"
+        );
+    }
+
+    // Second call with same state: run 200 is now in active_runs,
+    // so the rerun detection must NOT emit another RunStarted.
+    let poller2 = make_repo_poller("alice/app", &watches, &config, &rate_limit, &handle);
+    let changes2 = poller2.check_for_new_runs_repo_wide().await;
     assert!(
-        entry.active_runs.contains_key(&200),
-        "run 200 should be tracked as active"
+        changes2.is_empty(),
+        "second poll must not re-emit for already-tracked rerun, got {changes2:?}"
     );
 
     handle.cancel.cancel();
@@ -1271,7 +1316,10 @@ async fn check_for_new_runs_ignores_rerun_with_same_conclusion() {
     let runs = vec![make_run(200, RunStatus::Completed, "failure")];
     let gh = MockGitHub::with_runs(runs);
     let watches: Watches = Arc::new(Mutex::new(HashMap::new()));
-    let config: SharedConfig = Arc::new(Mutex::new(Config::default()));
+    let config: SharedConfig = Arc::new(ConfigManager::new(
+        Config::default(),
+        ConfigPersistence::Null,
+    ));
     let rate_limit: RateLimitState = Arc::new(Mutex::new(None));
     let handle = mock_handle(gh);
 
