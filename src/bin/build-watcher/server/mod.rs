@@ -132,7 +132,7 @@ pub(crate) fn json_error(msg: impl std::fmt::Display) -> axum::response::Respons
 /// The kernel releases the lock automatically when the process exits (even on
 /// SIGKILL), so there are no stale-lock issues. The returned `File` handle must
 /// be kept alive for the lifetime of the server.
-fn acquire_instance_lock() -> Result<std::fs::File, ServerError> {
+pub fn acquire_instance_lock() -> Result<std::fs::File, ServerError> {
     use std::io::Write;
     use std::os::unix::io::AsRawFd;
 
@@ -210,11 +210,11 @@ fn build_router(state: DaemonState, ct: &CancellationToken) -> axum::Router {
 ///
 /// Binds to the configured port, writes a port-discovery file, serves until
 /// ctrl-c, then shuts down pollers and persists state.
-pub async fn serve(state: DaemonState, ct: CancellationToken) -> Result<(), ServerError> {
-    // Acquire instance lock BEFORE binding the port so we get a clear error
-    // instead of a confusing "address in use" when another instance is running.
-    let _lock = acquire_instance_lock()?;
-
+pub async fn serve(
+    state: DaemonState,
+    ct: CancellationToken,
+    _lock: std::fs::File,
+) -> Result<(), ServerError> {
     let port: u16 = std::env::var("BUILD_WATCHER_PORT")
         .ok()
         .and_then(|p| p.parse().ok())

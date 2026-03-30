@@ -35,6 +35,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_env_filter(EnvFilter::from_default_env().add_directive("build_watcher=info".parse()?))
         .init();
 
+    // Acquire the instance lock before any expensive startup work (config saves,
+    // GitHub API calls) so we fail fast if another daemon is already running.
+    let lock = server::acquire_instance_lock()?;
+
     let config = Arc::new(Mutex::new(config::load_and_normalize()));
     let watches = Arc::new(Mutex::new(load_watches()));
     let pause: PauseState = Arc::new(Mutex::new(None));
@@ -63,5 +67,5 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         rate_limit,
         started_at: std::time::Instant::now(),
     };
-    server::serve(state, ct).await.map_err(|e| e.into())
+    server::serve(state, ct, lock).await.map_err(|e| e.into())
 }
