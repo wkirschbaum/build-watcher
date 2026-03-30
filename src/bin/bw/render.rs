@@ -965,35 +965,24 @@ pub(crate) fn render_header(frame: &mut ratatui::Frame, area: ratatui::layout::R
 
     let sep2 = Span::styled("  ", dim);
     let mut left2_spans: Vec<Span> = vec![
-        Span::styled(format!("{repo_count}r/{branch_count}b"), dim),
+        Span::styled(format!("{repo_count}r · {branch_count}b"), dim),
+        sep2.clone(),
+        Span::styled(format!("⏳ {n_active}"), Style::default().fg(Color::Yellow)),
         sep2.clone(),
         Span::styled(
             format!("✗ {n_failing}"),
-            if n_failing > 0 {
-                Style::default()
-                    .fg(Color::Rgb(220, 100, 100))
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                dim
-            },
-        ),
-        sep2.clone(),
-        Span::styled(
-            format!("⏳ {n_active}"),
-            if n_active > 0 {
-                Style::default().fg(Color::Yellow)
-            } else {
-                dim
-            },
+            Style::default()
+                .fg(Color::Rgb(220, 100, 100))
+                .add_modifier(if n_failing > 0 {
+                    Modifier::BOLD
+                } else {
+                    Modifier::DIM
+                }),
         ),
         sep2.clone(),
         Span::styled(
             format!("✓ {n_passing}"),
-            if n_passing > 0 {
-                Style::default().fg(Color::Rgb(100, 180, 100))
-            } else {
-                dim
-            },
+            Style::default().fg(Color::Rgb(100, 180, 100)),
         ),
         sep2.clone(),
         Span::styled(format!("· {n_idle}"), dim),
