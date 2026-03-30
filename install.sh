@@ -116,8 +116,18 @@ CONFIG_FILE="$CONFIG_DIR/config.json"
 mkdir -p "$CONFIG_DIR"
 
 if [ ! -f "$CONFIG_FILE" ]; then
-  echo "==> Creating default config at $CONFIG_FILE..."
-  cat > "$CONFIG_FILE" <<'CONFJSON'
+  # Recover from backup or draft left by a crash during save.
+  DRAFT_FILE="$CONFIG_FILE.draft"
+  BAK_FILE="$CONFIG_FILE.bak"
+  if [ -f "$DRAFT_FILE" ] && python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$DRAFT_FILE" 2>/dev/null; then
+    echo "==> Recovering config from draft file..."
+    mv "$DRAFT_FILE" "$CONFIG_FILE"
+  elif [ -f "$BAK_FILE" ]; then
+    echo "==> Recovering config from backup..."
+    cp "$BAK_FILE" "$CONFIG_FILE"
+  else
+    echo "==> Creating default config at $CONFIG_FILE..."
+    cat > "$CONFIG_FILE" <<'CONFJSON'
 {
   "default_branches": ["main"],
   "notifications": {
@@ -128,7 +138,8 @@ if [ ! -f "$CONFIG_FILE" ]; then
   "repos": {}
 }
 CONFJSON
-  echo "  Edit $CONFIG_FILE to add repos, or use the watch_builds MCP tool."
+    echo "  Edit $CONFIG_FILE to add repos, or use the watch_builds MCP tool."
+  fi
 else
   echo "==> Config already exists at $CONFIG_FILE (preserved)"
 fi
