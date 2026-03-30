@@ -145,6 +145,25 @@ impl App {
                             open_browser(&url);
                         }
                     }
+                    KeyCode::Char('r') | KeyCode::Char('R') => {
+                        if let Some(entry) = entries.get(*selected) {
+                            let run_id = entry.id;
+                            let repo = repo.clone();
+                            let failed_only = code == KeyCode::Char('r');
+                            let d = daemon.clone();
+                            let label = if failed_only {
+                                "failed jobs"
+                            } else {
+                                "all jobs"
+                            };
+                            self.input_mode = InputMode::Normal;
+                            self.spawn_action(
+                                format!("Rerunning {label} for run {run_id}…"),
+                                false,
+                                async move { d.rerun(&repo, Some(run_id), failed_only).await },
+                            );
+                        }
+                    }
                     KeyCode::Char('q') => {
                         self.input_mode = InputMode::Normal;
                     }
@@ -209,7 +228,7 @@ impl App {
             KeyCode::Enter | KeyCode::Right | KeyCode::Tab | KeyCode::Char('e')
                 if is_collapsible =>
             {
-                // Cycle expand level: Collapsed → Branches → Full → Collapsed
+                // Cycle expand level: Full → Branches → Collapsed → Full
                 if let Some((repo, _, _, _)) = selected {
                     let repo = repo.to_string();
                     let current = self.expand_level(&repo);
@@ -227,9 +246,19 @@ impl App {
             {
                 // Toggle workflow expansion for this branch.
                 if let Some((repo, branch, _, _)) = selected {
+                    let repo = repo.to_string();
                     let key = format!("{repo}#{branch}");
-                    if !self.workflow_collapsed.remove(&key) {
-                        self.workflow_collapsed.insert(key);
+
+                    if self.expand_level(&repo) != ExpandLevel::Full {
+                        // Repo-level gate is blocking workflows. Promote to Full
+                        // and ensure this branch's workflows will be visible.
+                        self.expand.remove(&repo); // Full is the default
+                        self.workflow_collapsed.remove(&key);
+                    } else {
+                        // Repo is at Full — toggle the per-branch workflow state.
+                        if !self.workflow_collapsed.remove(&key) {
+                            self.workflow_collapsed.insert(key);
+                        }
                     }
                     self.save_prefs();
                 }
@@ -520,7 +549,7 @@ impl App {
                 self.save_prefs();
             }
             KeyCode::Char('r') | KeyCode::Char('R') => {
-                if let Some((repo, _, Some(run_id), _)) = selected {
+                if let Some((repo, _, run_id, _)) = selected {
                     let repo = repo.to_string();
                     let failed_only = code == KeyCode::Char('r');
                     let label = if failed_only {
@@ -532,11 +561,7 @@ impl App {
                     self.spawn_action(
                         format!("Rerunning {label} for {repo}…"),
                         false,
-                        async move {
-                            d.rerun(&repo, run_id, failed_only)
-                                .await
-                                .map(|()| format!("Rerun triggered for {repo}"))
-                        },
+                        async move { d.rerun(&repo, run_id, failed_only).await },
                     );
                 }
             }

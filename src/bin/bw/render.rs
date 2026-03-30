@@ -146,14 +146,16 @@ fn repo_group_key(repo: &str, branches: &[WatchStatus], group_by: GroupBy) -> St
     group_key_impl(repo, first_branch, workflow, worst, group_by).unwrap_or_default()
 }
 
-/// Group consecutive watches by repo, preserving input order.
+/// Group watches by repo, preserving first-seen order.
 fn group_watches_by_repo(watches: &[WatchStatus]) -> Vec<(&str, Vec<&WatchStatus>)> {
     let mut groups: Vec<(&str, Vec<&WatchStatus>)> = Vec::new();
+    let mut index: HashMap<&str, usize> = HashMap::new();
     for w in watches {
-        if let Some(g) = groups.iter_mut().find(|(r, _)| *r == w.repo.as_str()) {
-            g.1.push(w);
+        if let Some(&idx) = index.get(w.repo.as_str()) {
+            groups[idx].1.push(w);
         } else {
-            groups.push((w.repo.as_str(), vec![w]));
+            index.insert(&w.repo, groups.len());
+            groups.push((&w.repo, vec![w]));
         }
     }
     groups
@@ -1132,13 +1134,6 @@ fn render_display_row<'a>(
                 format!("{arrow} {}{}", short_repo(repo), mute_indicator(*muted))
             };
 
-            // Compact status summary: active / passing / failing (/ idle when present)
-            let status_text = if *idle > 0 {
-                format!("{active}/{passing}/{failing}/{idle}")
-            } else {
-                format!("{active}/{passing}/{failing}")
-            };
-
             let age = newest_age
                 .map(|s| format::age(s as u64))
                 .unwrap_or_default();
@@ -1179,10 +1174,48 @@ fn render_display_row<'a>(
                 } else {
                     String::new()
                 };
+
+                // Color-coded status: active/passing/failing — dimmed when zero.
+                // Idle count appended only when > 0.
+                let status_cell = {
+                    let dim = |v: usize, s: Style| {
+                        if v > 0 {
+                            s
+                        } else {
+                            Style::default().fg(Color::DarkGray)
+                        }
+                    };
+                    let sep = Span::styled("/", Style::default().fg(Color::DarkGray));
+                    let mut spans = vec![
+                        Span::styled(
+                            format!("{active}"),
+                            dim(*active, Style::default().fg(Color::Yellow)),
+                        ),
+                        sep.clone(),
+                        Span::styled(
+                            format!("{passing}"),
+                            dim(*passing, Style::default().fg(Color::Rgb(100, 180, 100))),
+                        ),
+                        sep.clone(),
+                        Span::styled(
+                            format!("{failing}"),
+                            dim(*failing, Style::default().fg(Color::Rgb(220, 100, 100))),
+                        ),
+                    ];
+                    if *idle > 0 {
+                        spans.push(sep);
+                        spans.push(Span::styled(
+                            format!("{idle}"),
+                            Style::default().fg(Color::DarkGray),
+                        ));
+                    }
+                    Cell::from(Line::from(spans))
+                };
+
                 Row::new(vec![
                     Cell::from(format::truncate(&name, cw.repo)).style(repo_style),
                     Cell::from(format::truncate(&branch_label, cw.branch)),
-                    Cell::from(format::truncate(&status_text, cw.status)),
+                    status_cell,
                     Cell::from(format::truncate(&wf_label, cw.workflow)),
                     Cell::from(""),
                     Cell::from(age),
@@ -1632,7 +1665,9 @@ pub(crate) fn render_footer(frame: &mut ratatui::Frame, area: ratatui::layout::R
                 Span::styled("[d]", key_style),
                 Span::raw(" del  "),
                 Span::styled("[o/O]", key_style),
-                Span::raw(" open"),
+                Span::raw(" open  "),
+                Span::styled("[r/R]", key_style),
+                Span::raw(" rerun"),
                 sep.clone(),
                 // ── Notifications ─────────────────────────────────────────
                 Span::styled("[n/N]", key_style),
@@ -1977,6 +2012,48 @@ pub(crate) fn render_notification_picker_popup(
     );
 }
 
+/// Column widths for the history popup, computed from available inner width.
+struct HistoryColWidths {
+    status: usize,
+    branch: usize,
+    workflow: usize,
+    title: usize,
+    duration: usize,
+}
+
+impl HistoryColWidths {
+    fn new(w: usize, show_branch: bool) -> Self {
+        let duration = 8;
+        let age = 8;
+        let status = 14; // "▸ ✗ failure  " with arrow
+        let fixed = status + duration + age;
+        let remaining = w.saturating_sub(fixed);
+        if show_branch {
+            // branch 15%, workflow 20%, title 65%
+            let branch = (remaining * 15 / 100).max(6);
+            let workflow = (remaining * 20 / 100).max(6);
+            let title = remaining.saturating_sub(branch + workflow).max(6);
+            Self {
+                status,
+                branch,
+                workflow,
+                title,
+                duration,
+            }
+        } else {
+            let workflow = (remaining * 25 / 100).max(6);
+            let title = remaining.saturating_sub(workflow).max(6);
+            Self {
+                status,
+                branch: 0,
+                workflow,
+                title,
+                duration,
+            }
+        }
+    }
+}
+
 pub(crate) fn render_history_popup(
     frame: &mut ratatui::Frame,
     repo: &str,
@@ -2004,6 +2081,9 @@ pub(crate) fn render_history_popup(
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
 
+    let show_branch = branch.is_none();
+    let hcw = HistoryColWidths::new(inner.width as usize, show_branch);
+
     // Layout: header row + data rows (fill remaining) + blank + hint
     let inner_height = inner.height as usize;
     let mut constraints = vec![Constraint::Length(1)]; // column header
@@ -2022,15 +2102,37 @@ pub(crate) fn render_history_popup(
     let header_style = Style::default()
         .fg(Color::DarkGray)
         .add_modifier(Modifier::BOLD);
-    let header_row = if branch.is_none() {
-        "  STATUS        BRANCH    WORKFLOW       TITLE                           DURATION  AGE"
+    let header_line = if show_branch {
+        Line::from(vec![
+            Span::styled(format!("{:<w$}", "STATUS", w = hcw.status), header_style),
+            Span::styled(format!("{:<w$}", "BRANCH", w = hcw.branch), header_style),
+            Span::styled(
+                format!("{:<w$}", "WORKFLOW", w = hcw.workflow),
+                header_style,
+            ),
+            Span::styled(format!("{:<w$}", "TITLE", w = hcw.title), header_style),
+            Span::styled(
+                format!("{:<w$}", "DURATION", w = hcw.duration),
+                header_style,
+            ),
+            Span::styled("AGE", header_style),
+        ])
     } else {
-        "  STATUS        WORKFLOW       TITLE                                     DURATION  AGE"
+        Line::from(vec![
+            Span::styled(format!("{:<w$}", "STATUS", w = hcw.status), header_style),
+            Span::styled(
+                format!("{:<w$}", "WORKFLOW", w = hcw.workflow),
+                header_style,
+            ),
+            Span::styled(format!("{:<w$}", "TITLE", w = hcw.title), header_style),
+            Span::styled(
+                format!("{:<w$}", "DURATION", w = hcw.duration),
+                header_style,
+            ),
+            Span::styled("AGE", header_style),
+        ])
     };
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(header_row, header_style))),
-        rows_layout[0],
-    );
+    frame.render_widget(Paragraph::new(header_line), rows_layout[0]);
 
     // Scroll offset: keep selected centered
     let offset = if visible_rows == 0 {
@@ -2061,7 +2163,7 @@ pub(crate) fn render_history_popup(
             } else {
                 Style::default().fg(Color::Reset)
             };
-            let status_style = if is_selected {
+            let sstyle = if is_selected {
                 base_style
             } else {
                 status_style(&entry.conclusion)
@@ -2077,56 +2179,54 @@ pub(crate) fn render_history_popup(
                 .age_secs
                 .map(format::age)
                 .unwrap_or_else(|| "—".to_string());
-            let title_str = format::truncate(&entry.title, 32);
-            let workflow_str = format::truncate(&entry.workflow, 14);
 
-            let line = if branch.is_none() {
-                let branch_str = format::truncate(&entry.branch, 9);
-                Line::from(vec![
-                    Span::styled(format!("{arrow}{emoji} {status_str:<11}"), status_style),
-                    Span::styled(format!("{branch_str:<10}",), base_style),
-                    Span::styled(format!("{workflow_str:<15}"), base_style),
-                    Span::styled(format!("{title_str:<33}"), base_style),
-                    Span::styled(format!("{duration:<10}"), base_style),
-                    Span::styled(age, base_style),
-                ])
-            } else {
-                Line::from(vec![
-                    Span::styled(format!("{arrow}{emoji} {status_str:<11}"), status_style),
-                    Span::styled(format!("{workflow_str:<15}"), base_style),
-                    Span::styled(format!("{title_str:<37}"), base_style),
-                    Span::styled(format!("{duration:<10}"), base_style),
-                    Span::styled(age, base_style),
-                ])
-            };
-            frame.render_widget(Paragraph::new(line), rows_layout[layout_idx]);
+            let mut spans = vec![Span::styled(
+                format!("{arrow}{emoji} {status_str:<w$}", w = hcw.status - 4),
+                sstyle,
+            )];
+            if show_branch {
+                spans.push(Span::styled(
+                    format!(
+                        "{:<w$}",
+                        format::truncate(&entry.branch, hcw.branch - 1),
+                        w = hcw.branch
+                    ),
+                    base_style,
+                ));
+            }
+            spans.extend([
+                Span::styled(
+                    format!(
+                        "{:<w$}",
+                        format::truncate(&entry.workflow, hcw.workflow - 1),
+                        w = hcw.workflow
+                    ),
+                    base_style,
+                ),
+                Span::styled(
+                    format!(
+                        "{:<w$}",
+                        format::truncate(&entry.title, hcw.title - 1),
+                        w = hcw.title
+                    ),
+                    base_style,
+                ),
+                Span::styled(format!("{duration:<w$}", w = hcw.duration), base_style),
+                Span::styled(age, base_style),
+            ]);
+            frame.render_widget(Paragraph::new(Line::from(spans)), rows_layout[layout_idx]);
         }
     }
 
     // Hint row (last slot before end)
     let hint_idx = rows_layout.len() - 1;
-    let hint = Line::from(vec![
-        Span::styled(
-            "[↑↓]",
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(" scroll  ", Style::default().fg(Color::DarkGray)),
-        Span::styled(
-            "[o]",
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(" open  ", Style::default().fg(Color::DarkGray)),
-        Span::styled(
-            "[Esc]",
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(" close", Style::default().fg(Color::DarkGray)),
-    ]);
-    frame.render_widget(Paragraph::new(hint), rows_layout[hint_idx]);
+    frame.render_widget(
+        Paragraph::new(popup_hint(&[
+            ("[↑↓]", "scroll  "),
+            ("[o]", "open  "),
+            ("[r/R]", "rerun  "),
+            ("[Esc]", "close"),
+        ])),
+        rows_layout[hint_idx],
+    );
 }

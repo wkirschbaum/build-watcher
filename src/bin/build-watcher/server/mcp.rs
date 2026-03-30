@@ -11,11 +11,11 @@ use build_watcher::format;
 use build_watcher::github::{validate_branch, validate_repo};
 use build_watcher::history::history_for;
 use build_watcher::rate_limiter::{MIN_ACTIVE_SECS, MIN_IDLE_SECS, compute_intervals};
-use build_watcher::watcher::{count_api_calls, is_paused, last_failed_build};
+use build_watcher::watcher::{count_api_calls, is_paused};
 
 use super::DaemonState;
 use super::actions::{
-    apply_levels, apply_pause, apply_quiet_hours, do_configure_branches, do_stop_watches,
+    apply_levels, apply_pause, apply_quiet_hours, do_configure_branches, do_rerun, do_stop_watches,
     do_watch_builds, format_outcomes, persist_config, validate_hhmm,
 };
 use super::build_watch_snapshot;
@@ -170,7 +170,7 @@ impl BuildWatcher {
                     ))]));
                 }
 
-                let (snapshot, mut msgs) = {
+                let mut msgs = {
                     let mut config = self.state.config.lock().await;
                     let mut msgs = Vec::new();
                     config.default_branches = params.branches;
@@ -194,9 +194,9 @@ impl BuildWatcher {
                             msgs.push(format!("Branch filter: {filter}"));
                         }
                     }
-                    (config.clone(), msgs)
+                    msgs
                 };
-                if let Err(warning) = persist_config(snapshot).await {
+                if let Err(warning) = persist_config(&self.state.config).await {
                     msgs.push(warning);
                 }
                 Ok(CallToolResult::success(vec![Content::text(
@@ -350,7 +350,7 @@ impl BuildWatcher {
             )]));
         }
 
-        let (snapshot, mut msgs) = {
+        let mut msgs = {
             let mut config = self.state.config.lock().await;
             let rc = config.repos.entry(params.repo.clone()).or_default();
             let mut msgs = Vec::new();
@@ -372,9 +372,9 @@ impl BuildWatcher {
                 rc.alias = Some(alias.clone());
                 msgs.push(format!("{}: alias set to \"{alias}\"", params.repo));
             }
-            (config.clone(), msgs)
+            msgs
         };
-        if let Err(warning) = persist_config(snapshot).await {
+        if let Err(warning) = persist_config(&self.state.config).await {
             msgs.push(warning);
         }
         Ok(CallToolResult::success(vec![Content::text(
@@ -397,7 +397,7 @@ impl BuildWatcher {
             )]));
         }
 
-        let (snapshot, mut msgs) = {
+        let mut msgs = {
             let mut config = self.state.config.lock().await;
 
             let mut added = Vec::new();
@@ -438,9 +438,9 @@ impl BuildWatcher {
                 msgs.push(format!("Ignored: {:?}", config.ignored_workflows));
             }
 
-            (config.clone(), msgs)
+            msgs
         };
-        if let Err(warning) = persist_config(snapshot).await {
+        if let Err(warning) = persist_config(&self.state.config).await {
             msgs.push(warning);
         }
 
@@ -460,80 +460,9 @@ impl BuildWatcher {
             return Ok(CallToolResult::error(vec![Content::text(e)]));
         }
 
-        let run_id = if let Some(id) = params.run_id {
-            id
-        } else {
-            let in_memory = {
-                let watches = self.state.watches.lock().await;
-                last_failed_build(&watches, &params.repo).map(|(key, build)| {
-                    tracing::info!(
-                        repo = params.repo,
-                        branch = key.branch,
-                        run_id = build.run_id,
-                        "Rerunning last failed build (from memory)"
-                    );
-                    build.run_id
-                })
-            };
-
-            if let Some(id) = in_memory {
-                id
-            } else {
-                tracing::debug!(
-                    repo = params.repo,
-                    "No in-memory failed build; querying GitHub history"
-                );
-                match self
-                    .state
-                    .handle
-                    .github
-                    .run_list_history(&params.repo, None, 20)
-                    .await
-                {
-                    Ok(entries) => match entries.into_iter().find(|e| e.conclusion == "failure") {
-                        Some(entry) => {
-                            tracing::info!(
-                                repo = params.repo,
-                                run_id = entry.id,
-                                "Rerunning last failed build (from GitHub history)"
-                            );
-                            entry.id
-                        }
-                        None => {
-                            return Ok(CallToolResult::error(vec![Content::text(format!(
-                                "No recent failed build found for {}",
-                                params.repo
-                            ))]));
-                        }
-                    },
-                    Err(e) => {
-                        return Ok(CallToolResult::error(vec![Content::text(format!(
-                            "No in-memory failed build and GitHub history lookup failed: {e}"
-                        ))]));
-                    }
-                }
-            }
-        };
-
-        match self
-            .state
-            .handle
-            .github
-            .run_rerun(&params.repo, run_id, params.failed_only)
-            .await
-        {
-            Ok(_) => {
-                let url = format!("https://github.com/{}/actions/runs/{run_id}", params.repo);
-                let kind = if params.failed_only {
-                    "failed jobs"
-                } else {
-                    "all jobs"
-                };
-                Ok(CallToolResult::success(vec![Content::text(format!(
-                    "Rerunning {kind} for run {run_id}\n{url}"
-                ))]))
-            }
-            Err(e) => Ok(CallToolResult::error(vec![Content::text(e.to_string())])),
+        match do_rerun(&self.state, &params.repo, params.run_id, params.failed_only).await {
+            Ok(msg) => Ok(CallToolResult::success(vec![Content::text(msg)])),
+            Err(e) => Ok(CallToolResult::error(vec![Content::text(e)])),
         }
     }
 
@@ -699,7 +628,7 @@ impl BuildWatcher {
 
         // Quiet hours + notification levels (both touch config)
         if has_levels || has_quiet {
-            let (snapshot, scope, effective) = {
+            let (scope, effective) = {
                 let mut config = self.state.config.lock().await;
 
                 // Quiet hours
@@ -750,7 +679,7 @@ impl BuildWatcher {
                     (String::new(), None)
                 };
 
-                (config.clone(), scope, effective)
+                (scope, effective)
             };
 
             if let Some(eff) = effective {
@@ -760,7 +689,7 @@ impl BuildWatcher {
                 ));
             }
 
-            if let Err(warning) = persist_config(snapshot).await {
+            if let Err(warning) = persist_config(&self.state.config).await {
                 msgs.push(warning);
             }
         }
@@ -788,13 +717,12 @@ impl BuildWatcher {
                 ))]));
             }
         };
-        let snapshot = {
+        {
             let mut cfg = self.state.config.lock().await;
             cfg.poll_aggression = level;
-            cfg.clone()
-        };
+        }
         self.state.handle.config_changed.notify_waiters();
-        if let Err(w) = persist_config(snapshot).await {
+        if let Err(w) = persist_config(&self.state.config).await {
             return Ok(CallToolResult::success(vec![Content::text(w)]));
         }
         Ok(CallToolResult::success(vec![Content::text(format!(

@@ -159,7 +159,13 @@ pub fn save_config(config: &Config) -> Result<(), PersistError> {
     save_json(&config_dir().join("config.json"), config)
 }
 
+/// Mutex that serializes config writes so concurrent `save_config_async` calls
+/// don't race on the `.draft` temp file (which could cause an older snapshot to
+/// overwrite a newer one).
+static CONFIG_SAVE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 pub async fn save_config_async(config: &Config) -> Result<(), PersistError> {
+    let _guard = CONFIG_SAVE_LOCK.lock().await;
     save_json_async(config_dir().join("config.json"), config.clone()).await
 }
 

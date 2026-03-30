@@ -180,24 +180,40 @@ impl DaemonClient {
     pub(crate) async fn rerun(
         &self,
         repo: &str,
-        run_id: u64,
+        run_id: Option<u64>,
         failed_only: bool,
-    ) -> Result<(), String> {
+    ) -> Result<String, String> {
         #[derive(Serialize)]
         struct Req<'a> {
             repo: &'a str,
-            run_id: u64,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            run_id: Option<u64>,
             failed_only: bool,
         }
-        self.post_json(
-            "/rerun",
-            &Req {
+        let resp = self
+            .client
+            .post(self.url("/rerun"))
+            .json(&Req {
                 repo,
                 run_id,
                 failed_only,
-            },
-        )
-        .await
+            })
+            .send()
+            .await
+            .map_err(|e| format!("/rerun: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!("/rerun: HTTP {}", resp.status()));
+        }
+        let json: serde_json::Value = resp.json().await.map_err(|e| format!("/rerun: {e}"))?;
+        if let Some(err) = json.get("error").and_then(|v| v.as_str()) {
+            return Err(err.to_string());
+        }
+        let message = json
+            .get("message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Rerun triggered")
+            .to_string();
+        Ok(message)
     }
 
     pub(crate) async fn shutdown(&self) -> Result<(), String> {

@@ -29,23 +29,18 @@ use app::{App, InputMode, QuitAction, SseState, SseUpdate, TuiPrefs};
 use client::{DaemonClient, sse_task};
 use render::render;
 
-/// Read the daemon port from the port file, or start the daemon if it's not running.
-fn discover_or_start_daemon() -> Result<u16, Box<dyn std::error::Error>> {
+/// Try to connect to an existing daemon. Returns the port if reachable, or `None`.
+fn try_existing_daemon() -> Option<u16> {
     let port_file = state_dir().join("port");
+    let contents = std::fs::read_to_string(&port_file).ok()?;
+    let port = contents.trim().parse::<u16>().ok()?;
+    std::net::TcpStream::connect(format!("127.0.0.1:{port}"))
+        .ok()
+        .map(|_| port)
+}
 
-    // Try reading existing port file first.
-    if let Ok(contents) = std::fs::read_to_string(&port_file)
-        && let Ok(port) = contents.trim().parse::<u16>()
-    {
-        if std::net::TcpStream::connect(format!("127.0.0.1:{port}")).is_ok() {
-            return Ok(port);
-        }
-        // Port file exists but daemon is not responding — stale file.
-        let _ = std::fs::remove_file(&port_file);
-    }
-
-    // Daemon not running — try to start it.
-    eprintln!("Daemon not running, starting build-watcher…");
+/// Start the daemon process (fire and forget).
+fn start_daemon() -> Result<(), Box<dyn std::error::Error>> {
     let exe = std::env::current_exe()?;
     let daemon_bin = exe
         .parent()
@@ -66,19 +61,34 @@ fn discover_or_start_daemon() -> Result<u16, Box<dyn std::error::Error>> {
         .stderr(std::process::Stdio::null())
         .spawn()
         .map_err(|e| format!("Failed to start daemon: {e}"))?;
+    Ok(())
+}
 
-    // Wait for the port file to appear (up to 5 seconds).
-    for _ in 0..50 {
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        if let Ok(contents) = std::fs::read_to_string(&port_file)
+/// Background task: poll until the daemon is reachable, then send `DaemonReady`.
+async fn wait_for_daemon(tx: mpsc::Sender<SseUpdate>) {
+    let port_file = state_dir().join("port");
+    for _ in 0..300 {
+        // up to 30 seconds
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if let Ok(contents) = tokio::fs::read_to_string(&port_file).await
             && let Ok(port) = contents.trim().parse::<u16>()
-            && std::net::TcpStream::connect(format!("127.0.0.1:{port}")).is_ok()
         {
-            return Ok(port);
+            // Verify the port is actually accepting connections.
+            if tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
+                .await
+                .is_ok()
+            {
+                let _ = tx.send(SseUpdate::DaemonReady(port)).await;
+                return;
+            }
         }
     }
-
-    Err("Timed out waiting for daemon to start".into())
+    let _ = tx
+        .send(SseUpdate::BackgroundResult {
+            flash: "Timed out waiting for daemon to start".to_string(),
+            resync: false,
+        })
+        .await;
 }
 
 /// Delete watches and history state files, leaving config intact.
@@ -128,27 +138,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return run_remote_script("install.sh", "update");
     }
 
-    let port = discover_or_start_daemon()?;
-
-    // Fetch initial data concurrently so there's something to display before SSE connects.
-    let daemon = DaemonClient::new(port);
-    let (initial, initial_stats, initial_history) = tokio::join!(
-        daemon.get_json::<StatusResponse>("/status"),
-        daemon.get_json::<StatsResponse>("/stats"),
-        daemon.get_all_history(20),
-    );
-    let initial = initial.unwrap_or_else(|e| {
-        eprintln!("Warning: could not fetch initial status: {e}");
-        StatusResponse {
-            paused: false,
-            watches: vec![],
-        }
-    });
-    let initial_stats = initial_stats.unwrap_or_default();
-    let initial_history = initial_history.unwrap_or_default();
-
     // Shared channel for SSE events and background action results.
     let (sse_tx, mut sse_rx) = mpsc::channel::<SseUpdate>(64);
+
+    // Try to connect to an existing daemon, or start one and poll in the background.
+    let daemon: Option<DaemonClient> = if let Some(port) = try_existing_daemon() {
+        Some(DaemonClient::new(port))
+    } else {
+        eprintln!("Daemon not running, starting build-watcher…");
+        start_daemon()?;
+        tokio::spawn(wait_for_daemon(sse_tx.clone()));
+        None
+    };
+
+    // Fetch initial data if daemon is already available.
+    let (initial, initial_stats, initial_history) = if let Some(ref daemon) = daemon {
+        let (status, stats, history) = tokio::join!(
+            daemon.get_json::<StatusResponse>("/status"),
+            daemon.get_json::<StatsResponse>("/stats"),
+            daemon.get_all_history(20),
+        );
+        (
+            status.unwrap_or_else(|e| {
+                eprintln!("Warning: could not fetch initial status: {e}");
+                StatusResponse {
+                    paused: false,
+                    watches: vec![],
+                }
+            }),
+            stats.unwrap_or_default(),
+            history.unwrap_or_default(),
+        )
+    } else {
+        (
+            StatusResponse {
+                paused: false,
+                watches: vec![],
+            },
+            StatsResponse::default(),
+            vec![],
+        )
+    };
 
     // Check for a newer release at startup (10s delay), then every hour.
     tokio::spawn({
@@ -174,6 +204,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         sse_tx.clone(),
     );
 
+    if daemon.is_none() {
+        app.set_flash("Starting daemon…");
+    }
+
+    // Start SSE streaming if daemon is already available.
+    if let Some(ref daemon) = daemon {
+        tokio::spawn(sse_task(daemon.clone(), sse_tx.clone()));
+    }
+
     // Terminal setup.
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
@@ -181,7 +220,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    tokio::spawn(sse_task(daemon.clone(), sse_tx));
+    // Track the current daemon client — starts as None if daemon wasn't ready.
+    let mut daemon = daemon;
 
     let mut keyboard = EventStream::new();
 
@@ -202,29 +242,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             execute!(terminal.backend_mut(), SetTitle(app.terminal_title()))?;
             terminal.draw(|f| render(f, &app))?;
 
+            // Use a no-op daemon for input handling when the daemon isn't ready yet.
+            // All actions will fail gracefully with connection errors.
+            let fallback;
+            let active_daemon = match &daemon {
+                Some(d) => d,
+                None => {
+                    fallback = DaemonClient::new(0);
+                    &fallback
+                }
+            };
+
             tokio::select! {
                 _ = elapsed_tick.tick() => {
                     app.tick_timers();
                 }
                 _ = resync_tick.tick() => {
-                    app.resync(&daemon).await;
+                    if daemon.is_some() {
+                        app.resync(active_daemon).await;
+                    }
                 }
                 maybe_update = sse_rx.recv() => {
                     match maybe_update {
+                        Some(SseUpdate::DaemonReady(port)) => {
+                            let d = DaemonClient::new(port);
+                            app.resync(&d).await;
+                            app.set_flash("Daemon connected");
+                            tokio::spawn(sse_task(d.clone(), sse_tx.clone()));
+                            daemon = Some(d);
+                        }
                         Some(SseUpdate::Event(event)) => {
                             app.status.apply_event(*event);
                         }
                         Some(SseUpdate::Connected) => {
                             app.sse_state = SseState::Connected;
-                            app.resync(&daemon).await;
+                            app.resync(active_daemon).await;
                         }
                         Some(SseUpdate::Disconnected) => {
                             app.sse_state = SseState::Disconnected { since: Instant::now() };
                         }
                         Some(SseUpdate::BackgroundResult { flash, resync }) => {
                             app.set_flash(flash);
-                            if resync {
-                                app.resync(&daemon).await;
+                            if resync && daemon.is_some() {
+                                app.resync(active_daemon).await;
                             }
                         }
                         Some(SseUpdate::EnterForm { title, fields }) => {
@@ -267,13 +327,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 maybe_event = keyboard.next() => {
                     match maybe_event {
                         Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
-                            if app.handle_input(key.code, &daemon) {
+                            if app.handle_input(key.code, active_daemon) {
                                 continue;
                             }
-                            match app.handle_normal_key(key.code, key.modifiers, &daemon) {
+                            match app.handle_normal_key(key.code, key.modifiers, active_daemon) {
                                 QuitAction::Quit => break,
                                 QuitAction::QuitAndShutdown => {
-                                    let _ = daemon.shutdown().await;
+                                    if let Some(d) = &daemon {
+                                        let _ = d.shutdown().await;
+                                    }
                                     break;
                                 }
                                 QuitAction::None => {}

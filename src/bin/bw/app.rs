@@ -281,7 +281,9 @@ impl App {
     }
 
     pub(crate) fn set_flash(&mut self, msg: impl Into<String>) {
-        self.flash = Some((msg.into(), Instant::now()));
+        let msg = msg.into();
+        let first_line = msg.lines().next().unwrap_or(&msg).to_string();
+        self.flash = Some((first_line, Instant::now()));
     }
 
     pub(crate) fn save_prefs(&self) {
@@ -409,6 +411,8 @@ pub(crate) enum SseUpdate {
         branch: Option<String>,
         entries: Vec<HistoryEntryView>,
     },
+    /// Daemon became reachable after a background startup wait.
+    DaemonReady(u16),
     /// A newer release was found; tag name to display in the header.
     UpdateAvailable(String),
 }

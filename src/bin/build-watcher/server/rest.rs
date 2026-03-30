@@ -17,7 +17,9 @@ use build_watcher::status::{DefaultsConfig, HistoryEntryView, StatsResponse};
 use build_watcher::watcher::{count_api_calls, is_paused};
 
 use super::DaemonState;
-use super::actions::{do_configure_branches, do_stop_watches, do_watch_builds, persist_config};
+use super::actions::{
+    do_configure_branches, do_rerun, do_stop_watches, do_watch_builds, persist_config,
+};
 use super::{build_watch_snapshot, json_error};
 
 /// `GET /status` — JSON snapshot of all current watches and their build state.
@@ -118,24 +120,23 @@ pub(crate) async fn pause_handler(
 #[derive(Deserialize)]
 pub(crate) struct RerunRequest {
     repo: String,
-    run_id: u64,
+    run_id: Option<u64>,
     #[serde(default)]
     failed_only: bool,
 }
 
-/// `POST /rerun` — Rerun a GitHub Actions build by run ID.
+/// `POST /rerun` — Rerun a GitHub Actions build. If `run_id` is omitted, reruns
+/// the last failed build (from in-memory watches or GitHub history).
 pub(crate) async fn rerun_handler(
     State(state): State<DaemonState>,
     axum::Json(body): axum::Json<RerunRequest>,
-) -> axum::Json<serde_json::Value> {
-    match state
-        .handle
-        .github
-        .run_rerun(&body.repo, body.run_id, body.failed_only)
-        .await
-    {
-        Ok(_) => axum::Json(serde_json::json!({ "ok": true })),
-        Err(e) => axum::Json(serde_json::json!({ "error": e.to_string() })),
+) -> axum::response::Response {
+    if let Err(e) = validate_repo(&body.repo) {
+        return json_error(e);
+    }
+    match do_rerun(&state, &body.repo, body.run_id, body.failed_only).await {
+        Ok(msg) => axum::Json(serde_json::json!({ "ok": true, "message": msg })).into_response(),
+        Err(e) => axum::Json(serde_json::json!({ "error": e })).into_response(),
     }
 }
 
@@ -238,9 +239,9 @@ pub(crate) async fn notifications_handler(
 ) -> axum::response::Response {
     use super::actions::do_notification_action;
 
-    let (snapshot, msg) = {
+    let msg = {
         let mut cfg = state.config.lock().await;
-        let msg = match do_notification_action(
+        match do_notification_action(
             &mut cfg,
             &body.repo,
             body.branch.as_deref(),
@@ -251,10 +252,9 @@ pub(crate) async fn notifications_handler(
         ) {
             Ok(m) => m,
             Err(e) => return json_error(e),
-        };
-        (cfg.clone(), msg)
+        }
     };
-    if let Err(warning) = persist_config(snapshot).await {
+    if let Err(warning) = persist_config(&state.config).await {
         return axum::Json(serde_json::json!({ "ok": true, "message": msg, "warning": warning }))
             .into_response();
     }
@@ -294,7 +294,7 @@ pub(crate) async fn set_defaults_handler(
     State(state): State<DaemonState>,
     axum::Json(body): axum::Json<SetDefaultsRequest>,
 ) -> axum::response::Response {
-    let (snapshot, messages) = {
+    let messages = {
         let mut cfg = state.config.lock().await;
         let mut messages = Vec::new();
         if let Some(branches) = body.default_branches {
@@ -349,10 +349,10 @@ pub(crate) async fn set_defaults_handler(
                 messages.push(format!("branch filter: {filter}"));
             }
         }
-        (cfg.clone(), messages)
+        messages
     };
     state.handle.config_changed.notify_waiters();
-    if let Err(warning) = persist_config(snapshot).await {
+    if let Err(warning) = persist_config(&state.config).await {
         return axum::Json(
             serde_json::json!({ "ok": true, "messages": messages, "warning": warning }),
         )

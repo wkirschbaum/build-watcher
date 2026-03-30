@@ -226,11 +226,12 @@ impl RepoPoller {
             tracing::error!(error = %e, "Failed to save watches after removing dead repo");
         }
 
-        let snapshot = {
+        {
             let mut cfg = self.config.lock().await;
             cfg.repos.remove(&self.repo);
-            cfg.clone()
-        };
+        }
+        // Re-read under the save lock so concurrent modifications aren't lost.
+        let snapshot = self.config.lock().await.clone();
         if let Err(e) = crate::config::save_config_async(&snapshot).await {
             tracing::error!(error = %e, "Failed to save config after removing dead repo");
         }

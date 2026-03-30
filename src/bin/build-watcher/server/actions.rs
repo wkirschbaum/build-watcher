@@ -1,8 +1,10 @@
 use std::collections::HashSet;
 
 use build_watcher::config::{self, NotificationLevel, NotificationOverrides};
-use build_watcher::github::DEFAULT_REPO_LIMIT;
-use build_watcher::watcher::{SharedConfig, WatcherHandle, collect_persisted, start_watch};
+use build_watcher::github::{DEFAULT_REPO_LIMIT, run_url};
+use build_watcher::watcher::{
+    SharedConfig, WatcherHandle, collect_persisted, last_failed_build, start_watch,
+};
 
 use super::DaemonState;
 
@@ -121,12 +123,11 @@ pub(crate) async fn do_watch_builds(state: &DaemonState, repos: &[String]) -> Ve
         let persisted = collect_persisted(&state.watches).await;
         let hist = state.handle.history.lock().await.clone();
         state.handle.persistence.save_state(&persisted, &hist).await;
-        let snapshot = {
+        {
             let mut cfg = state.config.lock().await;
             cfg.add_repos(&started_repos);
-            cfg.clone()
-        };
-        if let Err(warning) = persist_config(snapshot).await {
+        }
+        if let Err(warning) = persist_config(&state.config).await {
             results.push(ActionOutcome::err(warning));
         }
     }
@@ -218,7 +219,7 @@ pub(crate) async fn do_stop_watches(state: &DaemonState, repos: &[String]) -> Ve
         tracing::error!(error = %e, "Failed to persist watches");
     }
 
-    let (snapshot, mut results) = {
+    let mut results = {
         let mut cfg = state.config.lock().await;
         let mut results: Vec<ActionOutcome> = Vec::new();
         for (repo, branch_count) in removed_counts {
@@ -234,9 +235,9 @@ pub(crate) async fn do_stop_watches(state: &DaemonState, repos: &[String]) -> Ve
                 _ => results.push(ActionOutcome::err(format!("{repo}: not found"))),
             }
         }
-        (cfg.clone(), results)
+        results
     };
-    if let Err(warning) = persist_config(snapshot).await {
+    if let Err(warning) = persist_config(&state.config).await {
         results.push(ActionOutcome::err(warning));
     }
 
@@ -307,16 +308,103 @@ pub(crate) async fn do_configure_branches(
     if let Err(e) = state.handle.persistence.save_watches(&persisted).await {
         tracing::error!(error = %e, "Failed to persist watches");
     }
-    let snapshot = state.config.lock().await.clone();
-    if let Err(warning) = persist_config(snapshot).await {
+    if let Err(warning) = persist_config(&state.config).await {
         results.push(ActionOutcome::err(warning));
     }
 
     results
 }
 
-pub(crate) async fn persist_config(cfg: build_watcher::config::Config) -> Result<(), String> {
-    config::save_config_async(&cfg).await.map_err(|e| {
+/// Rerun a GitHub Actions build. If `run_id` is `None`, finds the last failed build
+/// from in-memory watches or GitHub history.
+///
+/// Returns a human-readable success message including the run URL, or an error string.
+pub(crate) async fn do_rerun(
+    state: &DaemonState,
+    repo: &str,
+    run_id: Option<u64>,
+    failed_only: bool,
+) -> Result<String, String> {
+    let run_id = match run_id {
+        Some(id) => id,
+        None => {
+            // Try in-memory watches first.
+            let in_memory = {
+                let watches = state.watches.lock().await;
+                last_failed_build(&watches, repo).map(|(key, build)| {
+                    tracing::info!(
+                        repo = repo,
+                        branch = key.branch,
+                        run_id = build.run_id,
+                        "Rerunning last failed build (from memory)"
+                    );
+                    build.run_id
+                })
+            };
+
+            if let Some(id) = in_memory {
+                id
+            } else {
+                // Fall back to GitHub history.
+                tracing::debug!(
+                    repo = repo,
+                    "No in-memory failed build; querying GitHub history"
+                );
+                let entries = state
+                    .handle
+                    .github
+                    .run_list_history(repo, None, 20)
+                    .await
+                    .map_err(|e| {
+                        format!("No in-memory failed build and GitHub history lookup failed: {e}")
+                    })?;
+                let entry = entries
+                    .into_iter()
+                    .find(|e| e.conclusion == "failure")
+                    .ok_or_else(|| format!("No recent failed build found for {repo}"))?;
+                tracing::info!(
+                    repo = repo,
+                    run_id = entry.id,
+                    "Rerunning last failed build (from GitHub history)"
+                );
+                entry.id
+            }
+        }
+    };
+
+    state
+        .handle
+        .github
+        .run_rerun(repo, run_id, failed_only)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // Burst-poll at 1s, 5s, 10s so the poller picks up the rerun quickly.
+    let notify = state.handle.config_changed.clone();
+    tokio::spawn(async move {
+        for delay in [1, 5, 10] {
+            tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+            notify.notify_waiters();
+        }
+    });
+
+    let url = run_url(repo, run_id);
+    let kind = if failed_only {
+        "failed jobs"
+    } else {
+        "all jobs"
+    };
+    Ok(format!("Rerunning {kind} for run {run_id}\n{url}"))
+}
+
+/// Persist the current in-memory config to disk.
+///
+/// Re-reads the shared config under the save lock so concurrent modifications
+/// (e.g. poll_aggression changed while watch_builds is in flight) are never
+/// lost due to a stale snapshot winning the I/O race.
+pub(crate) async fn persist_config(config: &SharedConfig) -> Result<(), String> {
+    let snapshot = config.lock().await.clone();
+    config::save_config_async(&snapshot).await.map_err(|e| {
         tracing::error!("Failed to save config: {e}");
         format!("\n⚠️ Warning: config could not be saved to disk: {e}")
     })
