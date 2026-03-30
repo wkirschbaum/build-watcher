@@ -958,25 +958,7 @@ pub(crate) fn render_header(frame: &mut ratatui::Frame, area: ratatui::layout::R
         repos.len()
     };
     let branch_count = app.status.watches.len();
-    let mut n_active = 0usize;
-    let mut n_failing = 0usize;
-    let mut n_passing = 0usize;
-    let mut n_idle = 0usize;
-    for w in &app.status.watches {
-        if !w.active_runs.is_empty() {
-            n_active += 1;
-        } else if w.last_builds.is_empty() {
-            n_idle += 1;
-        } else if w
-            .last_builds
-            .iter()
-            .any(|b| b.conclusion != RunConclusion::Success)
-        {
-            n_failing += 1;
-        } else {
-            n_passing += 1;
-        }
-    }
+    let (n_active, n_failing, n_passing, n_idle) = app.branch_status_counts();
 
     let sep2 = Span::styled("  ", dim);
     let mut left2_spans: Vec<Span> = vec![

@@ -262,29 +262,38 @@ impl App {
             .sum()
     }
 
+    /// Per-branch status bucket counts used by both the header and the terminal title.
+    /// Each branch is placed in exactly one bucket: active, failing, passing, or idle.
+    pub(crate) fn branch_status_counts(&self) -> (usize, usize, usize, usize) {
+        let mut n_active = 0usize;
+        let mut n_failing = 0usize;
+        let mut n_passing = 0usize;
+        let mut n_idle = 0usize;
+        for w in &self.status.watches {
+            if !w.active_runs.is_empty() {
+                n_active += 1;
+            } else if w.last_builds.is_empty() {
+                n_idle += 1;
+            } else if w
+                .last_builds
+                .iter()
+                .any(|b| b.conclusion != RunConclusion::Success)
+            {
+                n_failing += 1;
+            } else {
+                n_passing += 1;
+            }
+        }
+        (n_active, n_failing, n_passing, n_idle)
+    }
+
     /// Build a terminal title string summarising build status counts.
     pub(crate) fn terminal_title(&self) -> String {
         if self.status.watches.is_empty() {
             return "bw".to_string();
         }
-
-        let active = self.active_count();
-        let mut success = 0usize;
-        let mut failed = 0usize;
-
-        for w in &self.status.watches {
-            for lb in &w.last_builds {
-                match &lb.conclusion {
-                    RunConclusion::Success => success += 1,
-                    RunConclusion::Failure
-                    | RunConclusion::TimedOut
-                    | RunConclusion::StartupFailure => failed += 1,
-                    _ => {}
-                }
-            }
-        }
-
-        format!("builds: {active} · {success} · {failed}")
+        let (n_active, n_failing, n_passing, _n_idle) = self.branch_status_counts();
+        format!("bw  ⏳{n_active}  ✗{n_failing}  ✓{n_passing}")
     }
 
     pub(crate) fn set_flash(&mut self, msg: impl Into<String>) {
