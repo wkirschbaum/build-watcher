@@ -1,7 +1,10 @@
+use std::collections::HashSet;
+
 use crossterm::event::{KeyCode, KeyModifiers};
 
 use build_watcher::config::NOTIFICATION_EVENT_COUNT;
 use build_watcher::github::{job_url, repo_url, run_url};
+use build_watcher::status::WatchStatus;
 
 use super::app::{App, ExpandLevel, QuitAction, SseUpdate};
 use super::client::{DaemonClient, open_browser};
@@ -228,10 +231,19 @@ impl App {
             KeyCode::Enter | KeyCode::Right | KeyCode::Tab | KeyCode::Char('e')
                 if is_collapsible =>
             {
-                // Cycle expand level: Full → Branches → Collapsed → Full
+                // Cycle expand level: Full → Branches → Collapsed → Full.
+                // Skip `Branches` when no branch in this repo has multiple workflows —
+                // Full and Branches would look identical, making the keypress feel broken.
                 if let Some((repo, _, _, _)) = selected {
                     let repo = repo.to_string();
-                    let next = self.expand_level(&repo).next();
+                    let current = self.expand_level(&repo);
+                    let skip_branches =
+                        !repo_has_multi_workflow_branch(&self.status.watches, &repo);
+                    let next = if skip_branches && current == ExpandLevel::Full {
+                        ExpandLevel::Collapsed
+                    } else {
+                        current.next()
+                    };
                     self.set_expand_level(&repo, next);
                     self.save_prefs();
                 }
@@ -571,4 +583,18 @@ impl App {
         }
         self.save_prefs();
     }
+}
+
+/// Returns true if any branch of `repo` has more than one workflow item
+/// (i.e. would show a BranchHeader with expandable children).
+fn repo_has_multi_workflow_branch(watches: &[WatchStatus], repo: &str) -> bool {
+    watches.iter().filter(|w| w.repo == repo).any(|w| {
+        let active_wfs: HashSet<&str> = w.active_runs.iter().map(|r| r.workflow.as_str()).collect();
+        let extra_last = w
+            .last_builds
+            .iter()
+            .filter(|lb| !active_wfs.contains(lb.workflow.as_str()))
+            .count();
+        active_wfs.len() + extra_last > 1
+    })
 }
