@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::sync::{Mutex, Notify, Semaphore};
 use tokio::time::Instant;
@@ -15,6 +16,9 @@ use crate::persistence::Persistence;
 use super::repo_poller::RepoPoller;
 use super::types::{ActiveRun, WatchEntry, WatchKey};
 use super::{RateLimitState, SharedConfig, Watches, filter_runs};
+
+/// How often the centralized rate-limit refresh task runs.
+const RATE_LIMIT_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
 // -- Watcher handle --
 
@@ -83,8 +87,26 @@ pub async fn start_watch(
         .recent_runs(repo, branch)
         .await
         .map_err(|e| e.to_string())?;
+
+    // No runs at all — register an idle watch so the poller will pick up future builds.
     if all_runs.is_empty() {
-        return Err(format!("{repo} [{branch}]: no workflow runs found"));
+        let entry = WatchEntry {
+            last_seen_run_id: 0,
+            active_runs: HashMap::new(),
+            failure_counts: HashMap::new(),
+            last_builds: HashMap::new(),
+        };
+        {
+            let mut w = watches.lock().await;
+            if w.contains_key(&key) {
+                return Ok(format!("{repo} [{branch}]: already being watched"));
+            }
+            w.insert(key.clone(), entry);
+        }
+        spawn_repo_poller(watches, config, handle, rate_limit, &key.repo).await;
+        return Ok(format!(
+            "{repo} [{branch}]: no workflow runs yet, watching for new builds"
+        ));
     }
 
     let (workflow_filter, ignored_workflows): (Vec<String>, Vec<String>) = {
@@ -223,12 +245,46 @@ pub async fn startup_watches(
 
     recover_existing_watches(watches, config, handle, rate_limit, &snapshot).await;
     start_new_config_watches(watches, config, handle, rate_limit, &snapshot).await;
+    spawn_rate_limit_refresher(handle, rate_limit);
+}
+
+/// Spawn a single background task that refreshes the shared rate-limit state
+/// every 60 seconds instead of each `RepoPoller` doing it independently.
+fn spawn_rate_limit_refresher(handle: &WatcherHandle, rate_limit: &RateLimitState) {
+    let gh = handle.github.clone();
+    let rl = rate_limit.clone();
+    let token = handle.cancel.child_token();
+    handle.tracker.spawn(async move {
+        loop {
+            match gh.rate_limit().await {
+                Ok(new_rl) => {
+                    tracing::debug!(
+                        remaining = new_rl.remaining,
+                        limit = new_rl.limit,
+                        "Rate limit refreshed"
+                    );
+                    *rl.lock().await = Some(new_rl);
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "Failed to fetch rate limit");
+                }
+            }
+            tokio::select! {
+                () = tokio::time::sleep(RATE_LIMIT_REFRESH_INTERVAL) => {}
+                () = token.cancelled() => return,
+            }
+        }
+    });
 }
 
 /// Maximum concurrent GitHub API requests during startup recovery.
 const MAX_CONCURRENT_RECOVERY: usize = 10;
 
 /// Resume persisted watches and recover any in-progress runs from GitHub.
+///
+/// Makes one `recent_runs_for_repo` call per unique repo (instead of one
+/// `recent_runs` per branch), then fans results to per-branch entries.
+/// With 500 branches across 5 repos this saves ~495 API calls at startup.
 pub(super) async fn recover_existing_watches(
     watches: &Watches,
     config: &SharedConfig,
@@ -236,68 +292,88 @@ pub(super) async fn recover_existing_watches(
     rate_limit: &RateLimitState,
     snapshot: &[WatchKey],
 ) {
+    // Group branches by repo.
+    let mut repos: HashMap<String, Vec<&WatchKey>> = HashMap::new();
+    for key in snapshot {
+        repos.entry(key.repo.clone()).or_default().push(key);
+    }
+
     let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_RECOVERY));
     let mut set = tokio::task::JoinSet::new();
-    for key in snapshot {
-        tracing::info!(key = %key, "Resuming watch");
-        let key = key.clone();
+    for (repo, keys) in &repos {
+        let branch_count = keys.len() as u32;
+        tracing::info!(repo, branches = branch_count, "Resuming watches for repo");
+        let repo = repo.clone();
         let gh = handle.github.clone();
         let sem = semaphore.clone();
+        let limit = super::scaled_repo_limit(branch_count);
         set.spawn(async move {
             let _permit = sem.acquire().await;
-            let result = gh.recent_runs(&key.repo, &key.branch).await;
-            (key, result)
+            let result = gh.recent_runs_for_repo(&repo, limit).await;
+            (repo, result)
         });
     }
 
     while let Some(join_result) = set.join_next().await {
-        let Ok((key, result)) = join_result else {
+        let Ok((repo, result)) = join_result else {
             tracing::error!("Recovery task panicked");
             continue;
         };
-        if let Ok(runs) = result {
-            let (workflow_filter, ignored_workflows) = {
-                let cfg = config.lock().await;
-                (
-                    cfg.workflows_for(&key.repo).to_vec(),
-                    cfg.ignored_workflows.clone(),
-                )
-            };
-            let filtered = filter_runs(&runs, &workflow_filter, &ignored_workflows);
+        let runs = match result {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(repo, error = %e, "Could not recover runs for repo");
+                continue;
+            }
+        };
 
-            let now = Instant::now();
-            let mut w = watches.lock().await;
-            if let Some(entry) = w.get_mut(&key) {
-                for run in &filtered {
-                    if !run.is_completed() && !entry.active_runs.contains_key(&run.id) {
-                        tracing::info!(key = %key, run_id = run.id, "Recovering in-progress run");
-                        // Note: started_at is approximate — the actual GitHub start
-                        // time is lost across restarts, so elapsed time in the
-                        // completion notification may be inaccurate for recovered runs.
-                        entry
-                            .active_runs
-                            .insert(run.id, ActiveRun::from_run(run, now));
-                    }
-                }
-                // Bump high-water mark from all runs (not just filtered) so
-                // check_for_new_runs doesn't re-notify for ignored workflows.
-                if let Some(max_id) = runs.iter().map(|r| r.id).max() {
-                    entry.last_seen_run_id = entry.last_seen_run_id.max(max_id);
+        let (workflow_filter, ignored_workflows) = {
+            let cfg = config.lock().await;
+            (
+                cfg.workflows_for(&repo).to_vec(),
+                cfg.ignored_workflows.clone(),
+            )
+        };
+
+        let now = Instant::now();
+        let mut w = watches.lock().await;
+        for key in repos.get(&repo).into_iter().flatten() {
+            let Some(entry) = w.get_mut(key) else {
+                continue;
+            };
+            let branch_runs = super::runs_for_branch(&runs, &key.branch);
+            let filtered = filter_runs(&branch_runs, &workflow_filter, &ignored_workflows);
+
+            for run in &filtered {
+                if !run.is_completed() && !entry.active_runs.contains_key(&run.id) {
+                    tracing::info!(key = %key, run_id = run.id, "Recovering in-progress run");
+                    // Note: started_at is approximate — the actual GitHub start
+                    // time is lost across restarts, so elapsed time in the
+                    // completion notification may be inaccurate for recovered runs.
+                    entry
+                        .active_runs
+                        .insert(run.id, ActiveRun::from_run(run, now));
                 }
             }
-        } else if let Err(e) = &result {
-            tracing::warn!(key = %key, error = %e, "Could not recover runs");
+            // Bump high-water mark from all runs for this branch (not just
+            // filtered) so check_for_new_runs doesn't re-notify for ignored workflows.
+            if let Some(max_id) = branch_runs.iter().map(|r| r.id).max() {
+                entry.last_seen_run_id = entry.last_seen_run_id.max(max_id);
+            }
         }
     }
 
     // Spawn one RepoPoller per unique repo.
-    let unique_repos: HashSet<String> = snapshot.iter().map(|k| k.repo.clone()).collect();
-    for repo in unique_repos {
-        spawn_repo_poller(watches, config, handle, rate_limit, &repo).await;
+    for repo in repos.keys() {
+        spawn_repo_poller(watches, config, handle, rate_limit, repo).await;
     }
 }
 
 /// Start watches for config repos that don't have persisted state yet.
+///
+/// For repos without explicit branch config, also resolves the GitHub default
+/// branch so that repos using "master" (or other non-"main" defaults) are
+/// watched correctly.
 async fn start_new_config_watches(
     watches: &Watches,
     config: &SharedConfig,
@@ -305,21 +381,53 @@ async fn start_new_config_watches(
     rate_limit: &RateLimitState,
     snapshot: &[WatchKey],
 ) {
-    let new_keys: Vec<WatchKey> = {
+    // For each watched repo, resolve branches: GitHub default + explicit per-repo.
+    // Global default_branches are only used as a fallback when GitHub is unreachable.
+    let mut new_keys: Vec<WatchKey> = Vec::new();
+    let repos: Vec<(String, bool)> = {
         let cfg = config.lock().await;
         cfg.watched_repos()
             .into_iter()
-            .flat_map(|repo| {
-                cfg.branches_for(repo)
-                    .iter()
-                    .filter_map(|branch| {
-                        let key = WatchKey::new(repo, branch);
-                        (!snapshot.contains(&key)).then_some(key)
-                    })
-                    .collect::<Vec<_>>()
+            .map(|repo| {
+                let has_explicit = cfg.has_explicit_branches(repo);
+                (repo.to_string(), has_explicit)
             })
             .collect()
     };
+
+    for (repo, has_explicit) in &repos {
+        let mut branches = Vec::new();
+
+        match handle.github.default_branch(repo).await {
+            Ok(gh_default) => {
+                branches.push(gh_default);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    repo = %repo, error = %e,
+                    "Failed to resolve default branch on startup, falling back to config"
+                );
+                let cfg = config.lock().await;
+                branches.extend(cfg.branches_for(repo).iter().cloned());
+            }
+        }
+
+        if *has_explicit {
+            let cfg = config.lock().await;
+            for b in cfg.branches_for(repo) {
+                if !branches.contains(b) {
+                    branches.push(b.clone());
+                }
+            }
+        }
+
+        for branch in &branches {
+            let key = WatchKey::new(repo, branch);
+            if !snapshot.contains(&key) {
+                new_keys.push(key);
+            }
+        }
+    }
 
     let mut set = tokio::task::JoinSet::new();
     for key in new_keys {

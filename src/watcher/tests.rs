@@ -498,6 +498,33 @@ fn count_api_calls_empty_watches() {
     assert_eq!(count_api_calls(&watches), 0);
 }
 
+// -- scaled_repo_limit --
+
+#[test]
+fn scaled_repo_limit_uses_default_for_few_branches() {
+    use super::scaled_repo_limit;
+    use crate::github::DEFAULT_REPO_LIMIT;
+    // 1-6 branches: 1*3=3..6*3=18, both below DEFAULT_REPO_LIMIT → clamped to default
+    assert_eq!(scaled_repo_limit(1), DEFAULT_REPO_LIMIT);
+    assert_eq!(scaled_repo_limit(6), DEFAULT_REPO_LIMIT);
+}
+
+#[test]
+fn scaled_repo_limit_scales_with_branches() {
+    use super::scaled_repo_limit;
+    // 10 branches → 30, 50 branches → 150
+    assert_eq!(scaled_repo_limit(10), 30);
+    assert_eq!(scaled_repo_limit(50), 150);
+}
+
+#[test]
+fn scaled_repo_limit_caps_at_max() {
+    use super::scaled_repo_limit;
+    // 100 branches → 300, capped at 200
+    assert_eq!(scaled_repo_limit(100), 200);
+    assert_eq!(scaled_repo_limit(500), 200);
+}
+
 // -- Mock GitHub client for integration tests --
 
 struct MockGitHub {
@@ -579,6 +606,9 @@ impl crate::github::GitHubClient for MockGitHub {
     async fn list_tags(&self, _: &str) -> Result<Vec<String>, GhError> {
         Ok(vec![])
     }
+    async fn default_branch(&self, _: &str) -> Result<String, GhError> {
+        Ok("main".to_string())
+    }
 }
 
 fn mock_handle(github: Arc<dyn crate::github::GitHubClient>) -> WatcherHandle {
@@ -640,7 +670,7 @@ async fn start_watch_with_mock_github() {
 }
 
 #[tokio::test]
-async fn start_watch_rejects_empty_runs() {
+async fn start_watch_registers_idle_watch_for_empty_runs() {
     let gh = MockGitHub::with_runs(vec![]);
     let watches: Watches = Arc::new(Mutex::new(HashMap::new()));
     let config: SharedConfig = Arc::new(Mutex::new(Config::default()));
@@ -648,8 +678,10 @@ async fn start_watch_rejects_empty_runs() {
     let handle = mock_handle(gh);
 
     let result = start_watch(&watches, &config, &handle, &rate_limit, "alice/app", "main").await;
-    assert!(result.is_err());
-    assert!(result.unwrap_err().contains("no workflow runs found"));
+    assert!(result.is_ok());
+    assert!(result.unwrap().contains("no workflow runs yet"));
+    let w = watches.lock().await;
+    assert!(w.contains_key(&WatchKey::new("alice/app", "main")));
 }
 
 #[tokio::test]

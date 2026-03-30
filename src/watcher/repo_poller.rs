@@ -8,7 +8,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::unix_now;
 use crate::events::{EventBus, RunSnapshot, WatchEvent};
-use crate::github::{DEFAULT_REPO_LIMIT, GitHubClient, LastBuild, RunInfo};
+use crate::github::{GitHubClient, LastBuild, RunInfo};
 use crate::history::push_build;
 use crate::persistence::Persistence;
 use crate::rate_limiter::compute_intervals;
@@ -19,10 +19,10 @@ use super::{
     RateLimitState, SharedConfig, Watches, collect_persisted, filter_runs, runs_for_branch,
 };
 
-/// How often each poller refreshes the shared rate limit state.
-const RATE_LIMIT_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 /// Maximum individual `run_status` fallback calls when the batch endpoint misses runs.
 const MAX_FALLBACK_CALLS: usize = 10;
+/// Maximum `failing_steps` backfill calls per poll cycle to avoid rate-limit blowout.
+const MAX_BACKFILL_CALLS: usize = 5;
 
 /// Reason a `cancellable_sleep` call returned.
 enum WakeReason {
@@ -168,30 +168,10 @@ impl RepoPoller {
     /// Main poller loop.
     #[tracing::instrument(skip_all, fields(repo = %self.repo))]
     pub(super) async fn run(mut self) {
-        let mut last_rate_limit_refresh: Option<Instant> = None;
-
         loop {
             if !self.has_any_watches().await {
                 tracing::info!(repo = %self.repo, "No more watches for repo, exiting poller");
                 return;
-            }
-
-            // Refresh rate limit every minute (free call).
-            if last_rate_limit_refresh.is_none_or(|t| t.elapsed() >= RATE_LIMIT_REFRESH_INTERVAL) {
-                match self.github.rate_limit().await {
-                    Ok(rl) => {
-                        tracing::debug!(
-                            remaining = rl.remaining,
-                            limit = rl.limit,
-                            "Rate limit refreshed"
-                        );
-                        *self.rate_limit.lock().await = Some(rl);
-                    }
-                    Err(e) => {
-                        tracing::warn!(repo = %self.repo, error = %e, "Failed to fetch rate limit");
-                    }
-                }
-                last_rate_limit_refresh = Some(Instant::now());
             }
 
             let has_active = self.has_any_active().await;
@@ -430,7 +410,7 @@ impl RepoPoller {
                     })
                     .collect()
             };
-            for (key, run_id, workflow) in missing {
+            for (key, run_id, workflow) in missing.into_iter().take(MAX_BACKFILL_CALLS) {
                 if self.token.is_cancelled() {
                     break;
                 }
@@ -466,11 +446,8 @@ impl RepoPoller {
             return changes;
         }
 
-        let all_runs = match self
-            .github
-            .recent_runs_for_repo(&self.repo, DEFAULT_REPO_LIMIT)
-            .await
-        {
+        let limit = super::scaled_repo_limit(branches.len() as u32);
+        let all_runs = match self.github.recent_runs_for_repo(&self.repo, limit).await {
             Ok(r) => r,
             Err(e) if e.is_repo_not_found() => {
                 tracing::warn!(repo = %self.repo, error = %e, "Repo not found, removing watches");
@@ -485,6 +462,7 @@ impl RepoPoller {
 
         let bpcfg = self.branch_poll_config().await;
         let mut any_changed = false;
+        let mut backfill_calls = 0usize;
 
         for key in &branches {
             let branch_runs = runs_for_branch(&all_runs, &key.branch);
@@ -691,31 +669,38 @@ impl RepoPoller {
             }
 
             // Backfill: if any last_build is a failure with no failing_steps, fetch them now.
-            let needs_backfill: Vec<(String, u64)> = {
-                let w = self.watches.lock().await;
-                w.get(key)
-                    .map(|e| {
-                        e.last_builds
-                            .iter()
-                            .filter(|(_, lb)| {
-                                lb.conclusion != "success" && lb.failing_steps.is_none()
-                            })
-                            .map(|(wf, lb)| (wf.clone(), lb.run_id))
-                            .collect()
-                    })
-                    .unwrap_or_default()
-            };
-            for (wf_name, run_id) in needs_backfill {
-                let info = self.github.failing_steps(&self.repo, run_id).await;
-                if let Some(info) = info {
-                    let mut w = self.watches.lock().await;
-                    if let Some(entry) = w.get_mut(key)
-                        && let Some(lb) = entry.last_builds.get_mut(&wf_name)
-                    {
-                        tracing::info!(key = %key, run_id, "Backfilled failing steps");
-                        lb.failing_steps = Some(info.steps);
-                        lb.failing_job_id = info.first_job_id;
-                        any_changed = true;
+            // Capped across all branches to avoid rate-limit blowout with many failures.
+            if backfill_calls < MAX_BACKFILL_CALLS {
+                let needs_backfill: Vec<(String, u64)> = {
+                    let w = self.watches.lock().await;
+                    w.get(key)
+                        .map(|e| {
+                            e.last_builds
+                                .iter()
+                                .filter(|(_, lb)| {
+                                    lb.conclusion != "success" && lb.failing_steps.is_none()
+                                })
+                                .map(|(wf, lb)| (wf.clone(), lb.run_id))
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                };
+                for (wf_name, run_id) in needs_backfill {
+                    if backfill_calls >= MAX_BACKFILL_CALLS {
+                        break;
+                    }
+                    backfill_calls += 1;
+                    let info = self.github.failing_steps(&self.repo, run_id).await;
+                    if let Some(info) = info {
+                        let mut w = self.watches.lock().await;
+                        if let Some(entry) = w.get_mut(key)
+                            && let Some(lb) = entry.last_builds.get_mut(&wf_name)
+                        {
+                            tracing::info!(key = %key, run_id, "Backfilled failing steps");
+                            lb.failing_steps = Some(info.steps);
+                            lb.failing_job_id = info.first_job_id;
+                            any_changed = true;
+                        }
                     }
                 }
             }

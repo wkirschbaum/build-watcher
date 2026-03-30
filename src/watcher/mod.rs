@@ -49,6 +49,17 @@ pub fn count_api_calls(watches: &HashMap<WatchKey, WatchEntry>) -> u64 {
     all_repos.len() as u64 + repos_with_active.len() as u64
 }
 
+/// Maximum limit for `recent_runs_for_repo` calls, even with many branches.
+const MAX_REPO_LIMIT: u32 = 200;
+
+/// Compute a dynamic `--limit` for `recent_runs_for_repo` based on how many
+/// branches are watched. With few branches the default (20) suffices; with
+/// many branches we scale up so that runs on quiet branches aren't missed.
+pub(super) fn scaled_repo_limit(branch_count: u32) -> u32 {
+    use crate::github::DEFAULT_REPO_LIMIT;
+    (branch_count * 3).clamp(DEFAULT_REPO_LIMIT, MAX_REPO_LIMIT)
+}
+
 /// Filter runs by branch name. Used to fan out repo-wide results to per-branch watchers.
 pub(super) fn runs_for_branch<'a>(runs: &'a [RunInfo], branch: &str) -> Vec<&'a RunInfo> {
     runs.iter().filter(|r| r.head_branch == branch).collect()
