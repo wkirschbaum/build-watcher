@@ -59,6 +59,10 @@ pub(crate) enum DisplayRow<'a> {
         extra_badge: String,
         muted: bool,
         tree_prefix: &'static str,
+        /// When true, this row is a child of a `BranchHeader`. The workflow
+        /// name is shown in the tree column instead of the branch name, and
+        /// the branch/workflow columns are left empty.
+        is_workflow_child: bool,
     },
     FailingSteps {
         steps: &'a str,
@@ -70,6 +74,8 @@ pub(crate) enum DisplayRow<'a> {
         build: &'a LastBuildView,
         muted: bool,
         tree_prefix: &'static str,
+        /// See `ActiveRun::is_workflow_child`.
+        is_workflow_child: bool,
     },
     NeverRan {
         repo: &'a str,
@@ -422,6 +428,7 @@ fn emit_branch_workflow_rows<'a>(
                 extra_badge: String::new(),
                 muted: w.muted,
                 tree_prefix,
+                is_workflow_child: false,
             });
         } else if let Some(b) = w.last_builds.first() {
             selectable.push(rows.len());
@@ -431,6 +438,7 @@ fn emit_branch_workflow_rows<'a>(
                 build: b,
                 muted: w.muted,
                 tree_prefix,
+                is_workflow_child: false,
             });
             if b.conclusion != RunConclusion::Success
                 && let Some(steps) = &b.failing_steps
@@ -504,6 +512,7 @@ fn emit_branch_workflow_rows<'a>(
                     extra_badge: String::new(),
                     muted: w.muted,
                     tree_prefix: wf_prefix,
+                    is_workflow_child: true,
                 });
             }
             WorkflowItem::Completed(b) => {
@@ -514,6 +523,7 @@ fn emit_branch_workflow_rows<'a>(
                     build: b,
                     muted: w.muted,
                     tree_prefix: wf_prefix,
+                    is_workflow_child: true,
                 });
                 if b.conclusion != RunConclusion::Success
                     && let Some(steps) = &b.failing_steps
@@ -1057,7 +1067,8 @@ pub(crate) fn render_body<'a>(
 /// Build a 6-cell Row for a branch-level entry (ActiveRun, LastBuild, NeverRan).
 #[allow(clippy::too_many_arguments)]
 fn branch_row<'a>(
-    branch: &str,
+    tree_label: &str,
+    branch_col: &str,
     muted: bool,
     tree_prefix: &str,
     status_text: &str,
@@ -1068,10 +1079,10 @@ fn branch_row<'a>(
     cw: &ColWidths,
     mute_indicator: &dyn Fn(bool) -> &'static str,
 ) -> Row<'a> {
-    let tree_name = format!("  {tree_prefix}{}{}", branch, mute_indicator(muted));
+    let tree_name = format!("  {tree_prefix}{}{}", tree_label, mute_indicator(muted));
     Row::new(vec![
         Cell::from(format::truncate(&tree_name, cw.repo)),
-        Cell::from(format::truncate(branch, cw.branch)),
+        Cell::from(format::truncate(branch_col, cw.branch)),
         Cell::from(format::truncate(status_text, cw.status)).style(style),
         Cell::from(format::truncate(workflow, cw.workflow)),
         Cell::from(format::truncate(title, cw.title)),
@@ -1184,6 +1195,7 @@ fn render_display_row<'a>(
             extra_badge,
             muted,
             tree_prefix,
+            is_workflow_child,
             ..
         } => {
             let status_str = run.status.as_str();
@@ -1206,18 +1218,36 @@ fn render_display_row<'a>(
                     format::status(status_str)
                 )
             };
-            branch_row(
-                branch,
-                *muted,
-                tree_prefix,
-                &status_text,
-                &run.workflow,
-                &run.title,
-                &elapsed,
-                style,
-                cw,
-                mute_indicator,
-            )
+            if *is_workflow_child {
+                // Show workflow name in tree, suppress branch/workflow columns.
+                branch_row(
+                    &run.workflow,
+                    "",
+                    false,
+                    tree_prefix,
+                    &status_text,
+                    "",
+                    &run.title,
+                    &elapsed,
+                    style,
+                    cw,
+                    mute_indicator,
+                )
+            } else {
+                branch_row(
+                    branch,
+                    branch,
+                    *muted,
+                    tree_prefix,
+                    &status_text,
+                    &run.workflow,
+                    &run.title,
+                    &elapsed,
+                    style,
+                    cw,
+                    mute_indicator,
+                )
+            }
         }
         DisplayRow::FailingSteps { steps, tree_indent } => Row::new(vec![
             Cell::from(format!("  {tree_indent}")),
@@ -1233,6 +1263,7 @@ fn render_display_row<'a>(
             build,
             muted,
             tree_prefix,
+            is_workflow_child,
             ..
         } => {
             let conclusion_str = build.conclusion.as_str();
@@ -1248,18 +1279,35 @@ fn render_display_row<'a>(
                 String::new()
             };
             let status_text = format!("{emoji} {}{attempt_suffix}", format::status(conclusion_str));
-            branch_row(
-                branch,
-                *muted,
-                tree_prefix,
-                &status_text,
-                &build.workflow,
-                &build.title,
-                &age,
-                style,
-                cw,
-                mute_indicator,
-            )
+            if *is_workflow_child {
+                branch_row(
+                    &build.workflow,
+                    "",
+                    false,
+                    tree_prefix,
+                    &status_text,
+                    "",
+                    &build.title,
+                    &age,
+                    style,
+                    cw,
+                    mute_indicator,
+                )
+            } else {
+                branch_row(
+                    branch,
+                    branch,
+                    *muted,
+                    tree_prefix,
+                    &status_text,
+                    &build.workflow,
+                    &build.title,
+                    &age,
+                    style,
+                    cw,
+                    mute_indicator,
+                )
+            }
         }
         DisplayRow::NeverRan {
             branch,
@@ -1267,6 +1315,7 @@ fn render_display_row<'a>(
             tree_prefix,
             ..
         } => branch_row(
+            branch,
             branch,
             *muted,
             tree_prefix,
@@ -1292,6 +1341,7 @@ fn render_display_row<'a>(
             let expand_indicator = if *expanded { "▾" } else { "▸" };
             let wf_label = format!("{expand_indicator} {workflow_count} workflows");
             branch_row(
+                branch,
                 branch,
                 *muted,
                 tree_prefix,
