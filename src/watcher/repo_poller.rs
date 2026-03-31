@@ -325,60 +325,113 @@ impl RepoPoller {
             }
         }
 
-        // Process all resolved runs.
+        let (run_changes, changed) = self.process_resolved_runs(&found_runs).await;
+        changes.extend(run_changes);
+
+        let backfill_changed = self.backfill_failing_steps().await;
+
+        if changed || backfill_changed {
+            let persisted = collect_persisted(&self.watches).await;
+            let hist = self.history.lock().await.clone();
+            self.persistence.save_state(&persisted, &hist).await;
+        }
+
+        changes
+    }
+
+    /// Process all resolved runs: detect completions and status changes.
+    /// Returns `(changes, any_state_changed)`.
+    async fn process_resolved_runs(
+        &self,
+        found_runs: &[(RunInfo, WatchKey)],
+    ) -> (Vec<RunChange>, bool) {
+        let mut changes = Vec::new();
         let mut changed = false;
-        for (run, key) in &found_runs {
-            if self.token.is_cancelled() {
-                return changes;
-            }
 
-            if run.is_completed() {
-                let elapsed = {
-                    let w = self.watches.lock().await;
-                    w.get(key)
+        // Phase 1: snapshot elapsed times for all completed runs in a single lock.
+        let elapsed_map: HashMap<u64, Option<f64>> = {
+            let w = self.watches.lock().await;
+            found_runs
+                .iter()
+                .filter(|(run, _)| run.is_completed())
+                .map(|(run, key)| {
+                    let elapsed = w
+                        .get(key)
                         .and_then(|e| e.active_runs.get(&run.id))
-                        .map(|a| a.started_at.elapsed().as_secs_f64())
-                };
+                        .map(|a| a.started_at.elapsed().as_secs_f64());
+                    (run.id, elapsed)
+                })
+                .collect()
+        };
 
+        // Phase 2: fetch failure info via API (no lock held).
+        struct CompletedInfo {
+            run_idx: usize,
+            elapsed: Option<f64>,
+            failing_steps: Option<String>,
+            failing_job_id: Option<u64>,
+        }
+        let mut completions: Vec<CompletedInfo> = Vec::new();
+
+        for (i, (run, _key)) in found_runs.iter().enumerate() {
+            if self.token.is_cancelled() {
+                return (changes, changed);
+            }
+            if run.is_completed() {
+                let elapsed = elapsed_map.get(&run.id).copied().flatten();
                 let failure_info = if run.succeeded() {
                     None
                 } else {
                     self.github.failing_steps(&self.repo, run.id).await
                 };
-                let failing_steps = failure_info.as_ref().map(|f| f.steps.clone());
-                let failing_job_id = failure_info.as_ref().and_then(|f| f.first_job_id);
-
-                changes.push(RunChange::Completed {
-                    run: RunSnapshot::from_run_info(run, &self.repo, &key.branch),
-                    conclusion: run.run_conclusion(),
+                completions.push(CompletedInfo {
+                    run_idx: i,
                     elapsed,
-                    failing_steps: failing_steps.clone(),
-                    failing_job_id,
+                    failing_steps: failure_info.as_ref().map(|f| f.steps.clone()),
+                    failing_job_id: failure_info.as_ref().and_then(|f| f.first_job_id),
                 });
+            }
+        }
 
-                tracing::info!(
-                    key = %key, run_id = run.id,
-                    sha = run.short_sha(), conclusion = %run.conclusion,
-                    "Build completed"
-                );
+        // Emit events for completions.
+        for c in &completions {
+            let (run, key) = &found_runs[c.run_idx];
+            changes.push(RunChange::Completed {
+                run: RunSnapshot::from_run_info(run, &self.repo, &key.branch),
+                conclusion: run.run_conclusion(),
+                elapsed: c.elapsed,
+                failing_steps: c.failing_steps.clone(),
+                failing_job_id: c.failing_job_id,
+            });
+            tracing::info!(
+                key = %key, run_id = run.id,
+                sha = run.short_sha(), conclusion = %run.conclusion,
+                "Build completed"
+            );
+        }
 
-                let new_build = {
-                    let mut w = self.watches.lock().await;
-                    if let Some(entry) = w.get_mut(key) {
-                        entry.record_completion(run, failing_steps, failing_job_id, unix_now());
-                        entry.last_builds.get(&run.workflow).cloned()
-                    } else {
-                        None
+        // Phase 3: single lock to apply all completions and status updates.
+        let mut new_builds: Vec<(WatchKey, crate::github::LastBuild)> = Vec::new();
+        {
+            let mut w = self.watches.lock().await;
+            for c in &completions {
+                let (run, key) = &found_runs[c.run_idx];
+                if let Some(entry) = w.get_mut(key) {
+                    entry.record_completion(
+                        run,
+                        c.failing_steps.clone(),
+                        c.failing_job_id,
+                        unix_now(),
+                    );
+                    if let Some(lb) = entry.last_builds.get(&run.workflow) {
+                        new_builds.push((key.clone(), lb.clone()));
                     }
-                };
-                if let Some(lb) = new_build {
-                    let mut hist = self.history.lock().await;
-                    push_build(&mut hist, key, lb);
                 }
-                changed = true;
-            } else {
-                let mut w = self.watches.lock().await;
-                if let Some(entry) = w.get_mut(key)
+            }
+            // Status updates for non-completed runs.
+            for (run, key) in found_runs {
+                if !run.is_completed()
+                    && let Some(entry) = w.get_mut(key)
                     && let Some(old_status) = entry.update_status(run.id, &run.status)
                 {
                     changes.push(RunChange::StatusChanged {
@@ -390,53 +443,71 @@ impl RepoPoller {
             }
         }
 
-        // Retry fetching failing_steps for failed builds that are missing them.
-        // Give up after 10 minutes to avoid hammering the API indefinitely.
-        {
-            let now = unix_now();
-            let missing: Vec<(WatchKey, u64, String)> = {
-                let w = self.watches.lock().await;
-                w.iter()
-                    .filter(|(k, _)| k.repo == self.repo)
-                    .flat_map(|(k, entry)| {
-                        entry.last_builds.values().filter_map(move |lb| {
-                            if lb.conclusion != "success"
-                                && lb.failing_steps.is_none()
-                                && lb.completed_at.is_some_and(|t| now.saturating_sub(t) < 600)
-                            {
-                                Some((k.clone(), lb.run_id, lb.workflow.clone()))
-                            } else {
-                                None
-                            }
-                        })
-                    })
-                    .collect()
-            };
-            for (key, run_id, workflow) in missing.into_iter().take(MAX_BACKFILL_CALLS) {
-                if self.token.is_cancelled() {
-                    break;
-                }
-                if let Some(info) = self.github.failing_steps(&self.repo, run_id).await {
-                    let mut w = self.watches.lock().await;
-                    if let Some(entry) = w.get_mut(&key)
-                        && let Some(lb) = entry.last_builds.get_mut(&workflow)
-                        && lb.run_id == run_id
-                    {
-                        lb.failing_steps = Some(info.steps);
-                        lb.failing_job_id = info.first_job_id;
-                        changed = true;
-                    }
-                }
+        // Push completed builds to history.
+        if !new_builds.is_empty() {
+            changed = true;
+            let mut hist = self.history.lock().await;
+            for (key, lb) in new_builds {
+                push_build(&mut hist, &key, lb);
             }
         }
 
-        if changed {
-            let persisted = collect_persisted(&self.watches).await;
-            let hist = self.history.lock().await.clone();
-            self.persistence.save_state(&persisted, &hist).await;
+        (changes, changed)
+    }
+
+    /// Retry fetching failing_steps for failed builds that are missing them.
+    /// Gives up after 10 minutes to avoid hammering the API indefinitely.
+    /// Returns `true` if any state was updated.
+    async fn backfill_failing_steps(&self) -> bool {
+        let now = unix_now();
+        let missing: Vec<(WatchKey, u64, String)> = {
+            let w = self.watches.lock().await;
+            w.iter()
+                .filter(|(k, _)| k.repo == self.repo)
+                .flat_map(|(k, entry)| {
+                    entry.last_builds.values().filter_map(move |lb| {
+                        if lb.conclusion != "success"
+                            && lb.failing_steps.is_none()
+                            && lb.completed_at.is_some_and(|t| now.saturating_sub(t) < 600)
+                        {
+                            Some((k.clone(), lb.run_id, lb.workflow.clone()))
+                        } else {
+                            None
+                        }
+                    })
+                })
+                .collect()
+        };
+
+        // Fetch all failing steps outside the lock.
+        let mut results: Vec<(WatchKey, u64, String, crate::github::FailureInfo)> = Vec::new();
+        for (key, run_id, workflow) in missing.into_iter().take(MAX_BACKFILL_CALLS) {
+            if self.token.is_cancelled() {
+                break;
+            }
+            if let Some(info) = self.github.failing_steps(&self.repo, run_id).await {
+                results.push((key, run_id, workflow, info));
+            }
         }
 
-        changes
+        if results.is_empty() {
+            return false;
+        }
+
+        // Apply all results in a single lock.
+        let mut changed = false;
+        let mut w = self.watches.lock().await;
+        for (key, run_id, workflow, info) in results {
+            if let Some(entry) = w.get_mut(&key)
+                && let Some(lb) = entry.last_builds.get_mut(&workflow)
+                && lb.run_id == run_id
+            {
+                lb.failing_steps = Some(info.steps);
+                lb.failing_job_id = info.first_job_id;
+                changed = true;
+            }
+        }
+        changed
     }
 
     /// Check for new runs across all watched branches using a single repo-wide API call.

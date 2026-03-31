@@ -77,10 +77,10 @@ impl NotificationLevel {
 pub enum PollAggression {
     /// Target ≤10% of the rate-limit per reset window.
     Low,
-    /// Target ≤25% of the rate-limit per reset window (default).
+    /// Target ≤40% of the rate-limit per reset window (default).
     #[default]
     Medium,
-    /// Target ≤50% of the rate-limit per reset window.
+    /// Target ≤80% of the rate-limit per reset window.
     High,
 }
 
@@ -105,6 +105,21 @@ impl std::fmt::Display for PollAggression {
             Self::Low => write!(f, "low"),
             Self::Medium => write!(f, "medium"),
             Self::High => write!(f, "high"),
+        }
+    }
+}
+
+impl std::str::FromStr for PollAggression {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "low" => Ok(Self::Low),
+            "medium" => Ok(Self::Medium),
+            "high" => Ok(Self::High),
+            other => Err(format!(
+                "unknown poll aggression {other:?}; valid: low, medium, high"
+            )),
         }
     }
 }
@@ -151,13 +166,11 @@ impl PollAggression {
 
 /// Per-event notification levels.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 #[allow(clippy::struct_field_names)] // `build_` prefix is intentional domain naming
 pub struct NotificationConfig {
-    #[serde(default = "default_normal")]
     pub build_started: NotificationLevel,
-    #[serde(default = "default_normal")]
     pub build_success: NotificationLevel,
-    #[serde(default = "default_critical")]
     pub build_failure: NotificationLevel,
 }
 
@@ -175,16 +188,8 @@ pub struct NotificationOverrides {
 
 impl NotificationOverrides {
     pub fn is_empty(&self) -> bool {
-        self.build_started.is_none() && self.build_success.is_none() && self.build_failure.is_none()
+        *self == Self::default()
     }
-}
-
-fn default_normal() -> NotificationLevel {
-    NotificationLevel::Normal
-}
-
-fn default_critical() -> NotificationLevel {
-    NotificationLevel::Critical
 }
 
 impl NotificationConfig {
@@ -314,5 +319,40 @@ impl Config {
         for repo in repos {
             self.repos.entry(repo.clone()).or_default();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn poll_aggression_from_str_valid() {
+        assert_eq!(
+            "low".parse::<PollAggression>().unwrap(),
+            PollAggression::Low
+        );
+        assert_eq!(
+            "Medium".parse::<PollAggression>().unwrap(),
+            PollAggression::Medium
+        );
+        assert_eq!(
+            "HIGH".parse::<PollAggression>().unwrap(),
+            PollAggression::High
+        );
+    }
+
+    #[test]
+    fn poll_aggression_from_str_invalid() {
+        let err = "bogus".parse::<PollAggression>().unwrap_err();
+        assert!(err.contains("bogus"));
+        assert!(err.contains("low"));
+    }
+
+    #[test]
+    fn notification_level_cycle() {
+        assert_eq!(NotificationLevel::Off.next(), NotificationLevel::Low);
+        assert_eq!(NotificationLevel::Critical.next(), NotificationLevel::Off);
+        assert_eq!(NotificationLevel::Off.prev(), NotificationLevel::Critical);
     }
 }

@@ -138,7 +138,9 @@ struct GhRunJson {
     attempt: u32,
 }
 
-fn default_attempt() -> u32 {
+/// Default GitHub Actions attempt number (1 = original run).
+/// Used as a serde default across multiple structs.
+pub fn default_attempt() -> u32 {
     1
 }
 

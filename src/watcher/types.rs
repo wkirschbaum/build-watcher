@@ -138,6 +138,8 @@ pub struct WatchEntry {
     pub(super) failure_counts: HashMap<u64, u8>,
     /// Last completed build per workflow name.
     pub last_builds: HashMap<String, LastBuild>,
+    /// True until the first successful poll provides data.
+    pub waiting: bool,
 }
 
 impl WatchEntry {
@@ -147,6 +149,7 @@ impl WatchEntry {
             active_runs: HashMap::new(),
             failure_counts: HashMap::new(),
             last_builds: p.last_builds,
+            waiting: false,
         }
     }
 

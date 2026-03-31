@@ -125,6 +125,7 @@ pub(crate) fn build_watch_snapshot(
                 active_runs,
                 last_builds,
                 muted,
+                waiting: entry.waiting,
             }
         })
         .collect();

@@ -29,6 +29,8 @@ pub(crate) struct SingleBranchInfo<'a> {
     pub failed: bool,
     /// Database ID of the first failed job (for opening the job URL directly).
     pub failing_job_id: Option<u64>,
+    /// True until the first successful poll provides data.
+    pub waiting: bool,
 }
 
 pub(crate) enum DisplayRow<'a> {
@@ -82,6 +84,7 @@ pub(crate) enum DisplayRow<'a> {
         branch: &'a str,
         muted: bool,
         tree_prefix: &'static str,
+        waiting: bool,
     },
     /// Branch header for multi-workflow branches. Shows aggregate status and
     /// can be toggled to expand/collapse individual workflow rows.
@@ -101,6 +104,150 @@ pub(crate) enum DisplayRow<'a> {
         /// Style matching the worst status.
         style: Style,
     },
+}
+
+/// Aggregate stats for a repo header row.
+struct RepoAggregates {
+    failing: usize,
+    active: usize,
+    passing: usize,
+    idle: usize,
+    newest_age: Option<f64>,
+    all_muted: bool,
+    failing_workflows: Vec<String>,
+}
+
+/// Compute aggregate stats (failing/active/passing/idle counts, newest age, mute state)
+/// from a set of branch watches for use in the repo header row.
+fn compute_repo_aggregates(branches: &[&WatchStatus]) -> RepoAggregates {
+    let mut failing = 0usize;
+    let mut active = 0usize;
+    let mut passing = 0usize;
+    let mut idle = 0usize;
+    let mut newest_age: Option<f64> = None;
+    let mut all_muted = true;
+    let mut failing_workflows: Vec<String> = Vec::new();
+
+    for w in branches {
+        if !w.active_runs.is_empty() {
+            active += 1;
+        } else if !w.last_builds.is_empty() {
+            let has_failure = w
+                .last_builds
+                .iter()
+                .any(|b| b.conclusion != RunConclusion::Success);
+            if has_failure {
+                failing += 1;
+                for b in &w.last_builds {
+                    if b.conclusion != RunConclusion::Success
+                        && !failing_workflows.contains(&b.workflow)
+                    {
+                        failing_workflows.push(b.workflow.clone());
+                    }
+                }
+            } else {
+                passing += 1;
+            }
+            for b in &w.last_builds {
+                if let Some(age) = b.age_secs {
+                    newest_age = Some(newest_age.map_or(age, |cur: f64| cur.min(age)));
+                }
+            }
+        } else if w.waiting {
+            // Waiting watches count towards active so they're visible.
+            active += 1;
+        } else {
+            idle += 1;
+        }
+        if !w.muted {
+            all_muted = false;
+        }
+        for run in &w.active_runs {
+            if let Some(e) = run.elapsed_secs {
+                newest_age = Some(newest_age.map_or(e, |cur: f64| cur.min(e)));
+            }
+        }
+    }
+
+    RepoAggregates {
+        failing,
+        active,
+        passing,
+        idle,
+        newest_age,
+        all_muted,
+        failing_workflows,
+    }
+}
+
+/// For single-branch repos with a single workflow, compute inline display info.
+/// Returns `None` for multi-branch repos or multi-workflow single-branch repos.
+fn compute_single_branch_info<'a>(branches: &[&'a WatchStatus]) -> Option<SingleBranchInfo<'a>> {
+    if branches.len() != 1 {
+        return None;
+    }
+    let w = branches[0];
+    let workflow_count = {
+        let mut wfs: Vec<&str> = Vec::new();
+        for run in &w.active_runs {
+            if !wfs.contains(&run.workflow.as_str()) {
+                wfs.push(&run.workflow);
+            }
+        }
+        for b in &w.last_builds {
+            if !wfs.contains(&b.workflow.as_str()) {
+                wfs.push(&b.workflow);
+            }
+        }
+        wfs.len()
+    };
+    if workflow_count > 1 {
+        return None; // multi-workflow: will expand into child rows
+    }
+    let (title, status_key, attempt, run_id, failed, failing_job_id) =
+        if let Some(run) = w.active_runs.first() {
+            (
+                run.title.clone(),
+                run.status.as_str().to_string(),
+                run.attempt,
+                Some(run.run_id),
+                false,
+                None,
+            )
+        } else if let Some(b) = newest_last_build(w) {
+            (
+                b.title.clone(),
+                b.conclusion.as_str().to_string(),
+                b.attempt,
+                Some(b.run_id),
+                b.conclusion != RunConclusion::Success,
+                b.failing_job_id,
+            )
+        } else {
+            (String::new(), String::new(), 1, None, false, None)
+        };
+    let mut wf_set: Vec<&str> = Vec::new();
+    for run in &w.active_runs {
+        if !wf_set.contains(&run.workflow.as_str()) {
+            wf_set.push(&run.workflow);
+        }
+    }
+    if wf_set.is_empty()
+        && let Some(b) = newest_last_build(w)
+    {
+        wf_set.push(&b.workflow);
+    }
+    Some(SingleBranchInfo {
+        branch: &w.branch,
+        workflows: wf_set.join(", "),
+        attempt,
+        title,
+        status_key,
+        run_id,
+        failed,
+        failing_job_id,
+        waiting: w.waiting,
+    })
 }
 
 /// Result of flattening watches into display rows.
@@ -196,124 +343,12 @@ pub(crate) fn flatten_rows<'a>(
             rows.push(DisplayRow::GroupHeader { label: key });
         }
 
-        // Compute aggregate stats for repo header
-        let mut failing = 0usize;
-        let mut active = 0usize;
-        let mut passing = 0usize;
-        let mut idle = 0usize;
-        let mut newest_age: Option<f64> = None;
-        let mut all_muted = true;
-        let mut failing_workflows: Vec<String> = Vec::new();
-
-        for w in branches {
-            if !w.active_runs.is_empty() {
-                active += 1;
-            } else if !w.last_builds.is_empty() {
-                let has_failure = w
-                    .last_builds
-                    .iter()
-                    .any(|b| b.conclusion != RunConclusion::Success);
-                if has_failure {
-                    failing += 1;
-                    for b in &w.last_builds {
-                        if b.conclusion != RunConclusion::Success
-                            && !failing_workflows.contains(&b.workflow)
-                        {
-                            failing_workflows.push(b.workflow.clone());
-                        }
-                    }
-                } else {
-                    passing += 1;
-                }
-                for b in &w.last_builds {
-                    if let Some(age) = b.age_secs {
-                        newest_age = Some(newest_age.map_or(age, |cur: f64| cur.min(age)));
-                    }
-                }
-            } else {
-                idle += 1;
-            }
-            if !w.muted {
-                all_muted = false;
-            }
-            for run in &w.active_runs {
-                if let Some(e) = run.elapsed_secs {
-                    newest_age = Some(newest_age.map_or(e, |cur: f64| cur.min(e)));
-                }
-            }
-        }
+        let agg = compute_repo_aggregates(branches);
 
         let expand_level = expand.get(*repo).copied().unwrap_or(ExpandLevel::Full);
         let is_collapsed = expand_level == ExpandLevel::Collapsed;
 
-        // For single-branch repos with a single workflow, collect info for inline display.
-        // Multi-workflow branches expand into child rows instead.
-        let single_branch = if branches.len() == 1 {
-            let w = branches[0];
-            let workflow_count = {
-                let mut wfs: Vec<&str> = Vec::new();
-                for run in &w.active_runs {
-                    if !wfs.contains(&run.workflow.as_str()) {
-                        wfs.push(&run.workflow);
-                    }
-                }
-                for b in &w.last_builds {
-                    if !wfs.contains(&b.workflow.as_str()) {
-                        wfs.push(&b.workflow);
-                    }
-                }
-                wfs.len()
-            };
-            if workflow_count <= 1 {
-                let (title, status_key, attempt, run_id, failed, failing_job_id) =
-                    if let Some(run) = w.active_runs.first() {
-                        (
-                            run.title.clone(),
-                            run.status.as_str().to_string(),
-                            run.attempt,
-                            Some(run.run_id),
-                            false,
-                            None,
-                        )
-                    } else if let Some(b) = newest_last_build(w) {
-                        (
-                            b.title.clone(),
-                            b.conclusion.as_str().to_string(),
-                            b.attempt,
-                            Some(b.run_id),
-                            b.conclusion != RunConclusion::Success,
-                            b.failing_job_id,
-                        )
-                    } else {
-                        (String::new(), String::new(), 1, None, false, None)
-                    };
-                let mut wf_set: Vec<&str> = Vec::new();
-                for run in &w.active_runs {
-                    if !wf_set.contains(&run.workflow.as_str()) {
-                        wf_set.push(&run.workflow);
-                    }
-                }
-                if wf_set.is_empty()
-                    && let Some(b) = newest_last_build(w)
-                {
-                    wf_set.push(&b.workflow);
-                }
-                Some(SingleBranchInfo {
-                    branch: &w.branch,
-                    workflows: wf_set.join(", "),
-                    attempt,
-                    title,
-                    status_key,
-                    run_id,
-                    failed,
-                    failing_job_id,
-                })
-            } else {
-                None // multi-workflow: will expand into child rows
-            }
-        } else {
-            None
-        };
+        let single_branch = compute_single_branch_info(branches);
 
         let is_single_branch_inline = single_branch.is_some();
 
@@ -323,14 +358,14 @@ pub(crate) fn flatten_rows<'a>(
             repo,
             branch_count: branches.len(),
             expand_level,
-            failing,
-            active,
-            passing,
-            idle,
-            muted: all_muted && !branches.is_empty(),
-            newest_age,
+            failing: agg.failing,
+            active: agg.active,
+            passing: agg.passing,
+            idle: agg.idle,
+            muted: agg.all_muted && !branches.is_empty(),
+            newest_age: agg.newest_age,
             single_branch,
-            failing_workflows,
+            failing_workflows: agg.failing_workflows,
         });
 
         // Failing steps for single-branch, single-workflow repos (shown directly under the header)
@@ -454,6 +489,7 @@ fn emit_branch_workflow_rows<'a>(
                 branch: &w.branch,
                 muted: w.muted,
                 tree_prefix,
+                waiting: w.waiting,
             });
         }
         return;
@@ -573,6 +609,12 @@ fn branch_aggregate_status(w: &WatchStatus) -> (String, String, Style) {
             age,
             status_style(conclusion_str),
         )
+    } else if w.waiting {
+        (
+            "⏳ waiting".to_string(),
+            String::new(),
+            Style::default().fg(Color::DarkGray),
+        )
     } else {
         (
             "· idle".to_string(),
@@ -584,12 +626,7 @@ fn branch_aggregate_status(w: &WatchStatus) -> (String, String, Style) {
 
 /// Find the "worst" last build (failure > other > success) for branch aggregate display.
 fn worst_last_build(w: &WatchStatus) -> Option<&LastBuildView> {
-    w.last_builds.iter().min_by_key(|b| match b.conclusion {
-        RunConclusion::Failure | RunConclusion::TimedOut | RunConclusion::StartupFailure => 0u8,
-        RunConclusion::Cancelled => 1,
-        RunConclusion::Success => 3,
-        _ => 2,
-    })
+    w.last_builds.iter().min_by_key(|b| b.conclusion.severity())
 }
 
 enum WorkflowItem<'a> {
@@ -598,47 +635,56 @@ enum WorkflowItem<'a> {
 }
 
 impl DisplayRow<'_> {
-    /// Returns `(repo, branch, run_id, muted)` for the selected row.
+    /// Returns `(repo, branch, run_id, muted)` for selectable rows.
     /// For multi-branch `RepoHeader`, branch is empty. For single-branch, returns the branch name.
-    pub(crate) fn repo_branch_run(&self) -> (&str, &str, Option<u64>, bool) {
+    /// Returns `None` for non-selectable rows (`GroupHeader`, `FailingSteps`).
+    pub(crate) fn repo_branch_run(&self) -> Option<(&str, &str, Option<u64>, bool)> {
         match self {
             DisplayRow::RepoHeader {
                 repo,
                 muted,
                 single_branch: Some(sb),
                 ..
-            } => (repo, sb.branch, sb.run_id, *muted),
-            DisplayRow::RepoHeader { repo, muted, .. } => (repo, "", None, *muted),
+            } => Some((repo, sb.branch, sb.run_id, *muted)),
+            DisplayRow::RepoHeader { repo, muted, .. } => Some((repo, "", None, *muted)),
             DisplayRow::ActiveRun {
                 repo,
                 branch,
                 run,
                 muted,
                 ..
-            } => (repo, branch, Some(run.run_id), *muted),
+            } => Some((repo, branch, Some(run.run_id), *muted)),
             DisplayRow::LastBuild {
                 repo,
                 branch,
                 build,
                 muted,
                 ..
-            } => (repo, branch, Some(build.run_id), *muted),
+            } => Some((repo, branch, Some(build.run_id), *muted)),
             DisplayRow::NeverRan {
                 repo,
                 branch,
                 muted,
                 ..
-            } => (repo, branch, None, *muted),
+            } => Some((repo, branch, None, *muted)),
             DisplayRow::BranchHeader {
                 repo,
                 branch,
                 muted,
                 ..
-            } => (repo, branch, None, *muted),
-            DisplayRow::GroupHeader { .. } | DisplayRow::FailingSteps { .. } => {
-                unreachable!("not selectable")
-            }
+            } => Some((repo, branch, None, *muted)),
+            DisplayRow::GroupHeader { .. } | DisplayRow::FailingSteps { .. } => None,
         }
+    }
+
+    /// Returns the repo name for selectable rows.
+    pub(crate) fn repo(&self) -> Option<&str> {
+        self.repo_branch_run().map(|(r, _, _, _)| r)
+    }
+
+    /// Returns `(repo, branch)` for selectable rows.
+    pub(crate) fn repo_branch(&self) -> Option<(&str, &str)> {
+        self.repo_branch_run().map(|(r, b, _, _)| (r, b))
     }
 
     /// Returns `true` if this is a `RepoHeader` row.
@@ -1151,27 +1197,297 @@ fn branch_row<'a>(
     ])
 }
 
+fn render_group_header<'a>(label: &str) -> Row<'a> {
+    let group_style = Style::default()
+        .fg(Color::Cyan)
+        .bg(Color::Rgb(25, 30, 40))
+        .add_modifier(Modifier::BOLD);
+    Row::new(vec![
+        Cell::from(format!("  {label}")).style(group_style),
+        Cell::from(""),
+        Cell::from(""),
+        Cell::from(""),
+        Cell::from(""),
+        Cell::from(""),
+    ])
+    .style(Style::default().bg(Color::Rgb(25, 30, 40)))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_repo_header<'a>(
+    repo: &str,
+    branch_count: &usize,
+    expand_level: &ExpandLevel,
+    failing: &usize,
+    active: &usize,
+    passing: &usize,
+    idle: &usize,
+    muted: &bool,
+    newest_age: &Option<f64>,
+    single_branch: &Option<SingleBranchInfo<'_>>,
+    failing_workflows: &[String],
+    cw: &ColWidths,
+    mute_indicator: &dyn Fn(bool) -> &'static str,
+) -> Row<'a> {
+    let name = if single_branch.is_some() {
+        format!("  {}{}", short_repo(repo), mute_indicator(*muted))
+    } else {
+        let arrow = match expand_level {
+            ExpandLevel::Collapsed => "›",
+            ExpandLevel::Branches => "⌄",
+            ExpandLevel::Full => "⌄",
+        };
+        format!("{arrow} {}{}", short_repo(repo), mute_indicator(*muted))
+    };
+
+    let age = newest_age
+        .map(|s| format::age(s as u64))
+        .unwrap_or_default();
+
+    let repo_style = Style::default().add_modifier(Modifier::BOLD);
+
+    // Single-branch repos: show branch name, workflow, and title inline
+    // with the actual status (e.g. "✅ success") instead of aggregate counts.
+    if let Some(sb) = single_branch {
+        let emoji = status_emoji(&sb.status_key);
+        let style = status_style(&sb.status_key);
+        let sfx = attempt_suffix(sb.attempt);
+        let inline_status = if sb.status_key.is_empty() {
+            if sb.waiting {
+                "⏳ waiting".to_string()
+            } else {
+                "· idle".to_string()
+            }
+        } else {
+            format!("{emoji} {}{sfx}", format::status(&sb.status_key))
+        };
+        Row::new(vec![
+            Cell::from(format::truncate(&name, cw.repo)).style(repo_style),
+            Cell::from(format::truncate(sb.branch, cw.branch)),
+            Cell::from(format::truncate(&inline_status, cw.status)).style(style),
+            Cell::from(format::truncate(&sb.workflows, cw.workflow)),
+            Cell::from(format::truncate(&sb.title, cw.title)),
+            Cell::from(age).style(style),
+        ])
+    } else {
+        let branch_label = if *expand_level == ExpandLevel::Collapsed {
+            format!("{branch_count} branches")
+        } else {
+            String::new()
+        };
+        let wf_label = if !failing_workflows.is_empty() {
+            failing_workflows.join(", ")
+        } else {
+            String::new()
+        };
+
+        // Color-coded status: active/passing/failing/idle — dimmed when zero.
+        let status_cell = {
+            let dim = |v: usize, s: Style| {
+                if v > 0 {
+                    s
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                }
+            };
+            let sep = Span::styled("·", Style::default().fg(Color::DarkGray));
+            let spans = vec![
+                Span::styled(
+                    format!("{active}"),
+                    dim(*active, Style::default().fg(COLOR_ACTIVE)),
+                ),
+                sep.clone(),
+                Span::styled(
+                    format!("{passing}"),
+                    dim(*passing, Style::default().fg(COLOR_SUCCESS)),
+                ),
+                sep.clone(),
+                Span::styled(
+                    format!("{failing}"),
+                    dim(*failing, Style::default().fg(COLOR_FAILURE)),
+                ),
+                sep,
+                Span::styled(format!("{idle}"), Style::default().fg(Color::DarkGray)),
+            ];
+            Cell::from(Line::from(spans))
+        };
+
+        Row::new(vec![
+            Cell::from(format::truncate(&name, cw.repo)).style(repo_style),
+            Cell::from(format::truncate(&branch_label, cw.branch)),
+            status_cell,
+            Cell::from(format::truncate(&wf_label, cw.workflow)),
+            Cell::from(""),
+            Cell::from(age),
+        ])
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_active_run<'a>(
+    branch: &str,
+    run: &ActiveRunView,
+    extra_badge: &str,
+    muted: bool,
+    tree_prefix: &str,
+    is_workflow_child: bool,
+    cw: &ColWidths,
+    mute_indicator: &dyn Fn(bool) -> &'static str,
+) -> Row<'a> {
+    let status_str = run.status.as_str();
+    let style = status_style(status_str);
+    let emoji = status_emoji(status_str);
+    let elapsed = run
+        .elapsed_secs
+        .map(|s| format::duration(Duration::from_secs_f64(s)))
+        .unwrap_or_default();
+    let sfx = attempt_suffix(run.attempt);
+    let status_text = if extra_badge.is_empty() {
+        format!("{emoji} {}{sfx}", format::status(status_str))
+    } else {
+        format!("{emoji} {}{sfx} {extra_badge}", format::status(status_str))
+    };
+    if is_workflow_child {
+        // Show workflow name in tree, suppress branch/workflow columns.
+        branch_row(
+            &run.workflow,
+            "",
+            false,
+            tree_prefix,
+            &status_text,
+            "",
+            &run.title,
+            &elapsed,
+            style,
+            cw,
+            mute_indicator,
+        )
+    } else {
+        branch_row(
+            branch,
+            branch,
+            muted,
+            tree_prefix,
+            &status_text,
+            &run.workflow,
+            &run.title,
+            &elapsed,
+            style,
+            cw,
+            mute_indicator,
+        )
+    }
+}
+
+fn render_last_build<'a>(
+    branch: &str,
+    build: &LastBuildView,
+    muted: bool,
+    tree_prefix: &str,
+    is_workflow_child: bool,
+    cw: &ColWidths,
+    mute_indicator: &dyn Fn(bool) -> &'static str,
+) -> Row<'a> {
+    let conclusion_str = build.conclusion.as_str();
+    let style = status_style(conclusion_str);
+    let emoji = status_emoji(conclusion_str);
+    let age = build
+        .age_secs
+        .map(|s| format::age(s as u64))
+        .unwrap_or_default();
+    let sfx = attempt_suffix(build.attempt);
+    let status_text = format!("{emoji} {}{sfx}", format::status(conclusion_str));
+    if is_workflow_child {
+        branch_row(
+            &build.workflow,
+            "",
+            false,
+            tree_prefix,
+            &status_text,
+            "",
+            &build.title,
+            &age,
+            style,
+            cw,
+            mute_indicator,
+        )
+    } else {
+        branch_row(
+            branch,
+            branch,
+            muted,
+            tree_prefix,
+            &status_text,
+            &build.workflow,
+            &build.title,
+            &age,
+            style,
+            cw,
+            mute_indicator,
+        )
+    }
+}
+
+fn render_never_ran<'a>(
+    branch: &str,
+    muted: bool,
+    tree_prefix: &str,
+    waiting: bool,
+    cw: &ColWidths,
+    mute_indicator: &dyn Fn(bool) -> &'static str,
+) -> Row<'a> {
+    branch_row(
+        branch,
+        branch,
+        muted,
+        tree_prefix,
+        if waiting { "⏳ waiting" } else { "· idle" },
+        "",
+        "",
+        "",
+        Style::default().fg(Color::DarkGray),
+        cw,
+        mute_indicator,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_branch_header<'a>(
+    branch: &str,
+    muted: bool,
+    tree_prefix: &str,
+    workflow_count: usize,
+    expanded: bool,
+    status_text: &str,
+    age_or_elapsed: &str,
+    style: Style,
+    cw: &ColWidths,
+    mute_indicator: &dyn Fn(bool) -> &'static str,
+) -> Row<'a> {
+    let expand_indicator = if expanded { "▾" } else { "▸" };
+    let wf_label = format!("{expand_indicator} {workflow_count} workflows");
+    branch_row(
+        branch,
+        branch,
+        muted,
+        tree_prefix,
+        status_text,
+        &wf_label,
+        "",
+        age_or_elapsed,
+        style,
+        cw,
+        mute_indicator,
+    )
+}
+
 fn render_display_row<'a>(
     dr: &DisplayRow<'_>,
     cw: &ColWidths,
     mute_indicator: &dyn Fn(bool) -> &'static str,
 ) -> Row<'a> {
     match dr {
-        DisplayRow::GroupHeader { label } => {
-            let group_style = Style::default()
-                .fg(Color::Cyan)
-                .bg(Color::Rgb(25, 30, 40))
-                .add_modifier(Modifier::BOLD);
-            Row::new(vec![
-                Cell::from(format!("  {label}")).style(group_style),
-                Cell::from(""),
-                Cell::from(""),
-                Cell::from(""),
-                Cell::from(""),
-                Cell::from(""),
-            ])
-            .style(Style::default().bg(Color::Rgb(25, 30, 40)))
-        }
+        DisplayRow::GroupHeader { label } => render_group_header(label),
         DisplayRow::RepoHeader {
             repo,
             branch_count,
@@ -1184,96 +1500,21 @@ fn render_display_row<'a>(
             newest_age,
             single_branch,
             failing_workflows,
-        } => {
-            let name = if single_branch.is_some() {
-                format!("  {}{}", short_repo(repo), mute_indicator(*muted))
-            } else {
-                let arrow = match expand_level {
-                    ExpandLevel::Collapsed => "›",
-                    ExpandLevel::Branches => "⌄",
-                    ExpandLevel::Full => "⌄",
-                };
-                format!("{arrow} {}{}", short_repo(repo), mute_indicator(*muted))
-            };
-
-            let age = newest_age
-                .map(|s| format::age(s as u64))
-                .unwrap_or_default();
-
-            let repo_style = Style::default().add_modifier(Modifier::BOLD);
-
-            // Single-branch repos: show branch name, workflow, and title inline
-            // with the actual status (e.g. "✅ success") instead of aggregate counts.
-            if let Some(sb) = single_branch {
-                let emoji = status_emoji(&sb.status_key);
-                let style = status_style(&sb.status_key);
-                let sfx = attempt_suffix(sb.attempt);
-                let inline_status = if sb.status_key.is_empty() {
-                    "· idle".to_string()
-                } else {
-                    format!("{emoji} {}{sfx}", format::status(&sb.status_key))
-                };
-                Row::new(vec![
-                    Cell::from(format::truncate(&name, cw.repo)).style(repo_style),
-                    Cell::from(format::truncate(sb.branch, cw.branch)),
-                    Cell::from(format::truncate(&inline_status, cw.status)).style(style),
-                    Cell::from(format::truncate(&sb.workflows, cw.workflow)),
-                    Cell::from(format::truncate(&sb.title, cw.title)),
-                    Cell::from(age).style(style),
-                ])
-            } else {
-                let branch_label = if *expand_level == ExpandLevel::Collapsed {
-                    format!("{branch_count} branches")
-                } else {
-                    String::new()
-                };
-                let wf_label = if !failing_workflows.is_empty() {
-                    failing_workflows.join(", ")
-                } else {
-                    String::new()
-                };
-
-                // Color-coded status: active/passing/failing/idle — dimmed when zero.
-                let status_cell = {
-                    let dim = |v: usize, s: Style| {
-                        if v > 0 {
-                            s
-                        } else {
-                            Style::default().fg(Color::DarkGray)
-                        }
-                    };
-                    let sep = Span::styled("·", Style::default().fg(Color::DarkGray));
-                    let spans = vec![
-                        Span::styled(
-                            format!("{active}"),
-                            dim(*active, Style::default().fg(COLOR_ACTIVE)),
-                        ),
-                        sep.clone(),
-                        Span::styled(
-                            format!("{passing}"),
-                            dim(*passing, Style::default().fg(COLOR_SUCCESS)),
-                        ),
-                        sep.clone(),
-                        Span::styled(
-                            format!("{failing}"),
-                            dim(*failing, Style::default().fg(COLOR_FAILURE)),
-                        ),
-                        sep,
-                        Span::styled(format!("{idle}"), Style::default().fg(Color::DarkGray)),
-                    ];
-                    Cell::from(Line::from(spans))
-                };
-
-                Row::new(vec![
-                    Cell::from(format::truncate(&name, cw.repo)).style(repo_style),
-                    Cell::from(format::truncate(&branch_label, cw.branch)),
-                    status_cell,
-                    Cell::from(format::truncate(&wf_label, cw.workflow)),
-                    Cell::from(""),
-                    Cell::from(age),
-                ])
-            }
-        }
+        } => render_repo_header(
+            repo,
+            branch_count,
+            expand_level,
+            failing,
+            active,
+            passing,
+            idle,
+            muted,
+            newest_age,
+            single_branch,
+            failing_workflows,
+            cw,
+            mute_indicator,
+        ),
         DisplayRow::ActiveRun {
             branch,
             run,
@@ -1282,51 +1523,16 @@ fn render_display_row<'a>(
             tree_prefix,
             is_workflow_child,
             ..
-        } => {
-            let status_str = run.status.as_str();
-            let style = status_style(status_str);
-            let emoji = status_emoji(status_str);
-            let elapsed = run
-                .elapsed_secs
-                .map(|s| format::duration(Duration::from_secs_f64(s)))
-                .unwrap_or_default();
-            let sfx = attempt_suffix(run.attempt);
-            let status_text = if extra_badge.is_empty() {
-                format!("{emoji} {}{sfx}", format::status(status_str))
-            } else {
-                format!("{emoji} {}{sfx} {extra_badge}", format::status(status_str))
-            };
-            if *is_workflow_child {
-                // Show workflow name in tree, suppress branch/workflow columns.
-                branch_row(
-                    &run.workflow,
-                    "",
-                    false,
-                    tree_prefix,
-                    &status_text,
-                    "",
-                    &run.title,
-                    &elapsed,
-                    style,
-                    cw,
-                    mute_indicator,
-                )
-            } else {
-                branch_row(
-                    branch,
-                    branch,
-                    *muted,
-                    tree_prefix,
-                    &status_text,
-                    &run.workflow,
-                    &run.title,
-                    &elapsed,
-                    style,
-                    cw,
-                    mute_indicator,
-                )
-            }
-        }
+        } => render_active_run(
+            branch,
+            run,
+            extra_badge,
+            *muted,
+            tree_prefix,
+            *is_workflow_child,
+            cw,
+            mute_indicator,
+        ),
         DisplayRow::FailingSteps { steps, tree_indent } => Row::new(vec![
             Cell::from(format!("  {tree_indent}")),
             Cell::from(""),
@@ -1343,64 +1549,22 @@ fn render_display_row<'a>(
             tree_prefix,
             is_workflow_child,
             ..
-        } => {
-            let conclusion_str = build.conclusion.as_str();
-            let style = status_style(conclusion_str);
-            let emoji = status_emoji(conclusion_str);
-            let age = build
-                .age_secs
-                .map(|s| format::age(s as u64))
-                .unwrap_or_default();
-            let sfx = attempt_suffix(build.attempt);
-            let status_text = format!("{emoji} {}{sfx}", format::status(conclusion_str));
-            if *is_workflow_child {
-                branch_row(
-                    &build.workflow,
-                    "",
-                    false,
-                    tree_prefix,
-                    &status_text,
-                    "",
-                    &build.title,
-                    &age,
-                    style,
-                    cw,
-                    mute_indicator,
-                )
-            } else {
-                branch_row(
-                    branch,
-                    branch,
-                    *muted,
-                    tree_prefix,
-                    &status_text,
-                    &build.workflow,
-                    &build.title,
-                    &age,
-                    style,
-                    cw,
-                    mute_indicator,
-                )
-            }
-        }
+        } => render_last_build(
+            branch,
+            build,
+            *muted,
+            tree_prefix,
+            *is_workflow_child,
+            cw,
+            mute_indicator,
+        ),
         DisplayRow::NeverRan {
             branch,
             muted,
             tree_prefix,
+            waiting,
             ..
-        } => branch_row(
-            branch,
-            branch,
-            *muted,
-            tree_prefix,
-            "· idle",
-            "",
-            "",
-            "",
-            Style::default().fg(Color::DarkGray),
-            cw,
-            mute_indicator,
-        ),
+        } => render_never_ran(branch, *muted, tree_prefix, *waiting, cw, mute_indicator),
         DisplayRow::BranchHeader {
             branch,
             muted,
@@ -1411,23 +1575,18 @@ fn render_display_row<'a>(
             age_or_elapsed,
             style,
             ..
-        } => {
-            let expand_indicator = if *expanded { "▾" } else { "▸" };
-            let wf_label = format!("{expand_indicator} {workflow_count} workflows");
-            branch_row(
-                branch,
-                branch,
-                *muted,
-                tree_prefix,
-                status_text,
-                &wf_label,
-                "",
-                age_or_elapsed,
-                *style,
-                cw,
-                mute_indicator,
-            )
-        }
+        } => render_branch_header(
+            branch,
+            *muted,
+            tree_prefix,
+            *workflow_count,
+            *expanded,
+            status_text,
+            age_or_elapsed,
+            *style,
+            cw,
+            mute_indicator,
+        ),
     }
 }
 
@@ -1630,11 +1789,21 @@ fn render_detail_bar(
             }
             s
         }
-        Some(DisplayRow::NeverRan { repo, branch, .. }) => {
+        Some(DisplayRow::NeverRan {
+            repo,
+            branch,
+            waiting,
+            ..
+        }) => {
+            let msg = if *waiting {
+                "waiting for first poll"
+            } else {
+                "no builds yet"
+            };
             vec![
                 Span::styled(format!("{} · {}", repo, branch), dim),
                 detail_sep(),
-                Span::styled("no builds yet", dim),
+                Span::styled(msg, dim),
             ]
         }
         Some(DisplayRow::GroupHeader { label }) => {

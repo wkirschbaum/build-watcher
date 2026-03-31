@@ -45,6 +45,17 @@ impl RunConclusion {
             RunConclusion::Unknown => "",
         }
     }
+
+    /// Severity ordering for display purposes: lower = worse.
+    /// Failures (0) sort before cancellations (1), unknown (2), and success (3).
+    pub fn severity(&self) -> u8 {
+        match self {
+            Self::Failure | Self::TimedOut | Self::StartupFailure => 0,
+            Self::Cancelled => 1,
+            Self::Success => 3,
+            Self::Unknown => 2,
+        }
+    }
 }
 
 impl RunStatus {
@@ -74,12 +85,8 @@ pub struct ActiveRunView {
     pub event: String,
     pub elapsed_secs: Option<f64>,
     /// GitHub Actions attempt number. 1 for the original run, 2+ for re-runs.
-    #[serde(default = "default_attempt")]
+    #[serde(default = "crate::github::default_attempt")]
     pub attempt: u32,
-}
-
-fn default_attempt() -> u32 {
-    1
 }
 
 /// Summary of the last completed build as returned by `GET /status`.
@@ -96,7 +103,7 @@ pub struct LastBuildView {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub age_secs: Option<f64>,
     /// GitHub Actions attempt number. 1 for the original run, 2+ for re-runs.
-    #[serde(default = "default_attempt")]
+    #[serde(default = "crate::github::default_attempt")]
     pub attempt: u32,
     /// Database ID of the first failed job (for constructing job URLs).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -115,6 +122,9 @@ pub struct WatchStatus {
     /// Whether notifications are muted for this repo (all levels set to off).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub muted: bool,
+    /// True until the first successful poll provides data.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub waiting: bool,
 }
 
 /// Full response body for `GET /status`.
@@ -285,6 +295,7 @@ mod tests {
             active_runs: vec![],
             last_builds: vec![],
             muted: false,
+            waiting: false,
         }
     }
 
@@ -375,6 +386,7 @@ mod tests {
             }],
             last_builds: vec![],
             muted: false,
+            waiting: false,
         }]);
 
         status.apply_event(WatchEvent::RunCompleted {
@@ -397,5 +409,21 @@ mod tests {
         let mut status = status_with(vec![watch("alice/app", "main")]);
         status.apply_event(WatchEvent::RunStarted(snap("other/repo", "main", 1)));
         assert!(status.watches[0].active_runs.is_empty());
+    }
+
+    #[test]
+    fn run_conclusion_severity_ordering() {
+        // Failures should be most severe (lowest number)
+        assert!(RunConclusion::Failure.severity() < RunConclusion::Cancelled.severity());
+        assert!(RunConclusion::Cancelled.severity() < RunConclusion::Success.severity());
+        // All failure types share the same severity
+        assert_eq!(
+            RunConclusion::Failure.severity(),
+            RunConclusion::TimedOut.severity()
+        );
+        assert_eq!(
+            RunConclusion::Failure.severity(),
+            RunConclusion::StartupFailure.severity()
+        );
     }
 }

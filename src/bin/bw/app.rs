@@ -489,6 +489,7 @@ mod tests {
             active_runs: vec![],
             last_builds: vec![],
             muted: false,
+            waiting: false,
         }
     }
 
@@ -549,6 +550,7 @@ mod tests {
             }],
             last_builds: vec![],
             muted: false,
+            waiting: false,
         }]);
 
         status.apply_event(WatchEvent::RunCompleted {
@@ -617,6 +619,7 @@ mod tests {
             }],
             last_builds: vec![],
             muted: false,
+            waiting: false,
         }]);
 
         status.apply_event(WatchEvent::StatusChanged {
@@ -647,6 +650,7 @@ mod tests {
             }],
             last_builds: vec![],
             muted: false,
+            waiting: false,
         }]);
 
         status.apply_event(WatchEvent::StatusChanged {
@@ -708,6 +712,7 @@ mod tests {
                 failing_job_id: None,
             }],
             muted: false,
+            waiting: false,
         }];
         let flat = flatten_rows(&watches, GroupBy::Org, &no_collapsed(), &no_wf_collapsed());
         assert_eq!(flat.rows.len(), 3);
@@ -735,6 +740,7 @@ mod tests {
                     failing_job_id: None,
                 }],
                 muted: false,
+                waiting: false,
             },
             WatchStatus {
                 repo: "alice/app".to_string(),
@@ -742,6 +748,7 @@ mod tests {
                 active_runs: vec![],
                 last_builds: vec![],
                 muted: false,
+                waiting: false,
             },
         ];
         let flat = flatten_rows(&watches, GroupBy::Org, &no_collapsed(), &no_wf_collapsed());
@@ -767,6 +774,7 @@ mod tests {
                 failing_job_id: None,
             }],
             muted: false,
+            waiting: false,
         }];
         let flat = flatten_rows(&watches, GroupBy::Org, &no_collapsed(), &no_wf_collapsed());
         // Single-branch: GroupHeader + RepoHeader (no child row)
@@ -806,6 +814,7 @@ mod tests {
                     },
                 ],
                 muted: false,
+                waiting: false,
             },
             WatchStatus {
                 repo: "alice/app".to_string(),
@@ -813,6 +822,7 @@ mod tests {
                 active_runs: vec![],
                 last_builds: vec![],
                 muted: false,
+                waiting: false,
             },
         ];
 
@@ -895,13 +905,29 @@ mod tests {
             }],
             last_builds: vec![],
             muted: false,
+            waiting: false,
         }];
         let flat = flatten_rows(&watches, GroupBy::Org, &no_collapsed(), &no_wf_collapsed());
         // Single-branch: Row 0: GroupHeader, Row 1: RepoHeader (inline)
         assert_eq!(flat.rows.len(), 2);
-        let (repo, branch, _run_id, _muted) = flat.rows[1].repo_branch_run();
+        let (repo, branch, _run_id, _muted) = flat.rows[1].repo_branch_run().unwrap();
         assert_eq!(repo, "alice/app");
         assert_eq!(branch, "main");
+    }
+
+    #[test]
+    fn display_row_group_header_returns_none() {
+        let watches = vec![WatchStatus {
+            repo: "alice/app".to_string(),
+            branch: "main".to_string(),
+            active_runs: vec![],
+            last_builds: vec![],
+            muted: false,
+            waiting: false,
+        }];
+        let flat = flatten_rows(&watches, GroupBy::Org, &no_collapsed(), &no_wf_collapsed());
+        // Row 0 is a GroupHeader — repo_branch_run should return None.
+        assert!(flat.rows[0].repo_branch_run().is_none());
     }
 
     #[test]
@@ -962,6 +988,7 @@ mod tests {
                 failing_job_id: None,
             }],
             muted: false,
+            waiting: false,
         }
     }
 
@@ -980,6 +1007,7 @@ mod tests {
             }],
             last_builds: vec![],
             muted: false,
+            waiting: false,
         }
     }
 

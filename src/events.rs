@@ -24,12 +24,8 @@ pub struct RunSnapshot {
     /// without re-fetching `/status`.
     pub status: RunStatus,
     /// GitHub Actions attempt number. 1 for the original run, 2+ for re-runs.
-    #[serde(default = "default_attempt")]
+    #[serde(default = "crate::github::default_attempt")]
     pub attempt: u32,
-}
-
-fn default_attempt() -> u32 {
-    1
 }
 
 impl RunSnapshot {

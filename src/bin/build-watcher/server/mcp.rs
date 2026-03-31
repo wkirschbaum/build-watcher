@@ -734,20 +734,16 @@ impl BuildWatcher {
 
     #[tool(
         description = "Set poll aggression: how much of the GitHub rate-limit budget \
-            the daemon uses per hour. low=≤10%, medium=≤25% (default), high=≤50%."
+            the daemon uses per hour. low=≤10%, medium=≤40% (default), high=≤80%."
     )]
     async fn set_poll_aggression(
         &self,
         Parameters(params): Parameters<SetPollAggressionParams>,
     ) -> Result<CallToolResult, McpError> {
-        let level = match params.level.to_lowercase().as_str() {
-            "low" => PollAggression::Low,
-            "medium" => PollAggression::Medium,
-            "high" => PollAggression::High,
-            other => {
-                return Ok(CallToolResult::error(vec![Content::text(format!(
-                    "unknown level {other:?}; valid: low, medium, high"
-                ))]));
+        let level: PollAggression = match params.level.parse() {
+            Ok(l) => l,
+            Err(e) => {
+                return Ok(CallToolResult::error(vec![Content::text(e)]));
             }
         };
         if let Err(e) = self

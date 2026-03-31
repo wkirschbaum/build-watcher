@@ -48,6 +48,7 @@ fn make_entry() -> WatchEntry {
         ]),
         failure_counts: HashMap::new(),
         last_builds: HashMap::new(),
+        waiting: false,
     }
 }
 
@@ -454,12 +455,14 @@ fn count_api_calls_reflects_active_runs() {
         active_runs,
         failure_counts: HashMap::new(),
         last_builds: HashMap::new(),
+        waiting: false,
     };
     let entry2 = WatchEntry {
         last_seen_run_id: 100,
         active_runs: HashMap::new(),
         failure_counts: HashMap::new(),
         last_builds: HashMap::new(),
+        waiting: false,
     };
     watches.insert(WatchKey::new("owner/repo1", "main"), entry1);
     watches.insert(WatchKey::new("owner/repo2", "main"), entry2);
@@ -478,12 +481,14 @@ fn count_api_calls_same_repo_multiple_branches() {
         active_runs,
         failure_counts: HashMap::new(),
         last_builds: HashMap::new(),
+        waiting: false,
     };
     let entry2 = WatchEntry {
         last_seen_run_id: 100,
         active_runs: HashMap::new(),
         failure_counts: HashMap::new(),
         last_builds: HashMap::new(),
+        waiting: false,
     };
     watches.insert(WatchKey::new("owner/repo1", "main"), entry1);
     watches.insert(WatchKey::new("owner/repo1", "develop"), entry2);
@@ -743,6 +748,7 @@ async fn check_for_new_runs_detects_new_builds() {
                 active_runs: HashMap::new(),
                 failure_counts: HashMap::new(),
                 last_builds: HashMap::new(),
+                waiting: false,
             },
         );
     }
@@ -816,6 +822,7 @@ async fn check_for_new_runs_applies_workflow_filter() {
                 active_runs: HashMap::new(),
                 failure_counts: HashMap::new(),
                 last_builds: HashMap::new(),
+                waiting: false,
             },
         );
     }
@@ -859,6 +866,7 @@ async fn poll_active_runs_detects_completion() {
             active_runs: HashMap::new(),
             failure_counts: HashMap::new(),
             last_builds: HashMap::new(),
+            waiting: false,
         };
         entry
             .active_runs
@@ -916,6 +924,7 @@ async fn poll_active_runs_emits_status_change() {
             active_runs: HashMap::new(),
             failure_counts: HashMap::new(),
             last_builds: HashMap::new(),
+            waiting: false,
         };
         entry
             .active_runs
@@ -970,6 +979,7 @@ async fn poll_active_runs_fetches_failing_steps() {
             active_runs: HashMap::new(),
             failure_counts: HashMap::new(),
             last_builds: HashMap::new(),
+            waiting: false,
         };
         entry
             .active_runs
@@ -1031,6 +1041,7 @@ async fn check_for_new_runs_skips_already_active() {
                 active_runs: HashMap::from([(101, make_active(RunStatus::InProgress))]),
                 failure_counts: HashMap::new(),
                 last_builds: HashMap::new(),
+                waiting: false,
             },
         );
     }
@@ -1055,6 +1066,7 @@ async fn record_completion_bumps_last_seen() {
         active_runs: HashMap::from([(100, make_active(RunStatus::InProgress))]),
         failure_counts: HashMap::new(),
         last_builds: HashMap::new(),
+        waiting: false,
     };
     let run = make_run(100, RunStatus::Completed, "success");
     entry.record_completion(&run, None, None, 999);
@@ -1094,6 +1106,7 @@ async fn recover_watches_recovers_active_runs() {
                 active_runs: HashMap::new(),
                 failure_counts: HashMap::new(),
                 last_builds: HashMap::new(),
+                waiting: false,
             },
         );
     }
@@ -1204,6 +1217,7 @@ async fn check_for_new_runs_detects_rerun_with_different_conclusion() {
                         attempt: 1,
                     },
                 )]),
+                waiting: false,
             },
         );
     }
@@ -1272,6 +1286,7 @@ async fn check_for_new_runs_detects_rerun_in_progress() {
                         attempt: 1,
                     },
                 )]),
+                waiting: false,
             },
         );
     }
@@ -1347,6 +1362,7 @@ async fn check_for_new_runs_ignores_rerun_with_same_conclusion() {
                         attempt: 1,
                     },
                 )]),
+                waiting: false,
             },
         );
     }

@@ -96,6 +96,7 @@ pub async fn start_watch(
             active_runs: HashMap::new(),
             failure_counts: HashMap::new(),
             last_builds: HashMap::new(),
+            waiting: true,
         };
         {
             let mut w = watches.lock().await;
@@ -166,6 +167,7 @@ pub async fn start_watch(
         active_runs: active,
         failure_counts: HashMap::new(),
         last_builds: last_builds.clone(),
+        waiting: false,
     };
 
     {

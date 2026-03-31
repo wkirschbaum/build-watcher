@@ -80,7 +80,7 @@ An internal broadcast channel decouples the polling loop from notification dispa
 
 ## MCP Server (Model Context Protocol)
 
-Runs as an HTTP server exposing tools via the MCP protocol, allowing Claude Code to manage watches interactively. The server uses `rmcp` with Streamable HTTP transport over `axum`. Tools exposed: `watch_builds`, `stop_watches`, `list_watches`, `configure_branches`, `configure_repo`, `configure_ignored_workflows`, `update_notifications`, `rerun_build`, `build_history`, `get_stats` (10 tools). All tool parameters support double-encoded JSON arrays (a workaround for MCP clients that stringify array parameters).
+Runs as an HTTP server exposing tools via the MCP protocol, allowing Claude Code to manage watches interactively. The server uses `rmcp` with Streamable HTTP transport over `axum`. Tools exposed: `watch_builds`, `stop_watches`, `list_watches`, `configure_branches`, `configure_repo`, `configure_ignored_workflows`, `update_notifications`, `rerun_build`, `build_history`, `get_stats`, `set_poll_aggression` (11 tools). All tool parameters support double-encoded JSON arrays (a workaround for MCP clients that stringify array parameters).
 
 ## Port Binding with Fallback
 

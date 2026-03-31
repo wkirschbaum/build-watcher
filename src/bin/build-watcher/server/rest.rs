@@ -17,7 +17,9 @@ use build_watcher::status::{DefaultsConfig, HistoryEntryView, StatsResponse};
 use build_watcher::watcher::{count_api_calls, is_paused};
 
 use super::DaemonState;
-use super::actions::{do_configure_branches, do_rerun, do_stop_watches, do_watch_builds};
+use super::actions::{
+    apply_pause, do_configure_branches, do_rerun, do_stop_watches, do_watch_builds,
+};
 use super::{build_watch_snapshot, json_error};
 
 /// `GET /status` — JSON snapshot of all current watches and their build state.
@@ -104,15 +106,12 @@ pub(crate) async fn pause_handler(
     State(state): State<DaemonState>,
     axum::Json(body): axum::Json<PauseRequest>,
 ) -> axum::Json<serde_json::Value> {
-    let mut p = state.pause.lock().await;
-    if body.pause {
-        const INDEFINITE: u64 = u32::MAX as u64;
-        *p = Some(tokio::time::Instant::now() + Duration::from_secs(INDEFINITE));
-    } else {
-        *p = None;
-    }
-    let paused = p.is_some_and(|d| tokio::time::Instant::now() < d);
-    axum::Json(serde_json::json!({ "paused": paused }))
+    let message = apply_pause(&state.pause, body.pause, None).await;
+    let paused = {
+        let p = state.pause.lock().await;
+        p.is_some_and(|d| tokio::time::Instant::now() < d)
+    };
+    axum::Json(serde_json::json!({ "paused": paused, "message": message }))
 }
 
 #[derive(Deserialize)]
@@ -295,15 +294,10 @@ pub(crate) async fn set_defaults_handler(
             return json_error("default_branches must not be empty");
         }
     }
-    if let Some(level) = &body.poll_aggression {
-        match level.to_lowercase().as_str() {
-            "low" | "medium" | "high" => {}
-            other => {
-                return json_error(format!(
-                    "unknown poll aggression: {other:?} (expected low/medium/high)"
-                ));
-            }
-        }
+    if let Some(level) = &body.poll_aggression
+        && let Err(e) = level.parse::<PollAggression>()
+    {
+        return json_error(e);
     }
     if let Some(filter) = &body.branch_filter
         && !filter.is_empty()
@@ -329,11 +323,8 @@ pub(crate) async fn set_defaults_handler(
                 }
             }
             if let Some(level) = body.poll_aggression {
-                let aggression = match level.to_lowercase().as_str() {
-                    "low" => PollAggression::Low,
-                    "high" => PollAggression::High,
-                    _ => PollAggression::Medium,
-                };
+                // Already validated above, so unwrap is safe.
+                let aggression = level.parse::<PollAggression>().unwrap_or_default();
                 cfg.poll_aggression = aggression;
                 messages.push(format!("poll aggression: {aggression}"));
             }
@@ -762,6 +753,10 @@ mod tests {
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["paused"], true);
+        assert!(
+            json["message"].as_str().unwrap().contains("paused"),
+            "should include message"
+        );
 
         let router = test_router_full(watches.clone(), pause.clone(), events.clone());
         let req = http::Request::post("/pause")
@@ -773,6 +768,10 @@ mod tests {
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["paused"], false);
+        assert!(
+            json["message"].as_str().unwrap().contains("resumed"),
+            "should include message"
+        );
     }
 
     #[tokio::test]
