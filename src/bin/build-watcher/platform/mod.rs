@@ -1,7 +1,6 @@
 use std::future::Future;
 use std::pin::Pin;
-
-use tokio::sync::OnceCell;
+use std::sync::Arc;
 
 use build_watcher::config::NotificationLevel;
 
@@ -17,12 +16,6 @@ use macos as imp;
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 compile_error!("Unsupported platform: only Linux and macOS are supported");
-
-#[cfg(test)]
-mod universal;
-#[cfg(test)]
-#[allow(unused_imports)]
-pub use universal::NullNotifier;
 
 /// Pre-computed notification data. All formatting happens before this is
 /// passed to the platform backend — the backend only does the OS dispatch.
@@ -42,21 +35,9 @@ pub trait Notifier: Send + Sync {
     fn send(&self, n: &Notification) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
 }
 
-static INSTANCE: OnceCell<Box<dyn Notifier>> = OnceCell::const_new();
-
-async fn notifier() -> &'static dyn Notifier {
-    &**INSTANCE
-        .get_or_init(|| async {
-            let n = imp::detect().await;
-            tracing::info!("Using notification backend: {}", n.name());
-            n
-        })
-        .await
-}
-
-pub async fn send(n: Notification) {
-    if n.level == NotificationLevel::Off {
-        return;
-    }
-    notifier().await.send(&n).await;
+/// Detect and initialize the platform notification backend.
+pub async fn init() -> Arc<dyn Notifier> {
+    let n = imp::detect().await;
+    tracing::info!("Using notification backend: {}", n.name());
+    Arc::from(n)
 }

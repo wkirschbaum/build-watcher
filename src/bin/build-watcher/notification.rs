@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt::Write as _;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::sync::broadcast;
@@ -11,7 +12,7 @@ use build_watcher::github;
 use build_watcher::status::RunConclusion;
 use build_watcher::watcher::{PauseState, is_paused};
 
-use crate::platform;
+use crate::platform::{Notification, Notifier};
 
 // -- Constants --
 
@@ -90,156 +91,6 @@ struct BufferedEvent {
     level: NotificationLevel,
 }
 
-/// Debounce buffer: holds events grouped by key until their deadline expires.
-struct DebounceBuffer {
-    pending: HashMap<DebounceKey, Vec<BufferedEvent>>,
-    /// Deadlines ordered by time. Uses `(Instant, u64)` to guarantee uniqueness.
-    deadlines: BTreeMap<(Instant, u64), DebounceKey>,
-    next_id: u64,
-}
-
-impl DebounceBuffer {
-    fn new() -> Self {
-        Self {
-            pending: HashMap::new(),
-            deadlines: BTreeMap::new(),
-            next_id: 0,
-        }
-    }
-
-    fn insert(&mut self, key: DebounceKey, event: BufferedEvent, now: Instant) {
-        let is_new = !self.pending.contains_key(&key);
-        self.pending.entry(key.clone()).or_default().push(event);
-        if is_new {
-            let id = self.next_id;
-            self.next_id += 1;
-            self.deadlines.insert((now + DEBOUNCE_DELAY, id), key);
-        }
-    }
-
-    fn next_deadline(&self) -> Option<Instant> {
-        self.deadlines
-            .first_key_value()
-            .map(|((instant, _), _)| *instant)
-    }
-
-    /// Remove and return all expired groups at or before `now`.
-    fn pop_expired(&mut self, now: Instant) -> Vec<(DebounceKey, Vec<BufferedEvent>)> {
-        let mut result = Vec::new();
-        while let Some((&(deadline, _), _)) = self.deadlines.first_key_value() {
-            if deadline > now {
-                break;
-            }
-            let (_, key) = self.deadlines.pop_first().unwrap();
-            if let Some(events) = self.pending.remove(&key) {
-                result.push((key, events));
-            }
-        }
-        result
-    }
-
-    fn is_empty(&self) -> bool {
-        self.pending.is_empty()
-    }
-}
-
-/// Sliding-window throttle tracking recent notification sends.
-struct ThrottleWindow {
-    timestamps: VecDeque<Instant>,
-}
-
-impl ThrottleWindow {
-    fn new() -> Self {
-        Self {
-            timestamps: VecDeque::new(),
-        }
-    }
-
-    /// Check whether a notification may be sent. Returns `true` if allowed.
-    /// Critical notifications always pass but still consume budget.
-    fn allows(&mut self, now: Instant, is_critical: bool) -> bool {
-        // Drain entries older than the window.
-        while self
-            .timestamps
-            .front()
-            .is_some_and(|&t| now.duration_since(t) > THROTTLE_WINDOW)
-        {
-            self.timestamps.pop_front();
-        }
-        if is_critical {
-            self.timestamps.push_back(now);
-            return true;
-        }
-        if self.timestamps.len() < THROTTLE_MAX {
-            self.timestamps.push_back(now);
-            true
-        } else {
-            false
-        }
-    }
-}
-
-// -- Transition tracking --
-
-/// Key for tracking per-workflow notification state.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct TransitionKey {
-    repo: String,
-    branch: String,
-    workflow: String,
-}
-
-/// Tracks the last conclusion we notified about per (repo, branch, workflow).
-/// Only fires a notification when the conclusion *changes* (or on first occurrence).
-struct TransitionTracker {
-    last: HashMap<TransitionKey, RunConclusion>,
-}
-
-impl TransitionTracker {
-    fn new() -> Self {
-        Self {
-            last: HashMap::new(),
-        }
-    }
-
-    /// Returns `true` if this event represents a status transition worth notifying about.
-    fn should_notify(&self, event: &WatchEvent) -> bool {
-        match event {
-            // RunStarted: suppress — the user only wants transition notifications.
-            WatchEvent::RunStarted(_) => false,
-            WatchEvent::RunCompleted {
-                run, conclusion, ..
-            } => {
-                let key = TransitionKey {
-                    repo: run.repo.clone(),
-                    branch: run.branch.clone(),
-                    workflow: run.workflow.clone(),
-                };
-                match self.last.get(&key) {
-                    Some(prev) => prev != conclusion,
-                    None => true,
-                }
-            }
-            WatchEvent::StatusChanged { .. } => false,
-        }
-    }
-
-    /// Record that we notified about this event's conclusion.
-    fn record(&mut self, event: &WatchEvent) {
-        if let WatchEvent::RunCompleted {
-            run, conclusion, ..
-        } = event
-        {
-            let key = TransitionKey {
-                repo: run.repo.clone(),
-                branch: run.branch.clone(),
-                workflow: run.workflow.clone(),
-            };
-            self.last.insert(key, conclusion.clone());
-        }
-    }
-}
-
 // -- Helpers --
 
 /// Numeric rank for comparing notification levels (higher = more urgent).
@@ -283,27 +134,6 @@ pub(crate) fn effective_level(event: &WatchEvent, cfg: &config::Config) -> Notif
             }
         }
         WatchEvent::StatusChanged { .. } => NotificationLevel::Off,
-    }
-}
-
-/// Check suppression (pause, quiet hours, level=Off) and return dispatch info if not suppressed.
-async fn check_suppression(
-    event: &WatchEvent,
-    config: &SharedConfigManager,
-    pause: &PauseState,
-) -> Option<(String, NotificationLevel)> {
-    let paused = is_paused(pause).await;
-    let cfg = config.read().await;
-    let level = effective_level(event, &cfg);
-    let suppressed = level == NotificationLevel::Off
-        || (level != NotificationLevel::Critical && (paused || cfg.is_in_quiet_hours()));
-    if suppressed {
-        None
-    } else {
-        let repo_label = event_repo(event)
-            .map(|r| cfg.short_repo(r).to_string())
-            .unwrap_or_default();
-        Some((repo_label, level))
     }
 }
 
@@ -351,74 +181,221 @@ fn coalesced_body(kind: EventKind, events: &[BufferedEvent]) -> String {
     body
 }
 
-/// Dispatch a group of buffered events, coalescing if there are multiple.
-async fn dispatch_coalesced(
-    key: DebounceKey,
-    events: Vec<BufferedEvent>,
-    throttle: &mut ThrottleWindow,
-) {
-    if events.is_empty() {
-        return;
+// -- NotificationPipeline --
+
+/// Owns all notification state: transition tracking, debounce buffer, and throttle window.
+/// Testable without channels, timers, or spawned tasks.
+struct NotificationPipeline {
+    transitions: HashMap<(String, String), EventKind>,
+    /// Debounce buffer: events grouped by key, with deadlines.
+    pending: HashMap<DebounceKey, Vec<BufferedEvent>>,
+    deadlines: BTreeMap<(Instant, u64), DebounceKey>,
+    next_id: u64,
+    /// Sliding-window throttle.
+    throttle_timestamps: VecDeque<Instant>,
+}
+
+impl NotificationPipeline {
+    fn new() -> Self {
+        Self {
+            transitions: HashMap::new(),
+            pending: HashMap::new(),
+            deadlines: BTreeMap::new(),
+            next_id: 0,
+            throttle_timestamps: VecDeque::new(),
+        }
     }
 
-    // Single event: dispatch normally (unchanged behavior).
-    if events.len() == 1 {
-        let e = events.into_iter().next().expect("checked len == 1 above");
-        let is_critical = e.level == NotificationLevel::Critical;
-        if !throttle.allows(Instant::now(), is_critical) {
+    /// Check whether this event represents a branch-level transition worth notifying about.
+    fn is_transition(&self, event: &WatchEvent) -> bool {
+        let (run, kind) = match event {
+            WatchEvent::RunStarted(run) => (run, EventKind::Started),
+            WatchEvent::RunCompleted {
+                run, conclusion, ..
+            } => (
+                run,
+                if *conclusion == RunConclusion::Success {
+                    EventKind::Succeeded
+                } else {
+                    EventKind::Failed
+                },
+            ),
+            WatchEvent::StatusChanged { .. } => return false,
+        };
+        let key = (run.repo.clone(), run.branch.clone());
+        self.transitions.get(&key).is_none_or(|prev| *prev != kind)
+    }
+
+    /// Ingest an event: check transition + suppression, buffer if appropriate.
+    async fn ingest(
+        &mut self,
+        event: WatchEvent,
+        config: &SharedConfigManager,
+        pause: &PauseState,
+        now: Instant,
+    ) {
+        if !self.is_transition(&event) {
+            return;
+        }
+
+        let paused = is_paused(pause).await;
+        let cfg = config.read().await;
+        let level = effective_level(&event, &cfg);
+        let suppressed = level == NotificationLevel::Off
+            || (level != NotificationLevel::Critical && (paused || cfg.is_in_quiet_hours()));
+        if suppressed {
+            return;
+        }
+
+        let repo_label = event_repo(&event)
+            .map(|r| cfg.short_repo(r).to_string())
+            .unwrap_or_default();
+        drop(cfg);
+
+        let Some(key) = DebounceKey::from_event(&event) else {
+            return;
+        };
+
+        // Record transition.
+        if let Some(kind) = EventKind::from_event(&event) {
+            let tk = match &event {
+                WatchEvent::RunStarted(run) | WatchEvent::RunCompleted { run, .. } => {
+                    (run.repo.clone(), run.branch.clone())
+                }
+                _ => unreachable!(),
+            };
+            self.transitions.insert(tk, kind);
+        }
+
+        // Buffer for debounce.
+        let is_new = !self.pending.contains_key(&key);
+        self.pending
+            .entry(key.clone())
+            .or_default()
+            .push(BufferedEvent {
+                event,
+                repo_label,
+                level,
+            });
+        if is_new {
+            let id = self.next_id;
+            self.next_id += 1;
+            self.deadlines.insert((now + DEBOUNCE_DELAY, id), key);
+        }
+    }
+
+    fn next_deadline(&self) -> Option<Instant> {
+        self.deadlines
+            .first_key_value()
+            .map(|((instant, _), _)| *instant)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.pending.is_empty()
+    }
+
+    /// Dispatch all expired debounce groups via the notifier.
+    async fn dispatch_expired(&mut self, now: Instant, notifier: &dyn Notifier) {
+        while let Some(&(deadline, _)) = self.deadlines.first_key_value().map(|(k, _)| k) {
+            if deadline > now {
+                break;
+            }
+            let (_, key) = self.deadlines.pop_first().unwrap();
+            if let Some(events) = self.pending.remove(&key) {
+                self.dispatch_group(key, events, notifier).await;
+            }
+        }
+    }
+
+    /// Dispatch a single debounce group.
+    async fn dispatch_group(
+        &mut self,
+        key: DebounceKey,
+        events: Vec<BufferedEvent>,
+        notifier: &dyn Notifier,
+    ) {
+        if events.is_empty() {
+            return;
+        }
+
+        let (level, is_single) = if events.len() == 1 {
+            (events[0].level, true)
+        } else {
+            (max_level(events.iter().map(|e| e.level)), false)
+        };
+        let is_critical = level == NotificationLevel::Critical;
+
+        if !self.throttle_allows(Instant::now(), is_critical) {
             tracing::warn!("Throttled notification for {} (budget exhausted)", key.repo);
             return;
         }
-        handle_notification(e.event, &e.repo_label, e.level).await;
-        return;
+
+        if is_single {
+            let e = events.into_iter().next().unwrap();
+            dispatch_single(e.event, &e.repo_label, e.level, notifier).await;
+        } else {
+            let repo_label = events
+                .first()
+                .map(|e| e.repo_label.as_str())
+                .unwrap_or(&key.repo);
+            let title = coalesced_title(key.kind, repo_label, &key.branch, events.len());
+            let body = coalesced_body(key.kind, &events);
+            let group = format!("{}#{}#{}", key.repo, key.branch, key.kind.label());
+            let url = github::actions_url(&key.repo, &key.branch);
+
+            notifier
+                .send(&Notification {
+                    title,
+                    body,
+                    level,
+                    url: Some(url),
+                    group,
+                    app_name: key.repo,
+                })
+                .await;
+        }
     }
 
-    // Multiple events: coalesce into a summary.
-    let level = max_level(events.iter().map(|e| e.level));
-    let is_critical = level == NotificationLevel::Critical;
-    if !throttle.allows(Instant::now(), is_critical) {
-        tracing::warn!(
-            "Throttled coalesced notification ({} events) for {} (budget exhausted)",
-            events.len(),
-            key.repo
-        );
-        return;
+    fn throttle_allows(&mut self, now: Instant, is_critical: bool) -> bool {
+        while self
+            .throttle_timestamps
+            .front()
+            .is_some_and(|&t| now.duration_since(t) > THROTTLE_WINDOW)
+        {
+            self.throttle_timestamps.pop_front();
+        }
+        if is_critical {
+            self.throttle_timestamps.push_back(now);
+            return true;
+        }
+        if self.throttle_timestamps.len() < THROTTLE_MAX {
+            self.throttle_timestamps.push_back(now);
+            true
+        } else {
+            false
+        }
     }
-
-    let repo_label = events
-        .first()
-        .map(|e| e.repo_label.as_str())
-        .unwrap_or(&key.repo);
-    let title = coalesced_title(key.kind, repo_label, &key.branch, events.len());
-    let body = coalesced_body(key.kind, &events);
-    let group = format!("{}#{}#{}", key.repo, key.branch, key.kind.label());
-    let url = github::actions_url(&key.repo, &key.branch);
-
-    platform::send(platform::Notification {
-        title,
-        body,
-        level,
-        url: Some(url),
-        group,
-        app_name: key.repo,
-    })
-    .await;
 }
 
-// -- Single-event dispatch (unchanged from original) --
-
-async fn handle_notification(event: WatchEvent, repo_label: &str, level: NotificationLevel) {
+/// Format and send a single-event notification.
+async fn dispatch_single(
+    event: WatchEvent,
+    repo_label: &str,
+    level: NotificationLevel,
+    notifier: &dyn Notifier,
+) {
     match event {
         WatchEvent::RunStarted(run) => {
-            platform::send(platform::Notification {
-                title: format!("\u{1f528} started: {} | {}", repo_label, run.workflow),
-                body: format!("[{}] {}", run.branch, run.display_title()),
-                level,
-                url: Some(run.url()),
-                group: run.notification_group(),
-                app_name: run.repo,
-            })
-            .await;
+            notifier
+                .send(&Notification {
+                    title: format!("\u{1f528} started: {} | {}", repo_label, run.workflow),
+                    body: format!("[{}] {}", run.branch, run.display_title()),
+                    level,
+                    url: Some(run.url()),
+                    group: run.notification_group(),
+                    app_name: run.repo,
+                })
+                .await;
         }
         WatchEvent::RunCompleted {
             run,
@@ -446,15 +423,16 @@ async fn handle_notification(event: WatchEvent, repo_label: &str, level: Notific
                 let _ = write!(body, "\nFailed: {steps}");
             }
 
-            platform::send(platform::Notification {
-                title: format!("{emoji} {status}: {} | {}", repo_label, run.workflow),
-                body,
-                level,
-                url: Some(run.url()),
-                group: run.notification_group(),
-                app_name: run.repo,
-            })
-            .await;
+            notifier
+                .send(&Notification {
+                    title: format!("{emoji} {status}: {} | {}", repo_label, run.workflow),
+                    body,
+                    level,
+                    url: Some(run.url()),
+                    group: run.notification_group(),
+                    app_name: run.repo,
+                })
+                .await;
         }
         WatchEvent::StatusChanged { .. } => {}
     }
@@ -468,14 +446,12 @@ pub async fn run_notification_handler(
     mut rx: broadcast::Receiver<WatchEvent>,
     config: SharedConfigManager,
     pause: PauseState,
+    notifier: Arc<dyn Notifier>,
 ) {
-    let mut buffer = DebounceBuffer::new();
-    let mut throttle = ThrottleWindow::new();
-    let mut transitions = TransitionTracker::new();
+    let mut pipeline = NotificationPipeline::new();
 
     loop {
-        // Determine sleep target: next deadline, or far future if buffer is empty.
-        let deadline = buffer
+        let deadline = pipeline
             .next_deadline()
             .unwrap_or_else(|| Instant::now() + Duration::from_secs(86400));
 
@@ -483,16 +459,7 @@ pub async fn run_notification_handler(
             result = rx.recv() => {
                 match result {
                     Ok(event) => {
-                        if transitions.should_notify(&event)
-                            && let Some((repo_label, level)) = check_suppression(&event, &config, &pause).await
-                            && let Some(key) = DebounceKey::from_event(&event)
-                        {
-                            buffer.insert(
-                                key,
-                                BufferedEvent { event, repo_label, level },
-                                Instant::now(),
-                            );
-                        }
+                        pipeline.ingest(event, &config, &pause, Instant::now()).await;
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         tracing::warn!("Notification handler dropped {n} events");
@@ -506,26 +473,14 @@ pub async fn run_notification_handler(
             _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {}
         }
 
-        // Dispatch any expired groups after every iteration, so a continuous
-        // stream of recv events cannot starve pending deadlines.
-        let expired = buffer.pop_expired(Instant::now());
-        for (key, events) in expired {
-            for e in &events {
-                transitions.record(&e.event);
-            }
-            dispatch_coalesced(key, events, &mut throttle).await;
-        }
+        pipeline.dispatch_expired(Instant::now(), &*notifier).await;
     }
 
-    // Flush any remaining buffered events on shutdown.
-    if !buffer.is_empty() {
-        let expired = buffer.pop_expired(Instant::now() + DEBOUNCE_DELAY);
-        for (key, events) in expired {
-            for e in &events {
-                transitions.record(&e.event);
-            }
-            dispatch_coalesced(key, events, &mut throttle).await;
-        }
+    // Flush remaining on shutdown.
+    if !pipeline.is_empty() {
+        pipeline
+            .dispatch_expired(Instant::now() + DEBOUNCE_DELAY, &*notifier)
+            .await;
     }
 }
 
@@ -535,6 +490,8 @@ mod tests {
     use build_watcher::config::NotificationLevel::*;
     use build_watcher::events::RunSnapshot;
     use build_watcher::status::RunStatus;
+    use std::pin::Pin;
+    use tokio::sync::Mutex;
 
     fn snap() -> RunSnapshot {
         RunSnapshot {
@@ -563,6 +520,71 @@ mod tests {
             failing_steps: None,
             failing_job_id: None,
         }
+    }
+
+    // -- Recording notifier --
+
+    struct RecordingNotifier {
+        sent: Mutex<Vec<String>>,
+    }
+
+    impl RecordingNotifier {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                sent: Mutex::new(Vec::new()),
+            })
+        }
+
+        async fn titles(&self) -> Vec<String> {
+            self.sent.lock().await.clone()
+        }
+    }
+
+    impl Notifier for RecordingNotifier {
+        fn name(&self) -> &'static str {
+            "recording"
+        }
+
+        fn send(
+            &self,
+            n: &Notification,
+        ) -> Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+            let title = n.title.clone();
+            Box::pin(async move {
+                self.sent.lock().await.push(title);
+            })
+        }
+    }
+
+    // -- Test helpers --
+
+    fn default_config_manager() -> SharedConfigManager {
+        Arc::new(config::ConfigManager::new(
+            config::Config::default(),
+            config::ConfigPersistence::Null,
+        ))
+    }
+
+    fn unpaused() -> PauseState {
+        Arc::new(Mutex::new(None))
+    }
+
+    /// Ingest events and flush, returning dispatched notification titles.
+    async fn dispatched_titles(events: Vec<WatchEvent>) -> Vec<String> {
+        let config = default_config_manager();
+        let pause = unpaused();
+        let recorder = RecordingNotifier::new();
+        let mut pipeline = NotificationPipeline::new();
+        let now = Instant::now();
+
+        for event in events {
+            pipeline.ingest(event, &config, &pause, now).await;
+        }
+
+        pipeline
+            .dispatch_expired(now + DEBOUNCE_DELAY, &*recorder)
+            .await;
+        recorder.titles().await
     }
 
     // -- EventKind tests --
@@ -617,148 +639,6 @@ mod tests {
         assert_eq!(max_level([Low, Normal, Critical].into_iter()), Critical);
         assert_eq!(max_level([Low, Normal].into_iter()), Normal);
         assert_eq!(max_level([Low].into_iter()), Low);
-    }
-
-    // -- DebounceBuffer tests --
-
-    #[test]
-    fn buffer_insert_same_key_groups() {
-        let mut buf = DebounceBuffer::new();
-        let now = Instant::now();
-        let key = DebounceKey {
-            repo: "alice/app".into(),
-            branch: "main".into(),
-            kind: EventKind::Started,
-        };
-        buf.insert(
-            key.clone(),
-            BufferedEvent {
-                event: WatchEvent::RunStarted(snap_workflow("CI")),
-                repo_label: "app".into(),
-                level: Normal,
-            },
-            now,
-        );
-        buf.insert(
-            key.clone(),
-            BufferedEvent {
-                event: WatchEvent::RunStarted(snap_workflow("Lint")),
-                repo_label: "app".into(),
-                level: Normal,
-            },
-            now,
-        );
-
-        assert_eq!(buf.pending.len(), 1);
-        assert_eq!(buf.pending[&key].len(), 2);
-        assert_eq!(buf.deadlines.len(), 1);
-    }
-
-    #[test]
-    fn buffer_different_keys_separate() {
-        let mut buf = DebounceBuffer::new();
-        let now = Instant::now();
-        let key1 = DebounceKey {
-            repo: "alice/app".into(),
-            branch: "main".into(),
-            kind: EventKind::Started,
-        };
-        let key2 = DebounceKey {
-            repo: "alice/app".into(),
-            branch: "main".into(),
-            kind: EventKind::Succeeded,
-        };
-        buf.insert(
-            key1,
-            BufferedEvent {
-                event: WatchEvent::RunStarted(snap()),
-                repo_label: "app".into(),
-                level: Normal,
-            },
-            now,
-        );
-        buf.insert(
-            key2,
-            BufferedEvent {
-                event: completed(RunConclusion::Success),
-                repo_label: "app".into(),
-                level: Normal,
-            },
-            now,
-        );
-
-        assert_eq!(buf.pending.len(), 2);
-        assert_eq!(buf.deadlines.len(), 2);
-    }
-
-    #[test]
-    fn buffer_pop_expired_respects_deadline() {
-        let mut buf = DebounceBuffer::new();
-        let now = Instant::now();
-        let key = DebounceKey {
-            repo: "alice/app".into(),
-            branch: "main".into(),
-            kind: EventKind::Started,
-        };
-        buf.insert(
-            key,
-            BufferedEvent {
-                event: WatchEvent::RunStarted(snap()),
-                repo_label: "app".into(),
-                level: Normal,
-            },
-            now,
-        );
-
-        // Before deadline: nothing expired.
-        let expired = buf.pop_expired(now + Duration::from_secs(1));
-        assert!(expired.is_empty());
-        assert_eq!(buf.pending.len(), 1);
-
-        // After deadline: pops the group.
-        let expired = buf.pop_expired(now + DEBOUNCE_DELAY + Duration::from_millis(1));
-        assert_eq!(expired.len(), 1);
-        assert!(buf.pending.is_empty());
-        assert!(buf.deadlines.is_empty());
-    }
-
-    // -- ThrottleWindow tests --
-
-    #[test]
-    fn throttle_allows_up_to_max() {
-        let mut tw = ThrottleWindow::new();
-        let now = Instant::now();
-        for _ in 0..THROTTLE_MAX {
-            assert!(tw.allows(now, false));
-        }
-        assert!(!tw.allows(now, false));
-    }
-
-    #[test]
-    fn throttle_critical_always_allowed() {
-        let mut tw = ThrottleWindow::new();
-        let now = Instant::now();
-        // Exhaust budget.
-        for _ in 0..THROTTLE_MAX {
-            tw.allows(now, false);
-        }
-        // Critical still passes.
-        assert!(tw.allows(now, true));
-    }
-
-    #[test]
-    fn throttle_drains_old_entries() {
-        let mut tw = ThrottleWindow::new();
-        let start = Instant::now();
-        // Fill budget.
-        for _ in 0..THROTTLE_MAX {
-            tw.allows(start, false);
-        }
-        assert!(!tw.allows(start, false));
-
-        // After the window expires, budget is available again.
-        let later = start + THROTTLE_WINDOW + Duration::from_millis(1);
-        assert!(tw.allows(later, false));
     }
 
     // -- Coalescing format tests --
@@ -828,7 +708,7 @@ mod tests {
         assert_eq!(body, "CI, Deploy\nCI: Build / Run tests");
     }
 
-    // -- effective_level tests (preserved from original) --
+    // -- effective_level tests --
 
     #[test]
     fn effective_level_by_event_type() {
@@ -855,59 +735,154 @@ mod tests {
         assert_eq!(effective_level(&status, &cfg), Off);
     }
 
-    // -- TransitionTracker tests --
+    // -- Pipeline transition tests --
 
     #[test]
-    fn transition_suppresses_run_started() {
-        let tracker = TransitionTracker::new();
-        let event = WatchEvent::RunStarted(snap());
-        assert!(!tracker.should_notify(&event));
+    fn transition_allows_first_started() {
+        let pipeline = NotificationPipeline::new();
+        assert!(pipeline.is_transition(&WatchEvent::RunStarted(snap())));
     }
 
     #[test]
     fn transition_allows_first_completion() {
-        let tracker = TransitionTracker::new();
-        let event = completed(RunConclusion::Success);
-        assert!(tracker.should_notify(&event));
+        let pipeline = NotificationPipeline::new();
+        assert!(pipeline.is_transition(&completed(RunConclusion::Success)));
     }
 
-    #[test]
-    fn transition_suppresses_same_conclusion() {
-        let mut tracker = TransitionTracker::new();
-        let event = completed(RunConclusion::Success);
-        assert!(tracker.should_notify(&event));
-        tracker.record(&event);
-        // Same conclusion again — suppress.
-        let event2 = completed(RunConclusion::Success);
-        assert!(!tracker.should_notify(&event2));
+    #[tokio::test]
+    async fn transition_suppresses_same_kind() {
+        let titles = dispatched_titles(vec![
+            completed(RunConclusion::Success),
+            completed(RunConclusion::Success),
+        ])
+        .await;
+        assert_eq!(titles.len(), 1);
+        assert!(titles[0].contains("succeeded"));
     }
 
-    #[test]
-    fn transition_allows_changed_conclusion() {
-        let mut tracker = TransitionTracker::new();
-        let success = completed(RunConclusion::Success);
-        tracker.record(&success);
-        // Different conclusion — notify.
-        let failure = completed(RunConclusion::Failure);
-        assert!(tracker.should_notify(&failure));
+    #[tokio::test]
+    async fn transition_allows_changed_conclusion() {
+        let titles = dispatched_titles(vec![
+            completed(RunConclusion::Success),
+            completed(RunConclusion::Failure),
+        ])
+        .await;
+        assert_eq!(titles.len(), 2);
     }
 
-    #[test]
-    fn transition_tracks_per_workflow() {
-        let mut tracker = TransitionTracker::new();
-        let ci_success = completed(RunConclusion::Success);
-        tracker.record(&ci_success);
+    #[tokio::test]
+    async fn transition_started_after_completion() {
+        let titles = dispatched_titles(vec![
+            completed(RunConclusion::Success),
+            WatchEvent::RunStarted(snap()),
+        ])
+        .await;
+        assert_eq!(titles.len(), 2);
+        assert!(titles.iter().any(|t| t.contains("succeeded")));
+        assert!(titles.iter().any(|t| t.contains("started")));
+    }
 
-        // Different workflow — should notify even with same conclusion.
-        let mut lint_snap = snap();
-        lint_snap.workflow = "Lint".to_string();
-        let lint_success = WatchEvent::RunCompleted {
-            run: lint_snap,
-            conclusion: RunConclusion::Success,
-            elapsed: None,
-            failing_steps: None,
-            failing_job_id: None,
-        };
-        assert!(tracker.should_notify(&lint_success));
+    #[tokio::test]
+    async fn transition_suppresses_started_while_started() {
+        let titles = dispatched_titles(vec![
+            WatchEvent::RunStarted(snap_workflow("CI")),
+            WatchEvent::RunStarted(snap_workflow("Lint")),
+        ])
+        .await;
+        assert_eq!(titles.len(), 1);
+        assert!(titles[0].contains("started"));
+    }
+
+    #[tokio::test]
+    async fn transition_tracks_per_branch_not_workflow() {
+        let titles = dispatched_titles(vec![completed(RunConclusion::Success), {
+            let mut s = snap();
+            s.workflow = "Lint".to_string();
+            WatchEvent::RunCompleted {
+                run: s,
+                conclusion: RunConclusion::Success,
+                elapsed: None,
+                failing_steps: None,
+                failing_job_id: None,
+            }
+        }])
+        .await;
+        // Same branch, same conclusion kind — second is suppressed.
+        assert_eq!(titles.len(), 1);
+    }
+
+    // -- Pipeline dispatch tests --
+
+    #[tokio::test]
+    async fn debounce_coalesces_same_kind_into_one_notification() {
+        let titles = dispatched_titles(vec![
+            WatchEvent::RunStarted(snap()),
+            completed(RunConclusion::Success),
+            WatchEvent::RunStarted(snap()),
+        ])
+        .await;
+        // Two "started" events share a debounce key and coalesce into one notification.
+        assert_eq!(titles.len(), 2);
+        assert!(titles.iter().any(|t| t.contains("started")));
+        assert!(titles.iter().any(|t| t.contains("succeeded")));
+    }
+
+    #[tokio::test]
+    async fn debounce_does_not_fire_before_deadline() {
+        let config = default_config_manager();
+        let pause = unpaused();
+        let recorder = RecordingNotifier::new();
+        let mut pipeline = NotificationPipeline::new();
+        let now = Instant::now();
+
+        pipeline
+            .ingest(WatchEvent::RunStarted(snap()), &config, &pause, now)
+            .await;
+
+        // Before deadline: nothing dispatched.
+        pipeline
+            .dispatch_expired(now + Duration::from_secs(1), &*recorder)
+            .await;
+        assert!(recorder.titles().await.is_empty());
+
+        // After deadline: dispatched.
+        pipeline
+            .dispatch_expired(now + DEBOUNCE_DELAY, &*recorder)
+            .await;
+        assert_eq!(recorder.titles().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn throttle_limits_normal_notifications() {
+        let config = default_config_manager();
+        let pause = unpaused();
+        let recorder = RecordingNotifier::new();
+        let mut pipeline = NotificationPipeline::new();
+        let now = Instant::now();
+
+        // Alternate started/success on distinct branches to create transitions.
+        // Both are Normal level, so throttle applies equally.
+        for i in 0..(THROTTLE_MAX + 2) {
+            let mut s = snap();
+            s.run_id = i as u64;
+            s.branch = format!("branch-{i}");
+            let event = if i % 2 == 0 {
+                WatchEvent::RunStarted(s)
+            } else {
+                WatchEvent::RunCompleted {
+                    run: s,
+                    conclusion: RunConclusion::Success,
+                    elapsed: None,
+                    failing_steps: None,
+                    failing_job_id: None,
+                }
+            };
+            pipeline.ingest(event, &config, &pause, now).await;
+        }
+
+        pipeline
+            .dispatch_expired(now + DEBOUNCE_DELAY, &*recorder)
+            .await;
+        assert_eq!(recorder.titles().await.len(), THROTTLE_MAX);
     }
 }

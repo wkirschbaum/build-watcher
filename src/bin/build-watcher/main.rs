@@ -53,10 +53,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let events = EventBus::new();
 
     // Subscribe before starting watches so no events are missed.
+    let notifier = platform::init().await;
     tokio::spawn(notification::run_notification_handler(
         events.subscribe(),
         config.clone(),
         pause.clone(),
+        notifier,
     ));
 
     let ct = CancellationToken::new();
