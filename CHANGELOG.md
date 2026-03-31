@@ -1,5 +1,47 @@
 # Changelog
 
+## [0.8.8] - 2026-03-31
+
+### Fixed
+
+- Notification bug: `RunStarted` events were silently suppressed — now triggers desktop notifications on branch-level transitions (started/succeeded/failed)
+- Transition tracking now operates per (repo, branch) instead of per workflow, so redundant notifications for multiple workflows on the same branch are suppressed
+
+### Changed
+
+- Extract `NotificationPipeline` struct owning all notification state (transition tracking, debounce buffer, throttle window)
+- Inject `Notifier` trait into notification handler instead of using global platform singleton — enables proper test assertions on dispatched notifications
+- Remove `NullNotifier` / `universal.rs` (replaced by `RecordingNotifier` in tests)
+- Notification tests now call pipeline methods directly — no channels, spawned tasks, or sleeps
+- Add `TestHarness` to watcher tests, eliminating repeated setup boilerplate
+- Remove redundant tests that duplicated coverage between unit and integration layers
+
+## [0.8.7] - 2026-03-31
+
+### Changed
+
+- Simplify shared types: flatten re-exports, remove redundant type aliases
+- Update poll aggression documentation
+- Update README
+
+## [0.8.6] - 2026-03-31
+
+### Fixed
+
+- Draft recovery for interrupted config saves — orphaned `.draft` files are automatically promoted on load
+- TUI status bar consistency improvements
+- Rename "NOTIFS PAUSED" label, remove dead `active_count` method
+
+### Changed
+
+- Centralize all config mutations behind `ConfigManager` — eliminates direct field access from server actions
+- TUI: remove header status summary, collapse to single line
+- TUI: align terminal title counts with header summary
+- TUI: skip Branches expand level when no branch has multiple workflows
+- TUI: extract colour constants, `attempt_suffix` helper, `set_expand_level` method
+- TUI: use middle dot separator consistently throughout UI
+- TUI: header status order active-first, always show counts
+
 ## [0.8.5] - 2026-03-30
 
 ### Fixed
@@ -44,6 +86,9 @@
 
 - Avoid unnecessary config re-save on reads; improve persistence error logging
 
+[0.8.8]: https://github.com/wkirschbaum/build-watcher/releases/tag/v0.8.8
+[0.8.7]: https://github.com/wkirschbaum/build-watcher/releases/tag/v0.8.7
+[0.8.6]: https://github.com/wkirschbaum/build-watcher/releases/tag/v0.8.6
 [0.8.5]: https://github.com/wkirschbaum/build-watcher/releases/tag/v0.8.5
 [0.8.4]: https://github.com/wkirschbaum/build-watcher/releases/tag/v0.8.4
 [0.8.3]: https://github.com/wkirschbaum/build-watcher/releases/tag/v0.8.3
