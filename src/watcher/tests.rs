@@ -4,7 +4,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use tokio::sync::Mutex;
-use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{Config, ConfigManager, ConfigPersistence};
@@ -27,17 +26,22 @@ fn make_run(id: u64, status: RunStatus, conclusion: &str) -> RunInfo {
         event: "push".to_string(),
         head_branch: "main".to_string(),
         attempt: 1,
+        created_at: "2026-01-01T10:00:00Z".to_string(),
+        updated_at: "2026-01-01T10:05:00Z".to_string(),
+        url: "https://github.com/test/repo/actions/runs/1".to_string(),
     }
 }
 
 fn make_active(status: RunStatus) -> ActiveRun {
     ActiveRun {
         status,
-        started_at: Instant::now(),
         workflow: "CI".to_string(),
         title: "Test PR".to_string(),
         event: "push".to_string(),
         attempt: 1,
+        created_at: "2026-01-01T10:00:00Z".to_string(),
+        updated_at: "2026-01-01T10:05:00Z".to_string(),
+        url: "https://github.com/test/repo/actions/runs/1".to_string(),
     }
 }
 
@@ -75,8 +79,9 @@ fn make_last_build(run_id: u64, conclusion: &str) -> crate::github::LastBuild {
         failing_steps: None,
         failing_job_id: None,
         completed_at: Some(1000),
-        duration_secs: None,
+        duration_secs: Some(300),
         attempt: 1,
+        url: "https://github.com/test/repo/actions/runs/1".to_string(),
     }
 }
 
@@ -270,26 +275,28 @@ fn active_run_display_title() {
 // -- WatchEntry state machine tests --
 
 #[test]
-fn record_completion_returns_elapsed() {
+fn record_completion_removes_active_run() {
     let mut entry = make_entry();
+    assert!(entry.active_runs.contains_key(&101));
     let run = make_run(101, RunStatus::Completed, "success");
-    let elapsed = entry.record_completion(&run, None, None, 0);
-    assert!(elapsed.is_some());
-    assert!(elapsed.unwrap() < std::time::Duration::from_secs(1));
+    entry.record_completion(&run, None, None);
+    assert!(!entry.active_runs.contains_key(&101));
 }
 
 #[test]
-fn record_completion_returns_none_for_unknown_run() {
+fn record_completion_noop_for_unknown_run() {
     let mut entry = make_entry();
     let run = make_run(999, RunStatus::Completed, "success");
-    assert!(entry.record_completion(&run, None, None, 0).is_none());
+    entry.record_completion(&run, None, None);
+    // Still has the original active runs
+    assert!(entry.active_runs.contains_key(&101));
 }
 
 #[test]
 fn record_completion_removes_run_and_sets_last_build() {
     let mut entry = make_entry();
     let run = make_run(101, RunStatus::Completed, "success");
-    entry.record_completion(&run, None, None, 0);
+    entry.record_completion(&run, None, None);
 
     assert!(!entry.active_runs.contains_key(&101));
     assert!(entry.active_runs.contains_key(&102));
@@ -302,7 +309,7 @@ fn record_completion_removes_run_and_sets_last_build() {
 fn record_completion_stores_failing_steps() {
     let mut entry = make_entry();
     let run = make_run(101, RunStatus::Completed, "failure");
-    entry.record_completion(&run, Some("Build / Run tests".to_string()), None, 0);
+    entry.record_completion(&run, Some("Build / Run tests".to_string()), None);
     assert_eq!(
         entry
             .last_builds
@@ -319,7 +326,7 @@ fn record_completion_clears_failure_count() {
     let mut entry = make_entry();
     entry.failure_counts.insert(101, 3);
     let run = make_run(101, RunStatus::Completed, "failure");
-    entry.record_completion(&run, None, None, 0);
+    entry.record_completion(&run, None, None);
     assert!(!entry.failure_counts.contains_key(&101));
 }
 
@@ -383,7 +390,7 @@ fn update_status_noop_for_unknown_run() {
 fn incorporate_new_runs_tracks_in_progress() {
     let mut entry = make_entry();
     let run = make_run(200, RunStatus::InProgress, "");
-    entry.incorporate_new_runs(&[&run], Instant::now(), 0);
+    entry.incorporate_new_runs(&[&run]);
 
     assert_eq!(entry.last_seen_run_id, 200);
     assert_eq!(entry.active_runs[&200].status, RunStatus::InProgress);
@@ -394,7 +401,7 @@ fn incorporate_new_runs_tracks_in_progress() {
 fn incorporate_new_runs_records_completed() {
     let mut entry = make_entry();
     let run = make_run(200, RunStatus::Completed, "success");
-    entry.incorporate_new_runs(&[&run], Instant::now(), 0);
+    entry.incorporate_new_runs(&[&run]);
 
     assert_eq!(entry.last_seen_run_id, 200);
     assert!(!entry.active_runs.contains_key(&200));
@@ -406,7 +413,7 @@ fn incorporate_new_runs_newest_completed_wins_last_build() {
     let mut entry = make_entry();
     let old = make_run(200, RunStatus::Completed, "failure");
     let new = make_run(201, RunStatus::Completed, "success");
-    entry.incorporate_new_runs(&[&new, &old], Instant::now(), 0);
+    entry.incorporate_new_runs(&[&new, &old]);
 
     assert_eq!(entry.last_seen_run_id, 201);
     let lb = entry.last_builds.get("CI").unwrap();
@@ -419,7 +426,7 @@ fn incorporate_new_runs_mixed_statuses() {
     let mut entry = make_entry();
     let completed = make_run(200, RunStatus::Completed, "success");
     let active = make_run(201, RunStatus::InProgress, "");
-    entry.incorporate_new_runs(&[&active, &completed], Instant::now(), 0);
+    entry.incorporate_new_runs(&[&active, &completed]);
 
     assert_eq!(entry.last_seen_run_id, 201);
     assert_eq!(entry.active_runs[&201].status, RunStatus::InProgress);
@@ -439,7 +446,7 @@ fn has_active_runs_reflects_state() {
 fn persisted_roundtrip_preserves_fields() {
     let mut entry = make_entry();
     let run = make_run(101, RunStatus::Completed, "success");
-    entry.record_completion(&run, None, None, 0);
+    entry.record_completion(&run, None, None);
 
     let restored = WatchEntry::from_persisted(entry.to_persisted());
     assert_eq!(restored.last_seen_run_id, 101);
@@ -526,12 +533,7 @@ fn filter_runs_both_filters() {
 fn last_failed_build_finds_failure() {
     let mut watches = HashMap::new();
     let mut entry = make_entry();
-    entry.record_completion(
-        &make_run(200, RunStatus::Completed, "failure"),
-        None,
-        None,
-        0,
-    );
+    entry.record_completion(&make_run(200, RunStatus::Completed, "failure"), None, None);
     watches.insert(WatchKey::new("alice/app", "main"), entry);
 
     let (key, build) = last_failed_build(&watches, "alice/app").unwrap();
@@ -543,12 +545,7 @@ fn last_failed_build_finds_failure() {
 fn last_failed_build_ignores_success() {
     let mut watches = HashMap::new();
     let mut entry = make_entry();
-    entry.record_completion(
-        &make_run(200, RunStatus::Completed, "success"),
-        None,
-        None,
-        0,
-    );
+    entry.record_completion(&make_run(200, RunStatus::Completed, "success"), None, None);
     watches.insert(WatchKey::new("alice/app", "main"), entry);
     assert!(last_failed_build(&watches, "alice/app").is_none());
 }
@@ -558,21 +555,11 @@ fn last_failed_build_picks_most_recent() {
     let mut watches = HashMap::new();
 
     let mut entry1 = make_entry();
-    entry1.record_completion(
-        &make_run(100, RunStatus::Completed, "failure"),
-        None,
-        None,
-        0,
-    );
+    entry1.record_completion(&make_run(100, RunStatus::Completed, "failure"), None, None);
     watches.insert(WatchKey::new("alice/app", "main"), entry1);
 
     let mut entry2 = make_entry();
-    entry2.record_completion(
-        &make_run(200, RunStatus::Completed, "failure"),
-        None,
-        None,
-        0,
-    );
+    entry2.record_completion(&make_run(200, RunStatus::Completed, "failure"), None, None);
     watches.insert(WatchKey::new("alice/app", "develop"), entry2);
 
     assert_eq!(
@@ -585,12 +572,7 @@ fn last_failed_build_picks_most_recent() {
 fn last_failed_build_ignores_other_repos() {
     let mut watches = HashMap::new();
     let mut entry = make_entry();
-    entry.record_completion(
-        &make_run(200, RunStatus::Completed, "failure"),
-        None,
-        None,
-        0,
-    );
+    entry.record_completion(&make_run(200, RunStatus::Completed, "failure"), None, None);
     watches.insert(WatchKey::new("bob/other", "main"), entry);
     assert!(last_failed_build(&watches, "alice/app").is_none());
 }
@@ -958,7 +940,7 @@ async fn record_completion_bumps_last_seen() {
         ..idle_entry(50)
     };
     let run = make_run(100, RunStatus::Completed, "success");
-    entry.record_completion(&run, None, None, 999);
+    entry.record_completion(&run, None, None);
 
     assert_eq!(entry.last_seen_run_id, 100);
     assert!(entry.active_runs.is_empty());
@@ -1005,6 +987,7 @@ fn run_change_dedup_keeps_first() {
         event: "push".to_string(),
         status: RunStatus::InProgress,
         attempt: 1,
+        url: format!("https://github.com/alice/app/actions/runs/{id}"),
     };
 
     let changes = vec![

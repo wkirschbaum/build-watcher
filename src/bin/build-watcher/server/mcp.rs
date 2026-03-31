@@ -82,7 +82,7 @@ impl BuildWatcher {
                 "No active watches",
             )]));
         }
-        let snapshot = build_watch_snapshot(&watches, None, paused, tokio::time::Instant::now());
+        let snapshot = build_watch_snapshot(&watches, None, paused);
 
         let mut lines: Vec<String> = Vec::new();
         if snapshot.paused {

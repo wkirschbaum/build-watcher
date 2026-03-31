@@ -5,8 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::status::RunStatus;
 
 const GH_TIMEOUT: Duration = Duration::from_secs(30);
-const GH_JSON_FIELDS: &str =
-    "databaseId,status,conclusion,displayTitle,workflowName,headSha,event,headBranch,attempt";
+const GH_JSON_FIELDS: &str = "databaseId,status,conclusion,displayTitle,workflowName,headSha,event,headBranch,attempt,createdAt,updatedAt,url";
 /// Default limit for `recent_runs` (per-branch).
 const DEFAULT_BRANCH_LIMIT: u32 = 10;
 /// Upper limit for `in_progress_runs_for_repo`.
@@ -106,6 +105,9 @@ pub struct LastBuild {
     /// GitHub Actions attempt number. 1 for the original run, 2+ for re-runs.
     #[serde(default = "default_attempt")]
     pub attempt: u32,
+    /// GitHub Actions run URL.
+    #[serde(default)]
+    pub url: String,
 }
 
 impl LastBuild {
@@ -136,6 +138,12 @@ struct GhRunJson {
     head_branch: String,
     #[serde(default = "default_attempt")]
     attempt: u32,
+    #[serde(default)]
+    created_at: String,
+    #[serde(default)]
+    updated_at: String,
+    #[serde(default)]
+    url: String,
 }
 
 /// Default GitHub Actions attempt number (1 = original run).
@@ -156,6 +164,9 @@ pub struct RunInfo {
     pub event: String,
     pub head_branch: String,
     pub attempt: u32,
+    pub created_at: String,
+    pub updated_at: String,
+    pub url: String,
 }
 
 impl RunInfo {
@@ -192,6 +203,9 @@ impl RunInfo {
             event: raw.event,
             head_branch: raw.head_branch,
             attempt: raw.attempt,
+            created_at: raw.created_at,
+            updated_at: raw.updated_at,
+            url: raw.url,
         })
     }
 
@@ -218,8 +232,17 @@ impl RunInfo {
             .unwrap_or(crate::status::RunConclusion::Unknown)
     }
 
-    pub fn url(&self, repo: &str) -> String {
-        run_url(repo, self.id)
+    /// Duration in seconds from `created_at` to `updated_at`.
+    pub fn duration_secs(&self) -> Option<u64> {
+        let start = parse_iso_epoch(&self.created_at)?;
+        let end = parse_iso_epoch(&self.updated_at)?;
+        Some(end.saturating_sub(start))
+    }
+
+    /// Seconds since `created_at`, given the current Unix epoch.
+    pub fn elapsed_secs(&self, now_unix: u64) -> Option<f64> {
+        let start = parse_iso_epoch(&self.created_at)?;
+        Some(now_unix.saturating_sub(start) as f64)
     }
 
     pub fn to_last_build(&self) -> LastBuild {
@@ -232,9 +255,10 @@ impl RunInfo {
             event: self.event.clone(),
             failing_steps: None,
             failing_job_id: None,
-            completed_at: None,
-            duration_secs: None,
+            completed_at: parse_iso_epoch(&self.updated_at),
+            duration_secs: self.duration_secs(),
             attempt: self.attempt,
+            url: self.url.clone(),
         }
     }
 }
@@ -446,14 +470,15 @@ impl GitHubClient for GhCliClient {
     }
 }
 
-/// Format a human-readable title. PR events get a "PR: " prefix;
-/// all other events use the title as-is.
+/// Format a human-readable title with a compact event prefix.
 pub(crate) fn display_title(event: &str, title: &str) -> String {
-    if event.starts_with("pull_request") {
-        format!("PR: {title}")
-    } else {
-        title.to_string()
-    }
+    let prefix = match event {
+        e if e.starts_with("pull_request") => "PR: ",
+        "schedule" => "cron: ",
+        "workflow_dispatch" => "manual: ",
+        _ => "",
+    };
+    format!("{prefix}{title}")
 }
 
 #[derive(Debug, Deserialize)]
@@ -546,6 +571,12 @@ impl HistoryEntry {
         let start = parse_iso_epoch(&self.created_at)?;
         Some(now.saturating_sub(start))
     }
+}
+
+/// Seconds elapsed since an ISO 8601 timestamp, given the current Unix epoch.
+pub fn elapsed_since(iso: &str, now_unix: u64) -> Option<f64> {
+    let start = parse_iso_epoch(iso)?;
+    Some(now_unix.saturating_sub(start) as f64)
 }
 
 /// Parse an ISO 8601 / RFC 3339 timestamp (e.g. `"2026-03-24T10:30:00Z"`) to Unix epoch seconds.
@@ -702,7 +733,10 @@ mod tests {
             "workflowName": "Lint and Test",
             "headSha": "abc1234def5678",
             "event": "push",
-            "headBranch": "main"
+            "headBranch": "main",
+            "createdAt": "2026-01-01T10:00:00Z",
+            "updatedAt": "2026-01-01T10:05:30Z",
+            "url": "https://github.com/test/repo/actions/runs/123456789"
         })
     }
 
@@ -744,9 +778,10 @@ mod tests {
         assert!(run.succeeded());
         assert_eq!(run.short_sha(), "abc1234");
         assert_eq!(
-            run.url("alice/myapp"),
-            "https://github.com/alice/myapp/actions/runs/123456789"
+            run.url,
+            "https://github.com/test/repo/actions/runs/123456789"
         );
+        assert_eq!(run.duration_secs(), Some(330)); // 5m30s
 
         let mut v = sample_json();
         v["status"] = json!("in_progress");
@@ -830,12 +865,18 @@ mod tests {
         assert_eq!(run.display_title(), "Fix login bug");
         assert_eq!(run.to_last_build().display_title(), "Fix login bug");
 
-        let mut v = sample_json();
-        v["event"] = json!("pull_request");
-        assert_eq!(
-            run_from_value(&v).unwrap().display_title(),
-            "PR: Fix login bug"
-        );
+        let cases = [
+            ("pull_request", "PR: Fix login bug"),
+            ("pull_request_target", "PR: Fix login bug"),
+            ("schedule", "cron: Fix login bug"),
+            ("workflow_dispatch", "manual: Fix login bug"),
+            ("push", "Fix login bug"),
+        ];
+        for (event, expected) in cases {
+            let mut v = sample_json();
+            v["event"] = json!(event);
+            assert_eq!(run_from_value(&v).unwrap().display_title(), expected);
+        }
     }
 
     #[test]

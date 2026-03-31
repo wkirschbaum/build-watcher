@@ -26,11 +26,10 @@ use super::{build_watch_snapshot, json_error};
 pub(crate) async fn status_handler(
     State(state): State<DaemonState>,
 ) -> axum::Json<build_watcher::status::StatusResponse> {
-    let now = tokio::time::Instant::now();
     let paused = is_paused(&state.pause).await;
     let watches = state.watches.lock().await;
     let cfg = state.config.read().await;
-    axum::Json(build_watch_snapshot(&watches, Some(&cfg), paused, now))
+    axum::Json(build_watch_snapshot(&watches, Some(&cfg), paused))
 }
 
 /// `GET /events` — SSE stream of `WatchEvent`s as they occur.
@@ -612,6 +611,7 @@ mod tests {
             event: "push".to_string(),
             status: build_watcher::status::RunStatus::InProgress,
             attempt: 1,
+            url: String::new(),
         }
     }
 
@@ -653,6 +653,7 @@ mod tests {
                 completed_at: None,
                 duration_secs: None,
                 attempt: 1,
+                url: String::new(),
             },
         );
         watches.lock().await.insert(key, entry);
@@ -786,11 +787,13 @@ mod tests {
             42,
             ActiveRun {
                 status: build_watcher::status::RunStatus::InProgress,
-                started_at: Instant::now(),
                 workflow: "CI".to_string(),
                 title: "Fix bug".to_string(),
                 event: "push".to_string(),
                 attempt: 1,
+                created_at: "2026-01-01T10:00:00Z".to_string(),
+                updated_at: "2026-01-01T10:05:00Z".to_string(),
+                url: String::new(),
             },
         );
         watches.lock().await.insert(key, entry);

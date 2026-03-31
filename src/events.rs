@@ -20,12 +20,13 @@ pub struct RunSnapshot {
     pub title: String,
     pub event: String,
     /// GitHub run status at the moment this snapshot was taken.
-    /// Allows TUI clients to populate `ActiveRunView.status` from a `RunStarted` event
-    /// without re-fetching `/status`.
     pub status: RunStatus,
     /// GitHub Actions attempt number. 1 for the original run, 2+ for re-runs.
     #[serde(default = "crate::github::default_attempt")]
     pub attempt: u32,
+    /// GitHub Actions run URL.
+    #[serde(default)]
+    pub url: String,
 }
 
 impl RunSnapshot {
@@ -39,11 +40,8 @@ impl RunSnapshot {
             event: run.event.clone(),
             status: run.status.clone(),
             attempt: run.attempt,
+            url: run.url.clone(),
         }
-    }
-
-    pub fn url(&self) -> String {
-        crate::github::run_url(&self.repo, self.run_id)
     }
 
     pub fn display_title(&self) -> String {
@@ -134,6 +132,7 @@ mod tests {
             event: "push".to_string(),
             status: RunStatus::InProgress,
             attempt: 1,
+            url: "https://github.com/alice/app/actions/runs/12345".to_string(),
         }
     }
 
@@ -150,7 +149,7 @@ mod tests {
     #[test]
     fn run_snapshot_methods() {
         let s = snap();
-        assert_eq!(s.url(), "https://github.com/alice/app/actions/runs/12345");
+        assert_eq!(s.url, "https://github.com/alice/app/actions/runs/12345");
         assert_eq!(s.display_title(), "Fix login bug");
         assert_eq!(s.notification_group(), "alice/app#main#CI");
 
@@ -171,6 +170,9 @@ mod tests {
             event: "pull_request".to_string(),
             head_branch: "feature/deps".to_string(),
             attempt: 1,
+            created_at: "2026-01-01T10:00:00Z".to_string(),
+            updated_at: "2026-01-01T10:05:00Z".to_string(),
+            url: "https://github.com/alice/app/actions/runs/99".to_string(),
         };
         let s = RunSnapshot::from_run_info(&run, "alice/app", "release");
         assert_eq!(s.repo, "alice/app");

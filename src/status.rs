@@ -87,6 +87,9 @@ pub struct ActiveRunView {
     /// GitHub Actions attempt number. 1 for the original run, 2+ for re-runs.
     #[serde(default = "crate::github::default_attempt")]
     pub attempt: u32,
+    /// GitHub Actions run URL.
+    #[serde(default)]
+    pub url: String,
 }
 
 /// Summary of the last completed build as returned by `GET /status`.
@@ -108,6 +111,12 @@ pub struct LastBuildView {
     /// Database ID of the first failed job (for constructing job URLs).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failing_job_id: Option<u64>,
+    /// GitHub Actions run URL.
+    #[serde(default)]
+    pub url: String,
+    /// Duration in seconds from run start to completion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_secs: Option<u64>,
 }
 
 /// One watched repo/branch as returned by `GET /status`.
@@ -208,6 +217,7 @@ impl StatusResponse {
                         event: snap.event,
                         elapsed_secs: Some(0.0),
                         attempt: snap.attempt,
+                        url: snap.url,
                     });
                 }
             }
@@ -232,6 +242,8 @@ impl StatusResponse {
                     age_secs: Some(0.0),
                     attempt: run.attempt,
                     failing_job_id,
+                    url: run.url,
+                    duration_secs: None,
                 };
                 // Replace existing entry for this workflow, or append.
                 if let Some(existing) = watch
@@ -285,6 +297,7 @@ mod tests {
             event: "push".to_string(),
             status: RunStatus::Queued,
             attempt: 1,
+            url: format!("https://github.com/{repo}/actions/runs/{run_id}"),
         }
     }
 
@@ -383,6 +396,7 @@ mod tests {
                 event: "push".to_string(),
                 elapsed_secs: Some(30.0),
                 attempt: 1,
+                url: String::new(),
             }],
             last_builds: vec![],
             muted: false,

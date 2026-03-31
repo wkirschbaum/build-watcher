@@ -391,7 +391,7 @@ async fn dispatch_single(
                     title: format!("\u{1f528} started: {} | {}", repo_label, run.workflow),
                     body: format!("[{}] {}", run.branch, run.display_title()),
                     level,
-                    url: Some(run.url()),
+                    url: Some(run.url.clone()),
                     group: run.notification_group(),
                     app_name: run.repo,
                 })
@@ -428,7 +428,7 @@ async fn dispatch_single(
                     title: format!("{emoji} {status}: {} | {}", repo_label, run.workflow),
                     body,
                     level,
-                    url: Some(run.url()),
+                    url: Some(run.url.clone()),
                     group: run.notification_group(),
                     app_name: run.repo,
                 })
@@ -503,6 +503,7 @@ mod tests {
             event: "push".to_string(),
             status: RunStatus::InProgress,
             attempt: 1,
+            url: "https://github.com/alice/app/actions/runs/12345".to_string(),
         }
     }
 

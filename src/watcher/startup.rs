@@ -3,7 +3,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::{Mutex, Notify, Semaphore};
-use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
@@ -130,11 +129,10 @@ pub async fn start_watch(
             "{repo} [{branch}]: filtered runs unexpectedly empty"
         ));
     };
-    let now = Instant::now();
     let active: HashMap<u64, ActiveRun> = runs
         .iter()
         .filter(|r| !r.is_completed())
-        .map(|r| (r.id, ActiveRun::from_run(r, now)))
+        .map(|r| (r.id, ActiveRun::from_run(r)))
         .collect();
     let msg = if active.is_empty() {
         let latest = runs[0];
@@ -143,7 +141,7 @@ pub async fn start_watch(
             latest.conclusion,
             latest.workflow,
             latest.display_title(),
-            latest.url(repo),
+            latest.url,
         )
     } else {
         format!(
@@ -413,7 +411,6 @@ pub(super) async fn recover_watches(
             )
         };
 
-        let now = Instant::now();
         let mut w = watches.lock().await;
         for key in repos.get(&repo).into_iter().flatten() {
             let Some(entry) = w.get_mut(key) else {
@@ -425,12 +422,7 @@ pub(super) async fn recover_watches(
             for run in &filtered {
                 if !run.is_completed() && !entry.active_runs.contains_key(&run.id) {
                     tracing::info!(key = %key, run_id = run.id, "Recovering in-progress run");
-                    // Note: started_at is approximate — the actual GitHub start
-                    // time is lost across restarts, so elapsed time in the
-                    // completion notification may be inaccurate for recovered runs.
-                    entry
-                        .active_runs
-                        .insert(run.id, ActiveRun::from_run(run, now));
+                    entry.active_runs.insert(run.id, ActiveRun::from_run(run));
                 }
             }
             // Bump high-water mark from all runs for this branch (not just

@@ -1,8 +1,6 @@
 use std::collections::HashMap;
-use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use tokio::time::Instant;
 
 use crate::dirs::state_dir;
 use crate::github::{GhError, LastBuild, RunInfo};
@@ -11,26 +9,30 @@ use crate::status::RunStatus;
 
 use super::Watches;
 
-/// Runtime state for an in-progress run, including when we first saw it.
+/// Runtime state for an in-progress run with GitHub timestamps.
 #[derive(Debug, Clone)]
 pub struct ActiveRun {
     pub status: RunStatus,
-    pub started_at: Instant,
     pub workflow: String,
     pub title: String,
     pub event: String,
     pub attempt: u32,
+    pub created_at: String,
+    pub updated_at: String,
+    pub url: String,
 }
 
 impl ActiveRun {
-    pub(super) fn from_run(run: &RunInfo, now: Instant) -> Self {
+    pub(super) fn from_run(run: &RunInfo) -> Self {
         Self {
             status: run.status.clone(),
-            started_at: now,
             workflow: run.workflow.clone(),
             title: run.title.clone(),
             event: run.event.clone(),
             attempt: run.attempt,
+            created_at: run.created_at.clone(),
+            updated_at: run.updated_at.clone(),
+            url: run.url.clone(),
         }
     }
 
@@ -174,12 +176,8 @@ impl WatchEntry {
         run: &RunInfo,
         failing_steps: Option<String>,
         failing_job_id: Option<u64>,
-        now_unix: u64,
-    ) -> Option<Duration> {
-        let elapsed = self
-            .active_runs
-            .remove(&run.id)
-            .map(|a| a.started_at.elapsed());
+    ) {
+        self.active_runs.remove(&run.id);
         self.failure_counts.remove(&run.id);
         // Bump high-water mark so check_for_new_runs doesn't re-discover
         // this run as "new" after it completes.
@@ -187,11 +185,8 @@ impl WatchEntry {
         let mut last_build = run.to_last_build();
         last_build.failing_steps = failing_steps;
         last_build.failing_job_id = failing_job_id;
-        last_build.completed_at = Some(now_unix);
-        last_build.duration_secs = elapsed.map(|d| d.as_secs());
         self.last_builds
             .insert(last_build.workflow.clone(), last_build);
-        elapsed
     }
 
     pub(super) fn clear_failure_count(&mut self, run_id: u64) {
@@ -232,23 +227,16 @@ impl WatchEntry {
 
     /// Incorporate newly discovered runs. Iterate oldest-first so the newest completed
     /// run ends up as `last_build`.
-    pub(super) fn incorporate_new_runs(
-        &mut self,
-        new_runs: &[&RunInfo],
-        now: Instant,
-        now_unix: u64,
-    ) {
+    pub(super) fn incorporate_new_runs(&mut self, new_runs: &[&RunInfo]) {
         if let Some(max_id) = new_runs.iter().map(|r| r.id).max() {
             self.last_seen_run_id = self.last_seen_run_id.max(max_id);
         }
         for run in new_runs.iter().rev() {
             if run.is_completed() {
-                let mut lb = run.to_last_build();
-                lb.completed_at = Some(now_unix);
-                self.last_builds.insert(lb.workflow.clone(), lb);
+                self.last_builds
+                    .insert(run.workflow.clone(), run.to_last_build());
             } else {
-                self.active_runs
-                    .insert(run.id, ActiveRun::from_run(run, now));
+                self.active_runs.insert(run.id, ActiveRun::from_run(run));
             }
         }
     }

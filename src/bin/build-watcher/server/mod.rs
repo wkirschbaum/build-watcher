@@ -55,8 +55,8 @@ pub(crate) fn build_watch_snapshot(
     watches: &HashMap<WatchKey, WatchEntry>,
     config: Option<&build_watcher::config::Config>,
     paused: bool,
-    now: tokio::time::Instant,
 ) -> StatusResponse {
+    let now_unix = unix_now();
     let mut watch_list: Vec<WatchStatus> = watches
         .iter()
         .map(|(key, entry)| {
@@ -71,9 +71,8 @@ pub(crate) fn build_watch_snapshot(
                     })
                 })
                 .map(|(run_id, run)| {
-                    let elapsed_secs = now
-                        .checked_duration_since(run.started_at)
-                        .map(|d| d.as_secs_f64());
+                    let elapsed_secs =
+                        build_watcher::github::elapsed_since(&run.created_at, now_unix);
                     ActiveRunView {
                         run_id: *run_id,
                         status: run.status.clone(),
@@ -82,6 +81,7 @@ pub(crate) fn build_watch_snapshot(
                         event: run.event.clone(),
                         elapsed_secs,
                         attempt: run.attempt,
+                        url: run.url.clone(),
                     }
                 })
                 .collect();
@@ -98,7 +98,7 @@ pub(crate) fn build_watch_snapshot(
                     })
                 })
                 .map(|lb| {
-                    let age_secs = lb.completed_at.map(|t| unix_now().saturating_sub(t) as f64);
+                    let age_secs = lb.completed_at.map(|t| now_unix.saturating_sub(t) as f64);
                     let conclusion =
                         serde_json::from_value(serde_json::Value::String(lb.conclusion.clone()))
                             .unwrap_or(RunConclusion::Unknown);
@@ -111,6 +111,8 @@ pub(crate) fn build_watch_snapshot(
                         age_secs,
                         attempt: lb.attempt,
                         failing_job_id: lb.failing_job_id,
+                        url: lb.url.clone(),
+                        duration_secs: lb.duration_secs,
                     }
                 })
                 .collect();

@@ -3,7 +3,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::Notify;
-use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::unix_now;
@@ -348,26 +347,9 @@ impl RepoPoller {
         let mut changes = Vec::new();
         let mut changed = false;
 
-        // Phase 1: snapshot elapsed times for all completed runs in a single lock.
-        let elapsed_map: HashMap<u64, Option<f64>> = {
-            let w = self.watches.lock().await;
-            found_runs
-                .iter()
-                .filter(|(run, _)| run.is_completed())
-                .map(|(run, key)| {
-                    let elapsed = w
-                        .get(key)
-                        .and_then(|e| e.active_runs.get(&run.id))
-                        .map(|a| a.started_at.elapsed().as_secs_f64());
-                    (run.id, elapsed)
-                })
-                .collect()
-        };
-
-        // Phase 2: fetch failure info via API (no lock held).
+        // Phase 1: fetch failure info via API (no lock held).
         struct CompletedInfo {
             run_idx: usize,
-            elapsed: Option<f64>,
             failing_steps: Option<String>,
             failing_job_id: Option<u64>,
         }
@@ -378,7 +360,6 @@ impl RepoPoller {
                 return (changes, changed);
             }
             if run.is_completed() {
-                let elapsed = elapsed_map.get(&run.id).copied().flatten();
                 let failure_info = if run.succeeded() {
                     None
                 } else {
@@ -386,7 +367,6 @@ impl RepoPoller {
                 };
                 completions.push(CompletedInfo {
                     run_idx: i,
-                    elapsed,
                     failing_steps: failure_info.as_ref().map(|f| f.steps.clone()),
                     failing_job_id: failure_info.as_ref().and_then(|f| f.first_job_id),
                 });
@@ -399,7 +379,7 @@ impl RepoPoller {
             changes.push(RunChange::Completed {
                 run: RunSnapshot::from_run_info(run, &self.repo, &key.branch),
                 conclusion: run.run_conclusion(),
-                elapsed: c.elapsed,
+                elapsed: run.duration_secs().map(|s| s as f64),
                 failing_steps: c.failing_steps.clone(),
                 failing_job_id: c.failing_job_id,
             });
@@ -410,19 +390,14 @@ impl RepoPoller {
             );
         }
 
-        // Phase 3: single lock to apply all completions and status updates.
+        // Phase 2: single lock to apply all completions and status updates.
         let mut new_builds: Vec<(WatchKey, crate::github::LastBuild)> = Vec::new();
         {
             let mut w = self.watches.lock().await;
             for c in &completions {
                 let (run, key) = &found_runs[c.run_idx];
                 if let Some(entry) = w.get_mut(key) {
-                    entry.record_completion(
-                        run,
-                        c.failing_steps.clone(),
-                        c.failing_job_id,
-                        unix_now(),
-                    );
+                    entry.record_completion(run, c.failing_steps.clone(), c.failing_job_id);
                     if let Some(lb) = entry.last_builds.get(&run.workflow) {
                         new_builds.push((key.clone(), lb.clone()));
                     }
@@ -664,17 +639,15 @@ impl RepoPoller {
             {
                 let mut w = self.watches.lock().await;
                 if let Some(entry) = w.get_mut(key) {
-                    entry.incorporate_new_runs(&new_runs, Instant::now(), unix_now());
+                    entry.incorporate_new_runs(&new_runs);
 
                     for (rerun, _lb) in &reruns {
                         if !rerun.is_completed() {
-                            entry.active_runs.insert(
-                                rerun.id,
-                                super::types::ActiveRun::from_run(rerun, Instant::now()),
-                            );
+                            entry
+                                .active_runs
+                                .insert(rerun.id, super::types::ActiveRun::from_run(rerun));
                         } else {
                             let mut new_lb = rerun.to_last_build();
-                            new_lb.completed_at = Some(unix_now());
                             if let Some((steps, job_id)) = failure_by_id.get(&rerun.id) {
                                 new_lb.failing_steps = steps.clone();
                                 new_lb.failing_job_id = *job_id;
@@ -702,13 +675,11 @@ impl RepoPoller {
             }
 
             // Push completed new runs and rerun completions into history.
-            let now_unix = unix_now();
             let mut completed: Vec<LastBuild> = new_runs
                 .iter()
                 .filter(|r| r.is_completed())
                 .map(|r| {
                     let mut lb = r.to_last_build();
-                    lb.completed_at = Some(now_unix);
                     if let Some((steps, job_id)) = failure_by_id.get(&r.id) {
                         lb.failing_steps = steps.clone();
                         lb.failing_job_id = *job_id;
@@ -719,7 +690,6 @@ impl RepoPoller {
             for (rerun, _lb) in &reruns {
                 if rerun.is_completed() {
                     let mut new_lb = rerun.to_last_build();
-                    new_lb.completed_at = Some(now_unix);
                     if let Some((steps, job_id)) = failure_by_id.get(&rerun.id) {
                         new_lb.failing_steps = steps.clone();
                         new_lb.failing_job_id = *job_id;

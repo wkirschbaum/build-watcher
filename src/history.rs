@@ -85,6 +85,7 @@ mod tests {
             completed_at,
             duration_secs: None,
             attempt: 1,
+            url: String::new(),
         }
     }
 
