@@ -110,6 +110,12 @@ pub struct LastBuild {
     /// GitHub Actions run URL.
     #[serde(default)]
     pub url: String,
+    /// GitHub login of the user who triggered this run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor: Option<String>,
+    /// Name of the commit author (from head_commit.author.name).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_author: Option<String>,
 }
 
 impl LastBuild {
@@ -263,6 +269,8 @@ impl RunInfo {
             duration_secs: self.duration_secs(),
             attempt: self.attempt,
             url: self.url.clone(),
+            actor: None,
+            commit_author: None,
         }
     }
 }
@@ -392,6 +400,18 @@ pub trait GitHubClient: Send + Sync + 'static {
     async fn open_prs(&self, repo: &str) -> Result<Vec<PrInfo>, GhError>;
     /// Merge a PR by number.
     async fn pr_merge(&self, repo: &str, number: u64) -> Result<String, GhError>;
+    /// Fetch the triggering actor and commit author for a run.
+    /// Returns `None` on any error (graceful degradation).
+    async fn run_author(&self, repo: &str, run_id: u64) -> Option<RunAuthorInfo>;
+}
+
+/// Author information fetched from the GitHub Actions run detail API.
+#[derive(Debug, Clone)]
+pub struct RunAuthorInfo {
+    /// GitHub login of the user who triggered this run (pushed, re-ran, etc.).
+    pub actor: String,
+    /// Name of the commit author (from `head_commit.author.name`).
+    pub commit_author: Option<String>,
 }
 
 /// Real GitHub client that shells out to the `gh` CLI.
@@ -616,6 +636,38 @@ impl GitHubClient for GhCliClient {
         )
         .await?;
         Ok(String::from_utf8_lossy(&stdout).trim().to_string())
+    }
+
+    async fn run_author(&self, repo: &str, run_id: u64) -> Option<RunAuthorInfo> {
+        let jq = ".triggering_actor.login as $actor | .head_commit.author.name as $author | {actor: $actor, commit_author: $author}";
+        let endpoint = format!("repos/{repo}/actions/runs/{run_id}");
+        let stdout = match gh_exec(repo, &["api", &endpoint, "--jq", jq]).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::debug!(%repo, %run_id, error = %e, "Failed to fetch run author");
+                return None;
+            }
+        };
+
+        #[derive(Deserialize)]
+        struct AuthorResponse {
+            actor: Option<String>,
+            commit_author: Option<String>,
+        }
+
+        match serde_json::from_slice::<AuthorResponse>(&stdout) {
+            Ok(resp) => {
+                let actor = resp.actor.filter(|s| !s.is_empty())?;
+                Some(RunAuthorInfo {
+                    actor,
+                    commit_author: resp.commit_author.filter(|s| !s.is_empty()),
+                })
+            }
+            Err(e) => {
+                tracing::debug!(%repo, %run_id, error = %e, "Failed to parse run author");
+                None
+            }
+        }
     }
 }
 

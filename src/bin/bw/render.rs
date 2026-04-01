@@ -1792,6 +1792,11 @@ fn render_detail_bar(
                 s.push(detail_sep());
                 s.push(Span::styled(format::age(elapsed as u64), dim));
             }
+            if let Some(actor) = &run.actor {
+                s.push(detail_sep());
+                s.push(Span::styled("by ", label_style));
+                s.push(Span::styled(actor.as_str(), dim));
+            }
             s
         }
         Some(DisplayRow::LastBuild {
@@ -1833,6 +1838,11 @@ fn render_detail_bar(
                     format!("{} ago", format::age(age as u64)),
                     dim,
                 ));
+            }
+            if let Some(actor) = &build.actor {
+                s.push(detail_sep());
+                s.push(Span::styled("by ", label_style));
+                s.push(Span::styled(actor.as_str(), dim));
             }
             s
         }

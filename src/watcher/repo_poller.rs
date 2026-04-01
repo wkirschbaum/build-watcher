@@ -98,6 +98,8 @@ pub(super) struct RepoPoller {
     pub(super) history: crate::history::SharedHistory,
     pub(super) config_changed: Arc<Notify>,
     pub(super) last_active_secs: u64,
+    /// True until the first poll cycle completes — triggers a 1 s initial delay.
+    pub(super) first_poll: bool,
     /// Last known merge state per PR number — used to detect transitions.
     pub(super) pr_states: HashMap<u64, crate::github::MergeState>,
 }
@@ -174,9 +176,14 @@ impl RepoPoller {
             }
 
             let has_active = self.has_any_active().await;
-            let (active_secs, idle_secs) = self.read_config().await;
-            self.last_active_secs = active_secs;
-            let delay = if has_active { active_secs } else { idle_secs };
+            let delay = if self.first_poll {
+                self.first_poll = false;
+                1
+            } else {
+                let (active_secs, idle_secs) = self.read_config().await;
+                self.last_active_secs = active_secs;
+                if has_active { active_secs } else { idle_secs }
+            };
 
             match self.cancellable_sleep(Duration::from_secs(delay)).await {
                 WakeReason::Cancelled => return,
@@ -378,11 +385,20 @@ impl RepoPoller {
             }
         }
 
-        // Emit events for completions.
+        // Emit events for completions, copying author from the ActiveRun
+        // (which holds it from initial detection) before it gets removed.
         for c in &completions {
             let (run, key) = &found_runs[c.run_idx];
+            let mut snapshot = RunSnapshot::from_run_info(run, &self.repo, &key.branch);
+            {
+                let w = self.watches.lock().await;
+                if let Some(active) = w.get(key).and_then(|e| e.active_runs.get(&run.id)) {
+                    snapshot.actor.clone_from(&active.actor);
+                    snapshot.commit_author.clone_from(&active.commit_author);
+                }
+            }
             changes.push(RunChange::Completed {
-                run: RunSnapshot::from_run_info(run, &self.repo, &key.branch),
+                run: snapshot,
                 conclusion: run.run_conclusion(),
                 elapsed: run.duration_secs().map(|s| s as f64),
                 failing_steps: c.failing_steps.clone(),
@@ -690,17 +706,23 @@ impl RepoPoller {
         let branches = self.sync_branches(&all_runs, branches).await;
 
         let run_filters = self.run_filters().await;
+        let show_author = self.config.read().await.show_author;
         let mut any_changed = false;
 
         for key in &branches {
             let branch_runs = runs_for_branch(&all_runs, &key.branch);
 
-            let (last_seen, active_ids, prev_last_builds) = {
+            let (last_seen, active_ids, prev_last_builds, is_initial) = {
                 let w = self.watches.lock().await;
                 match w.get(key) {
                     Some(entry) => {
                         let ids: Vec<u64> = entry.active_runs.keys().copied().collect();
-                        (entry.last_seen_run_id, ids, entry.last_builds.clone())
+                        (
+                            entry.last_seen_run_id,
+                            ids,
+                            entry.last_builds.clone(),
+                            entry.waiting,
+                        )
                     }
                     None => continue,
                 }
@@ -730,89 +752,121 @@ impl RepoPoller {
                 continue;
             }
 
-            // -- Pre-fetch failure info outside the lock (async API calls). --
-
-            // Maps run_id → (failing_steps, failing_job_id).
+            // On initial seed (waiting entry), skip notifications and extra API
+            // calls — just update state below.
             let mut failure_by_id: HashMap<u64, (Option<String>, Option<u64>)> = HashMap::new();
+            let mut author_by_id: HashMap<u64, crate::github::RunAuthorInfo> = HashMap::new();
 
-            // New runs that were already completed when discovered.
-            for run in &new_runs {
-                if run.is_completed()
-                    && !run.succeeded()
-                    && let Some(info) = self.github.failing_steps(&self.repo, run.id).await
-                {
-                    failure_by_id.insert(run.id, (Some(info.steps), info.first_job_id));
+            if !is_initial {
+                // -- Pre-fetch failure info outside the lock (async API calls). --
+
+                for run in &new_runs {
+                    if run.is_completed()
+                        && !run.succeeded()
+                        && let Some(info) = self.github.failing_steps(&self.repo, run.id).await
+                    {
+                        failure_by_id.insert(run.id, (Some(info.steps), info.first_job_id));
+                    }
                 }
-            }
-
-            // Completed reruns with a changed conclusion.
-            for (rerun, _lb) in &reruns {
-                if rerun.is_completed()
-                    && !rerun.succeeded()
-                    && let Some(info) = self.github.failing_steps(&self.repo, rerun.id).await
-                {
-                    failure_by_id.insert(rerun.id, (Some(info.steps), info.first_job_id));
+                for (rerun, _lb) in &reruns {
+                    if rerun.is_completed()
+                        && !rerun.succeeded()
+                        && let Some(info) = self.github.failing_steps(&self.repo, rerun.id).await
+                    {
+                        failure_by_id.insert(rerun.id, (Some(info.steps), info.first_job_id));
+                    }
                 }
-            }
 
-            // -- Emit events for new runs. --
+                // -- Pre-fetch author info (if enabled). --
 
-            for run in &new_runs {
-                let snapshot = RunSnapshot::from_run_info(run, &self.repo, &key.branch);
-                if run.is_completed() {
-                    let (failing_steps, failing_job_id) =
-                        failure_by_id.get(&run.id).cloned().unwrap_or((None, None));
-                    tracing::info!(
-                        key = %key, run_id = run.id,
-                        sha = run.short_sha(), conclusion = %run.conclusion,
-                        "Build already completed"
-                    );
-                    changes.push(RunChange::Completed {
-                        run: snapshot,
-                        conclusion: run.run_conclusion(),
-                        elapsed: None,
-                        failing_steps,
-                        failing_job_id,
-                    });
-                } else {
-                    tracing::info!(
-                        key = %key, run_id = run.id,
-                        sha = run.short_sha(), workflow = %run.workflow, title = %run.title,
-                        "New build detected"
-                    );
-                    changes.push(RunChange::Started { run: snapshot });
+                if show_author {
+                    for run in &new_runs {
+                        if self.token.is_cancelled() {
+                            break;
+                        }
+                        if let Some(info) = self.github.run_author(&self.repo, run.id).await {
+                            author_by_id.insert(run.id, info);
+                        }
+                    }
+                    for (rerun, _) in &reruns {
+                        if self.token.is_cancelled() {
+                            break;
+                        }
+                        if let std::collections::hash_map::Entry::Vacant(e) =
+                            author_by_id.entry(rerun.id)
+                            && let Some(info) = self.github.run_author(&self.repo, rerun.id).await
+                        {
+                            e.insert(info);
+                        }
+                    }
                 }
-            }
 
-            // -- Emit events for reruns. --
+                // -- Emit events for new runs. --
 
-            for (rerun, lb) in &reruns {
-                let snapshot = RunSnapshot::from_run_info(rerun, &self.repo, &key.branch);
-                if !rerun.is_completed() {
-                    tracing::info!(
-                        key = %key, run_id = rerun.id,
-                        "Re-run detected (now in progress)"
-                    );
-                    changes.push(RunChange::Started { run: snapshot });
-                } else {
-                    let (failing_steps, failing_job_id) = failure_by_id
-                        .get(&rerun.id)
-                        .cloned()
-                        .unwrap_or((None, None));
-                    tracing::info!(
-                        key = %key, run_id = rerun.id,
-                        old_conclusion = %lb.conclusion, new_conclusion = %rerun.conclusion,
-                        "Re-run completed with different conclusion"
-                    );
-                    changes.push(RunChange::Completed {
-                        run: snapshot,
-                        conclusion: rerun.run_conclusion(),
-                        elapsed: None,
-                        failing_steps,
-                        failing_job_id,
-                    });
+                for run in &new_runs {
+                    let mut snapshot = RunSnapshot::from_run_info(run, &self.repo, &key.branch);
+                    if let Some(info) = author_by_id.get(&run.id) {
+                        snapshot.set_author(info);
+                    }
+                    if run.is_completed() {
+                        let (failing_steps, failing_job_id) =
+                            failure_by_id.get(&run.id).cloned().unwrap_or((None, None));
+                        tracing::info!(
+                            key = %key, run_id = run.id,
+                            sha = run.short_sha(), conclusion = %run.conclusion,
+                            "Build already completed"
+                        );
+                        changes.push(RunChange::Completed {
+                            run: snapshot,
+                            conclusion: run.run_conclusion(),
+                            elapsed: None,
+                            failing_steps,
+                            failing_job_id,
+                        });
+                    } else {
+                        tracing::info!(
+                            key = %key, run_id = run.id,
+                            sha = run.short_sha(), workflow = %run.workflow, title = %run.title,
+                            "New build detected"
+                        );
+                        changes.push(RunChange::Started { run: snapshot });
+                    }
                 }
-            }
+
+                // -- Emit events for reruns. --
+
+                for (rerun, lb) in &reruns {
+                    let mut snapshot = RunSnapshot::from_run_info(rerun, &self.repo, &key.branch);
+                    if let Some(info) = author_by_id.get(&rerun.id) {
+                        snapshot.actor = Some(info.actor.clone());
+                        snapshot.commit_author = info.commit_author.clone();
+                    }
+                    if !rerun.is_completed() {
+                        tracing::info!(
+                            key = %key, run_id = rerun.id,
+                            "Re-run detected (now in progress)"
+                        );
+                        changes.push(RunChange::Started { run: snapshot });
+                    } else {
+                        let (failing_steps, failing_job_id) = failure_by_id
+                            .get(&rerun.id)
+                            .cloned()
+                            .unwrap_or((None, None));
+                        tracing::info!(
+                            key = %key, run_id = rerun.id,
+                            old_conclusion = %lb.conclusion, new_conclusion = %rerun.conclusion,
+                            "Re-run completed with different conclusion"
+                        );
+                        changes.push(RunChange::Completed {
+                            run: snapshot,
+                            conclusion: rerun.run_conclusion(),
+                            elapsed: None,
+                            failing_steps,
+                            failing_job_id,
+                        });
+                    }
+                }
+            } // end if !is_initial
 
             // -- Single lock: apply all state changes. --
 
@@ -836,7 +890,9 @@ impl RepoPoller {
                         }
                     }
 
-                    // Apply failure info to any matching last_builds.
+                    entry.apply_author_info(&author_by_id);
+
+                    // Apply failure info to last builds.
                     for lb in entry.last_builds.values_mut() {
                         if let Some((steps, job_id)) = failure_by_id.get(&lb.run_id) {
                             lb.failing_steps = steps.clone();
@@ -881,6 +937,17 @@ impl RepoPoller {
                 let mut hist = self.history.lock().await;
                 for lb in completed.into_iter().rev() {
                     push_build(&mut hist, key, lb);
+                }
+            }
+        }
+
+        // Clear waiting flag for all branches — the poll succeeded.
+        {
+            let mut w = self.watches.lock().await;
+            for (key, entry) in w.iter_mut() {
+                if key.matches_repo(&self.repo) && entry.waiting {
+                    entry.waiting = false;
+                    any_changed = true;
                 }
             }
         }

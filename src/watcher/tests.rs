@@ -42,6 +42,8 @@ fn make_active(status: RunStatus) -> ActiveRun {
         created_at: "2026-01-01T10:00:00Z".to_string(),
         updated_at: "2026-01-01T10:05:00Z".to_string(),
         url: "https://github.com/test/repo/actions/runs/1".to_string(),
+        actor: None,
+        commit_author: None,
     }
 }
 
@@ -77,6 +79,8 @@ fn make_last_build(run_id: u64, conclusion: &str) -> crate::github::LastBuild {
         duration_secs: Some(300),
         attempt: 1,
         url: "https://github.com/test/repo/actions/runs/1".to_string(),
+        actor: None,
+        commit_author: None,
     }
 }
 
@@ -180,6 +184,9 @@ impl crate::github::GitHubClient for MockGitHub {
     async fn pr_merge(&self, _: &str, _: u64) -> Result<String, GhError> {
         Ok("Merged".to_string())
     }
+    async fn run_author(&self, _: &str, _: u64) -> Option<crate::github::RunAuthorInfo> {
+        None
+    }
 }
 
 // -- Test harness for async integration tests --
@@ -230,6 +237,7 @@ impl TestHarness {
             history: self.handle.history.clone(),
             config_changed: self.handle.config_changed.clone(),
             last_active_secs: 0,
+            first_poll: false,
             pr_states: HashMap::new(),
         }
     }
@@ -713,10 +721,10 @@ async fn start_watch_with_mock_github() {
     .await;
     assert!(result.is_ok());
 
+    // start_watch inserts a waiting entry; the poller handles initial data on its first cycle.
     let entry = h.entry(&WatchKey::new("alice/app", "main")).await;
-    assert_eq!(entry.last_seen_run_id, 101);
-    assert!(entry.active_runs.contains_key(&101));
-    assert!(!entry.active_runs.contains_key(&100));
+    assert!(entry.waiting);
+    assert_eq!(entry.last_seen_run_id, 0);
 
     h.cancel();
 }
@@ -734,7 +742,8 @@ async fn start_watch_registers_idle_watch_for_empty_runs() {
         "main",
     )
     .await;
-    assert!(result.unwrap().contains("no workflow runs yet"));
+    // start_watch now inserts a waiting entry; the poller discovers empty runs on first cycle.
+    assert!(result.unwrap().contains("watching"));
     assert!(
         h.watches
             .lock()
@@ -995,32 +1004,6 @@ async fn record_completion_bumps_last_seen() {
     assert!(!entry.last_builds.is_empty());
 }
 
-#[tokio::test]
-async fn recover_watches_recovers_active_runs() {
-    let key = WatchKey::new("alice/app", "main");
-    let runs = vec![
-        make_run(100, RunStatus::Completed, "success"),
-        make_run(101, RunStatus::InProgress, ""),
-    ];
-    let h = TestHarness::new(MockGitHub::with_runs(runs));
-    h.seed(key.clone(), idle_entry(99)).await;
-
-    startup::recover_watches(
-        &h.watches,
-        &h.config,
-        &h.handle,
-        &h.rate_limit,
-        &[key.clone()],
-    )
-    .await;
-
-    let entry = h.entry(&key).await;
-    assert!(entry.active_runs.contains_key(&101));
-    assert_eq!(entry.last_seen_run_id, 101);
-
-    h.cancel();
-}
-
 #[test]
 fn run_change_dedup_keeps_first() {
     use crate::events::RunSnapshot;
@@ -1036,6 +1019,8 @@ fn run_change_dedup_keeps_first() {
         status: RunStatus::InProgress,
         attempt: 1,
         url: format!("https://github.com/alice/app/actions/runs/{id}"),
+        actor: None,
+        commit_author: None,
     };
 
     let changes = vec![

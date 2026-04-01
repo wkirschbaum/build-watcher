@@ -394,10 +394,14 @@ async fn dispatch_single(
 ) {
     match event {
         WatchEvent::RunStarted(run) => {
+            let mut body = format!("[{}] {}", run.branch, run.display_title());
+            if let Some(actor) = &run.actor {
+                let _ = write!(body, "\nby {actor}");
+            }
             notifier
                 .send(&Notification {
                     title: format!("\u{1f528} started: {} | {}", repo_label, run.workflow),
-                    body: format!("[{}] {}", run.branch, run.display_title()),
+                    body,
                     level,
                     url: Some(run.url.clone()),
                     group: run.notification_group(),
@@ -429,6 +433,9 @@ async fn dispatch_single(
             }
             if let Some(steps) = &failing_steps {
                 let _ = write!(body, "\nFailed: {steps}");
+            }
+            if let Some(actor) = &run.actor {
+                let _ = write!(body, "\nby {actor}");
             }
 
             notifier
@@ -573,6 +580,8 @@ mod tests {
             status: RunStatus::InProgress,
             attempt: 1,
             url: "https://github.com/alice/app/actions/runs/12345".to_string(),
+            actor: None,
+            commit_author: None,
         }
     }
 

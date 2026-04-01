@@ -27,6 +27,12 @@ pub struct RunSnapshot {
     /// GitHub Actions run URL.
     #[serde(default)]
     pub url: String,
+    /// GitHub login of the user who triggered this run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor: Option<String>,
+    /// Name of the commit author.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_author: Option<String>,
 }
 
 impl RunSnapshot {
@@ -41,7 +47,15 @@ impl RunSnapshot {
             status: run.status.clone(),
             attempt: run.attempt,
             url: run.url.clone(),
+            actor: None,
+            commit_author: None,
         }
+    }
+
+    /// Set author info from a `RunAuthorInfo` lookup.
+    pub fn set_author(&mut self, info: &crate::github::RunAuthorInfo) {
+        self.actor = Some(info.actor.clone());
+        self.commit_author = info.commit_author.clone();
     }
 
     pub fn display_title(&self) -> String {
@@ -145,6 +159,8 @@ mod tests {
             status: RunStatus::InProgress,
             attempt: 1,
             url: "https://github.com/alice/app/actions/runs/12345".to_string(),
+            actor: None,
+            commit_author: None,
         }
     }
 

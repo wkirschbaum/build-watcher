@@ -94,6 +94,8 @@ pub(crate) fn build_watch_snapshot(
                         elapsed_secs,
                         attempt: run.attempt,
                         url: run.url.clone(),
+                        actor: run.actor.clone(),
+                        commit_author: run.commit_author.clone(),
                     }
                 })
                 .collect();
@@ -120,6 +122,8 @@ pub(crate) fn build_watch_snapshot(
                         failing_job_id: lb.failing_job_id,
                         url: lb.url.clone(),
                         duration_secs: lb.duration_secs,
+                        actor: lb.actor.clone(),
+                        commit_author: lb.commit_author.clone(),
                     }
                 })
                 .collect();

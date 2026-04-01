@@ -20,6 +20,9 @@ pub struct ActiveRun {
     pub created_at: String,
     pub updated_at: String,
     pub url: String,
+    /// Fetched once on detection when `show_author` is enabled.
+    pub actor: Option<String>,
+    pub commit_author: Option<String>,
 }
 
 impl ActiveRun {
@@ -33,6 +36,8 @@ impl ActiveRun {
             created_at: run.created_at.clone(),
             updated_at: run.updated_at.clone(),
             url: run.url.clone(),
+            actor: None,
+            commit_author: None,
         }
     }
 
@@ -177,6 +182,12 @@ impl WatchEntry {
         failing_steps: Option<String>,
         failing_job_id: Option<u64>,
     ) {
+        // Propagate author info from ActiveRun before removing it.
+        let (actor, commit_author) = self
+            .active_runs
+            .get(&run.id)
+            .map(|a| (a.actor.clone(), a.commit_author.clone()))
+            .unwrap_or_default();
         self.active_runs.remove(&run.id);
         self.failure_counts.remove(&run.id);
         // Bump high-water mark so check_for_new_runs doesn't re-discover
@@ -185,6 +196,8 @@ impl WatchEntry {
         let mut last_build = run.to_last_build();
         last_build.failing_steps = failing_steps;
         last_build.failing_job_id = failing_job_id;
+        last_build.actor = actor;
+        last_build.commit_author = commit_author;
         self.last_builds
             .insert(last_build.workflow.clone(), last_build);
     }
@@ -222,6 +235,25 @@ impl WatchEntry {
             Some(old)
         } else {
             None
+        }
+    }
+
+    /// Apply author info from fetched `RunAuthorInfo` to matching active runs and last builds.
+    pub(super) fn apply_author_info(
+        &mut self,
+        authors: &HashMap<u64, crate::github::RunAuthorInfo>,
+    ) {
+        for (run_id, info) in authors {
+            if let Some(active) = self.active_runs.get_mut(run_id) {
+                active.actor = Some(info.actor.clone());
+                active.commit_author = info.commit_author.clone();
+            }
+        }
+        for lb in self.last_builds.values_mut() {
+            if let Some(info) = authors.get(&lb.run_id) {
+                lb.actor = Some(info.actor.clone());
+                lb.commit_author = info.commit_author.clone();
+            }
         }
     }
 

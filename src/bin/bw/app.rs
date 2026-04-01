@@ -476,6 +476,8 @@ mod tests {
             status: RunStatus::Queued,
             attempt: 1,
             url: format!("https://github.com/{repo}/actions/runs/{run_id}"),
+            actor: None,
+            commit_author: None,
         }
     }
 

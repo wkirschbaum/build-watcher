@@ -86,6 +86,8 @@ mod tests {
             duration_secs: None,
             attempt: 1,
             url: String::new(),
+            actor: None,
+            commit_author: None,
         }
     }
 

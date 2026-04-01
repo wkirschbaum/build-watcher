@@ -123,6 +123,10 @@ pub struct ActiveRunView {
     /// GitHub Actions run URL.
     #[serde(default)]
     pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_author: Option<String>,
 }
 
 /// Summary of the last completed build as returned by `GET /status`.
@@ -150,6 +154,10 @@ pub struct LastBuildView {
     /// Duration in seconds from run start to completion.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duration_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_author: Option<String>,
 }
 
 /// One watched repo/branch as returned by `GET /status`.
@@ -283,6 +291,8 @@ impl StatusResponse {
                         elapsed_secs: Some(0.0),
                         attempt: snap.attempt,
                         url: snap.url,
+                        actor: snap.actor,
+                        commit_author: snap.commit_author,
                     });
                 }
             }
@@ -309,6 +319,8 @@ impl StatusResponse {
                     failing_job_id,
                     url: run.url,
                     duration_secs: None,
+                    actor: run.actor,
+                    commit_author: run.commit_author,
                 };
                 // Replace existing entry for this workflow, or append.
                 if let Some(existing) = watch
@@ -388,6 +400,8 @@ mod tests {
             status: RunStatus::Queued,
             attempt: 1,
             url: format!("https://github.com/{repo}/actions/runs/{run_id}"),
+            actor: None,
+            commit_author: None,
         }
     }
 
@@ -484,6 +498,8 @@ mod tests {
                 elapsed_secs: Some(30.0),
                 attempt: 1,
                 url: String::new(),
+                actor: None,
+                commit_author: None,
             }],
             ..Default::default()
         }]);

@@ -285,6 +285,10 @@ pub struct Config {
     pub notifications: NotificationConfig,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quiet_hours: Option<QuietHours>,
+    /// When true, fetch the triggering actor and commit author for each new run
+    /// (costs 1 extra API call per newly detected run).
+    #[serde(default)]
+    pub show_author: bool,
     #[serde(default)]
     pub auto_discover_branches: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -299,6 +303,7 @@ impl Default for Config {
             schema_version: CURRENT_SCHEMA_VERSION,
             ignored_workflows: Vec::new(),
             ignored_events: Vec::new(),
+            show_author: false,
             notifications: NotificationConfig::default(),
             quiet_hours: None,
             poll_aggression: PollAggression::default(),

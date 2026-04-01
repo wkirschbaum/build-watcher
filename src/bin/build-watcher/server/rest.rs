@@ -663,6 +663,13 @@ mod tests {
         ) -> Result<String, build_watcher::github::GhError> {
             Ok("Merged".to_string())
         }
+        async fn run_author(
+            &self,
+            _: &str,
+            _: u64,
+        ) -> Option<build_watcher::github::RunAuthorInfo> {
+            None
+        }
     }
 
     fn stub_handle() -> build_watcher::watcher::WatcherHandle {
@@ -743,6 +750,8 @@ mod tests {
             status: build_watcher::status::RunStatus::InProgress,
             attempt: 1,
             url: String::new(),
+            actor: None,
+            commit_author: None,
         }
     }
 
@@ -785,6 +794,8 @@ mod tests {
                 duration_secs: None,
                 attempt: 1,
                 url: String::new(),
+                actor: None,
+                commit_author: None,
             },
         );
         watches.lock().await.insert(key, entry);
@@ -925,6 +936,8 @@ mod tests {
                 created_at: "2026-01-01T10:00:00Z".to_string(),
                 updated_at: "2026-01-01T10:05:00Z".to_string(),
                 url: String::new(),
+                actor: None,
+                commit_author: None,
             },
         );
         watches.lock().await.insert(key, entry);
