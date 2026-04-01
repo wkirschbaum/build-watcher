@@ -32,7 +32,7 @@ cargo clippy                # Lint
 - `src/bin/build-watcher/main.rs` — Daemon entry point, wires up config, watches, event bus, and server
 - `src/bin/build-watcher/server/` — Server module directory:
   - `mod.rs` — `DaemonState`, axum router setup, `build_watch_snapshot()`, instance lock, `serve()`
-  - `mcp.rs` — MCP tool handlers (`BuildWatcher` struct, 11 tools)
+  - `mcp.rs` — MCP tool handlers (`BuildWatcher` struct, 13 tools)
   - `rest.rs` — REST/SSE endpoints (`/status`, `/stats`, `/events`, `/pause`, `/rerun`, etc.)
   - `actions.rs` — MCP tool action implementations, `persist_config()`
   - `schema.rs` — JSON schema definitions for tool parameters
@@ -71,7 +71,7 @@ cargo clippy                # Lint
 
 ### How it works
 
-The `BuildWatcher` struct implements 11 MCP tools. When a repo is watched, it spawns an async tokio task per repo that polls GitHub via the `gh` CLI. Events are emitted onto a broadcast `EventBus`; a notification handler subscribes, debounces (3s per repo/branch/kind), coalesces multiple workflows into summary notifications, throttles (10/60s), and dispatches desktop notifications based on config and pause/quiet-hours state.
+The `BuildWatcher` struct implements 13 MCP tools. When a repo is watched, it spawns an async tokio task per repo that polls GitHub via the `gh` CLI. Events are emitted onto a broadcast `EventBus`; a notification handler subscribes, debounces (3s per repo/branch/kind), coalesces multiple workflows into summary notifications, throttles (10/60s), and dispatches desktop notifications based on config and pause/quiet-hours state.
 
 **Polling intervals:** Minimum 15s when builds are active, 60s when idle. Intervals scale dynamically based on the GitHub API rate limit. The `gh` CLI must be authenticated (`gh auth login`).
 

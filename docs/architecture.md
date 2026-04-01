@@ -1,91 +1,151 @@
 # Architecture
 
-`build-watcher` is a Rust daemon that monitors GitHub Actions workflows and delivers desktop notifications. It exposes an MCP (Model Context Protocol) server over HTTP so Claude Code can manage watched repos via tool calls.
+`build-watcher` is a Rust daemon that monitors GitHub Actions workflows, tracks PR merge readiness, and sends desktop notifications. It exposes an MCP (Model Context Protocol) server over HTTP so Claude Code can manage watched repos via tool calls, and a REST API consumed by the `bw` TUI dashboard.
 
-## High-level flow
-
-```
-Claude Code ──HTTP/MCP──► server.rs (axum + rmcp)
-                               │
-                               ├── config.json  (persisted configuration)
-                               ├── watches.json (persisted watch state)
-                               │
-                               ▼
-                          watcher.rs (per-repo/branch polling tasks)
-                               │
-                               ├── github.rs ──► gh CLI ──► GitHub API
-                               │
-                               ▼
-                          events.rs (broadcast EventBus)
-                               │
-                      ┌────────┴────────┐
-                      ▼                 ▼
-                 platform/         GET /events (SSE)
-            (desktop notifs)            │
-                                        ▼
-                                   bw TUI (bin/bw.rs)
-                                   ├── GET /status
-                                   ├── GET /stats
-                                   ├── GET|POST /notifications
-                                   ├── GET|POST /defaults
-                                   ├── POST /pause
-                                   ├── POST /rerun
-                                   ├── POST /watch
-                                   ├── POST /unwatch
-                                   ├── POST /branches
-                                   └── POST /shutdown
-```
-
-## Source layout
+## System overview
 
 ```
-src/
-├── main.rs          — entry point, wires up config, watches, event bus, server
-├── server/          — server module directory (see below)
-├── watcher/         — watch lifecycle module directory (see below)
-├── events.rs        — EventBus (broadcast channel), WatchEvent types
-├── config.rs        — Config structs, crash-safe JSON persistence helpers
-├── status.rs        — shared HTTP response types (StatusResponse, StatsResponse)
-├── format.rs        — duration, age, and truncation formatting
-├── github.rs        — gh CLI wrappers, RunInfo/HistoryEntry types, input validation
-├── notification.rs  — notification handler, subscribes to EventBus, dispatches to platform
-├── register.rs      — MCP server registration in ~/.claude.json (--register flag)
-├── bin/
-│   └── bw/          — TUI dashboard binary
-│       ├── main.rs  — entry point, terminal setup, event loop, daemon discovery
-│       ├── app.rs   — App state, input handling, event application
-│       ├── client.rs — HTTP client for daemon REST API, SSE streaming
-│       ├── render.rs — TUI rendering, display rows, sorting, grouping
-│       └── update.rs — Background update checker, self-update via GitHub releases
+                          ┌─────────────────────────────────────────────────────────────┐
+                          │                    build-watcher daemon                      │
+                          │                                                             │
+ Claude Code ──MCP/HTTP──►│  server/           ┌─────────────┐    ┌──────────────────┐  │
+                          │  ├── mcp.rs ───────►│             │    │  config/         │  │
+                          │  ├── rest.rs ──────►│  actions.rs │◄──►│  ├── types.rs    │  │
+                          │  └── mod.rs         │             │    │  ├── resolve.rs  │  │
+                          │       │             └──────┬──────┘    │  └── mod.rs      │  │
+                          │       │                    │           └────────┬─────────┘  │
+                          │       │                    ▼                    │             │
+                          │       │            watcher/                     │             │
+                          │       │            ├── repo_poller.rs ◄────────┘             │
+                          │       │            │    (per-repo async task)                │
+                          │       │            ├── startup.rs                            │
+                          │       │            └── types.rs                              │
+                          │       │                    │                                 │
+                          │       │                    │ github.rs ──► gh CLI ──► GitHub │
+                          │       │                    │                                 │
+                          │       │                    ▼                                 │
+                          │       │            events.rs (broadcast EventBus)            │
+                          │       │                    │                                 │
+                          │       │            ┌───────┴────────┐                        │
+                          │       │            ▼                ▼                        │
+                          │       │      notification.rs   SSE stream                   │
+                          │       │            │           GET /events                   │
+                          │       │            ▼                │                        │
+                          │       │      platform/             │                        │
+                          │       │      ├── linux/ (D-Bus)    │                        │
+                          │       │      └── macos/ (notifier) │                        │
+                          │       │                            │                        │
+                          └───────┼────────────────────────────┼────────────────────────┘
+                                  │                            │
+                          ┌───────┼────────────────────────────┼──────┐
+                          │       ▼           bw TUI           ▼      │
+                          │  client.rs ──────────────► app.rs         │
+                          │                            ├── render.rs  │
+                          │                            ├── input.rs   │
+                          │                            └── forms.rs   │
+                          └───────────────────────────────────────────┘
+```
+
+## Data flow
+
+```
+                    ┌──────────┐
+                    │  GitHub  │
+                    │   API    │
+                    └────┬─────┘
+                         │ gh CLI
+                         ▼
+                  ┌──────────────┐
+                  │ repo_poller  │──── polls runs (15s active / 60s idle)
+                  │  (per repo)  │──── polls PRs (on idle cycles)
+                  └──────┬───────┘
+                         │ emits
+                         ▼
+  ┌───────────────── EventBus ──────────────────┐
+  │                                             │
+  │  RunStarted   RunCompleted   StatusChanged  │
+  │                PrStateChanged               │
+  └──────┬──────────────┬───────────────┬───────┘
+         │              │               │
+         ▼              ▼               ▼
+   notification    SSE /events     status.rs
+   handler         (to bw TUI)    (apply_event)
+         │
+         ▼
+   desktop notif
+```
+
+## Crate structure
+
+The project builds two binaries from a shared library crate:
+
+```
+build_watcher (lib)              Shared types and logic
+├── config/                      Configuration loading, saving, resolution
+│   ├── types.rs                 Config, RepoConfig, NotificationLevel, QuietHours
+│   ├── resolve.rs               Hierarchical notification resolution (global → repo → branch)
+│   └── mod.rs                   load_and_normalize(), save_config(), draft recovery
+├── watcher/                     Watch lifecycle
+│   ├── types.rs                 WatchKey, WatchEntry, ActiveRun, persistence helpers
+│   ├── repo_poller.rs           Per-repo async polling: runs + PRs
+│   ├── startup.rs               WatcherHandle, start_watch(), startup recovery
+│   └── tests.rs                 Mock GitHub client, unit and integration tests
+├── events.rs                    EventBus (broadcast), WatchEvent, RunSnapshot
+├── github.rs                    GitHubClient trait, gh CLI impl, RunInfo, PrInfo, MergeState
+├── status.rs                    WatchStatus, PrView, StatusResponse, StatsResponse
+├── history.rs                   Per-repo/branch build history (capped ring buffer)
+├── persistence.rs               Crash-safe save_json/load_json, draft recovery
+├── rate_limiter.rs              API budget computation, dynamic poll interval scaling
+├── format.rs                    Duration, age, and truncation formatting
+├── dirs.rs                      config_dir() and state_dir() helpers
+└── lib.rs                       Re-exports all modules
+
+build-watcher (daemon binary)    Daemon-only code
+├── main.rs                      Entry point, startup orchestration
+├── server/
+│   ├── mod.rs                   DaemonState, axum router, build_watch_snapshot()
+│   ├── mcp.rs                   MCP tool handlers (13 tools)
+│   ├── rest.rs                  REST/SSE endpoints
+│   ├── actions.rs               Tool action implementations, burst polling, config persistence
+│   └── schema.rs                JSON schema definitions for tool parameters
+├── notification.rs              Debounce, coalesce, throttle, dispatch desktop notifications
+├── register.rs                  MCP server registration in ~/.claude.json
 └── platform/
-    ├── mod.rs       — Notifier trait, global singleton, platform dispatch
-    ├── universal/
-    │   └── mod.rs   — NullNotifier (used in tests)
-    ├── linux/
-    │   └── mod.rs   — D-Bus backend via zbus (org.freedesktop.Notifications), notification props, action listener
-    └── macos/
-        └── mod.rs   — detection (terminal-notifier → osascript), both backends, sound mapping
+    ├── mod.rs                   Notifier trait, platform detection, global singleton
+    ├── linux/mod.rs             D-Bus via zbus, action click handling
+    └── macos/mod.rs             terminal-notifier / osascript backends
+
+bw (TUI binary)                  Terminal dashboard
+├── main.rs                      Entry point, terminal setup, event loop, daemon discovery
+├── app.rs                       App state, event application, sort/group enums
+├── input.rs                     Keyboard input handling (normal + form modes)
+├── render.rs                    Rendering, display rows, sorting, grouping, PR badges
+├── client.rs                    HTTP client for daemon REST API, SSE streaming
+├── forms.rs                     Form/picker UI components
+└── update.rs                    Background update checker, self-update via GitHub releases
 ```
 
 ## Key types
 
 | Type | Module | Purpose |
 |------|--------|---------|
-| `BuildWatcher` | `server` | MCP server handler; owns shared state, routes tool calls |
+| `DaemonState` | `server` | Shared state: watches, config, watcher handle, github client |
 | `WatcherHandle` | `watcher` | `TaskTracker` + `CancellationToken` + `EventBus` for poller lifecycle |
 | `Watches` | `watcher` | `Arc<Mutex<HashMap<WatchKey, WatchEntry>>>` — runtime watch state |
 | `WatchKey` | `watcher` | Type-safe `repo#branch` key, serializes as string |
-| `WatchEntry` | `watcher` | Per-branch state: active runs, failure counts, last build |
-| `Poller` | `watcher` | Per-repo/branch async polling task |
-| `Config` | `config` | Persisted configuration: repos, branches, notification levels, quiet hours, ignored workflows. `short_repo(&str)` returns an unambiguous display name |
+| `WatchEntry` | `watcher` | Per-branch state: active runs, last builds, PRs |
+| `RepoPoller` | `watcher` | Per-repo async polling task (runs + PRs) |
+| `Config` | `config` | Persisted config: repos, branches, notifications, quiet hours, ignored workflows |
 | `EventBus` | `events` | Broadcast channel for `WatchEvent`s |
-| `WatchEvent` | `events` | `RunStarted`, `RunCompleted`, `StatusChanged` |
+| `WatchEvent` | `events` | `RunStarted`, `RunCompleted`, `StatusChanged`, `PrStateChanged` |
 | `RunSnapshot` | `events` | Immutable snapshot of a run's identity, carried by events |
+| `GitHubClient` | `github` | Trait abstracting the `gh` CLI (real impl + test mocks) |
 | `RunInfo` | `github` | A GitHub Actions run parsed from `gh` CLI output |
-| `HistoryEntry` | `github` | A build history entry with timestamps for duration/age |
+| `PrInfo` | `github` | An open PR: number, branches, merge state, author, draft status |
+| `MergeState` | `github` | PR merge readiness: Clean, Blocked, Unstable, Behind, Dirty, HasHooks |
 | `StatusResponse` | `status` | JSON snapshot of all watches, used by `GET /status` and the TUI |
-| `StatsResponse` | `status` | Daemon stats (uptime, poll intervals, rate limit), used by `GET /stats` |
-| `DefaultsConfig` | `status` | Global config defaults (branches, ignored workflows, poll aggression), used by `GET /defaults` |
+| `WatchStatus` | `status` | Per-branch view: active runs, last builds, PRs |
+| `PrView` | `status` | Compact PR for wire format: number, title, merge state, draft |
 | `Notifier` | `platform` | Trait for desktop notification backends |
 
 ## Startup sequence
@@ -101,126 +161,133 @@ src/
 
 ## Watch lifecycle
 
-1. **`watch_builds` tool call** → validates repo names, reads branch config, calls `start_watch` per branch. Only persists repos to config after at least one branch successfully starts (prevents typos from polluting config).
-2. **`start_watch`** → fetches recent runs via `gh run list`, applies workflow filters, sets `last_seen_run_id` to the highest run ID, records any in-progress runs, inserts a `WatchEntry`, then spawns a `Poller` task.
-3. **`Poller::run` loop** → runs until the watch entry is removed or cancellation:
-   - Sleeps `active_secs` (minimum 15s) when builds are running, `idle_secs` (minimum 60s) when idle.
-   - Calls `poll_active_runs` every cycle when active.
-   - Calls `check_for_new_runs` at least every idle interval regardless of active state.
-4. **`stop_watches` tool call** → removes entries from the watch map. Pollers detect the missing key on their next iteration and exit. Also removes from config.
+```
+watch_builds (MCP/REST)
+       │
+       ▼
+  start_watch()
+       │
+       ├── fetch recent runs via gh
+       ├── apply workflow filters
+       ├── set last_seen_run_id to highest
+       ├── record any in-progress runs
+       ├── insert WatchEntry
+       │
+       └── spawn RepoPoller ──────────────┐
+                                          │
+                                   poll loop:
+                                   ├── sleep (15s active / 60s idle)
+                                   ├── poll_active_runs() — gh run view per active run
+                                   ├── check_for_new_runs() — gh run list, compare IDs
+                                   ├── poll_prs() — gh pr list (when idle, if enabled)
+                                   └── emit events → EventBus
+```
+
+### PR polling
+
+When `watch_prs` is enabled for a repo, `poll_prs()` runs on idle cycles:
+
+1. Fetches all open PRs via `gh pr list` (up to 50).
+2. Groups PRs by their **target branch** (baseRefName).
+3. Updates each `WatchEntry.prs` with PRs targeting that watched branch.
+4. Detects merge-state transitions and emits `PrStateChanged` events.
+
+This means watching `main` shows all PRs that target `main`, not PRs whose source branch happens to be named `main`.
 
 ## Event bus
 
-The `EventBus` (`events.rs`) is a `tokio::sync::broadcast` channel that decouples polling from notification dispatch:
+The `EventBus` (`events.rs`) is a `tokio::sync::broadcast` channel that decouples polling from consumers:
 
-- **Producers**: Pollers emit `WatchEvent::RunStarted`, `RunCompleted`, and `StatusChanged`.
-- **Consumer**: The notification handler (`run_notification_handler`) subscribes at startup, resolves notification levels from config, checks pause/quiet-hours state, and dispatches to the platform notification backend.
-
-This separation means adding new consumers (logging, webhooks) doesn't require modifying the poller.
+- **Producers**: Pollers emit `RunStarted`, `RunCompleted`, `StatusChanged`, and `PrStateChanged`.
+- **Consumers**:
+  - **Notification handler** — debounces (3s per repo/branch/kind), coalesces multiple workflows, throttles (10/60s), checks pause/quiet-hours, dispatches desktop notifications.
+  - **SSE stream** — `GET /events` forwards events to the TUI for real-time updates.
+  - **TUI local state** — `apply_event` on `StatusResponse` updates the TUI's in-memory copy without a full resync.
 
 ## Polling strategy
 
-Each `Poller` task refreshes the shared `RateLimitState` every 60 seconds via `gh api rate_limit`. `compute_intervals` uses the current quota to derive dynamic sleep durations: floor speed (15s/60s, scaled by √calls) above 50% remaining, throttled proportionally below that, waiting out the reset window at zero. Before the first rate-limit fetch, fallback intervals of 30s/120s are used. All pollers share the same `Arc<Mutex<Option<RateLimit>>>` so they coordinate rather than independently consuming quota.
+All pollers share a `RateLimitState` refreshed every 60 seconds via `gh api rate_limit`. `compute_intervals` derives dynamic sleep durations:
 
-Two functions handle different concerns:
+- **Above 50% remaining** — floor speed (15s/60s), scaled by √(api_calls_per_cycle).
+- **Below 50% remaining** — spread remaining budget across seconds until reset.
+- **At zero** — wait out the full reset window.
 
-- **`poll_active_runs`** — calls `gh run view` for each run ID in `active_runs`. Detects completion and emits `RunCompleted` (with elapsed time and failing step names for failures). Tracks consecutive API failures per run; evicts a run after `MAX_GH_FAILURES` (5) failures. The watch lock is released during each GitHub API call to avoid holding it across awaits.
-- **`check_for_new_runs`** — calls `gh run list` and compares against `last_seen_run_id`. Any run with a higher ID is new: emits `RunStarted`, and immediately `RunCompleted` too if it already finished between polls. Advances `last_seen_run_id` past all unseen runs (including filtered-out ones) to avoid re-checking.
+Poll aggression (`low`/`medium`/`high`) controls what fraction of the hourly budget to use.
 
 ## Configuration and state persistence
 
-All JSON files are written via a crash-safe draft/backup pattern (`save_json` in `config.rs`):
+All JSON files use crash-safe writes:
 
-1. Serialize to a `.draft` file and `fsync`.
-2. Read the `.draft` back and parse it to confirm it is valid JSON.
-3. Rename the current file to `.bak`.
-4. Rename `.draft` to the target path.
+1. Serialize to `.draft`, fsync.
+2. Re-read and parse `.draft` to verify.
+3. Rename current to `.bak`.
+4. Rename `.draft` to target path.
 
-A crash at any point leaves either the previous file or the backup intact. On load, `load_json` falls back to `.bak` if the primary is missing or unparseable.
-
-**Config** (`~/.config/build-watcher/config.json`) — watched repos, per-repo branch/workflow lists, hierarchical notification level overrides (global → per-repo → per-branch), quiet hours, ignored workflows, and repo aliases. Written only when the user changes settings. On first startup, re-saved to normalize the schema (add missing fields with defaults).
-
-**Watch state** (`~/.local/state/build-watcher/watches.json`) — `last_seen_run_id` and `last_build` per watch key (`owner/repo#branch`). Written after every meaningful state change. Runtime-only fields (`active_runs`, `failure_counts`) are not persisted; they are reconstructed at startup via `startup_watches`.
-
-## Startup recovery
-
-`startup_watches` (called at daemon start) does two things:
-
-1. **Recover existing watches**: For each key in `watches.json`, fetches recent runs concurrently via a `JoinSet`, adds any in-progress ones back to `active_runs`, and advances `last_seen_run_id` to the latest run seen. Without this, `check_for_new_runs` would treat runs from during downtime as new and fire spurious notifications.
-
-2. **Start new config watches**: For each repo in `config.json` that has no entry in `watches.json`, calls `start_watch` to begin fresh.
-
-## Desktop notifications
-
-The `Notifier` trait (`platform/mod.rs`) abstracts the backend. A global `OnceLock` singleton is initialized on first use. The active backend is chosen at startup via platform-specific detection:
-
-- **Linux** — D-Bus via `zbus` (`org.freedesktop.Notifications` interface). Uses `replaces_id` for notification stacking per group, urgency hints, icons, categories, expiry times, and a `desktop-entry` hint for GNOME/KDE grouping. Clicking a notification opens the GitHub Actions run URL via `xdg-open` (using the D-Bus `ActionInvoked` signal with a 10-minute listener timeout).
-- **macOS** — `terminal-notifier` if available (supports URL open, grouping, and sound), otherwise `osascript` (AppleScript `display notification` with sound). Both macOS backends reap child processes with a 10-second timeout to prevent zombies.
-
-Notifications are grouped per `repo#branch#workflow` so each workflow slot replaces rather than stacks.
-
-## MCP server
-
-The `BuildWatcher` struct implements 10 MCP tools via `rmcp`'s `#[tool]` / `#[tool_router]` macros. The server uses Streamable HTTP transport in stateless mode over axum. A `StreamableHttpService` wraps the handler with `LocalSessionManager`.
-
-Port binding tries the preferred port (default 8417), falling back to up to 9 consecutive ports. The bound port is written to `~/.local/state/build-watcher/port`.
-
-Tool parameters use a custom `deserialize_string_or_vec` deserializer to handle MCP clients that double-encode JSON arrays as strings.
+| File | Path | Contents |
+|------|------|----------|
+| Config | `~/.config/build-watcher/config.json` | Repos, branches, notifications, quiet hours, ignored workflows, aliases |
+| Watch state | `~/.local/state/build-watcher/watches.json` | `last_seen_run_id` and `last_builds` per watch key |
+| Port | `~/.local/state/build-watcher/port` | Actual bound port for daemon discovery |
 
 ## REST API
 
-Alongside the MCP endpoint, the daemon exposes REST endpoints on the same port for the TUI and other consumers:
-
 | Endpoint | Method | Purpose |
 |----------|--------|---------|
-| `/status` | GET | JSON snapshot of all watches, active runs, and last builds |
+| `/status` | GET | JSON snapshot of all watches, active runs, last builds, PRs |
 | `/stats` | GET | Daemon stats: uptime, polling intervals, API rate limit |
-| `/events` | GET | SSE stream of `WatchEvent`s (RunStarted, RunCompleted, StatusChanged) |
+| `/events` | GET | SSE stream of `WatchEvent`s |
 | `/notifications` | GET | Resolved notification config for `?repo=&branch=` |
-| `/notifications` | POST | Mute, unmute, or set per-event levels (`action: mute\|unmute\|set_levels`) |
-| `/defaults` | GET | Global config defaults (branches, ignored workflows, poll aggression) |
-| `/defaults` | POST | Update global default branches and/or ignored workflows |
+| `/notifications` | POST | Mute, unmute, or set per-event levels |
+| `/defaults` | GET | Global config defaults |
+| `/defaults` | POST | Update global config defaults |
 | `/history` | GET | Build history for a repo (`?repo=&branch=&limit=`) |
-| `/history/all` | GET | Recent builds across all repos (`?limit=`) |
-| `/watch` | POST | Add a repo/branch to watches |
-| `/unwatch` | POST | Remove a repo from watches |
+| `/history/all` | GET | Recent builds across all repos |
+| `/watch` | POST | Add repos to watches |
+| `/unwatch` | POST | Remove repos from watches |
 | `/branches` | POST | Update branch config for a repo |
-| `/pause` | POST | Toggle notification pause (`{"pause": true/false}`) |
-| `/rerun` | POST | Rerun a build (`{"repo": "owner/repo", "run_id": 123}`) |
-| `/shutdown` | POST | Initiate graceful daemon shutdown |
+| `/pause` | POST | Toggle notification pause |
+| `/rerun` | POST | Rerun a build (specific or last failed) |
+| `/merge` | POST | Merge a PR by number |
+| `/shutdown` | POST | Graceful daemon shutdown |
 
 ## TUI dashboard (`bw`)
 
-The `bw` binary (`src/bin/bw.rs`) is a ratatui-based live terminal dashboard. It connects to the daemon's REST API:
+The `bw` binary connects to the daemon via HTTP:
 
-- **Real-time updates** via SSE (`GET /events`), with `apply_event` updating local state in-place
-- **Periodic resync** via `GET /status` + `GET /stats` every 30 seconds and on SSE reconnect
-- **Local ticking** of elapsed times and build ages every second between resyncs
-- **Row selection** (`↑`/`↓`/`j`/`k`) with actions on the selected repo/branch
-- **Watch management** — add (`a`), remove (`d`), configure branches (`b`) via inline text prompts
-- **Sortable columns** — cycle repo, branch, status, workflow, age with `s`/`S`; direction toggles within the same column before advancing
-- **Configurable grouping** — cycle org, branch, workflow, status, none with `g`/`G`; group header rows separate each group
-- **Notification picker popup** (`N`) — loads current resolved levels via `GET /notifications`, then presents a `←`/`→` cycling picker per event type, saved via `POST /notifications`
-- **Config form popup** (`C`) — loads `GET /defaults`, edits default branches + ignored workflows, saves via `POST /defaults`
-- **Auto-start** — if no port file exists or the port is unreachable, `bw` spawns the `build-watcher` daemon and waits up to 5 seconds for it to bind
-- **Non-blocking actions** — all HTTP mutations are `spawn_action` calls; the UI stays responsive with transient flash messages
-- **Responsive layout** with column widths scaling to terminal width
-- **Reconnection** with exponential backoff (1s → 30s), resetting on successful connection
-- **Quit+shutdown** (`Q`) — calls `POST /shutdown` before exiting, stopping the daemon
+```
+bw startup
+    │
+    ├── read port file (~/.local/state/build-watcher/port)
+    │   └── if missing/unreachable → spawn daemon, wait up to 5s
+    │
+    ├── tokio::join! {
+    │     GET /status   → initial watch state
+    │     GET /stats    → daemon stats
+    │     GET /history/all → recent builds
+    │   }
+    │
+    └── event loop
+         ├── SSE /events → apply_event() on local state (real-time)
+         ├── periodic resync (GET /status + /stats + /history/all every 30s)
+         ├── local tick every 1s (elapsed times, build ages)
+         ├── keyboard input → actions (POST /rerun, /merge, /watch, etc.)
+         └── background update checker (10s delay, then hourly)
+```
 
-The TUI shares types from the `build_watcher` library crate (`status.rs`, `events.rs`, `format.rs`) but has no dependency on daemon-only code.
+The TUI shares types from the library crate (`status.rs`, `events.rs`, `format.rs`, `github.rs`) but has no dependency on daemon-only code.
 
 ## Graceful shutdown
 
-Triggered by SIGINT (ctrl-c) or `POST /shutdown` (from the TUI `Q` key). The server uses `tokio::select!` to wait for either signal, then cancels the shared `CancellationToken`:
+Triggered by SIGINT (ctrl-c) or `POST /shutdown`:
 
-1. Cancel the `CancellationToken` — all pollers exit their sleep loops.
-2. Close the `TaskTracker` and wait for all poller tasks to complete.
+1. Cancel the `CancellationToken` — all pollers exit their loops.
+2. Close the `TaskTracker` and wait for all tasks.
 3. Save final watch state to disk.
 4. Remove the port file.
 
 ## Concurrency notes
 
-- Each watched branch has exactly one `Poller` task. The `Watches` mutex is held only for brief in-memory reads/writes — never across `await` points or GitHub API calls.
-- `start_watch` performs a double-checked lock: checks for a duplicate before the `gh` call, makes the network call, then re-checks before inserting. This prevents duplicate pollers if concurrent `watch_builds` calls race for the same key.
-- The D-Bus notification backend (`zbus`) is fully async. The `replaces_id` for notification grouping is tracked in an `Arc<Mutex<HashMap>>` keyed by group. Action click handling (for opening URLs) spawns a background task per notification with a 10-minute timeout.
+- One `RepoPoller` task per watched repo. The `Watches` mutex is held only for brief reads/writes — never across awaits or API calls.
+- `start_watch` uses double-checked locking: checks before the `gh` call, makes the call, re-checks before inserting.
+- The D-Bus notification backend is fully async. `replaces_id` tracking and action click handling use `Arc<Mutex<_>>`.
+- Burst polling (1s, 5s, 10s) after rerun/merge triggers the pollers to pick up changes quickly without waiting for the normal interval.

@@ -33,25 +33,30 @@ pub(crate) struct SingleBranchInfo<'a> {
     pub waiting: bool,
     /// Compact PR merge-state badge (e.g. "PR:✓" or "PR:✗"), empty if no PR.
     pub pr_badge: String,
+    /// Failing step names from the last build, if any.
+    pub failing_steps: Option<String>,
 }
 
-/// Format a compact PR badge from a `PrView`, or empty string if no PR.
-fn pr_badge(pr: &Option<PrView>) -> String {
-    let Some(pr) = pr else {
-        return String::new();
-    };
-    let icon = match pr.merge_state {
-        build_watcher::github::MergeState::Clean => "✓",
-        build_watcher::github::MergeState::Blocked => "⊘",
-        build_watcher::github::MergeState::Unstable => "!",
-        build_watcher::github::MergeState::Behind => "↓",
-        build_watcher::github::MergeState::Dirty => "✗",
-        _ => "?",
-    };
-    if pr.draft {
-        format!("PR:{icon}~")
-    } else {
-        format!("PR:{icon}")
+/// Format a compact PR badge from a list of `PrView`s, or empty string if none.
+fn pr_badge(prs: &[PrView]) -> String {
+    match prs.len() {
+        0 => String::new(),
+        1 => {
+            let pr = &prs[0];
+            let draft = if pr.draft { "~" } else { "" };
+            format!("[PR#{} {}{draft}]", pr.number, pr.merge_state.icon())
+        }
+        n => {
+            let ready = prs
+                .iter()
+                .filter(|p| p.merge_state == build_watcher::github::MergeState::Clean)
+                .count();
+            if ready > 0 {
+                format!("[{n} PRs, {ready}✓]")
+            } else {
+                format!("[{n} PRs]")
+            }
+        }
     }
 }
 
@@ -85,10 +90,6 @@ pub(crate) enum DisplayRow<'a> {
         tree_prefix: &'static str,
         is_workflow_child: bool,
         pr_badge: String,
-    },
-    FailingSteps {
-        steps: &'a str,
-        tree_indent: &'static str,
     },
     LastBuild {
         repo: &'a str,
@@ -224,7 +225,7 @@ fn compute_single_branch_info<'a>(branches: &[&'a WatchStatus]) -> Option<Single
     if workflow_count > 1 {
         return None; // multi-workflow: will expand into child rows
     }
-    let (title, status_key, attempt, run_id, failed, failing_job_id) =
+    let (title, status_key, attempt, run_id, failed, failing_job_id, failing_steps) =
         if let Some(run) = w.active_runs.first() {
             (
                 run.title.clone(),
@@ -232,6 +233,7 @@ fn compute_single_branch_info<'a>(branches: &[&'a WatchStatus]) -> Option<Single
                 run.attempt,
                 Some(run.run_id),
                 false,
+                None,
                 None,
             )
         } else if let Some(b) = newest_last_build(w) {
@@ -242,9 +244,10 @@ fn compute_single_branch_info<'a>(branches: &[&'a WatchStatus]) -> Option<Single
                 Some(b.run_id),
                 b.conclusion != RunConclusion::Success,
                 b.failing_job_id,
+                b.failing_steps.clone(),
             )
         } else {
-            (String::new(), String::new(), 1, None, false, None)
+            (String::new(), String::new(), 1, None, false, None, None)
         };
     let mut wf_set: Vec<&str> = Vec::new();
     for run in &w.active_runs {
@@ -267,14 +270,15 @@ fn compute_single_branch_info<'a>(branches: &[&'a WatchStatus]) -> Option<Single
         failed,
         failing_job_id,
         waiting: w.waiting,
-        pr_badge: pr_badge(&w.pr),
+        pr_badge: pr_badge(&w.prs),
+        failing_steps,
     })
 }
 
 /// Result of flattening watches into display rows.
 pub(crate) struct FlatRows<'a> {
     pub(crate) rows: Vec<DisplayRow<'a>>,
-    /// Indices into `rows` that are selectable (everything except `FailingSteps`).
+    /// Indices into `rows` that are selectable (everything except `GroupHeader`).
     pub(crate) selectable: Vec<usize>,
 }
 
@@ -389,23 +393,6 @@ pub(crate) fn flatten_rows<'a>(
             failing_workflows: agg.failing_workflows,
         });
 
-        // Failing steps for single-branch, single-workflow repos (shown directly under the header)
-        if is_single_branch_inline && branches.len() == 1 {
-            let w = branches[0];
-            if w.active_runs.is_empty() {
-                for b in &w.last_builds {
-                    if b.conclusion != RunConclusion::Success
-                        && let Some(steps) = &b.failing_steps
-                    {
-                        rows.push(DisplayRow::FailingSteps {
-                            steps,
-                            tree_indent: "",
-                        });
-                    }
-                }
-            }
-        }
-
         // Expand child rows when not collapsed.
         // For multi-branch repos: show branch rows (each may further expand into workflow rows).
         // For single-branch, multi-workflow repos: show workflow rows directly under the header.
@@ -487,7 +474,7 @@ fn emit_branch_workflow_rows<'a>(
                 muted: w.muted,
                 tree_prefix,
                 is_workflow_child: false,
-                pr_badge: pr_badge(&w.pr),
+                pr_badge: pr_badge(&w.prs),
             });
         } else if let Some(b) = w.last_builds.first() {
             selectable.push(rows.len());
@@ -498,13 +485,8 @@ fn emit_branch_workflow_rows<'a>(
                 muted: w.muted,
                 tree_prefix,
                 is_workflow_child: false,
-                pr_badge: pr_badge(&w.pr),
+                pr_badge: pr_badge(&w.prs),
             });
-            if b.conclusion != RunConclusion::Success
-                && let Some(steps) = &b.failing_steps
-            {
-                rows.push(DisplayRow::FailingSteps { steps, tree_indent });
-            }
         } else {
             selectable.push(rows.len());
             rows.push(DisplayRow::NeverRan {
@@ -552,16 +534,6 @@ fn emit_branch_workflow_rows<'a>(
             (_, true) => "└─ ",
             (_, false) => "├─ ",
         };
-        let wf_indent: &'static str = match (tree_indent, is_last) {
-            ("", true) => "   ",
-            ("", false) => "│  ",
-            ("│  ", true) => "│     ",
-            ("│  ", false) => "│  │  ",
-            ("   ", true) => "      ",
-            ("   ", false) => "   │  ",
-            (_, true) => "   ",
-            (_, false) => "│  ",
-        };
 
         match item {
             WorkflowItem::Active(run) => {
@@ -588,14 +560,6 @@ fn emit_branch_workflow_rows<'a>(
                     is_workflow_child: true,
                     pr_badge: String::new(),
                 });
-                if b.conclusion != RunConclusion::Success
-                    && let Some(steps) = &b.failing_steps
-                {
-                    rows.push(DisplayRow::FailingSteps {
-                        steps,
-                        tree_indent: wf_indent,
-                    });
-                }
             }
         }
     }
@@ -662,7 +626,7 @@ enum WorkflowItem<'a> {
 impl DisplayRow<'_> {
     /// Returns `(repo, branch, run_id, muted)` for selectable rows.
     /// For multi-branch `RepoHeader`, branch is empty. For single-branch, returns the branch name.
-    /// Returns `None` for non-selectable rows (`GroupHeader`, `FailingSteps`).
+    /// Returns `None` for non-selectable rows (`GroupHeader`).
     pub(crate) fn repo_branch_run(&self) -> Option<(&str, &str, Option<u64>, bool)> {
         match self {
             DisplayRow::RepoHeader {
@@ -698,18 +662,8 @@ impl DisplayRow<'_> {
                 muted,
                 ..
             } => Some((repo, branch, None, *muted)),
-            DisplayRow::GroupHeader { .. } | DisplayRow::FailingSteps { .. } => None,
+            DisplayRow::GroupHeader { .. } => None,
         }
-    }
-
-    /// Returns the repo name for selectable rows.
-    pub(crate) fn repo(&self) -> Option<&str> {
-        self.repo_branch_run().map(|(r, _, _, _)| r)
-    }
-
-    /// Returns `(repo, branch)` for selectable rows.
-    pub(crate) fn repo_branch(&self) -> Option<(&str, &str)> {
-        self.repo_branch_run().map(|(r, b, _, _)| (r, b))
     }
 
     /// Returns `true` if this is a `RepoHeader` row.
@@ -755,6 +709,19 @@ impl DisplayRow<'_> {
                 ..
             }
         )
+    }
+
+    /// Returns `true` if this row is a workflow-level child (nested under a branch header).
+    pub(crate) fn is_workflow_child(&self) -> bool {
+        match self {
+            DisplayRow::ActiveRun {
+                is_workflow_child, ..
+            }
+            | DisplayRow::LastBuild {
+                is_workflow_child, ..
+            } => *is_workflow_child,
+            _ => false,
+        }
     }
 }
 
@@ -1205,6 +1172,25 @@ fn format_branch_with_pr(branch: &str, pr_badge: &str) -> String {
     }
 }
 
+/// Build a styled title line, appending failing steps in red when present.
+fn title_line(title: &str, steps: Option<&str>, max_width: usize) -> Line<'static> {
+    match steps {
+        Some(s) if !s.is_empty() => {
+            let sep = " · ";
+            let available = max_width.saturating_sub(title.len() + sep.len());
+            Line::from(vec![
+                Span::raw(format::truncate(title, max_width)),
+                Span::styled(sep, Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format::truncate(s, available),
+                    Style::default().fg(COLOR_FAILURE),
+                ),
+            ])
+        }
+        _ => Line::from(format::truncate(title, max_width)),
+    }
+}
+
 /// Build a 6-cell Row for a branch-level entry (ActiveRun, LastBuild, NeverRan).
 #[allow(clippy::too_many_arguments)]
 fn branch_row<'a>(
@@ -1214,7 +1200,7 @@ fn branch_row<'a>(
     tree_prefix: &str,
     status_text: &str,
     workflow: &str,
-    title: &str,
+    title: Line<'static>,
     age_or_elapsed: &str,
     style: Style,
     cw: &ColWidths,
@@ -1226,7 +1212,7 @@ fn branch_row<'a>(
         Cell::from(format::truncate(branch_col, cw.branch)),
         Cell::from(format::truncate(status_text, cw.status)).style(style),
         Cell::from(format::truncate(workflow, cw.workflow)),
-        Cell::from(format::truncate(title, cw.title)),
+        Cell::from(title),
         Cell::from(age_or_elapsed.to_string()).style(style),
     ])
 }
@@ -1300,12 +1286,13 @@ fn render_repo_header<'a>(
         } else {
             format!("{} {}", sb.branch, sb.pr_badge)
         };
+        let title = title_line(&sb.title, sb.failing_steps.as_deref(), cw.title);
         Row::new(vec![
             Cell::from(format::truncate(&name, cw.repo)).style(repo_style),
             Cell::from(format::truncate(&branch_text, cw.branch)),
             Cell::from(format::truncate(&inline_status, cw.status)).style(style),
             Cell::from(format::truncate(&sb.workflows, cw.workflow)),
-            Cell::from(format::truncate(&sb.title, cw.title)),
+            Cell::from(title),
             Cell::from(age).style(style),
         ])
     } else {
@@ -1387,6 +1374,7 @@ fn render_active_run<'a>(
     } else {
         format!("{emoji} {}{sfx} {extra_badge}", format::status(status_str))
     };
+    let title = Line::from(format::truncate(&run.title, cw.title));
     if is_workflow_child {
         branch_row(
             &run.workflow,
@@ -1395,7 +1383,7 @@ fn render_active_run<'a>(
             tree_prefix,
             &status_text,
             "",
-            &run.title,
+            title,
             &elapsed,
             style,
             cw,
@@ -1410,7 +1398,7 @@ fn render_active_run<'a>(
             tree_prefix,
             &status_text,
             &run.workflow,
-            &run.title,
+            title,
             &elapsed,
             style,
             cw,
@@ -1439,6 +1427,7 @@ fn render_last_build<'a>(
         .unwrap_or_default();
     let sfx = attempt_suffix(build.attempt);
     let status_text = format!("{emoji} {}{sfx}", format::status(conclusion_str));
+    let title = title_line(&build.title, build.failing_steps.as_deref(), cw.title);
     if is_workflow_child {
         branch_row(
             &build.workflow,
@@ -1447,7 +1436,7 @@ fn render_last_build<'a>(
             tree_prefix,
             &status_text,
             "",
-            &build.title,
+            title,
             &age,
             style,
             cw,
@@ -1462,7 +1451,7 @@ fn render_last_build<'a>(
             tree_prefix,
             &status_text,
             &build.workflow,
-            &build.title,
+            title,
             &age,
             style,
             cw,
@@ -1486,7 +1475,7 @@ fn render_never_ran<'a>(
         tree_prefix,
         if waiting { "⏳ waiting" } else { "· idle" },
         "",
-        "",
+        Line::default(),
         "",
         Style::default().fg(Color::DarkGray),
         cw,
@@ -1516,7 +1505,7 @@ fn render_branch_header<'a>(
         tree_prefix,
         status_text,
         &wf_label,
-        "",
+        Line::default(),
         age_or_elapsed,
         style,
         cw,
@@ -1578,15 +1567,6 @@ fn render_display_row<'a>(
             cw,
             mute_indicator,
         ),
-        DisplayRow::FailingSteps { steps, tree_indent } => Row::new(vec![
-            Cell::from(format!("  {tree_indent}")),
-            Cell::from(""),
-            Cell::from(""),
-            Cell::from(""),
-            Cell::from(format!("↳ {}", format::truncate(steps, cw.title)))
-                .style(Style::default().fg(COLOR_FAILURE)),
-            Cell::from(""),
-        ]),
         DisplayRow::LastBuild {
             branch,
             build,
@@ -1733,7 +1713,19 @@ fn render_detail_bar(
                 }
                 if sb.attempt > 1 {
                     s.push(detail_sep());
-                    s.push(Span::styled(format!("({})", sb.attempt), dim));
+                    s.push(Span::styled("retry ", label_style));
+                    s.push(Span::styled(
+                        format!("#{}", sb.attempt),
+                        Style::default().fg(Color::Yellow),
+                    ));
+                }
+                if let Some(steps) = &sb.failing_steps {
+                    s.push(detail_sep());
+                    s.push(Span::styled("failed: ", label_style));
+                    s.push(Span::styled(
+                        steps.clone(),
+                        Style::default().fg(COLOR_FAILURE),
+                    ));
                 }
             } else {
                 s.push(detail_sep());
@@ -1790,7 +1782,11 @@ fn render_detail_bar(
             }
             if run.attempt > 1 {
                 s.push(detail_sep());
-                s.push(Span::styled(format!("({})", run.attempt), dim));
+                s.push(Span::styled("retry ", label_style));
+                s.push(Span::styled(
+                    format!("#{}", run.attempt),
+                    Style::default().fg(Color::Yellow),
+                ));
             }
             if let Some(elapsed) = run.elapsed_secs {
                 s.push(detail_sep());
@@ -1817,7 +1813,11 @@ fn render_detail_bar(
             ];
             if build.attempt > 1 {
                 s.push(detail_sep());
-                s.push(Span::styled(format!("({})", build.attempt), dim));
+                s.push(Span::styled("retry ", label_style));
+                s.push(Span::styled(
+                    format!("#{}", build.attempt),
+                    Style::default().fg(Color::Yellow),
+                ));
             }
             if let Some(steps) = &build.failing_steps {
                 s.push(detail_sep());
@@ -1873,7 +1873,7 @@ fn render_detail_bar(
                 Span::styled(format!("{workflow_count} workflows ({state})"), dim),
             ]
         }
-        Some(DisplayRow::FailingSteps { .. }) | None => vec![],
+        None => vec![],
     };
 
     // Pad with a leading space to align with the body panel's inner content.
@@ -1887,15 +1887,23 @@ pub(crate) fn render_footer(frame: &mut ratatui::Frame, area: ratatui::layout::R
         .fg(Color::DarkGray)
         .add_modifier(Modifier::BOLD);
     let footer = match &app.input_mode {
-        InputMode::TextInput { prompt, buffer, .. } => Paragraph::new(Line::from(vec![
-            Span::styled(prompt.as_str(), Style::default().fg(Color::Cyan)),
-            Span::raw(buffer.as_str()),
-            Span::styled("█", Style::default().fg(Color::Cyan)),
-            Span::styled(
-                "  [Enter] confirm  [Esc] cancel",
-                Style::default().fg(Color::DarkGray),
-            ),
-        ])),
+        InputMode::TextInput { prompt, editor, .. } => {
+            let (before, cursor_ch, after) = editor.split_at_cursor();
+            let cursor_str = cursor_ch.unwrap_or(' ').to_string();
+            Paragraph::new(Line::from(vec![
+                Span::styled(prompt.as_str(), Style::default().fg(Color::Cyan)),
+                Span::raw(before.to_string()),
+                Span::styled(
+                    cursor_str,
+                    Style::default().fg(Color::Black).bg(Color::Cyan),
+                ),
+                Span::raw(after.to_string()),
+                Span::styled(
+                    "  [Enter] confirm  [Esc] cancel",
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]))
+        }
         InputMode::Form { .. }
         | InputMode::NotificationPicker { .. }
         | InputMode::History { .. } => Paragraph::new(""),
@@ -1905,7 +1913,7 @@ pub(crate) fn render_footer(frame: &mut ratatui::Frame, area: ratatui::layout::R
                 // ── Navigate ──────────────────────────────────────────────
                 Span::styled("[↑↓/jk]", key_style),
                 Span::raw(" nav  "),
-                Span::styled("[e/E]", key_style),
+                Span::styled("[Tab/⇧Tab]", key_style),
                 Span::raw(" expand"),
                 sep.clone(),
                 // ── Repos ─────────────────────────────────────────────────
@@ -2129,7 +2137,6 @@ pub(crate) fn render_form_popup(
     let active_label_style = Style::default()
         .fg(Color::Cyan)
         .add_modifier(Modifier::BOLD);
-    let cursor_style = Style::default().fg(Color::Cyan);
 
     // Find the longest label for alignment
     let label_width = fields.iter().map(|f| f.label.len()).max().unwrap_or(0);
@@ -2179,13 +2186,19 @@ pub(crate) fn render_form_popup(
                 Style::default().fg(Color::DarkGray)
             };
             spans.push(Span::styled("◀ ", arrow_style));
-            spans.push(Span::raw(&field.buffer));
+            spans.push(Span::raw(field.buffer().to_string()));
             spans.push(Span::styled(" ▶", arrow_style));
         } else if is_active {
-            spans.push(Span::raw(&field.buffer));
-            spans.push(Span::styled("█", cursor_style));
+            let (before, cursor_ch, after) = field.editor.split_at_cursor();
+            let cursor_str = cursor_ch.unwrap_or(' ').to_string();
+            spans.push(Span::raw(before.to_string()));
+            spans.push(Span::styled(
+                cursor_str,
+                Style::default().fg(Color::Black).bg(Color::Cyan),
+            ));
+            spans.push(Span::raw(after.to_string()));
         } else {
-            spans.push(Span::raw(&field.buffer));
+            spans.push(Span::raw(field.buffer().to_string()));
         }
 
         frame.render_widget(Paragraph::new(Line::from(spans)), cols[1]);

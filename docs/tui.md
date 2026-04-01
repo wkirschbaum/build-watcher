@@ -29,7 +29,7 @@ build-watcher — up 2h 15m                    poll 15s/60s  API 4521/5000 (90%)
 │ floatpays/benefits  main  ✓ success  CI  Fix login bug  2m 01s  5m ago                      │
 └─────────────────────────────────────────────────────────────────────────────────────────────┘
  floatpays/moneyclub  ·  main  ·  failure  ·  run 12345  ·  failed: Build / Run tests
-─[↑↓/jk] nav  [e/E] expand  │  [a] add  [b] branch  [d] del  [o/O] open  [r/R] rerun  │  [n/N] mute  [p] pause  [h] hist  [H] recent  │  [s/S] sort  [g/G] group  [C] config  │  [q] quit  [Q] stop  [?] hide
+─[↑↓/jk] nav  [Tab/⇧Tab] expand  │  [a] add  [b] branch  [d] del  [o/O] open  [r/R] rerun  │  [n/N] mute  [p] pause  [h] hist  [H] recent  │  [s/S] sort  [g/G] group  [C] config  │  [q] quit  [Q] stop  [?] hide
 ```
 
 **Header line 1:** daemon uptime, polling intervals (active/idle), GitHub API rate limit and reset time.
@@ -50,15 +50,14 @@ build-watcher — up 2h 15m                    poll 15s/60s  API 4521/5000 (90%)
 |-----|--------|
 | `↑` / `k` | Move cursor up |
 | `↓` / `j` | Move cursor down |
-| `e` | Cycle expand level for selected repo (Full → Branches → Collapsed) |
-| `E` | Cycle expand level for all repos simultaneously |
-| `←` | Collapse selected row (repo → branches → collapsed) |
-| `→` / `Tab` / `Enter` | Expand selected row |
+| `Tab` / `Enter` | Cycle expand level: repo row cycles Collapsed → Branches → Full; branch row toggles workflow visibility; no-op on workflow rows |
+| `Shift-Tab` / `E` | Cycle expand level for all repos simultaneously |
 | `a` | Add a repo to watch |
 | `d` | Remove selected repo or branch |
 | `b` | Set branches for selected repo |
 | `r` | Rerun failed jobs for selected build |
 | `R` | Rerun all jobs for selected build |
+| `M` | Merge the first PR targeting the selected branch |
 | `o` | Open failed job or current run in browser |
 | `O` | Open repo Actions page in browser |
 | `n` | Toggle mute for selected repo/branch |
@@ -68,7 +67,7 @@ build-watcher — up 2h 15m                    poll 15s/60s  API 4521/5000 (90%)
 | `p` | Toggle notification pause |
 | `s` / `S` | Cycle sort column forward / backward |
 | `g` / `G` | Cycle group-by forward / backward |
-| `C` | Edit global config (default branches, ignored workflows, poll aggression) |
+| `C` | Edit global config (ignored workflows, ignored events, poll aggression, auto-discover, branch filter) |
 | `?` | Toggle help bar |
 | `q` | Quit |
 | `Q` | Quit and shut down daemon |
@@ -89,7 +88,7 @@ The TUI connects to the daemon via HTTP endpoints:
 - **`GET /defaults`** and **`POST /defaults`** — Global config management
 - **`GET /notifications`** and **`POST /notifications`** — Per-repo/branch notification config
 - **`POST /watch`**, **`/unwatch`**, **`/branches`** — Watch management
-- **`POST /pause`**, **`/rerun`**, **`/shutdown`** — Actions
+- **`POST /pause`**, **`/rerun`**, **`/merge`**, **`/shutdown`** — Actions
 
 Initial data is fetched concurrently via `tokio::join!`. Updates arrive via SSE and are applied in-place to the local state. A `/status` + `/stats` + `/history/all` resync runs on every SSE (re)connect and every 30 seconds as a fallback. Elapsed times and build ages tick locally every second.
 

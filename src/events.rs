@@ -83,6 +83,7 @@ pub enum WatchEvent {
     PrStateChanged {
         repo: String,
         branch: String,
+        target_branch: String,
         number: u64,
         title: String,
         url: String,

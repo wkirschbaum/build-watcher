@@ -173,9 +173,6 @@ fn load_config() -> (Config, bool) {
 
 /// Load config, apply startup validation, and re-save to normalise the schema.
 ///
-/// Validation rules applied after loading:
-/// - `default_branches` must not be empty (reset to `["main"]` if so).
-///
 /// Re-save is skipped when we fell back to the backup file, to avoid overwriting
 /// the primary with backup data before the user has a chance to inspect it.
 pub fn load_and_normalize() -> Config {
@@ -193,20 +190,7 @@ pub fn load_and_normalize() -> Config {
         needs_save = true;
     }
 
-    if cfg.default_branches.is_empty() {
-        tracing::warn!(
-            "config: 'default_branches' is empty — no branches would be watched. \
-             Resetting to [\"main\"]."
-        );
-        cfg.default_branches = default_branches();
-    }
-
     // Validate repo and branch names loaded from config.
-    for branch in &cfg.default_branches {
-        if let Err(e) = crate::github::validate_branch(branch) {
-            tracing::warn!("config: invalid default branch: {e}");
-        }
-    }
     let repo_names: Vec<String> = cfg.repos.keys().cloned().collect();
     for repo in &repo_names {
         if let Err(e) = crate::github::validate_repo(repo) {
@@ -278,7 +262,7 @@ mod tests {
         std::fs::write(&path, "not json").unwrap();
 
         let loaded: Config = load_json(&path).unwrap();
-        assert_eq!(loaded.default_branches, vec!["main".to_string()]);
+        assert_eq!(loaded.schema_version, CURRENT_SCHEMA_VERSION);
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -388,12 +372,12 @@ mod tests {
     }
 
     #[test]
-    fn branches_for_defaults_to_main() {
+    fn branches_for_returns_empty_when_unconfigured() {
         let config = Config::default();
-        assert_eq!(config.branches_for("unknown/repo"), ["main"]);
-        // Repo with no branch config also falls back to defaults
+        assert!(config.branches_for("unknown/repo").is_empty());
+        // Repo with no branch config returns empty slice
         let config = config_with_repos(&["alice/app"]);
-        assert_eq!(config.branches_for("alice/app"), ["main"]);
+        assert!(config.branches_for("alice/app").is_empty());
     }
 
     #[test]
@@ -461,29 +445,6 @@ mod tests {
     }
 
     #[test]
-    fn default_branches_empty_is_reset_to_main() {
-        let dir = std::env::temp_dir().join(format!("bw-test-empty-br-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("config.json");
-        std::fs::write(&path, r#"{"default_branches": []}"#).unwrap();
-
-        let cfg = load_config_lenient(&path).unwrap();
-        assert!(
-            cfg.default_branches.is_empty(),
-            "lenient load keeps the empty vec as-is"
-        );
-
-        // Simulate load_and_normalize validation
-        let mut cfg = cfg;
-        if cfg.default_branches.is_empty() {
-            cfg.default_branches = default_branches();
-        }
-        assert_eq!(cfg.default_branches, vec!["main".to_string()]);
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
     fn notification_level_unknown_variant_falls_back_to_normal() {
         let level: NotificationLevel = serde_json::from_str("\"urgent\"").unwrap();
         assert_eq!(level, NotificationLevel::Normal);
@@ -518,16 +479,16 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.json");
 
-        // Write config with a wrong type for default_branches (number instead of array)
+        // Write config with a wrong type for ignored_workflows (number instead of array)
         std::fs::write(
             &path,
-            r#"{"default_branches": 42, "repos": {"alice/app": {}}}"#,
+            r#"{"ignored_workflows": 42, "repos": {"alice/app": {}}}"#,
         )
         .unwrap();
 
         let cfg = load_config_lenient(&path).unwrap();
         // Bad field falls back to default
-        assert_eq!(cfg.default_branches, vec!["main".to_string()]);
+        assert!(cfg.ignored_workflows.is_empty());
         // Good field is preserved
         assert!(cfg.repos.contains_key("alice/app"));
 
@@ -562,7 +523,7 @@ mod tests {
 
     #[test]
     fn schema_version_defaults_to_zero_for_old_configs() {
-        let cfg: Config = serde_json::from_str(r#"{"default_branches": ["main"]}"#).unwrap();
+        let cfg: Config = serde_json::from_str(r#"{"repos": {}}"#).unwrap();
         assert_eq!(cfg.schema_version, 0);
     }
 

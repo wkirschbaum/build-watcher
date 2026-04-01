@@ -40,7 +40,11 @@ impl DaemonClient {
         resp.json::<T>().await.map_err(|e| format!("parse: {e}"))
     }
 
-    async fn post_json<T: Serialize>(&self, path: &str, body: &T) -> Result<(), String> {
+    async fn post_response<T: Serialize>(
+        &self,
+        path: &str,
+        body: &T,
+    ) -> Result<serde_json::Value, String> {
         let resp = self
             .client
             .post(self.url(path))
@@ -51,12 +55,29 @@ impl DaemonClient {
         if !resp.status().is_success() {
             return Err(format!("{path}: HTTP {}", resp.status()));
         }
-        // Daemon handlers return {"error": "..."} on validation failures (with 200 status).
         let json: serde_json::Value = resp.json().await.map_err(|e| format!("{path}: {e}"))?;
         if let Some(err) = json.get("error").and_then(|v| v.as_str()) {
             return Err(err.to_string());
         }
-        Ok(())
+        Ok(json)
+    }
+
+    async fn post_json<T: Serialize>(&self, path: &str, body: &T) -> Result<(), String> {
+        self.post_response(path, body).await.map(|_| ())
+    }
+
+    async fn post_with_message<T: Serialize>(
+        &self,
+        path: &str,
+        body: &T,
+        default_msg: &str,
+    ) -> Result<String, String> {
+        let json = self.post_response(path, body).await?;
+        Ok(json
+            .get("message")
+            .and_then(|v| v.as_str())
+            .unwrap_or(default_msg)
+            .to_string())
     }
 
     pub(crate) async fn pause(&self, pause: bool) -> Result<(), String> {
@@ -190,30 +211,26 @@ impl DaemonClient {
             run_id: Option<u64>,
             failed_only: bool,
         }
-        let resp = self
-            .client
-            .post(self.url("/rerun"))
-            .json(&Req {
+        self.post_with_message(
+            "/rerun",
+            &Req {
                 repo,
                 run_id,
                 failed_only,
-            })
-            .send()
+            },
+            "Rerun triggered",
+        )
+        .await
+    }
+
+    pub(crate) async fn merge_pr(&self, repo: &str, number: u64) -> Result<String, String> {
+        #[derive(Serialize)]
+        struct Req<'a> {
+            repo: &'a str,
+            number: u64,
+        }
+        self.post_with_message("/merge", &Req { repo, number }, "PR merged")
             .await
-            .map_err(|e| format!("/rerun: {e}"))?;
-        if !resp.status().is_success() {
-            return Err(format!("/rerun: HTTP {}", resp.status()));
-        }
-        let json: serde_json::Value = resp.json().await.map_err(|e| format!("/rerun: {e}"))?;
-        if let Some(err) = json.get("error").and_then(|v| v.as_str()) {
-            return Err(err.to_string());
-        }
-        let message = json
-            .get("message")
-            .and_then(|v| v.as_str())
-            .unwrap_or("Rerun triggered")
-            .to_string();
-        Ok(message)
     }
 
     pub(crate) async fn shutdown(&self) -> Result<(), String> {

@@ -65,15 +65,73 @@ pub(super) fn runs_for_branch<'a>(runs: &'a [RunInfo], branch: &str) -> Vec<&'a 
     runs.iter().filter(|r| r.head_branch == branch).collect()
 }
 
-/// Filter runs by workflow allow-list and ignore-list. Case-insensitive matching.
+/// A single ignore-list filter dimension: extracts a string field from RunInfo
+/// and checks it against a list of ignored values (case-insensitive).
+pub(super) struct IgnoreFilter<'a> {
+    pub field: fn(&RunInfo) -> &str,
+    pub ignored: &'a [String],
+}
+
+/// Snapshot of all run-filtering config for a repo: workflow allow-list + ignore lists.
+/// Read once from config, then reused for all `filter_runs` calls in a poll cycle.
+pub(super) struct RunFilters {
+    pub workflows: Vec<String>,
+    pub ignored_workflows: Vec<String>,
+    pub ignored_events: Vec<String>,
+}
+
+impl RunFilters {
+    /// Read the filtering config for a repo from the shared config manager.
+    pub(super) async fn from_config(
+        config: &crate::config::SharedConfigManager,
+        repo: &str,
+    ) -> Self {
+        let cfg = config.read().await;
+        Self {
+            workflows: cfg.workflows_for(repo).to_vec(),
+            ignored_workflows: cfg.ignored_workflows.clone(),
+            ignored_events: cfg.ignored_events_for(repo),
+        }
+    }
+
+    /// Build the ignore-filter slice for use with `filter_runs`.
+    pub(super) fn ignore_filters(&self) -> [IgnoreFilter<'_>; 2] {
+        [
+            IgnoreFilter {
+                field: |r| &r.workflow,
+                ignored: &self.ignored_workflows,
+            },
+            IgnoreFilter {
+                field: |r| &r.event,
+                ignored: &self.ignored_events,
+            },
+        ]
+    }
+
+    /// Convenience: filter runs using this config's allow-list and ignore lists.
+    pub(super) fn filter<'a, R: std::borrow::Borrow<RunInfo> + 'a>(
+        &self,
+        runs: &'a [R],
+    ) -> Vec<&'a RunInfo> {
+        let filters = self.ignore_filters();
+        filter_runs(runs, &self.workflows, &filters)
+    }
+}
+
+/// Filter runs by workflow allow-list and ignore-list dimensions. Case-insensitive matching.
 fn filter_runs<'a, R: std::borrow::Borrow<RunInfo> + 'a>(
     runs: &'a [R],
     workflows: &[String],
-    ignored: &[String],
+    ignore_filters: &[IgnoreFilter<'_>],
 ) -> Vec<&'a RunInfo> {
     runs.iter()
         .map(|r| r.borrow())
-        .filter(|r| !ignored.iter().any(|i| r.workflow.eq_ignore_ascii_case(i)))
+        .filter(|r| {
+            !ignore_filters.iter().any(|f| {
+                let val = (f.field)(r);
+                f.ignored.iter().any(|i| val.eq_ignore_ascii_case(i))
+            })
+        })
         .filter(|r| {
             workflows.is_empty() || workflows.iter().any(|w| r.workflow.eq_ignore_ascii_case(w))
         })

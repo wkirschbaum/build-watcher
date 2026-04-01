@@ -328,7 +328,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 maybe_event = keyboard.next() => {
                     match maybe_event {
                         Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
-                            if app.handle_input(key.code, active_daemon) {
+                            if app.handle_input(key.code, key.modifiers, active_daemon) {
                                 continue;
                             }
                             match app.handle_normal_key(key.code, key.modifiers, active_daemon) {

@@ -161,9 +161,9 @@ pub struct WatchStatus {
     /// Last completed build per workflow.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub last_builds: Vec<LastBuildView>,
-    /// Open PR targeting this branch, if any.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pr: Option<PrView>,
+    /// Open PRs targeting this branch.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prs: Vec<PrView>,
     /// Whether notifications are muted for this repo (all levels set to off).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub muted: bool,
@@ -213,9 +213,9 @@ pub struct HistoryEntryView {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DefaultsConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub default_branches: Option<Vec<String>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ignored_workflows: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ignored_events: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub poll_aggression: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -236,6 +236,10 @@ pub struct RepoConfigView {
     pub watch_prs: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub poll_aggression: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_discover_branches: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch_filter: Option<String>,
 }
 
 /// Daemon stats returned by `GET /stats`.
@@ -331,23 +335,27 @@ impl StatusResponse {
             }
             WatchEvent::PrStateChanged {
                 repo,
-                branch,
+                target_branch,
                 number,
                 title,
                 url,
                 to,
                 ..
             } => {
-                // Find the watch for the PR's source branch and update it.
-                if let Some(watch) = find_watch_mut(&mut self.watches, &repo, &branch) {
-                    watch.pr = Some(PrView {
-                        number,
-                        title,
-                        url,
-                        author: String::new(),
-                        merge_state: to,
-                        draft: false,
-                    });
+                // Find the watch for the PR's target branch and upsert the PR.
+                if let Some(watch) = find_watch_mut(&mut self.watches, &repo, &target_branch) {
+                    if let Some(existing) = watch.prs.iter_mut().find(|p| p.number == number) {
+                        existing.merge_state = to;
+                    } else {
+                        watch.prs.push(PrView {
+                            number,
+                            title,
+                            url,
+                            author: String::new(),
+                            merge_state: to,
+                            draft: false,
+                        });
+                    }
                 }
             }
         }
@@ -387,11 +395,7 @@ mod tests {
         WatchStatus {
             repo: repo.to_string(),
             branch: branch.to_string(),
-            active_runs: vec![],
-            last_builds: vec![],
-            pr: None,
-            muted: false,
-            waiting: false,
+            ..Default::default()
         }
     }
 
@@ -481,10 +485,7 @@ mod tests {
                 attempt: 1,
                 url: String::new(),
             }],
-            last_builds: vec![],
-            pr: None,
-            muted: false,
-            waiting: false,
+            ..Default::default()
         }]);
 
         status.apply_event(WatchEvent::RunCompleted {

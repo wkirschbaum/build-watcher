@@ -46,6 +46,24 @@ pub(crate) struct DaemonState {
     pub started_at: std::time::Instant,
 }
 
+/// Check if a run should be hidden based on ignored workflow and event lists.
+fn is_ignored(
+    cfg: Option<&build_watcher::config::Config>,
+    repo: &str,
+    workflow: &str,
+    event: &str,
+) -> bool {
+    cfg.is_some_and(|cfg| {
+        cfg.ignored_workflows
+            .iter()
+            .any(|i| workflow.eq_ignore_ascii_case(i))
+            || cfg
+                .ignored_events_for(repo)
+                .iter()
+                .any(|i| event.eq_ignore_ascii_case(i))
+    })
+}
+
 /// Build a snapshot of all current watches from already-locked state.
 ///
 /// Pure function (no async, no locks) — callers acquire the locks and pass
@@ -63,13 +81,7 @@ pub(crate) fn build_watch_snapshot(
             let mut active_runs: Vec<ActiveRunView> = entry
                 .active_runs
                 .iter()
-                .filter(|(_, run)| {
-                    config.is_none_or(|cfg| {
-                        !cfg.ignored_workflows
-                            .iter()
-                            .any(|i| run.workflow.eq_ignore_ascii_case(i))
-                    })
-                })
+                .filter(|(_, run)| !is_ignored(config, &key.repo, &run.workflow, &run.event))
                 .map(|(run_id, run)| {
                     let elapsed_secs =
                         build_watcher::github::elapsed_since(&run.created_at, now_unix);
@@ -90,13 +102,7 @@ pub(crate) fn build_watch_snapshot(
             let mut last_builds: Vec<LastBuildView> = entry
                 .last_builds
                 .values()
-                .filter(|lb| {
-                    config.is_none_or(|cfg| {
-                        !cfg.ignored_workflows
-                            .iter()
-                            .any(|i| lb.workflow.eq_ignore_ascii_case(i))
-                    })
-                })
+                .filter(|lb| !is_ignored(config, &key.repo, &lb.workflow, &lb.event))
                 .map(|lb| {
                     let age_secs = lb.completed_at.map(|t| now_unix.saturating_sub(t) as f64);
                     let conclusion = lb
@@ -122,21 +128,25 @@ pub(crate) fn build_watch_snapshot(
             let muted = config
                 .is_some_and(|cfg| cfg.notifications_for(&key.repo, &key.branch).is_all_off());
 
-            let pr = entry.pr.as_ref().map(|pr| PrView {
-                number: pr.number,
-                title: pr.title.clone(),
-                url: pr.url.clone(),
-                author: pr.author.clone(),
-                merge_state: pr.merge_state.clone(),
-                draft: pr.draft,
-            });
+            let prs = entry
+                .prs
+                .iter()
+                .map(|pr| PrView {
+                    number: pr.number,
+                    title: pr.title.clone(),
+                    url: pr.url.clone(),
+                    author: pr.author.clone(),
+                    merge_state: pr.merge_state.clone(),
+                    draft: pr.draft,
+                })
+                .collect();
 
             WatchStatus {
                 repo: key.repo.clone(),
                 branch: key.branch.clone(),
                 active_runs,
                 last_builds,
-                pr,
+                prs,
                 muted,
                 waiting: entry.waiting,
             }
@@ -216,6 +226,7 @@ fn build_router(state: DaemonState, ct: &CancellationToken) -> axum::Router {
         .route("/events", get(rest::events_handler))
         .route("/pause", axum::routing::post(rest::pause_handler))
         .route("/rerun", axum::routing::post(rest::rerun_handler))
+        .route("/merge", axum::routing::post(rest::merge_handler))
         .route("/watch", axum::routing::post(rest::watch_handler))
         .route("/unwatch", axum::routing::post(rest::unwatch_handler))
         .route(

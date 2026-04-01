@@ -241,6 +241,9 @@ pub struct RepoConfig {
     pub branches: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub workflows: Vec<String>,
+    /// Per-repo event ignore list (merged with global `ignored_events`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ignored_events: Vec<String>,
     #[serde(default, skip_serializing_if = "NotificationOverrides::is_empty")]
     pub notifications: NotificationOverrides,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
@@ -251,6 +254,16 @@ pub struct RepoConfig {
     /// Per-repo poll aggression override. Falls back to the global setting when `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub poll_aggression: Option<PollAggression>,
+    /// Per-repo auto-discover override. Falls back to the global setting when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_discover_branches: Option<bool>,
+    /// Per-repo branch filter regex override. Falls back to the global setting when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch_filter: Option<String>,
+    /// Branches found by auto-discover. Managed by the poller, not the user.
+    /// Persisted so they survive restarts, but pruned when no longer active.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub discovered_branches: Vec<String>,
 }
 
 /// Current schema version. Bump when making breaking changes to the config format.
@@ -262,10 +275,10 @@ pub struct Config {
     /// field deserialize as 0; `load_and_normalize` migrates them to `CURRENT_SCHEMA_VERSION`.
     #[serde(default)]
     pub schema_version: u32,
-    #[serde(default = "default_branches")]
-    pub default_branches: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ignored_workflows: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ignored_events: Vec<String>,
     #[serde(default)]
     pub poll_aggression: PollAggression,
     #[serde(default)]
@@ -280,16 +293,12 @@ pub struct Config {
     pub repos: HashMap<String, RepoConfig>,
 }
 
-pub(crate) fn default_branches() -> Vec<String> {
-    vec!["main".to_string()]
-}
-
 impl Default for Config {
     fn default() -> Self {
         Self {
             schema_version: CURRENT_SCHEMA_VERSION,
-            default_branches: default_branches(),
             ignored_workflows: Vec::new(),
+            ignored_events: Vec::new(),
             notifications: NotificationConfig::default(),
             quiet_hours: None,
             poll_aggression: PollAggression::default(),

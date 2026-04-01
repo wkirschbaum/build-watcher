@@ -107,7 +107,7 @@ build-watcher -- up 2h 15m                    poll 15s . 60s [medium]  API 4521 
 | wkirschbaum/build.. main      . success       CI             Add TUI           2h ago         |
 +----------------------------------------------------------------------------------------------+
  floatpays/moneyclub  .  main  .  failure  .  run 12345  .  failed: Build / Run tests
--[..../jk] nav  [e/E] expand  |  [a] add  [b] branch  [d] del  [o/O] open  [r/R] rerun  |  [n/N] mute  [p] pause  [h] hist  [H] recent  |  [s/S] sort  [g/G] group  [C] config  |  [q] quit  [Q] stop  [?] hide
+-[..../jk] nav  [Tab/⇧Tab] expand  |  [a] add  [b] branch  [d] del  [o/O] open  [r/R] rerun  |  [n/N] mute  [p] pause  [h] hist  [H] recent  |  [s/S] sort  [g/G] group  [C] config  |  [q] quit  [Q] stop  [?] hide
 ```
 
 The **header** shows daemon uptime, current poll intervals, API rate limit usage, and status indicators (paused, connecting, update available).
@@ -122,7 +122,7 @@ Repos can be expanded to three levels:
 - **Branches** -- repo + branch rows
 - **Full** -- repo + branch + per-workflow detail rows (default)
 
-Use `e`/`Enter` to cycle the selected repo, or `E` to toggle all repos at once. Expand state is persisted across sessions.
+Use `Tab`/`Enter` to cycle expand level on the selected row, or `Shift-Tab` to cycle all repos at once. On a repo row, it cycles Collapsed → Branches → Full. On a branch row, it toggles workflow visibility. On workflow rows, it does nothing. Expand state is persisted across sessions.
 
 #### Sorting and Grouping
 
@@ -135,12 +135,13 @@ Use `e`/`Enter` to cycle the selected repo, or `E` to toggle all repos at once. 
 | Key | Action |
 | --- | --- |
 | `Up`/`Down` or `j`/`k` | Navigate rows |
-| `e` / `Enter` | Expand/collapse selected repo |
-| `E` | Global expand/collapse toggle |
+| `Tab` / `Enter` | Cycle expand level (repo: Collapsed → Branches → Full; branch: toggle workflows) |
+| `Shift-Tab` / `E` | Cycle expand level for all repos |
 | `a` | Add a repo to watch |
 | `d` | Remove selected repo or branch |
 | `b` | Set branches for selected repo |
 | `r` / `R` | Rerun failed jobs / all jobs for selected build |
+| `M` | Merge the first PR targeting the selected branch |
 | `o` | Open failed job or current run in browser |
 | `O` | Open repo Actions page in browser |
 | `n` | Toggle mute for selected repo/branch |
@@ -244,6 +245,7 @@ The daemon exposes REST endpoints on the same port for the TUI and other consume
 | `/branches` | POST | Update branch config for a repo |
 | `/pause` | POST | Toggle notification pause |
 | `/rerun` | POST | Rerun a build by repo and run ID |
+| `/merge` | POST | Merge a PR by repo and PR number |
 | `/shutdown` | POST | Graceful daemon shutdown |
 
 ## Managing the service

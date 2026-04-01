@@ -52,21 +52,14 @@ fn make_entry() -> WatchEntry {
             (101, make_active(RunStatus::InProgress)),
             (102, make_active(RunStatus::Queued)),
         ]),
-        failure_counts: HashMap::new(),
-        last_builds: HashMap::new(),
-        pr: None,
-        waiting: false,
+        ..Default::default()
     }
 }
 
 fn idle_entry(last_seen: u64) -> WatchEntry {
     WatchEntry {
         last_seen_run_id: last_seen,
-        active_runs: HashMap::new(),
-        failure_counts: HashMap::new(),
-        last_builds: HashMap::new(),
-        pr: None,
-        waiting: false,
+        ..Default::default()
     }
 }
 
@@ -89,6 +82,7 @@ fn make_last_build(run_id: u64, conclusion: &str) -> crate::github::LastBuild {
 
 // -- Mock GitHub client --
 
+#[derive(Default)]
 struct MockGitHub {
     runs: Vec<RunInfo>,
     failure_msg: Option<String>,
@@ -99,8 +93,7 @@ impl MockGitHub {
     fn with_runs(runs: Vec<RunInfo>) -> Arc<dyn crate::github::GitHubClient> {
         Arc::new(Self {
             runs,
-            failure_msg: None,
-            prs: vec![],
+            ..Default::default()
         })
     }
 
@@ -111,15 +104,14 @@ impl MockGitHub {
         Arc::new(Self {
             runs,
             failure_msg: Some(failure_msg.to_string()),
-            prs: vec![],
+            ..Default::default()
         })
     }
 
     fn with_prs(prs: Vec<crate::github::PrInfo>) -> Arc<dyn crate::github::GitHubClient> {
         Arc::new(Self {
-            runs: vec![],
-            failure_msg: None,
             prs,
+            ..Default::default()
         })
     }
 }
@@ -184,6 +176,9 @@ impl crate::github::GitHubClient for MockGitHub {
     }
     async fn open_prs(&self, _: &str) -> Result<Vec<crate::github::PrInfo>, GhError> {
         Ok(self.prs.clone())
+    }
+    async fn pr_merge(&self, _: &str, _: u64) -> Result<String, GhError> {
+        Ok("Merged".to_string())
     }
 }
 
@@ -521,7 +516,12 @@ fn filter_runs_ignored_workflows() {
     r2.workflow = "Semgrep".to_string();
     let runs = vec![r1, r2];
 
-    let filtered = filter_runs(&runs, &[], &["semgrep".to_string()]);
+    let ignored = ["semgrep".to_string()];
+    let filters = [IgnoreFilter {
+        field: |r| &r.workflow,
+        ignored: &ignored,
+    }];
+    let filtered = filter_runs(&runs, &[], &filters);
     assert_eq!(filtered.len(), 1);
     assert_eq!(filtered[0].workflow, "CI");
 }
@@ -536,12 +536,43 @@ fn filter_runs_both_filters() {
     r3.workflow = "Semgrep".to_string();
     let runs = vec![r1, r2, r3];
 
-    let filtered = filter_runs(
-        &runs,
-        &["CI".to_string(), "Deploy".to_string()],
-        &["Semgrep".to_string()],
-    );
+    let ignored = ["Semgrep".to_string()];
+    let filters = [IgnoreFilter {
+        field: |r| &r.workflow,
+        ignored: &ignored,
+    }];
+    let filtered = filter_runs(&runs, &["CI".to_string(), "Deploy".to_string()], &filters);
     assert_eq!(filtered.len(), 2);
+}
+
+#[test]
+fn filter_runs_multiple_ignore_dimensions() {
+    let mut r1 = make_run(1, RunStatus::Completed, "success");
+    r1.workflow = "CI".to_string();
+    r1.event = "push".to_string();
+    let mut r2 = make_run(2, RunStatus::Completed, "success");
+    r2.workflow = "CI".to_string();
+    r2.event = "schedule".to_string();
+    let mut r3 = make_run(3, RunStatus::Completed, "success");
+    r3.workflow = "Semgrep".to_string();
+    r3.event = "push".to_string();
+    let runs = vec![r1, r2, r3];
+
+    let ignored_workflows = ["Semgrep".to_string()];
+    let ignored_events = ["schedule".to_string()];
+    let filters = [
+        IgnoreFilter {
+            field: |r| &r.workflow,
+            ignored: &ignored_workflows,
+        },
+        IgnoreFilter {
+            field: |r| &r.event,
+            ignored: &ignored_events,
+        },
+    ];
+    let filtered = filter_runs(&runs, &[], &filters);
+    assert_eq!(filtered.len(), 1);
+    assert_eq!(filtered[0].id, 1);
 }
 
 // -- last_failed_build tests --
@@ -1145,6 +1176,7 @@ fn make_pr(number: u64, branch: &str, state: crate::github::MergeState) -> crate
         number,
         title: format!("PR #{number}"),
         branch: branch.to_string(),
+        target_branch: "main".to_string(),
         url: format!("https://github.com/alice/app/pull/{number}"),
         author: "alice".to_string(),
         draft: false,

@@ -16,13 +16,13 @@ use build_watcher::watcher::{count_api_calls, is_paused};
 use super::DaemonState;
 use super::actions::{
     apply_levels, apply_pause, apply_quiet_hours, do_configure_branches, do_rerun, do_stop_watches,
-    do_watch_builds, format_outcomes, validate_hhmm,
+    do_watch_builds, format_outcomes, modify_ignore_list, validate_hhmm,
 };
 use super::build_watch_snapshot;
 use super::schema::{
-    BuildHistoryParams, ConfigureBranchesParams, ConfigureIgnoredWorkflowsParams,
-    ConfigureRepoParams, ReposParams, RerunBuildParams, SetPollAggressionParams,
-    UpdateNotificationsParams,
+    BuildHistoryParams, ConfigureBranchesParams, ConfigureIgnoredEventsParams,
+    ConfigureIgnoredWorkflowsParams, ConfigureRepoParams, ReposParams, RerunBuildParams,
+    SetPollAggressionParams, UpdateNotificationsParams, WatchFromGitRemoteParams,
 };
 
 #[derive(Clone)]
@@ -58,6 +58,30 @@ impl BuildWatcher {
         Ok(CallToolResult::success(vec![Content::text(
             format_outcomes(&results, "\n\n"),
         )]))
+    }
+
+    #[tool(
+        description = "Detect the GitHub repo from the origin remote of a local git repository \
+                       and start watching it. Pass the absolute path to the repo directory."
+    )]
+    async fn watch_from_git_remote(
+        &self,
+        Parameters(params): Parameters<WatchFromGitRemoteParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let repo = match build_watcher::github::repo_from_git_remote(&params.path).await {
+            Ok(r) => r,
+            Err(e) => {
+                return Ok(CallToolResult::error(vec![Content::text(format!(
+                    "Could not detect GitHub repo from {}: {e}",
+                    params.path
+                ))]));
+            }
+        };
+
+        let results = do_watch_builds(&self.state, std::slice::from_ref(&repo)).await;
+        let mut msg = format!("Detected repo: {repo}\n\n");
+        msg.push_str(&format_outcomes(&results, "\n\n"));
+        Ok(CallToolResult::success(vec![Content::text(msg)]))
     }
 
     #[tool(
@@ -140,9 +164,7 @@ impl BuildWatcher {
         )]))
     }
 
-    #[tool(
-        description = "Configure which branches to watch. If repo is given, overrides branches for that repo only. If repo is omitted, sets the global default branches used for repos without per-repo config."
-    )]
+    #[tool(description = "Configure which branches to watch for a specific repo.")]
     async fn configure_branches(
         &self,
         Parameters(params): Parameters<ConfigureBranchesParams>,
@@ -157,71 +179,13 @@ impl BuildWatcher {
                 return Ok(CallToolResult::error(vec![Content::text(e)]));
             }
         }
-
-        match params.repo {
-            None => {
-                // Validate branch_filter regex before applying.
-                if let Some(ref filter) = params.branch_filter
-                    && !filter.is_empty()
-                    && let Err(e) = regex::Regex::new(filter)
-                {
-                    return Ok(CallToolResult::error(vec![Content::text(format!(
-                        "invalid branch_filter regex: {e}"
-                    ))]));
-                }
-
-                let branches = params.branches;
-                let auto_discover = params.auto_discover_branches;
-                let filter = params.branch_filter;
-                let result = self
-                    .state
-                    .config
-                    .modify(|config| {
-                        let mut msgs = Vec::new();
-                        config.default_branches = branches;
-                        msgs.push(format!(
-                            "Default branches set to {:?}",
-                            config.default_branches
-                        ));
-                        if let Some(enabled) = auto_discover {
-                            config.auto_discover_branches = enabled;
-                            msgs.push(format!(
-                                "Auto-discover branches: {}",
-                                if enabled { "on" } else { "off" }
-                            ));
-                        }
-                        if let Some(filter) = filter {
-                            if filter.is_empty() {
-                                config.branch_filter = None;
-                                msgs.push("Branch filter cleared".to_string());
-                            } else {
-                                config.branch_filter = Some(filter.clone());
-                                msgs.push(format!("Branch filter: {filter}"));
-                            }
-                        }
-                        msgs
-                    })
-                    .await;
-                let msgs = match result {
-                    Ok(m) => m,
-                    Err(e) => vec![format!(
-                        "\u{26a0}\u{fe0f} Warning: config could not be saved to disk: {e}"
-                    )],
-                };
-                Ok(CallToolResult::success(vec![Content::text(
-                    msgs.join("\n"),
-                )]))
-            }
-            Some(repo) => {
-                if let Err(e) = validate_repo(&repo) {
-                    return Ok(CallToolResult::error(vec![Content::text(e)]));
-                }
-                let results = do_configure_branches(&self.state, &repo, params.branches).await;
-                Ok(CallToolResult::success(vec![Content::text(
-                    format_outcomes(&results, "\n"),
-                )]))
-            }
+        if let Err(e) = validate_repo(&params.repo) {
+            return Ok(CallToolResult::error(vec![Content::text(e)]));
         }
+        let results = do_configure_branches(&self.state, &params.repo, params.branches).await;
+        Ok(CallToolResult::success(vec![Content::text(
+            format_outcomes(&results, "\n"),
+        )]))
     }
 
     #[tool(
@@ -247,7 +211,14 @@ impl BuildWatcher {
         let throttled = active_secs > MIN_ACTIVE_SECS || idle_secs > MIN_IDLE_SECS;
 
         let paused = is_paused(&self.state.pause).await;
-        let (quiet_hours_label, quiet_active, notif_levels, ignored_workflows, repo_count) = {
+        let (
+            quiet_hours_label,
+            quiet_active,
+            notif_levels,
+            ignored_workflows,
+            ignored_events,
+            repo_count,
+        ) = {
             let cfg = self.state.config.read().await;
             let label = cfg.quiet_hours.as_ref().map_or_else(
                 || "off".to_string(),
@@ -255,9 +226,10 @@ impl BuildWatcher {
             );
             let active = cfg.is_in_quiet_hours();
             let levels = cfg.notifications.clone();
-            let ignored = cfg.ignored_workflows.clone();
+            let ignored_wf = cfg.ignored_workflows.clone();
+            let ignored_ev = cfg.ignored_events.clone();
             let repos = cfg.repos.len();
-            (label, active, levels, ignored, repos)
+            (label, active, levels, ignored_wf, ignored_ev, repos)
         };
 
         let uptime = format::seconds(self.state.started_at.elapsed().as_secs());
@@ -320,6 +292,14 @@ impl BuildWatcher {
             lines.push(format!(
                 "  Ignored workflows: {}",
                 ignored_workflows.join(", ")
+            ));
+        }
+        if ignored_events.is_empty() {
+            lines.push("  Ignored events   : (none)".to_string());
+        } else {
+            lines.push(format!(
+                "  Ignored events   : {}",
+                ignored_events.join(", ")
             ));
         }
 
@@ -419,43 +399,57 @@ impl BuildWatcher {
             .state
             .config
             .modify(|config| {
-                let mut added = Vec::new();
-                for w in &add {
-                    if !config
-                        .ignored_workflows
-                        .iter()
-                        .any(|existing| existing.eq_ignore_ascii_case(w))
-                    {
-                        config.ignored_workflows.push(w.clone());
-                        added.push(w.clone());
-                    }
-                }
+                modify_ignore_list(&mut config.ignored_workflows, &add, &remove, "workflow")
+            })
+            .await;
+        let msgs = match result {
+            Ok(m) => m,
+            Err(e) => vec![format!(
+                "\u{26a0}\u{fe0f} Warning: config could not be saved to disk: {e}"
+            )],
+        };
 
-                let before = config.ignored_workflows.len();
-                config
-                    .ignored_workflows
-                    .retain(|existing| !remove.iter().any(|w| w.eq_ignore_ascii_case(existing)));
-                let removed = before - config.ignored_workflows.len();
+        Ok(CallToolResult::success(vec![Content::text(
+            msgs.join("\n"),
+        )]))
+    }
 
-                let mut msgs = Vec::new();
-                if !added.is_empty() {
-                    msgs.push(format!("Added to ignore list: {}", added.join(", ")));
-                } else if !add.is_empty() {
-                    msgs.push("All specified workflows were already ignored".to_string());
-                }
-                if removed > 0 {
-                    msgs.push(format!("Removed from ignore list: {removed} workflow(s)"));
-                } else if !remove.is_empty() {
-                    msgs.push(
-                        "None of the specified workflows were in the ignore list".to_string(),
-                    );
-                }
-                if config.ignored_workflows.is_empty() {
-                    msgs.push("No workflows are globally ignored now.".to_string());
+    #[tool(
+        description = "Add to or remove from the ignored event types list. Runs triggered by ignored \
+                       events are never tracked or notified. Case-insensitive. Common events: push, \
+                       pull_request, schedule, workflow_dispatch. Pass add and/or remove — at least \
+                       one must be non-empty. Optionally scope to a repo (global if omitted)."
+    )]
+    async fn configure_ignored_events(
+        &self,
+        Parameters(params): Parameters<ConfigureIgnoredEventsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        if params.add.is_empty() && params.remove.is_empty() {
+            return Ok(CallToolResult::error(vec![Content::text(
+                "at least one of add or remove must be non-empty",
+            )]));
+        }
+        if let Some(repo) = &params.repo
+            && let Err(e) = validate_repo(repo)
+        {
+            return Ok(CallToolResult::error(vec![Content::text(e)]));
+        }
+
+        let add = params.add;
+        let remove = params.remove;
+        let repo = params.repo;
+        let result = self
+            .state
+            .config
+            .modify(|config| {
+                let list = if let Some(ref repo) = repo {
+                    &mut config.repos.entry(repo.clone()).or_default().ignored_events
                 } else {
-                    msgs.push(format!("Ignored: {:?}", config.ignored_workflows));
-                }
-
+                    &mut config.ignored_events
+                };
+                let scope = repo.as_deref().unwrap_or("global");
+                let mut msgs = modify_ignore_list(list, &add, &remove, "event");
+                msgs.push(format!("Scope: {scope}"));
                 msgs
             })
             .await;
@@ -704,7 +698,7 @@ impl BuildWatcher {
                             (Some(repo), None) => config.notifications_for(
                                 repo,
                                 config
-                                    .default_branches
+                                    .branches_for(repo)
                                     .first()
                                     .map_or("main", |s| s.as_str()),
                             ),
@@ -772,9 +766,11 @@ impl ServerHandler for BuildWatcher {
             .with_instructions(
                 "Monitors GitHub Actions builds and sends desktop notifications on completion. \
                  Use watch_builds with one or more repos in 'owner/repo' format to start watching. \
-                 Use configure_branches to set which branches to watch — omit repo to set global defaults, or pass repo to override for a specific repo. \
+                 Use watch_from_git_remote with a local repo path to auto-detect and watch the GitHub repo from its origin remote. \
+                 Use configure_branches to set which branches to watch for a specific repo. \
                  Use configure_repo to set per-repo workflow allow-list and/or display alias. \
                  Use configure_ignored_workflows(add/remove) to manage the global workflow ignore list (e.g. Semgrep, Dependabot). \
+                 Use configure_ignored_events(add/remove) to ignore runs by GitHub event type (e.g. schedule, workflow_dispatch) globally or per-repo. \
                  Use update_notifications to set notification levels (off/low/normal/critical, per event and scope), \
                  configure quiet hours (quiet_start/quiet_end in HH:MM, or quiet_clear=true), \
                  or pause/resume (pause=true/false, with optional pause_minutes). \

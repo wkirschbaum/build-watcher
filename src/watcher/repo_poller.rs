@@ -15,7 +15,7 @@ use crate::status::{RunConclusion, RunStatus};
 
 use super::types::WatchKey;
 use super::{
-    RateLimitState, SharedConfig, Watches, collect_persisted, filter_runs, runs_for_branch,
+    RateLimitState, RunFilters, SharedConfig, Watches, collect_persisted, runs_for_branch,
 };
 
 /// Maximum individual `run_status` fallback calls when the batch endpoint misses runs.
@@ -82,12 +82,6 @@ impl RunChange {
             Self::StatusChanged { run, from, to } => WatchEvent::StatusChanged { run, from, to },
         }
     }
-}
-
-/// Snapshot of config values needed for a poll cycle, per branch.
-struct BranchPollConfig {
-    workflows: Vec<String>,
-    ignored: Vec<String>,
 }
 
 /// Per-repo async polling task. Consolidates all branch watches for a single repo
@@ -165,13 +159,9 @@ impl RepoPoller {
         )
     }
 
-    /// Read per-branch workflow config for a given repo.
-    async fn branch_poll_config(&self) -> BranchPollConfig {
-        let cfg = self.config.read().await;
-        BranchPollConfig {
-            workflows: cfg.workflows_for(&self.repo).to_vec(),
-            ignored: cfg.ignored_workflows.clone(),
-        }
+    /// Read run-filtering config for this repo.
+    async fn run_filters(&self) -> RunFilters {
+        RunFilters::from_config(&self.config, &self.repo).await
     }
 
     /// Main poller loop.
@@ -529,6 +519,7 @@ impl RepoPoller {
                     self.events.emit(WatchEvent::PrStateChanged {
                         repo: self.repo.clone(),
                         branch: pr.branch.clone(),
+                        target_branch: pr.target_branch.clone(),
                         number: pr.number,
                         title: pr.title.clone(),
                         url: pr.url.clone(),
@@ -544,16 +535,132 @@ impl RepoPoller {
 
         // Update watch entries with PR data for display.
         let mut w = self.watches.lock().await;
-        // Build a map of branch → PR for this repo's PRs.
-        let pr_by_branch: HashMap<&str, &crate::github::PrInfo> =
-            prs.iter().map(|pr| (pr.branch.as_str(), pr)).collect();
+        // Build a map of target_branch → PRs for this repo's PRs.
+        let mut prs_by_target: HashMap<&str, Vec<&crate::github::PrInfo>> = HashMap::new();
+        for pr in &prs {
+            prs_by_target
+                .entry(pr.target_branch.as_str())
+                .or_default()
+                .push(pr);
+        }
         for (key, entry) in w.iter_mut() {
             if key.repo == self.repo {
-                entry.pr = pr_by_branch
+                entry.prs = prs_by_target
                     .get(key.branch.as_str())
-                    .map(|pr| (*pr).clone());
+                    .map(|prs| prs.iter().map(|pr| (*pr).clone()).collect())
+                    .unwrap_or_default();
             }
         }
+    }
+
+    /// Sync watched branches based on recent runs: add newly discovered branches,
+    /// remove stale branches that no longer have runs. Never removes branches that
+    /// are explicitly configured for the repo.
+    async fn sync_branches(&self, all_runs: &[RunInfo], current: Vec<WatchKey>) -> Vec<WatchKey> {
+        let (enabled, filter_re, pinned) = {
+            let cfg = self.config.read().await;
+            let enabled = cfg.auto_discover_for(&self.repo);
+            let filter_re = cfg.branch_filter_for(&self.repo);
+            // User-configured branches should never be auto-removed.
+            let pinned: HashSet<String> = cfg
+                .pinned_branches_for(&self.repo)
+                .iter()
+                .cloned()
+                .collect();
+            (enabled, filter_re, pinned)
+        };
+        if !enabled {
+            return current;
+        }
+
+        // Fetch tags so we can exclude them from discovered "branches".
+        let tags: HashSet<String> = self
+            .github
+            .list_tags(&self.repo)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+
+        let active_branches: HashSet<&str> = all_runs
+            .iter()
+            .map(|r| r.head_branch.as_str())
+            .filter(|b| !tags.contains(*b))
+            .filter(|b| filter_re.as_ref().is_none_or(|re| re.is_match(b)))
+            .collect();
+
+        let current_branches: HashSet<&str> = current.iter().map(|k| k.branch.as_str()).collect();
+
+        // Add new branches.
+        let to_add: Vec<String> = active_branches
+            .iter()
+            .filter(|b| !current_branches.contains(**b))
+            .map(|b| b.to_string())
+            .collect();
+
+        // Remove stale branches (no recent runs, not pinned, no active runs).
+        let to_remove: Vec<WatchKey> = current
+            .iter()
+            .filter(|k| !active_branches.contains(k.branch.as_str()))
+            .filter(|k| !pinned.contains(&k.branch))
+            .cloned()
+            .collect();
+
+        if to_add.is_empty() && to_remove.is_empty() {
+            return current;
+        }
+
+        if !to_add.is_empty() {
+            tracing::info!(
+                repo = %self.repo,
+                branches = ?to_add,
+                "Auto-discovered new branches"
+            );
+        }
+        if !to_remove.is_empty() {
+            let names: Vec<&str> = to_remove.iter().map(|k| k.branch.as_str()).collect();
+            tracing::info!(
+                repo = %self.repo,
+                branches = ?names,
+                "Removing stale discovered branches"
+            );
+        }
+
+        // Update watches.
+        {
+            let mut w = self.watches.lock().await;
+            for key in &to_remove {
+                w.remove(key);
+            }
+            for branch in &to_add {
+                let key = WatchKey::new(&self.repo, branch);
+                w.entry(key).or_default();
+            }
+        }
+
+        // Persist to discovered_branches so they survive restarts.
+        let repo = self.repo.clone();
+        let add = to_add;
+        let remove: HashSet<String> = to_remove.iter().map(|k| k.branch.clone()).collect();
+        if let Err(e) = self
+            .config
+            .modify(|cfg| {
+                if let Some(rc) = cfg.repos.get_mut(&repo) {
+                    for branch in &add {
+                        if !rc.discovered_branches.contains(branch) {
+                            rc.discovered_branches.push(branch.clone());
+                        }
+                    }
+                    rc.discovered_branches.retain(|b| !remove.contains(b));
+                }
+            })
+            .await
+        {
+            tracing::error!(error = %e, "Failed to persist branch discovery changes");
+        }
+
+        // Return the updated branch list.
+        self.watched_branches().await
     }
 
     /// Check for new runs across all watched branches using a single repo-wide API call.
@@ -579,7 +686,10 @@ impl RepoPoller {
             }
         };
 
-        let bpcfg = self.branch_poll_config().await;
+        // Sync discovered branches: add new, remove stale.
+        let branches = self.sync_branches(&all_runs, branches).await;
+
+        let run_filters = self.run_filters().await;
         let mut any_changed = false;
 
         for key in &branches {
@@ -602,7 +712,7 @@ impl RepoPoller {
                 .filter(|r| r.id > last_seen && !active_ids.contains(&r.id))
                 .copied()
                 .collect();
-            let new_runs = filter_runs(&unseen, &bpcfg.workflows, &bpcfg.ignored);
+            let new_runs = run_filters.filter(&unseen);
             // Identify re-runs: last_build run_ids that reappear in the API with
             // a changed state. Skip runs already tracked as active (those are
             // handled by poll_active_runs_batch).

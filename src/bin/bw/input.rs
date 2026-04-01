@@ -8,35 +8,37 @@ use build_watcher::status::WatchStatus;
 
 use super::app::{App, ExpandLevel, FormKind, QuitAction, SseUpdate};
 use super::client::{DaemonClient, open_browser};
-use super::forms::{InputMode, TextAction};
+use super::forms::{InputMode, LineEditor, TextAction};
 use super::render::flatten_rows;
 
 impl App {
     /// Handle a key press while in a non-normal input mode.
     /// Returns `true` if the event was consumed.
-    pub(crate) fn handle_input(&mut self, code: KeyCode, daemon: &DaemonClient) -> bool {
+    pub(crate) fn handle_input(
+        &mut self,
+        code: KeyCode,
+        modifiers: KeyModifiers,
+        daemon: &DaemonClient,
+    ) -> bool {
+        let ctrl = modifiers.contains(KeyModifiers::CONTROL);
+        let alt = modifiers.contains(KeyModifiers::ALT);
+
         match &mut self.input_mode {
             InputMode::Normal => false,
-            InputMode::TextInput { buffer, action, .. } => {
+            InputMode::TextInput { editor, action, .. } => {
                 match code {
                     KeyCode::Esc => {
                         self.input_mode = InputMode::Normal;
                     }
                     KeyCode::Enter => {
-                        let input = buffer.trim().to_string();
+                        let input = editor.buf.trim().to_string();
                         let action = std::mem::replace(action, TextAction::AddRepo);
                         self.input_mode = InputMode::Normal;
                         if !input.is_empty() {
                             self.submit_text_input(input, action, daemon);
                         }
                     }
-                    KeyCode::Backspace => {
-                        buffer.pop();
-                    }
-                    KeyCode::Char(c) => {
-                        buffer.push(c);
-                    }
-                    _ => {}
+                    _ => handle_line_edit(editor, code, ctrl, alt),
                 }
                 true
             }
@@ -46,6 +48,8 @@ impl App {
                 active,
                 ..
             } => {
+                let f = &mut fields[*active];
+                let is_cycle = !f.options.is_empty();
                 match code {
                     KeyCode::Esc => {
                         self.input_mode = InputMode::Normal;
@@ -56,37 +60,30 @@ impl App {
                     KeyCode::BackTab | KeyCode::Up => {
                         *active = (*active + fields.len() - 1) % fields.len();
                     }
-                    KeyCode::Right | KeyCode::Char(' ') => {
-                        let f = &mut fields[*active];
-                        if !f.options.is_empty() {
-                            let idx = f.options.iter().position(|&o| o == f.buffer).unwrap_or(0);
-                            f.buffer = f.options[(idx + 1) % f.options.len()].to_string();
-                        }
+                    KeyCode::Right | KeyCode::Char(' ') if is_cycle && !ctrl && !alt => {
+                        let idx = f
+                            .options
+                            .iter()
+                            .position(|&o| o == f.editor.buf)
+                            .unwrap_or(0);
+                        f.editor.buf = f.options[(idx + 1) % f.options.len()].to_string();
                     }
-                    KeyCode::Left => {
-                        let f = &mut fields[*active];
-                        if !f.options.is_empty() {
-                            let n = f.options.len();
-                            let idx = f.options.iter().position(|&o| o == f.buffer).unwrap_or(0);
-                            f.buffer = f.options[(idx + n - 1) % n].to_string();
-                        }
-                    }
-                    KeyCode::Backspace => {
-                        let f = &mut fields[*active];
-                        if f.options.is_empty() {
-                            f.buffer.pop();
-                        }
-                    }
-                    KeyCode::Char(c) => {
-                        let f = &mut fields[*active];
-                        if f.options.is_empty() {
-                            f.buffer.push(c);
-                        }
+                    KeyCode::Left if is_cycle && !ctrl && !alt => {
+                        let n = f.options.len();
+                        let idx = f
+                            .options
+                            .iter()
+                            .position(|&o| o == f.editor.buf)
+                            .unwrap_or(0);
+                        f.editor.buf = f.options[(idx + n - 1) % n].to_string();
                     }
                     KeyCode::Enter => match kind {
                         FormKind::GlobalDefaults => self.submit_config_form(daemon),
                         FormKind::RepoConfig { .. } => self.submit_repo_config_form(daemon),
                     },
+                    _ if !is_cycle => {
+                        handle_line_edit(&mut f.editor, code, ctrl, alt);
+                    }
                     _ => {}
                 }
                 true
@@ -205,20 +202,12 @@ impl App {
         let sel_count = flat.selectable.len();
         let selected_display_idx = flat.selectable.get(self.selected).copied();
         let selected = selected_display_idx.and_then(|idx| flat.rows[idx].repo_branch_run());
-        let is_repo_row = selected_display_idx
-            .map(|idx| flat.rows[idx].is_repo_header())
-            .unwrap_or(false);
-        let is_collapsible = is_repo_row
-            && !selected_display_idx
-                .map(|idx| flat.rows[idx].is_single_branch())
-                .unwrap_or(false);
-        let is_branch_header = selected_display_idx
-            .map(|idx| flat.rows[idx].is_branch_header())
-            .unwrap_or(false);
-        let is_failed = selected_display_idx
-            .map(|idx| flat.rows[idx].is_failed())
-            .unwrap_or(false);
-        let failing_job_id = selected_display_idx.and_then(|idx| flat.rows[idx].failing_job_id());
+        let row = selected_display_idx.map(|idx| &flat.rows[idx]);
+        let is_repo_row = row.is_some_and(|r| r.is_repo_header());
+        let is_branch_header = row.is_some_and(|r| r.is_branch_header());
+        let is_workflow_child = row.is_some_and(|r| r.is_workflow_child());
+        let is_failed = row.is_some_and(|r| r.is_failed());
+        let failing_job_id = row.and_then(|r| r.failing_job_id());
 
         match code {
             // -- Quit / Navigation --
@@ -248,14 +237,31 @@ impl App {
                 self.save_prefs();
             }
             // -- Expand / Collapse --
-            KeyCode::Enter | KeyCode::Right | KeyCode::Tab | KeyCode::Char('e')
-                if is_collapsible || is_branch_header =>
-            {
-                self.handle_expand(code, selected, is_collapsible, is_branch_header);
+            // Repo row (multi-branch): cycle Collapsed → Branches → Full
+            // Skip Full when no branch has multiple workflows (nothing to show).
+            KeyCode::Tab | KeyCode::Enter if is_repo_row && !row.unwrap().is_single_branch() => {
+                if let Some((repo, _, _, _)) = selected {
+                    let has_workflows = repo_has_multi_workflow_branch(&self.status.watches, repo);
+                    let next = self.expand_level(repo).next_expand(has_workflows);
+                    self.set_expand_level(repo, next);
+                    self.save_prefs();
+                }
             }
-            KeyCode::Left if is_branch_header || !is_repo_row => {
-                self.handle_collapse(selected, is_branch_header, &flat);
+            // Branch header: toggle workflow children visible/hidden
+            KeyCode::Tab | KeyCode::Enter if is_branch_header => {
+                if let Some((repo, branch, _, _)) = selected {
+                    let key = format!("{repo}#{branch}");
+                    if self.expand_level(repo) != ExpandLevel::Full {
+                        // First expand the repo to Full so workflows are visible
+                        self.set_expand_level(repo, ExpandLevel::Full);
+                    } else if !self.workflow_collapsed.remove(&key) {
+                        self.workflow_collapsed.insert(key);
+                    }
+                    self.save_prefs();
+                }
             }
+            // Workflow row: no toggle
+            KeyCode::Tab | KeyCode::Enter if is_workflow_child => {}
             KeyCode::BackTab | KeyCode::Char('E') => {
                 self.handle_expand_all();
             }
@@ -274,122 +280,21 @@ impl App {
         QuitAction::None
     }
 
-    /// Handle Enter/Right/Tab/e for expand toggling.
-    fn handle_expand(
-        &mut self,
-        _code: KeyCode,
-        selected: Option<(&str, &str, Option<u64>, bool)>,
-        is_collapsible: bool,
-        is_branch_header: bool,
-    ) {
-        if is_collapsible {
-            if let Some((repo, _, _, _)) = selected {
-                let repo = repo.to_string();
-                let current = self.expand_level(&repo);
-                let skip_branches = !repo_has_multi_workflow_branch(&self.status.watches, &repo);
-                let next = if skip_branches && current == ExpandLevel::Full {
-                    ExpandLevel::Collapsed
-                } else {
-                    current.next()
-                };
-                self.set_expand_level(&repo, next);
-                self.save_prefs();
-            }
-        } else if is_branch_header && let Some((repo, branch, _, _)) = selected {
-            let repo = repo.to_string();
-            let key = format!("{repo}#{branch}");
-            if self.expand_level(&repo) != ExpandLevel::Full {
-                self.expand.remove(&repo);
-                self.workflow_collapsed.remove(&key);
-            } else if !self.workflow_collapsed.remove(&key) {
-                self.workflow_collapsed.insert(key);
-            }
-            self.save_prefs();
-        }
-    }
-
-    /// Handle Left key for collapsing branches and workflows.
-    fn handle_collapse(
-        &mut self,
-        selected: Option<(&str, &str, Option<u64>, bool)>,
-        is_branch_header: bool,
-        flat: &super::render::FlatRows<'_>,
-    ) {
-        if is_branch_header {
-            if let Some((repo, _, _, _)) = selected {
-                let repo = repo.to_string();
-                let prev = self.expand_level(&repo).prev();
-                self.set_expand_level(&repo, prev);
-                if let Some(pos) = flat.selectable.iter().position(|&idx| {
-                    flat.rows[idx].is_repo_header() && flat.rows[idx].repo().unwrap_or("") == repo
-                }) {
-                    self.selected = pos;
-                }
-                self.save_prefs();
-            }
-        } else if let Some((repo, branch, _, _)) = selected {
-            let repo = repo.to_string();
-            let branch = branch.to_string();
-            let key = format!("{repo}#{branch}");
-            if !self.workflow_collapsed.contains(&key)
-                && flat.selectable.iter().any(|&idx| {
-                    flat.rows[idx].is_branch_header()
-                        && flat.rows[idx].repo().unwrap_or("") == repo
-                        && flat.rows[idx].repo_branch().map_or("", |(_, b)| b) == branch
-                })
-            {
-                self.workflow_collapsed.insert(key);
-                if let Some(pos) = flat.selectable.iter().position(|&idx| {
-                    flat.rows[idx].is_branch_header()
-                        && flat.rows[idx].repo().unwrap_or("") == repo
-                        && flat.rows[idx].repo_branch().map_or("", |(_, b)| b) == branch
-                }) {
-                    self.selected = pos;
-                }
-            } else {
-                let prev = self.expand_level(&repo).prev();
-                self.set_expand_level(&repo, prev);
-                if let Some(pos) = flat.selectable.iter().position(|&idx| {
-                    flat.rows[idx].is_repo_header() && flat.rows[idx].repo().unwrap_or("") == repo
-                }) {
-                    self.selected = pos;
-                }
-            }
-            self.save_prefs();
-        }
-    }
-
     /// Handle BackTab/E for global expand/collapse toggle.
+    /// Cycles the global expand level and forces it on all repos.
     fn handle_expand_all(&mut self) {
-        let expandable_repos: Vec<String> = {
-            let mut counts: std::collections::HashMap<&str, usize> =
-                std::collections::HashMap::new();
-            for w in &self.status.watches {
-                *counts.entry(w.repo.as_str()).or_insert(0) += 1;
-            }
-            counts
-                .into_iter()
-                .filter(|(_, n)| *n > 1)
-                .map(|(repo, _)| repo.to_string())
-                .collect()
-        };
-        if !expandable_repos.is_empty() {
-            let all_full = expandable_repos
-                .iter()
-                .all(|r| self.expand_level(r) == ExpandLevel::Full);
-            let all_branches = expandable_repos
-                .iter()
-                .all(|r| self.expand_level(r) == ExpandLevel::Branches);
-            let target = if all_full {
-                ExpandLevel::Branches
-            } else if all_branches {
-                ExpandLevel::Collapsed
-            } else {
-                ExpandLevel::Full
-            };
-            for r in &expandable_repos {
-                self.set_expand_level(r, target);
-            }
+        // Use `true` so the global cycle always includes Full.
+        self.global_expand = self.global_expand.next_expand(true);
+        let repos: Vec<String> = self
+            .status
+            .watches
+            .iter()
+            .map(|w| w.repo.clone())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        for repo in &repos {
+            self.set_expand_level(repo, self.global_expand);
         }
         self.save_prefs();
     }
@@ -409,7 +314,7 @@ impl App {
             KeyCode::Char('a') => {
                 self.input_mode = InputMode::TextInput {
                     prompt: "Add repo (owner/repo): ".to_string(),
-                    buffer: String::new(),
+                    editor: LineEditor::empty(),
                     action: TextAction::AddRepo,
                 };
             }
@@ -425,7 +330,7 @@ impl App {
                         .collect();
                     self.input_mode = InputMode::TextInput {
                         prompt: format!("Branches for {repo}: "),
-                        buffer: current.join(", "),
+                        editor: LineEditor::new(current.join(", ")),
                         action: TextAction::SetBranches { repo },
                     };
                 }
@@ -579,6 +484,29 @@ impl App {
                     );
                 }
             }
+            KeyCode::Char('M') => {
+                if let Some((repo, branch, _, _)) = selected {
+                    // Find the first PR targeting this branch.
+                    let pr = self
+                        .status
+                        .watches
+                        .iter()
+                        .find(|w| w.repo == repo && w.branch == branch)
+                        .and_then(|w| w.prs.first());
+                    if let Some(pr) = pr {
+                        let repo = repo.to_string();
+                        let number = pr.number;
+                        let d = daemon.clone();
+                        self.spawn_action(
+                            format!("Merging PR #{number} in {repo}…"),
+                            false,
+                            async move { d.merge_pr(&repo, number).await },
+                        );
+                    } else {
+                        self.set_flash("No PR found for this branch");
+                    }
+                }
+            }
             KeyCode::Char('c') => {
                 if let Some((repo, _, _, _)) = selected {
                     self.open_repo_config_form(daemon, repo);
@@ -613,16 +541,47 @@ impl App {
     }
 }
 
+/// Dispatch a key event to a `LineEditor` using readline-style shortcuts.
+fn handle_line_edit(ed: &mut LineEditor, code: KeyCode, ctrl: bool, alt: bool) {
+    match code {
+        // Movement
+        KeyCode::Char('a') if ctrl => ed.move_home(),
+        KeyCode::Char('e') if ctrl => ed.move_end(),
+        KeyCode::Char('b') if ctrl => ed.move_left(),
+        KeyCode::Char('f') if ctrl => ed.move_right(),
+        KeyCode::Char('b') if alt => ed.move_word_left(),
+        KeyCode::Char('f') if alt => ed.move_word_right(),
+        KeyCode::Left if alt => ed.move_word_left(),
+        KeyCode::Left => ed.move_left(),
+        KeyCode::Right if alt => ed.move_word_right(),
+        KeyCode::Right => ed.move_right(),
+        KeyCode::Home => ed.move_home(),
+        KeyCode::End => ed.move_end(),
+        // Deletion
+        KeyCode::Char('d') if ctrl => ed.delete(),
+        KeyCode::Char('h') if ctrl => ed.backspace(),
+        KeyCode::Char('k') if ctrl => ed.kill_to_end(),
+        KeyCode::Char('u') if ctrl => ed.kill_to_start(),
+        KeyCode::Char('w') if ctrl => ed.delete_word_left(),
+        KeyCode::Char('d') if alt => ed.delete_word_right(),
+        KeyCode::Backspace if alt => ed.delete_word_left(),
+        KeyCode::Backspace => ed.backspace(),
+        // Insert
+        KeyCode::Char(c) if !ctrl && !alt => ed.insert(c),
+        _ => {}
+    }
+}
+
 /// Returns true if any branch of `repo` has more than one workflow item
-/// (i.e. would show a BranchHeader with expandable children).
+/// (i.e. expanding to Full would show workflow children).
 fn repo_has_multi_workflow_branch(watches: &[WatchStatus], repo: &str) -> bool {
     watches.iter().filter(|w| w.repo == repo).any(|w| {
         let active_wfs: HashSet<&str> = w.active_runs.iter().map(|r| r.workflow.as_str()).collect();
-        let extra_last = w
+        let extra = w
             .last_builds
             .iter()
-            .filter(|lb| !active_wfs.contains(lb.workflow.as_str()))
+            .filter(|b| !active_wfs.contains(b.workflow.as_str()))
             .count();
-        active_wfs.len() + extra_last > 1
+        active_wfs.len() + extra > 1
     })
 }

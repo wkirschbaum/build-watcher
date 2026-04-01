@@ -14,7 +14,7 @@ use crate::persistence::Persistence;
 
 use super::repo_poller::RepoPoller;
 use super::types::{ActiveRun, PersistedWatches, WatchEntry, WatchKey};
-use super::{RateLimitState, SharedConfig, Watches, filter_runs};
+use super::{RateLimitState, RunFilters, SharedConfig, Watches};
 
 /// How often the centralized rate-limit refresh task runs.
 const RATE_LIMIT_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
@@ -91,12 +91,8 @@ pub async fn start_watch(
     // No runs at all — register an idle watch so the poller will pick up future builds.
     if all_runs.is_empty() {
         let entry = WatchEntry {
-            last_seen_run_id: 0,
-            active_runs: HashMap::new(),
-            failure_counts: HashMap::new(),
-            last_builds: HashMap::new(),
-            pr: None,
             waiting: true,
+            ..Default::default()
         };
         {
             let mut w = watches.lock().await;
@@ -111,17 +107,12 @@ pub async fn start_watch(
         ));
     }
 
-    let (workflow_filter, ignored_workflows): (Vec<String>, Vec<String>) = {
-        let cfg = config.read().await;
-        (
-            cfg.workflows_for(repo).to_vec(),
-            cfg.ignored_workflows.clone(),
-        )
-    };
-    let runs = filter_runs(&all_runs, &workflow_filter, &ignored_workflows);
+    let rf = RunFilters::from_config(config, repo).await;
+    let runs = rf.filter(&all_runs);
     if runs.is_empty() {
         return Err(format!(
-            "{repo} [{branch}]: no runs match workflow filter {workflow_filter:?}"
+            "{repo} [{branch}]: no runs match workflow filter {:?}",
+            rf.workflows
         ));
     }
 
@@ -164,10 +155,8 @@ pub async fn start_watch(
     let entry = WatchEntry {
         last_seen_run_id: max_id,
         active_runs: active,
-        failure_counts: HashMap::new(),
         last_builds: last_builds.clone(),
-        pr: None,
-        waiting: false,
+        ..Default::default()
     };
 
     {
@@ -307,41 +296,36 @@ fn spawn_rate_limit_refresher(handle: &WatcherHandle, rate_limit: &RateLimitStat
 /// Resolve the complete set of WatchKeys from config, querying GitHub for
 /// default branches where needed.
 async fn resolve_config_keys(config: &SharedConfig, handle: &WatcherHandle) -> Vec<WatchKey> {
-    let repos: Vec<(String, bool)> = {
+    let repos: Vec<(String, Vec<String>)> = {
         let cfg = config.read().await;
         cfg.watched_repos()
             .into_iter()
             .map(|repo| {
-                let has_explicit = cfg.has_explicit_branches(repo);
-                (repo.to_string(), has_explicit)
+                let branches = cfg.branches_for(repo);
+                (repo.to_string(), branches)
             })
             .collect()
     };
 
     let mut keys = Vec::new();
-    for (repo, has_explicit) in &repos {
+    for (repo, configured_branches) in &repos {
         let mut branches = Vec::new();
 
+        // Always resolve the GitHub default branch.
         match handle.github.default_branch(repo).await {
-            Ok(gh_default) => {
-                branches.push(gh_default);
-            }
+            Ok(gh_default) => branches.push(gh_default),
             Err(e) => {
                 tracing::warn!(
                     repo = %repo, error = %e,
-                    "Failed to resolve default branch on startup, falling back to config"
+                    "Failed to resolve default branch on startup"
                 );
-                let cfg = config.read().await;
-                branches.extend(cfg.branches_for(repo).iter().cloned());
             }
         }
 
-        if *has_explicit {
-            let cfg = config.read().await;
-            for b in cfg.branches_for(repo) {
-                if !branches.contains(b) {
-                    branches.push(b.clone());
-                }
+        // Add any explicitly configured branches.
+        for b in configured_branches {
+            if !branches.contains(b) {
+                branches.push(b.clone());
             }
         }
 
@@ -412,13 +396,7 @@ pub(super) async fn recover_watches(
             }
         };
 
-        let (workflow_filter, ignored_workflows) = {
-            let cfg = config.read().await;
-            (
-                cfg.workflows_for(&repo).to_vec(),
-                cfg.ignored_workflows.clone(),
-            )
-        };
+        let rf = RunFilters::from_config(config, &repo).await;
 
         let mut w = watches.lock().await;
         for key in repos.get(&repo).into_iter().flatten() {
@@ -426,7 +404,7 @@ pub(super) async fn recover_watches(
                 continue;
             };
             let branch_runs = super::runs_for_branch(&runs, &key.branch);
-            let filtered = filter_runs(&branch_runs, &workflow_filter, &ignored_workflows);
+            let filtered = rf.filter(&branch_runs);
 
             for run in &filtered {
                 if !run.is_completed() && !entry.active_runs.contains_key(&run.id) {

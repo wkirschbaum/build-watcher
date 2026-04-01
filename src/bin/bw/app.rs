@@ -118,21 +118,13 @@ pub(crate) enum ExpandLevel {
 }
 
 impl ExpandLevel {
-    /// Cycle to the next expand level: Full → Branches → Collapsed → Full.
-    pub(crate) fn next(self) -> Self {
-        match self {
-            ExpandLevel::Full => ExpandLevel::Branches,
-            ExpandLevel::Branches => ExpandLevel::Collapsed,
-            ExpandLevel::Collapsed => ExpandLevel::Full,
-        }
-    }
-
-    /// Cycle to the previous expand level: Collapsed → Branches → Full → Collapsed.
-    pub(crate) fn prev(self) -> Self {
+    /// Cycle to next expand level (expand direction): Collapsed → Branches → Full → Collapsed.
+    /// When `has_workflows` is false, skip Full (Collapsed → Branches → Collapsed).
+    pub(crate) fn next_expand(self, has_workflows: bool) -> Self {
         match self {
             ExpandLevel::Collapsed => ExpandLevel::Branches,
-            ExpandLevel::Branches => ExpandLevel::Full,
-            ExpandLevel::Full => ExpandLevel::Collapsed,
+            ExpandLevel::Branches if has_workflows => ExpandLevel::Full,
+            ExpandLevel::Branches | ExpandLevel::Full => ExpandLevel::Collapsed,
         }
     }
 }
@@ -216,6 +208,8 @@ pub(crate) struct App {
     pub(crate) expand: HashMap<String, ExpandLevel>,
     /// Branches with workflows collapsed (key: "repo#branch"). Absent = expanded.
     pub(crate) workflow_collapsed: HashSet<String>,
+    /// Tracks the global expand level for Shift-Tab toggling.
+    pub(crate) global_expand: ExpandLevel,
     /// Tag name of a newer release, if one was found by the background checker.
     pub(crate) update_available: Option<String>,
     /// Whether to show the help bar at the bottom.
@@ -248,6 +242,7 @@ impl App {
             group_by: prefs.group_by,
             expand: prefs.expand,
             workflow_collapsed: prefs.workflow_collapsed,
+            global_expand: ExpandLevel::Full,
             update_available: None,
             show_help: prefs.show_help,
             show_recent_panel: prefs.show_recent_panel,
@@ -488,9 +483,6 @@ mod tests {
         WatchStatus {
             repo: repo.to_string(),
             branch: branch.to_string(),
-            active_runs: vec![],
-            last_builds: vec![],
-            pr: None,
             ..Default::default()
         }
     }
@@ -698,7 +690,7 @@ mod tests {
 
     #[test]
     fn flatten_rows_with_failing_steps_single_branch() {
-        // Single-branch repo with a failed build: GroupHeader + RepoHeader + FailingSteps.
+        // Single-branch repo with a failed build: GroupHeader + RepoHeader (steps shown inline).
         let watches = vec![WatchStatus {
             repo: "alice/app".to_string(),
             branch: "main".to_string(),
@@ -717,15 +709,14 @@ mod tests {
             ..Default::default()
         }];
         let flat = flatten_rows(&watches, GroupBy::Org, &no_collapsed(), &no_wf_collapsed());
-        assert_eq!(flat.rows.len(), 3);
-        assert_eq!(flat.selectable.len(), 1); // FailingSteps is not selectable
+        assert_eq!(flat.rows.len(), 2); // GroupHeader + RepoHeader (failing steps inline)
+        assert_eq!(flat.selectable.len(), 1);
         assert!(matches!(flat.rows[1], DisplayRow::RepoHeader { .. }));
-        assert!(matches!(flat.rows[2], DisplayRow::FailingSteps { .. }));
     }
 
     #[test]
     fn flatten_rows_multi_branch_with_failing_steps() {
-        // Multi-branch repo: child rows including FailingSteps are emitted.
+        // Multi-branch repo: failing steps shown inline in LastBuild title.
         let watches = vec![
             WatchStatus {
                 repo: "alice/app".to_string(),
@@ -747,16 +738,12 @@ mod tests {
             WatchStatus {
                 repo: "alice/app".to_string(),
                 branch: "develop".to_string(),
-                active_runs: vec![],
-                last_builds: vec![],
-                pr: None,
                 ..Default::default()
             },
         ];
         let flat = flatten_rows(&watches, GroupBy::Org, &no_collapsed(), &no_wf_collapsed());
-        // GroupHeader + RepoHeader + LastBuild + FailingSteps + NeverRan
-        assert_eq!(flat.rows.len(), 5);
-        assert!(matches!(flat.rows[3], DisplayRow::FailingSteps { .. }));
+        // GroupHeader + RepoHeader + LastBuild + NeverRan (no separate FailingSteps row)
+        assert_eq!(flat.rows.len(), 4);
     }
 
     #[test]
@@ -822,9 +809,6 @@ mod tests {
             WatchStatus {
                 repo: "alice/app".to_string(),
                 branch: "develop".to_string(),
-                active_runs: vec![],
-                last_builds: vec![],
-                pr: None,
                 ..Default::default()
             },
         ];
@@ -923,9 +907,6 @@ mod tests {
         let watches = vec![WatchStatus {
             repo: "alice/app".to_string(),
             branch: "main".to_string(),
-            active_runs: vec![],
-            last_builds: vec![],
-            pr: None,
             ..Default::default()
         }];
         let flat = flatten_rows(&watches, GroupBy::Org, &no_collapsed(), &no_wf_collapsed());

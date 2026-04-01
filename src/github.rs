@@ -296,6 +296,17 @@ impl MergeState {
             Self::Unknown => "unknown",
         }
     }
+
+    pub fn icon(&self) -> &'static str {
+        match self {
+            Self::Clean => "✓",
+            Self::Blocked => "⊘",
+            Self::Unstable => "!",
+            Self::Behind => "↓",
+            Self::Dirty => "✗",
+            _ => "?",
+        }
+    }
 }
 
 impl std::fmt::Display for MergeState {
@@ -313,6 +324,8 @@ struct GhPrJson {
     title: String,
     #[serde(default)]
     head_ref_name: String,
+    #[serde(default)]
+    base_ref_name: String,
     #[serde(default)]
     url: String,
     #[serde(default)]
@@ -336,6 +349,7 @@ pub struct PrInfo {
     pub number: u64,
     pub title: String,
     pub branch: String,
+    pub target_branch: String,
     pub url: String,
     pub author: String,
     pub draft: bool,
@@ -344,7 +358,7 @@ pub struct PrInfo {
 }
 
 const GH_PR_FIELDS: &str =
-    "number,title,headRefName,url,isDraft,mergeStateStatus,reviewDecision,author";
+    "number,title,headRefName,baseRefName,url,isDraft,mergeStateStatus,reviewDecision,author";
 
 /// Abstraction over the GitHub API. The real implementation (`GhCliClient`) calls
 /// the `gh` CLI; tests can inject a mock.
@@ -376,6 +390,8 @@ pub trait GitHubClient: Send + Sync + 'static {
     async fn default_branch(&self, repo: &str) -> Result<String, GhError>;
     /// Fetch open PRs for a repo.
     async fn open_prs(&self, repo: &str) -> Result<Vec<PrInfo>, GhError>;
+    /// Merge a PR by number.
+    async fn pr_merge(&self, repo: &str, number: u64) -> Result<String, GhError>;
 }
 
 /// Real GitHub client that shells out to the `gh` CLI.
@@ -582,6 +598,7 @@ impl GitHubClient for GhCliClient {
                 number: pr.number,
                 title: pr.title,
                 branch: pr.head_ref_name,
+                target_branch: pr.base_ref_name,
                 url: pr.url,
                 author: pr.author.map(|a| a.login).unwrap_or_default(),
                 draft: pr.is_draft,
@@ -589,6 +606,16 @@ impl GitHubClient for GhCliClient {
                 review_decision: pr.review_decision,
             })
             .collect())
+    }
+
+    async fn pr_merge(&self, repo: &str, number: u64) -> Result<String, GhError> {
+        let number_str = number.to_string();
+        let stdout = gh_exec(
+            repo,
+            &["pr", "merge", &number_str, "--repo", repo, "--merge"],
+        )
+        .await?;
+        Ok(String::from_utf8_lossy(&stdout).trim().to_string())
     }
 }
 
@@ -821,6 +848,77 @@ pub fn validate_repo(repo: &str) -> Result<(), String> {
 
 // -- GitHub URLs --
 
+/// Parse a GitHub `owner/repo` from a git remote URL (SSH or HTTPS).
+///
+/// Supports:
+/// - `https://github.com/owner/repo.git`
+/// - `https://github.com/owner/repo`
+/// - `git@github.com:owner/repo.git`
+/// - `ssh://git@github.com/owner/repo.git`
+///
+/// Returns an error for non-GitHub URLs.
+pub fn parse_github_remote(url: &str) -> Result<String, String> {
+    let url = url.trim();
+
+    // SSH shorthand: git@github.com:owner/repo.git
+    let path = if let Some(rest) = url.strip_prefix("git@github.com:") {
+        rest
+    } else if let Some(rest) = url
+        .strip_prefix("https://github.com/")
+        .or_else(|| url.strip_prefix("ssh://git@github.com/"))
+    {
+        rest
+    } else {
+        return Err(format!(
+            "Not a GitHub remote URL: {url:?} — only github.com remotes are supported"
+        ));
+    };
+
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    // Strip any trailing slash
+    let path = path.strip_suffix('/').unwrap_or(path);
+
+    validate_repo(path)
+        .map_err(|_| format!("Could not extract owner/repo from remote URL: {url:?}"))?;
+
+    Ok(path.to_string())
+}
+
+/// Detect the GitHub `owner/repo` from a local git repository's origin remote.
+///
+/// Runs `git -C <path> remote get-url origin` and parses the result.
+pub async fn repo_from_git_remote(path: &str) -> Result<String, GhError> {
+    let output = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::process::Command::new("git")
+            .args(["-C", path, "remote", "get-url", "origin"])
+            .output(),
+    )
+    .await
+    .map_err(|_| GhError::Timeout {
+        repo: path.to_string(),
+        timeout_secs: 5,
+    })?
+    .map_err(|e| GhError::Spawn {
+        repo: path.to_string(),
+        source: e,
+    })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        return Err(GhError::CliError {
+            repo: path.to_string(),
+            stderr,
+        });
+    }
+
+    let url = String::from_utf8_lossy(&output.stdout);
+    parse_github_remote(&url).map_err(|msg| GhError::CliError {
+        repo: path.to_string(),
+        stderr: msg,
+    })
+}
+
 /// URL for a specific workflow run.
 pub fn run_url(repo: &str, run_id: u64) -> String {
     format!("https://github.com/{repo}/actions/runs/{run_id}")
@@ -970,6 +1068,52 @@ mod tests {
             timeout_secs: 30,
         };
         assert!(!timeout.is_repo_not_found());
+    }
+
+    #[test]
+    fn parse_github_remote_https() {
+        assert_eq!(
+            parse_github_remote("https://github.com/owner/repo.git").unwrap(),
+            "owner/repo"
+        );
+        assert_eq!(
+            parse_github_remote("https://github.com/owner/repo").unwrap(),
+            "owner/repo"
+        );
+        assert_eq!(
+            parse_github_remote("https://github.com/owner/repo/").unwrap(),
+            "owner/repo"
+        );
+    }
+
+    #[test]
+    fn parse_github_remote_ssh() {
+        assert_eq!(
+            parse_github_remote("git@github.com:owner/repo.git").unwrap(),
+            "owner/repo"
+        );
+        assert_eq!(
+            parse_github_remote("git@github.com:owner/repo").unwrap(),
+            "owner/repo"
+        );
+        assert_eq!(
+            parse_github_remote("ssh://git@github.com/owner/repo.git").unwrap(),
+            "owner/repo"
+        );
+    }
+
+    #[test]
+    fn parse_github_remote_with_trailing_newline() {
+        assert_eq!(
+            parse_github_remote("git@github.com:owner/repo.git\n").unwrap(),
+            "owner/repo"
+        );
+    }
+
+    #[test]
+    fn parse_github_remote_non_github() {
+        assert!(parse_github_remote("https://gitlab.com/owner/repo.git").is_err());
+        assert!(parse_github_remote("git@bitbucket.org:owner/repo.git").is_err());
     }
 
     #[test]
@@ -1142,6 +1286,7 @@ mod tests {
             "number": 42,
             "title": "Fix login bug",
             "headRefName": "feat/login",
+            "baseRefName": "main",
             "url": "https://github.com/alice/app/pull/42",
             "isDraft": false,
             "mergeStateStatus": "CLEAN",
@@ -1154,6 +1299,7 @@ mod tests {
         assert_eq!(pr.number, 42);
         assert_eq!(pr.merge_state_status, MergeState::Clean);
         assert_eq!(pr.head_ref_name, "feat/login");
+        assert_eq!(pr.base_ref_name, "main");
         assert!(!pr.is_draft);
     }
 

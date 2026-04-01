@@ -1,8 +1,6 @@
-use std::collections::HashSet;
-
-use build_watcher::config::{NotificationLevel, NotificationOverrides, SharedConfigManager};
-use build_watcher::github::{DEFAULT_REPO_LIMIT, run_url};
-use build_watcher::watcher::{WatcherHandle, collect_persisted, last_failed_build, start_watch};
+use build_watcher::config::{NotificationLevel, NotificationOverrides};
+use build_watcher::github::run_url;
+use build_watcher::watcher::{collect_persisted, last_failed_build, start_watch};
 
 use super::DaemonState;
 
@@ -54,19 +52,15 @@ pub(crate) async fn do_watch_builds(state: &DaemonState, repos: &[String]) -> Ve
                 Err(e) => {
                     tracing::warn!(
                         repo = %repo, error = %e,
-                        "Failed to resolve default branch, falling back to config"
+                        "Failed to resolve default branch"
                     );
-                    // Fall back to configured defaults only when GitHub is unreachable.
-                    branches.extend(cfg.branches_for(repo).iter().cloned());
                 }
             }
 
-            // Add any explicitly configured per-repo branches (they're intentional).
-            if cfg.has_explicit_branches(repo) {
-                for b in cfg.branches_for(repo) {
-                    if !branches.contains(b) {
-                        branches.push(b.clone());
-                    }
+            // Add configured + discovered branches.
+            for b in cfg.branches_for(repo) {
+                if !branches.contains(&b) {
+                    branches.push(b);
                 }
             }
 
@@ -74,6 +68,8 @@ pub(crate) async fn do_watch_builds(state: &DaemonState, repos: &[String]) -> Ve
         }
         pairs
     };
+
+    // Auto-discovered branches are handled by the poller's sync_branches() on each cycle.
 
     let mut results = Vec::new();
     let mut started_repos: Vec<String> = Vec::new();
@@ -97,24 +93,6 @@ pub(crate) async fn do_watch_builds(state: &DaemonState, repos: &[String]) -> Ve
                 Err(msg) => results.push(ActionOutcome::err(msg)),
             }
         }
-
-        // Auto-discover additional branches from recent runs.
-        for branch in discover_branches(&state.config, &state.handle, repo, branches).await {
-            if let Ok(msg) = start_watch(
-                &state.watches,
-                &state.config,
-                &state.handle,
-                &state.rate_limit,
-                repo,
-                &branch,
-            )
-            .await
-            {
-                any_started = true;
-                results.push(ActionOutcome::ok(msg));
-            }
-        }
-
         if any_started {
             started_repos.push(repo.clone());
         }
@@ -137,65 +115,6 @@ pub(crate) async fn do_watch_builds(state: &DaemonState, repos: &[String]) -> Ve
     }
 
     results
-}
-
-/// Discover branches with recent GitHub Actions runs that aren't already being watched.
-/// Returns an empty vec when auto-discover is disabled or no new branches are found.
-async fn discover_branches(
-    config: &SharedConfigManager,
-    handle: &WatcherHandle,
-    repo: &str,
-    already_watching: &[String],
-) -> Vec<String> {
-    let (enabled, filter_re) = {
-        let cfg = config.read().await;
-        (cfg.auto_discover_branches, cfg.branch_filter_regex())
-    };
-    if !enabled {
-        return Vec::new();
-    }
-
-    let all_runs = match handle
-        .github
-        .recent_runs_for_repo(repo, DEFAULT_REPO_LIMIT)
-        .await
-    {
-        Ok(runs) => runs,
-        Err(e) => {
-            tracing::warn!(repo = %repo, error = %e, "Auto-discover: failed to fetch runs");
-            return Vec::new();
-        }
-    };
-
-    // Fetch tags so we can exclude them from discovered "branches".
-    let tags: HashSet<String> = handle
-        .github
-        .list_tags(repo)
-        .await
-        .unwrap_or_default()
-        .into_iter()
-        .collect();
-
-    let watching: HashSet<&str> = already_watching.iter().map(|b| b.as_str()).collect();
-    let discovered: Vec<String> = all_runs
-        .iter()
-        .map(|r| r.head_branch.as_str())
-        .filter(|b| !watching.contains(b))
-        .filter(|b| !tags.contains(*b))
-        .filter(|b| filter_re.as_ref().is_none_or(|re| re.is_match(b)))
-        .collect::<HashSet<_>>()
-        .into_iter()
-        .map(|b| b.to_string())
-        .collect();
-
-    if !discovered.is_empty() {
-        tracing::info!(
-            repo = %repo,
-            branches = ?discovered,
-            "Auto-discovered branches"
-        );
-    }
-    discovered
 }
 
 /// Shared logic for removing repos from watch — used by both the MCP tool and REST endpoint.
@@ -327,6 +246,17 @@ pub(crate) async fn do_configure_branches(
     results
 }
 
+/// Trigger burst polling at 1s, 5s, 10s so the poller picks up changes quickly.
+fn trigger_burst_poll(state: &DaemonState) {
+    let changed = state.config.changed().clone();
+    tokio::spawn(async move {
+        for delay in [1, 5, 10] {
+            tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+            changed.notify_waiters();
+        }
+    });
+}
+
 /// Rerun a GitHub Actions build. If `run_id` is `None`, finds the last failed build
 /// from in-memory watches or GitHub history.
 ///
@@ -391,14 +321,7 @@ pub(crate) async fn do_rerun(
         .await
         .map_err(|e| e.to_string())?;
 
-    // Burst-poll at 1s, 5s, 10s so the poller picks up the rerun quickly.
-    let changed = state.config.changed().clone();
-    tokio::spawn(async move {
-        for delay in [1, 5, 10] {
-            tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
-            changed.notify_waiters();
-        }
-    });
+    trigger_burst_poll(state);
 
     let url = run_url(repo, run_id);
     let kind = if failed_only {
@@ -407,6 +330,70 @@ pub(crate) async fn do_rerun(
         "all jobs"
     };
     Ok(format!("Rerunning {kind} for run {run_id}\n{url}"))
+}
+
+/// Merge a PR by number and trigger burst polling.
+pub(crate) async fn do_merge(
+    state: &DaemonState,
+    repo: &str,
+    number: u64,
+) -> Result<String, String> {
+    state
+        .handle
+        .github
+        .pr_merge(repo, number)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    trigger_burst_poll(state);
+
+    Ok(format!("Merged PR #{number} in {repo}"))
+}
+
+/// Modify a case-insensitive ignore list: add new items, remove existing ones.
+/// Returns human-readable messages describing what changed.
+pub(crate) fn modify_ignore_list(
+    list: &mut Vec<String>,
+    add: &[String],
+    remove: &[String],
+    label: &str,
+) -> Vec<String> {
+    let mut msgs = Vec::new();
+
+    let mut added = Vec::new();
+    for item in add {
+        if !list
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(item))
+        {
+            list.push(item.clone());
+            added.push(item.clone());
+        }
+    }
+
+    let before = list.len();
+    list.retain(|existing| !remove.iter().any(|r| r.eq_ignore_ascii_case(existing)));
+    let removed = before - list.len();
+
+    if !added.is_empty() {
+        msgs.push(format!("Added to ignore list: {}", added.join(", ")));
+    } else if !add.is_empty() {
+        msgs.push(format!("All specified {label}s were already ignored"));
+    }
+    if removed > 0 {
+        msgs.push(format!("Removed from ignore list: {removed} {label}(s)"));
+    } else if !remove.is_empty() {
+        msgs.push(format!(
+            "None of the specified {label}s were in the ignore list"
+        ));
+    }
+    if list.is_empty() {
+        msgs.push(format!("No {label}s are globally ignored now."));
+    } else {
+        msgs.push(format!("Ignored: {list:?}"));
+    }
+
+    msgs
 }
 
 /// Types that can have notification levels applied to them field-by-field.
@@ -620,6 +607,36 @@ fn format_notification_overrides(overrides: &NotificationOverrides) -> String {
 mod tests {
     use super::*;
     use build_watcher::config::{NotificationLevel, NotificationOverrides};
+
+    #[test]
+    fn modify_ignore_list_add_and_remove() {
+        let mut list = vec!["CI".to_string()];
+        let msgs = modify_ignore_list(
+            &mut list,
+            &["Deploy".to_string()],
+            &["ci".to_string()],
+            "workflow",
+        );
+        assert_eq!(list, vec!["Deploy"]);
+        assert!(msgs.iter().any(|m| m.contains("Added")));
+        assert!(msgs.iter().any(|m| m.contains("Removed")));
+    }
+
+    #[test]
+    fn modify_ignore_list_deduplicates() {
+        let mut list = vec!["CI".to_string()];
+        let msgs = modify_ignore_list(&mut list, &["ci".to_string()], &[], "workflow");
+        assert_eq!(list.len(), 1);
+        assert!(msgs.iter().any(|m| m.contains("already ignored")));
+    }
+
+    #[test]
+    fn modify_ignore_list_empty_result() {
+        let mut list = vec!["CI".to_string()];
+        let msgs = modify_ignore_list(&mut list, &[], &["CI".to_string()], "event");
+        assert!(list.is_empty());
+        assert!(msgs.iter().any(|m| m.contains("No events are globally")));
+    }
 
     #[test]
     fn hhmm_validation() {

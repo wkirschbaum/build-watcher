@@ -18,7 +18,7 @@ use build_watcher::watcher::{count_api_calls, is_paused};
 
 use super::DaemonState;
 use super::actions::{
-    apply_pause, do_configure_branches, do_rerun, do_stop_watches, do_watch_builds,
+    apply_pause, do_configure_branches, do_merge, do_rerun, do_stop_watches, do_watch_builds,
 };
 use super::{build_watch_snapshot, json_error};
 
@@ -132,6 +132,26 @@ pub(crate) async fn rerun_handler(
         return json_error(e);
     }
     match do_rerun(&state, &body.repo, body.run_id, body.failed_only).await {
+        Ok(msg) => axum::Json(serde_json::json!({ "ok": true, "message": msg })).into_response(),
+        Err(e) => axum::Json(serde_json::json!({ "error": e })).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+pub(crate) struct MergeRequest {
+    repo: String,
+    number: u64,
+}
+
+/// `POST /merge` — Merge a PR by number.
+pub(crate) async fn merge_handler(
+    State(state): State<DaemonState>,
+    axum::Json(body): axum::Json<MergeRequest>,
+) -> axum::response::Response {
+    if let Err(e) = validate_repo(&body.repo) {
+        return json_error(e);
+    }
+    match do_merge(&state, &body.repo, body.number).await {
         Ok(msg) => axum::Json(serde_json::json!({ "ok": true, "message": msg })).into_response(),
         Err(e) => axum::Json(serde_json::json!({ "error": e })).into_response(),
     }
@@ -263,14 +283,14 @@ pub(crate) async fn notifications_handler(
     }
 }
 
-/// `GET /defaults` — Read global default config (branches, ignored workflows, poll aggression).
+/// `GET /defaults` — Read global default config (ignored workflows, poll aggression, auto-discover, branch filter).
 pub(crate) async fn get_defaults_handler(
     State(state): State<DaemonState>,
 ) -> axum::Json<DefaultsConfig> {
     let cfg = state.config.read().await;
     axum::Json(DefaultsConfig {
-        default_branches: Some(cfg.default_branches.clone()),
         ignored_workflows: Some(cfg.ignored_workflows.clone()),
+        ignored_events: Some(cfg.ignored_events.clone()),
         poll_aggression: Some(cfg.poll_aggression.to_string()),
         auto_discover_branches: Some(cfg.auto_discover_branches),
         branch_filter: cfg.branch_filter.clone(),
@@ -284,16 +304,6 @@ pub(crate) async fn set_defaults_handler(
     axum::Json(body): axum::Json<DefaultsConfig>,
 ) -> axum::response::Response {
     // Validate inputs before taking the config lock.
-    if let Some(branches) = &body.default_branches {
-        for b in branches {
-            if let Err(e) = validate_branch(b) {
-                return json_error(e);
-            }
-        }
-        if branches.is_empty() {
-            return json_error("default_branches must not be empty");
-        }
-    }
     if let Some(level) = &body.poll_aggression
         && let Err(e) = level.parse::<PollAggression>()
     {
@@ -310,16 +320,20 @@ pub(crate) async fn set_defaults_handler(
         .config
         .modify(|cfg| {
             let mut messages = Vec::new();
-            if let Some(branches) = body.default_branches {
-                cfg.default_branches = branches.clone();
-                messages.push(format!("default branches: {}", branches.join(", ")));
-            }
             if let Some(workflows) = body.ignored_workflows {
                 cfg.ignored_workflows = workflows.clone();
                 if workflows.is_empty() {
                     messages.push("ignored workflows cleared".to_string());
                 } else {
                     messages.push(format!("ignored workflows: {}", workflows.join(", ")));
+                }
+            }
+            if let Some(events) = body.ignored_events {
+                cfg.ignored_events = events.clone();
+                if events.is_empty() {
+                    messages.push("ignored events cleared".to_string());
+                } else {
+                    messages.push(format!("ignored events: {}", events.join(", ")));
                 }
             }
             if let Some(level) = body.poll_aggression {
@@ -379,6 +393,8 @@ pub(crate) async fn get_repo_config_handler(
         workflows: Some(rc.map(|r| r.workflows.clone()).unwrap_or_default()),
         watch_prs: Some(rc.is_some_and(|r| r.watch_prs)),
         poll_aggression: rc.and_then(|r| r.poll_aggression.map(|a| a.to_string())),
+        auto_discover_branches: rc.and_then(|r| r.auto_discover_branches),
+        branch_filter: rc.and_then(|r| r.branch_filter.clone()),
     })
 }
 
@@ -427,6 +443,22 @@ pub(crate) async fn set_repo_config_handler(
                 } else if let Ok(aggression) = level.parse::<PollAggression>() {
                     rc.poll_aggression = Some(aggression);
                     messages.push(format!("poll aggression: {aggression}"));
+                }
+            }
+            if let Some(enabled) = body.auto_discover_branches {
+                rc.auto_discover_branches = Some(enabled);
+                messages.push(format!(
+                    "auto-discover branches: {}",
+                    if enabled { "on" } else { "off" }
+                ));
+            }
+            if let Some(filter) = &body.branch_filter {
+                if filter.is_empty() {
+                    rc.branch_filter = None;
+                    messages.push("branch filter: default (global)".to_string());
+                } else {
+                    rc.branch_filter = Some(filter.clone());
+                    messages.push(format!("branch filter: {filter}"));
                 }
             }
             messages
@@ -623,6 +655,13 @@ mod tests {
             _: &str,
         ) -> Result<Vec<build_watcher::github::PrInfo>, build_watcher::github::GhError> {
             Ok(vec![])
+        }
+        async fn pr_merge(
+            &self,
+            _: &str,
+            _: u64,
+        ) -> Result<String, build_watcher::github::GhError> {
+            Ok("Merged".to_string())
         }
     }
 
@@ -1124,6 +1163,8 @@ mod tests {
             workflows: Some(vec!["CI".to_string(), "Deploy".to_string()]),
             watch_prs: Some(true),
             poll_aggression: Some("high".to_string()),
+            auto_discover_branches: None,
+            branch_filter: None,
         };
         let resp = json_post(&router, "/repo-config", &body).await;
         assert_eq!(resp["ok"], true);

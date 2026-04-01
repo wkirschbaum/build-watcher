@@ -39,16 +39,40 @@ impl Config {
             .map_or(&[], |r| r.workflows.as_slice())
     }
 
-    pub fn branches_for(&self, repo: &str) -> &[String] {
-        self.repos
-            .get(repo)
-            .filter(|r| !r.branches.is_empty())
-            .map_or(&self.default_branches, |r| r.branches.as_slice())
+    /// Merged ignored events for a repo (global union per-repo). Case-preserved.
+    pub fn ignored_events_for(&self, repo: &str) -> Vec<String> {
+        let mut events = self.ignored_events.clone();
+        if let Some(rc) = self.repos.get(repo) {
+            for e in &rc.ignored_events {
+                if !events
+                    .iter()
+                    .any(|existing| existing.eq_ignore_ascii_case(e))
+                {
+                    events.push(e.clone());
+                }
+            }
+        }
+        events
     }
 
-    /// Returns `true` if the repo has explicit branch configuration (not using global defaults).
-    pub fn has_explicit_branches(&self, repo: &str) -> bool {
-        self.repos.get(repo).is_some_and(|r| !r.branches.is_empty())
+    /// All branches for a repo: user-configured + auto-discovered.
+    pub fn branches_for(&self, repo: &str) -> Vec<String> {
+        let Some(rc) = self.repos.get(repo) else {
+            return Vec::new();
+        };
+        let mut all = rc.branches.clone();
+        for b in &rc.discovered_branches {
+            if !all.contains(b) {
+                all.push(b.clone());
+            }
+        }
+        all
+    }
+
+    /// Only user-configured branches (not auto-discovered). These are "pinned"
+    /// and should never be auto-removed by the poller.
+    pub fn pinned_branches_for(&self, repo: &str) -> &[String] {
+        self.repos.get(repo).map_or(&[], |r| r.branches.as_slice())
     }
 
     /// Returns `true` if the current local time falls within the configured quiet hours.
@@ -60,10 +84,22 @@ impl Config {
         is_in_quiet_hours_at(qh, cur_mins)
     }
 
-    /// Compile the `branch_filter` regex, if set and valid.
-    pub fn branch_filter_regex(&self) -> Option<regex::Regex> {
-        self.branch_filter
-            .as_ref()
+    /// Whether auto-discover is enabled for the given repo (per-repo override → global).
+    pub fn auto_discover_for(&self, repo: &str) -> bool {
+        self.repos
+            .get(repo)
+            .and_then(|r| r.auto_discover_branches)
+            .unwrap_or(self.auto_discover_branches)
+    }
+
+    /// Compile the effective `branch_filter` regex for a repo (per-repo → global fallback).
+    pub fn branch_filter_for(&self, repo: &str) -> Option<regex::Regex> {
+        let pattern = self
+            .repos
+            .get(repo)
+            .and_then(|r| r.branch_filter.as_ref())
+            .or(self.branch_filter.as_ref());
+        pattern
             .filter(|p| !p.is_empty())
             .and_then(|p| regex::Regex::new(p).ok())
     }
@@ -207,5 +243,31 @@ mod tests {
         assert_eq!(n.build_started, NotificationLevel::Off); // from branch
         assert_eq!(n.build_success, NotificationLevel::Critical); // from branch
         assert_eq!(n.build_failure, NotificationLevel::Low); // from repo (branch is None)
+    }
+
+    #[test]
+    fn ignored_events_merges_global_and_per_repo() {
+        let mut config = Config::default();
+        config.ignored_events = vec!["schedule".to_string()];
+        config.repos.insert(
+            "alice/app".to_string(),
+            RepoConfig {
+                ignored_events: vec!["workflow_dispatch".to_string(), "Schedule".to_string()],
+                ..Default::default()
+            },
+        );
+        let events = config.ignored_events_for("alice/app");
+        // "Schedule" duplicates global "schedule" (case-insensitive), should not appear twice
+        assert_eq!(events.len(), 2);
+        assert!(events.iter().any(|e| e == "schedule"));
+        assert!(events.iter().any(|e| e == "workflow_dispatch"));
+    }
+
+    #[test]
+    fn ignored_events_global_only() {
+        let mut config = Config::default();
+        config.ignored_events = vec!["schedule".to_string()];
+        let events = config.ignored_events_for("unknown/repo");
+        assert_eq!(events, vec!["schedule"]);
     }
 }

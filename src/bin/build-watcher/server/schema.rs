@@ -83,15 +83,11 @@ pub(crate) struct ReposParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub(crate) struct ConfigureBranchesParams {
-    /// GitHub repo in "owner/repo" format. Omit to set the global default branches.
-    pub repo: Option<String>,
+    /// GitHub repo in "owner/repo" format.
+    pub repo: String,
     /// Branches to watch (e.g. `["main", "develop"]`)
     #[serde(deserialize_with = "deserialize_string_or_vec")]
     pub branches: Vec<String>,
-    /// Enable automatic discovery of branches with active runs. Global setting (ignored when repo is set).
-    pub auto_discover_branches: Option<bool>,
-    /// Regex pattern to filter discovered branches (e.g. `"^(main|develop)"` ). Global setting (ignored when repo is set). Pass empty string to clear.
-    pub branch_filter: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -144,6 +140,25 @@ pub(crate) struct ConfigureIgnoredWorkflowsParams {
     /// Workflow names to remove from the global ignore list (case-insensitive)
     #[serde(default, deserialize_with = "deserialize_string_or_vec")]
     pub remove: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub(crate) struct ConfigureIgnoredEventsParams {
+    /// Event types to add to the ignore list (case-insensitive), e.g. "schedule", "workflow_dispatch"
+    #[serde(default, deserialize_with = "deserialize_string_or_vec")]
+    pub add: Vec<String>,
+    /// Event types to remove from the ignore list (case-insensitive)
+    #[serde(default, deserialize_with = "deserialize_string_or_vec")]
+    pub remove: Vec<String>,
+    /// Optional repo scope in "owner/repo" format. Omit to modify the global ignore list.
+    pub repo: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub(crate) struct WatchFromGitRemoteParams {
+    /// Path to a local git repository directory. The daemon will read its origin remote
+    /// to detect the GitHub owner/repo and start watching it.
+    pub path: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
