@@ -11,7 +11,10 @@ A background daemon that monitors GitHub Actions builds and sends desktop notifi
 - Short repo names in notifications -- org prefix omitted when the name is unambiguous
 - Build duration shown in completion notifications
 - Failing job/step context included in failure notifications
-- PR titles displayed for pull request events
+- PR titles displayed for pull request events; compact event prefixes (`PR:`, `cron:`, `manual:`)
+- **PR watch** -- opt-in per-repo polling of open PRs with merge-readiness badges (`PR:✓`/`PR:⊘`/`PR:✗`) and notifications when PRs become ready to merge
+- **Per-repo config** -- `c` key in TUI to configure alias, watch PRs, and poll aggression per repo
+- Per-repo poll aggression override (falls back to global when unset)
 - Per-repo workflow filtering and global workflow ignore list
 - Quiet hours window for silencing notifications at scheduled times
 - Build history summary with duration and age

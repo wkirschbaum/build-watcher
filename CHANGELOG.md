@@ -1,5 +1,41 @@
 # Changelog
 
+## [0.10.0] - 2026-04-01
+
+### Added
+
+- **PR watch**: opt-in per-repo feature to poll open PRs and track merge-readiness
+  - Enable via `c` per-repo config form or `watch_prs` in config.json
+  - Detects merge-state transitions: Clean, Blocked, Unstable, Behind, Dirty
+  - Desktop notifications when PRs become ready to merge or blocked
+  - Compact PR badge in TUI branch column: `PR:✓` / `PR:⊘` / `PR:!` / `PR:↓` / `PR:✗`
+- **Per-repo config form** (`c` key): edit alias, watch PRs, and poll aggression per repo
+- **Per-repo poll aggression**: override the global poll aggression per repo (falls back to global when unset)
+- Compact event prefixes in titles: `PR:`, `cron:`, `manual:`
+
+### Changed
+
+- `C` key remains global config; `c` key opens per-repo config
+- Form dispatch uses `FormKind` enum instead of string matching
+- REST `GET/POST /repo-config` endpoints for per-repo settings
+- Derive `Default` on `WatchStatus`, `ActiveRunView`, `LastBuildView`, `RunStatus`, `RunConclusion` — reduces test boilerplate
+
+## [0.9.0] - 2026-03-31
+
+### Added
+
+- Fetch `createdAt`, `updatedAt`, `url` from GitHub API — durations and URLs now come from real timestamps instead of local tracking
+- `RunInfo.duration_secs()` computes real duration from GitHub timestamps
+- `elapsed_since()` helper for computing elapsed time from ISO timestamps
+
+### Changed
+
+- Replace `Instant`-based elapsed tracking with GitHub timestamps — durations survive daemon restarts
+- `ActiveRun` stores `created_at`/`updated_at`/`url` instead of `tokio::time::Instant`
+- Simplify `record_completion` (3 params, no return), `incorporate_new_runs` (1 param), `build_watch_snapshot` (no Instant param)
+- Remove `elapsed_map` from repo poller — use timestamp-based duration directly
+- Propagate `url` field through `RunSnapshot`, `ActiveRunView`, `LastBuildView`
+
 ## [0.8.8] - 2026-03-31
 
 ### Fixed
@@ -86,6 +122,8 @@
 
 - Avoid unnecessary config re-save on reads; improve persistence error logging
 
+[0.10.0]: https://github.com/wkirschbaum/build-watcher/releases/tag/v0.10.0
+[0.9.0]: https://github.com/wkirschbaum/build-watcher/releases/tag/v0.9.0
 [0.8.8]: https://github.com/wkirschbaum/build-watcher/releases/tag/v0.8.8
 [0.8.7]: https://github.com/wkirschbaum/build-watcher/releases/tag/v0.8.7
 [0.8.6]: https://github.com/wkirschbaum/build-watcher/releases/tag/v0.8.6
