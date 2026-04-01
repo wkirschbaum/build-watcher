@@ -95,6 +95,7 @@ pub async fn start_watch(
             active_runs: HashMap::new(),
             failure_counts: HashMap::new(),
             last_builds: HashMap::new(),
+            pr: None,
             waiting: true,
         };
         {
@@ -165,6 +166,7 @@ pub async fn start_watch(
         active_runs: active,
         failure_counts: HashMap::new(),
         last_builds: last_builds.clone(),
+        pr: None,
         waiting: false,
     };
 
@@ -223,6 +225,7 @@ pub(super) async fn spawn_repo_poller(
         history: handle.history.clone(),
         config_changed: handle.config_changed.clone(),
         last_active_secs: 0,
+        pr_states: std::collections::HashMap::new(),
     };
     handle.tracker.spawn(async move {
         poller.run().await;

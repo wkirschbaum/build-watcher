@@ -27,6 +27,12 @@ pub(crate) struct FormField {
     pub(crate) options: Vec<&'static str>,
 }
 
+/// Distinguishes which form is open so submission dispatches correctly.
+pub(crate) enum FormKind {
+    GlobalDefaults,
+    RepoConfig { repo: String },
+}
+
 /// Text input mode for interactive prompts (e.g. "Add repo: ").
 pub(crate) enum InputMode {
     Normal,
@@ -35,9 +41,10 @@ pub(crate) enum InputMode {
         buffer: String,
         action: TextAction,
     },
-    /// Multi-field form popup (e.g. config defaults).
+    /// Multi-field form popup.
     Form {
         title: String,
+        kind: FormKind,
         fields: Vec<FormField>,
         active: usize,
     },
@@ -195,6 +202,99 @@ impl App {
         }
     }
 
+    /// Open per-repo config form (fetches current values from daemon).
+    pub(crate) fn open_repo_config_form(&mut self, daemon: &DaemonClient, repo: &str) {
+        let d = daemon.clone();
+        let tx = self.bg_tx.clone();
+        let repo = repo.to_string();
+        self.set_flash("Loading repo config…");
+        tokio::spawn(async move {
+            match d.get_repo_config(&repo).await {
+                Ok(rc) => {
+                    let _ = tx
+                        .send(SseUpdate::EnterForm {
+                            title: format!("Repo: {repo}"),
+                            kind: FormKind::RepoConfig { repo: repo.clone() },
+                            fields: vec![
+                                FormField {
+                                    label: "Alias".to_string(),
+                                    buffer: rc.alias.unwrap_or_default(),
+                                    options: vec![],
+                                },
+                                FormField {
+                                    label: "Watch PRs".to_string(),
+                                    buffer: if rc.watch_prs.unwrap_or(false) {
+                                        "on".to_string()
+                                    } else {
+                                        "off".to_string()
+                                    },
+                                    options: vec!["off", "on"],
+                                },
+                                FormField {
+                                    label: "Poll aggression".to_string(),
+                                    buffer: rc
+                                        .poll_aggression
+                                        .unwrap_or_else(|| "default".to_string()),
+                                    options: vec!["default", "low", "medium", "high"],
+                                },
+                            ],
+                        })
+                        .await;
+                }
+                Err(e) => {
+                    let _ = tx
+                        .send(SseUpdate::BackgroundResult {
+                            flash: e,
+                            resync: false,
+                        })
+                        .await;
+                }
+            }
+        });
+    }
+
+    /// Submit the per-repo config form to the daemon.
+    pub(crate) fn submit_repo_config_form(&mut self, daemon: &DaemonClient) {
+        let InputMode::Form {
+            kind: FormKind::RepoConfig { repo },
+            fields,
+            ..
+        } = &self.input_mode
+        else {
+            return;
+        };
+        let repo = repo.clone();
+
+        let alias = fields
+            .iter()
+            .find(|f| f.label == "Alias")
+            .map(|f| f.buffer.clone());
+        let watch_prs: Option<bool> = fields
+            .iter()
+            .find(|f| f.label == "Watch PRs")
+            .map(|f| f.buffer == "on");
+        let poll_aggression: Option<String> = fields
+            .iter()
+            .find(|f| f.label == "Poll aggression")
+            .map(|f| f.buffer.clone());
+
+        let config = build_watcher::status::RepoConfigView {
+            repo,
+            alias,
+            workflows: None,
+            watch_prs,
+            poll_aggression,
+        };
+
+        let d = daemon.clone();
+        self.input_mode = InputMode::Normal;
+        self.spawn_action("Saving repo config…", true, async move {
+            d.set_repo_config(&config)
+                .await
+                .map(|()| "Repo config saved".to_string())
+        });
+    }
+
     /// Open the config defaults form (fetches current values from daemon).
     pub(crate) fn open_config_form(&mut self, daemon: &DaemonClient) {
         let d = daemon.clone();
@@ -206,6 +306,7 @@ impl App {
                     let _ = tx
                         .send(SseUpdate::EnterForm {
                             title: "Config".to_string(),
+                            kind: FormKind::GlobalDefaults,
                             fields: vec![
                                 FormField {
                                     label: "Default branches".to_string(),

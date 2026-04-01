@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 
 /// GitHub Actions run conclusion values.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunConclusion {
     Success,
@@ -14,12 +14,13 @@ pub enum RunConclusion {
     TimedOut,
     #[serde(rename = "startup_failure")]
     StartupFailure,
+    #[default]
     #[serde(other)]
     Unknown,
 }
 
 /// GitHub Actions run status values.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunStatus {
     #[serde(rename = "in_progress")]
@@ -29,6 +30,7 @@ pub enum RunStatus {
     Requested,
     Pending,
     Completed,
+    #[default]
     #[serde(other)]
     Unknown,
 }
@@ -74,7 +76,7 @@ impl RunStatus {
 }
 
 /// A single active run as returned by `GET /status`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ActiveRunView {
     pub run_id: u64,
     pub status: RunStatus,
@@ -93,7 +95,7 @@ pub struct ActiveRunView {
 }
 
 /// Summary of the last completed build as returned by `GET /status`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LastBuildView {
     pub run_id: u64,
     pub conclusion: RunConclusion,
@@ -120,7 +122,7 @@ pub struct LastBuildView {
 }
 
 /// One watched repo/branch as returned by `GET /status`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct WatchStatus {
     pub repo: String,
     pub branch: String,
@@ -128,12 +130,26 @@ pub struct WatchStatus {
     /// Last completed build per workflow.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub last_builds: Vec<LastBuildView>,
+    /// Open PR targeting this branch, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr: Option<PrView>,
     /// Whether notifications are muted for this repo (all levels set to off).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub muted: bool,
     /// True until the first successful poll provides data.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub waiting: bool,
+}
+
+/// Compact PR view for the TUI status display.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrView {
+    pub number: u64,
+    pub title: String,
+    pub url: String,
+    pub author: String,
+    pub merge_state: crate::github::MergeState,
+    pub draft: bool,
 }
 
 /// Full response body for `GET /status`.
@@ -175,6 +191,20 @@ pub struct DefaultsConfig {
     pub auto_discover_branches: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch_filter: Option<String>,
+}
+
+/// Per-repo config view used by `GET /repo-config` and `POST /repo-config`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RepoConfigView {
+    pub repo: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alias: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflows: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watch_prs: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub poll_aggression: Option<String>,
 }
 
 /// Daemon stats returned by `GET /stats`.
@@ -268,6 +298,27 @@ impl StatusResponse {
                     active.status = to;
                 }
             }
+            WatchEvent::PrStateChanged {
+                repo,
+                branch,
+                number,
+                title,
+                url,
+                to,
+                ..
+            } => {
+                // Find the watch for the PR's source branch and update it.
+                if let Some(watch) = find_watch_mut(&mut self.watches, &repo, &branch) {
+                    watch.pr = Some(PrView {
+                        number,
+                        title,
+                        url,
+                        author: String::new(),
+                        merge_state: to,
+                        draft: false,
+                    });
+                }
+            }
         }
     }
 }
@@ -307,6 +358,7 @@ mod tests {
             branch: branch.to_string(),
             active_runs: vec![],
             last_builds: vec![],
+            pr: None,
             muted: false,
             waiting: false,
         }
@@ -399,6 +451,7 @@ mod tests {
                 url: String::new(),
             }],
             last_builds: vec![],
+            pr: None,
             muted: false,
             waiting: false,
         }]);

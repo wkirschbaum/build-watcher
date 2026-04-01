@@ -102,6 +102,8 @@ pub(super) struct RepoPoller {
     pub(super) history: crate::history::SharedHistory,
     pub(super) config_changed: Arc<Notify>,
     pub(super) last_active_secs: u64,
+    /// Last known merge state per PR number — used to detect transitions.
+    pub(super) pr_states: HashMap<u64, crate::github::MergeState>,
 }
 
 impl RepoPoller {
@@ -145,7 +147,13 @@ impl RepoPoller {
             let w = self.watches.lock().await;
             super::count_api_calls(&w)
         };
-        let aggression = self.config.read().await.poll_aggression;
+        let cfg = self.config.read().await;
+        let aggression = cfg
+            .repos
+            .get(&self.repo)
+            .and_then(|rc| rc.poll_aggression)
+            .unwrap_or(cfg.poll_aggression);
+        drop(cfg);
         compute_intervals(
             rate_limit.as_ref(),
             api_calls,
@@ -201,6 +209,11 @@ impl RepoPoller {
                 } else {
                     tracing::debug!(run_id = change.run_id(), "Suppressed duplicate event");
                 }
+            }
+
+            // PR polling — only on idle cycles for repos with watch_prs enabled.
+            if !has_active {
+                self.poll_prs().await;
             }
         }
     }
@@ -483,6 +496,60 @@ impl RepoPoller {
             }
         }
         changed
+    }
+
+    /// Poll open PRs and emit events when merge state transitions.
+    pub(super) async fn poll_prs(&mut self) {
+        let watch_prs = {
+            let cfg = self.config.read().await;
+            cfg.repos.get(&self.repo).is_some_and(|rc| rc.watch_prs)
+        };
+        if !watch_prs {
+            return;
+        }
+
+        let prs = match self.github.open_prs(&self.repo).await {
+            Ok(prs) => prs,
+            Err(e) => {
+                tracing::debug!(repo = %self.repo, error = %e, "Failed to poll PRs");
+                return;
+            }
+        };
+
+        // Detect transitions and emit events.
+        let current_ids: HashSet<u64> = prs.iter().map(|pr| pr.number).collect();
+        for pr in &prs {
+            let old = self.pr_states.get(&pr.number);
+            if old.is_none_or(|prev| *prev != pr.merge_state) {
+                if let Some(from) = old.cloned() {
+                    self.events.emit(WatchEvent::PrStateChanged {
+                        repo: self.repo.clone(),
+                        branch: pr.branch.clone(),
+                        number: pr.number,
+                        title: pr.title.clone(),
+                        url: pr.url.clone(),
+                        from,
+                        to: pr.merge_state.clone(),
+                    });
+                }
+                self.pr_states.insert(pr.number, pr.merge_state.clone());
+            }
+        }
+        // Remove closed PRs from state.
+        self.pr_states.retain(|id, _| current_ids.contains(id));
+
+        // Update watch entries with PR data for display.
+        let mut w = self.watches.lock().await;
+        // Build a map of branch → PR for this repo's PRs.
+        let pr_by_branch: HashMap<&str, &crate::github::PrInfo> =
+            prs.iter().map(|pr| (pr.branch.as_str(), pr)).collect();
+        for (key, entry) in w.iter_mut() {
+            if key.repo == self.repo {
+                entry.pr = pr_by_branch
+                    .get(key.branch.as_str())
+                    .map(|pr| (*pr).clone());
+            }
+        }
     }
 
     /// Check for new runs across all watched branches using a single repo-wide API call.

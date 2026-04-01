@@ -287,9 +287,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 app.resync(active_daemon).await;
                             }
                         }
-                        Some(SseUpdate::EnterForm { title, fields }) => {
+                        Some(SseUpdate::EnterForm { title, kind, fields }) => {
                             app.input_mode = InputMode::Form {
                                 title,
+                                kind,
                                 fields,
                                 active: 0,
                             };

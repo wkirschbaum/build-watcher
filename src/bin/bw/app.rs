@@ -15,7 +15,7 @@ use build_watcher::status::{HistoryEntryView, RunConclusion, StatsResponse, Stat
 use super::client::DaemonClient;
 
 // Re-export form types so existing imports from `app::` keep working.
-pub(crate) use super::forms::{FormField, InputMode};
+pub(crate) use super::forms::{FormField, FormKind, InputMode};
 
 /// What to do when the user presses a quit key.
 pub(crate) enum QuitAction {
@@ -415,9 +415,10 @@ pub(crate) enum SseUpdate {
     Disconnected,
     /// Result from a background HTTP action (e.g. adding a repo).
     BackgroundResult { flash: String, resync: bool },
-    /// Open the config form popup (used after fetching current defaults).
+    /// Open a config form popup.
     EnterForm {
         title: String,
+        kind: FormKind,
         fields: Vec<FormField>,
     },
     /// Open the per-event notification level picker popup.
@@ -489,8 +490,8 @@ mod tests {
             branch: branch.to_string(),
             active_runs: vec![],
             last_builds: vec![],
-            muted: false,
-            waiting: false,
+            pr: None,
+            ..Default::default()
         }
     }
 
@@ -548,11 +549,10 @@ mod tests {
                 event: "push".to_string(),
                 elapsed_secs: Some(30.0),
                 attempt: 1,
-                url: String::new(),
+                ..Default::default()
             }],
             last_builds: vec![],
-            muted: false,
-            waiting: false,
+            ..Default::default()
         }]);
 
         status.apply_event(WatchEvent::RunCompleted {
@@ -618,11 +618,10 @@ mod tests {
                 event: "push".to_string(),
                 elapsed_secs: None,
                 attempt: 1,
-                url: String::new(),
+                ..Default::default()
             }],
             last_builds: vec![],
-            muted: false,
-            waiting: false,
+            ..Default::default()
         }]);
 
         status.apply_event(WatchEvent::StatusChanged {
@@ -650,11 +649,10 @@ mod tests {
                 event: "push".to_string(),
                 elapsed_secs: None,
                 attempt: 1,
-                url: String::new(),
+                ..Default::default()
             }],
             last_builds: vec![],
-            muted: false,
-            waiting: false,
+            ..Default::default()
         }]);
 
         status.apply_event(WatchEvent::StatusChanged {
@@ -714,11 +712,9 @@ mod tests {
                 age_secs: Some(60.0),
                 attempt: 1,
                 failing_job_id: None,
-                url: String::new(),
-                duration_secs: None,
+                ..Default::default()
             }],
-            muted: false,
-            waiting: false,
+            ..Default::default()
         }];
         let flat = flatten_rows(&watches, GroupBy::Org, &no_collapsed(), &no_wf_collapsed());
         assert_eq!(flat.rows.len(), 3);
@@ -744,19 +740,17 @@ mod tests {
                     age_secs: Some(60.0),
                     attempt: 1,
                     failing_job_id: None,
-                    url: String::new(),
-                    duration_secs: None,
+                    ..Default::default()
                 }],
-                muted: false,
-                waiting: false,
+                ..Default::default()
             },
             WatchStatus {
                 repo: "alice/app".to_string(),
                 branch: "develop".to_string(),
                 active_runs: vec![],
                 last_builds: vec![],
-                muted: false,
-                waiting: false,
+                pr: None,
+                ..Default::default()
             },
         ];
         let flat = flatten_rows(&watches, GroupBy::Org, &no_collapsed(), &no_wf_collapsed());
@@ -780,11 +774,9 @@ mod tests {
                 age_secs: Some(60.0),
                 attempt: 1,
                 failing_job_id: None,
-                url: String::new(),
-                duration_secs: None,
+                ..Default::default()
             }],
-            muted: false,
-            waiting: false,
+            ..Default::default()
         }];
         let flat = flatten_rows(&watches, GroupBy::Org, &no_collapsed(), &no_wf_collapsed());
         // Single-branch: GroupHeader + RepoHeader (no child row)
@@ -811,8 +803,7 @@ mod tests {
                         age_secs: Some(60.0),
                         attempt: 1,
                         failing_job_id: None,
-                        url: String::new(),
-                        duration_secs: None,
+                        ..Default::default()
                     },
                     LastBuildView {
                         run_id: 2,
@@ -823,20 +814,18 @@ mod tests {
                         age_secs: Some(30.0),
                         attempt: 1,
                         failing_job_id: None,
-                        url: String::new(),
-                        duration_secs: None,
+                        ..Default::default()
                     },
                 ],
-                muted: false,
-                waiting: false,
+                ..Default::default()
             },
             WatchStatus {
                 repo: "alice/app".to_string(),
                 branch: "develop".to_string(),
                 active_runs: vec![],
                 last_builds: vec![],
-                muted: false,
-                waiting: false,
+                pr: None,
+                ..Default::default()
             },
         ];
 
@@ -916,11 +905,10 @@ mod tests {
                 event: "push".to_string(),
                 elapsed_secs: Some(10.0),
                 attempt: 1,
-                url: String::new(),
+                ..Default::default()
             }],
             last_builds: vec![],
-            muted: false,
-            waiting: false,
+            ..Default::default()
         }];
         let flat = flatten_rows(&watches, GroupBy::Org, &no_collapsed(), &no_wf_collapsed());
         // Single-branch: Row 0: GroupHeader, Row 1: RepoHeader (inline)
@@ -937,8 +925,8 @@ mod tests {
             branch: "main".to_string(),
             active_runs: vec![],
             last_builds: vec![],
-            muted: false,
-            waiting: false,
+            pr: None,
+            ..Default::default()
         }];
         let flat = flatten_rows(&watches, GroupBy::Org, &no_collapsed(), &no_wf_collapsed());
         // Row 0 is a GroupHeader — repo_branch_run should return None.
@@ -1001,11 +989,9 @@ mod tests {
                 age_secs: Some(age),
                 attempt: 1,
                 failing_job_id: None,
-                url: String::new(),
-                duration_secs: None,
+                ..Default::default()
             }],
-            muted: false,
-            waiting: false,
+            ..Default::default()
         }
     }
 
@@ -1021,11 +1007,10 @@ mod tests {
                 event: "push".to_string(),
                 elapsed_secs: Some(elapsed),
                 attempt: 1,
-                url: String::new(),
+                ..Default::default()
             }],
             last_builds: vec![],
-            muted: false,
-            waiting: false,
+            ..Default::default()
         }
     }
 

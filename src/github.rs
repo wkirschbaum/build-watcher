@@ -263,6 +263,85 @@ impl RunInfo {
     }
 }
 
+// -- Pull request types --
+
+/// Merge-readiness state from GitHub's `mergeStateStatus` field.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum MergeState {
+    Clean,
+    Blocked,
+    Unstable,
+    Behind,
+    Dirty,
+    HasHooks,
+    #[default]
+    #[serde(other)]
+    Unknown,
+}
+
+impl MergeState {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Clean => "ready",
+            Self::Blocked => "blocked",
+            Self::Unstable => "unstable",
+            Self::Behind => "behind",
+            Self::Dirty => "conflict",
+            Self::HasHooks => "hooks",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+impl std::fmt::Display for MergeState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+/// Raw JSON shape for a PR from `gh pr list`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GhPrJson {
+    number: u64,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    head_ref_name: String,
+    #[serde(default)]
+    url: String,
+    #[serde(default)]
+    is_draft: bool,
+    #[serde(default)]
+    merge_state_status: MergeState,
+    #[serde(default)]
+    review_decision: String,
+    author: Option<GhAuthorJson>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GhAuthorJson {
+    #[serde(default)]
+    login: String,
+}
+
+/// A GitHub pull request parsed for internal use.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrInfo {
+    pub number: u64,
+    pub title: String,
+    pub branch: String,
+    pub url: String,
+    pub author: String,
+    pub draft: bool,
+    pub merge_state: MergeState,
+    pub review_decision: String,
+}
+
+const GH_PR_FIELDS: &str =
+    "number,title,headRefName,url,isDraft,mergeStateStatus,reviewDecision,author";
+
 /// Abstraction over the GitHub API. The real implementation (`GhCliClient`) calls
 /// the `gh` CLI; tests can inject a mock.
 #[async_trait::async_trait]
@@ -291,6 +370,8 @@ pub trait GitHubClient: Send + Sync + 'static {
     async fn list_tags(&self, repo: &str) -> Result<Vec<String>, GhError>;
     /// Fetch the default branch name for a repo (e.g. "main" or "master").
     async fn default_branch(&self, repo: &str) -> Result<String, GhError>;
+    /// Fetch open PRs for a repo.
+    async fn open_prs(&self, repo: &str) -> Result<Vec<PrInfo>, GhError>;
 }
 
 /// Real GitHub client that shells out to the `gh` CLI.
@@ -467,6 +548,43 @@ impl GitHubClient for GhCliClient {
         } else {
             Ok(name)
         }
+    }
+
+    #[tracing::instrument(skip_all, fields(%repo))]
+    async fn open_prs(&self, repo: &str) -> Result<Vec<PrInfo>, GhError> {
+        let stdout = gh_exec(
+            repo,
+            &[
+                "pr",
+                "list",
+                "--repo",
+                repo,
+                "--state",
+                "open",
+                "--limit",
+                "50",
+                "--json",
+                GH_PR_FIELDS,
+            ],
+        )
+        .await?;
+        let raw: Vec<GhPrJson> = serde_json::from_slice(&stdout).map_err(|e| GhError::Parse {
+            repo: repo.to_string(),
+            source: e,
+        })?;
+        Ok(raw
+            .into_iter()
+            .map(|pr| PrInfo {
+                number: pr.number,
+                title: pr.title,
+                branch: pr.head_ref_name,
+                url: pr.url,
+                author: pr.author.map(|a| a.login).unwrap_or_default(),
+                draft: pr.is_draft,
+                merge_state: pr.merge_state_status,
+                review_decision: pr.review_decision,
+            })
+            .collect())
     }
 }
 
@@ -1010,5 +1128,51 @@ mod tests {
     #[test]
     fn extract_failing_steps_empty_jobs() {
         assert!(extract_failing_steps(&[]).is_none());
+    }
+
+    // -- PR parsing tests --
+
+    #[test]
+    fn pr_json_parses_all_fields() {
+        let json = json!([{
+            "number": 42,
+            "title": "Fix login bug",
+            "headRefName": "feat/login",
+            "url": "https://github.com/alice/app/pull/42",
+            "isDraft": false,
+            "mergeStateStatus": "CLEAN",
+            "reviewDecision": "APPROVED",
+            "author": { "login": "alice" }
+        }]);
+        let raw: Vec<GhPrJson> = serde_json::from_value(json).unwrap();
+        assert_eq!(raw.len(), 1);
+        let pr = &raw[0];
+        assert_eq!(pr.number, 42);
+        assert_eq!(pr.merge_state_status, MergeState::Clean);
+        assert_eq!(pr.head_ref_name, "feat/login");
+        assert!(!pr.is_draft);
+    }
+
+    #[test]
+    fn merge_state_deserializes_all_variants() {
+        for (s, expected) in [
+            ("CLEAN", MergeState::Clean),
+            ("BLOCKED", MergeState::Blocked),
+            ("UNSTABLE", MergeState::Unstable),
+            ("BEHIND", MergeState::Behind),
+            ("DIRTY", MergeState::Dirty),
+            ("HAS_HOOKS", MergeState::HasHooks),
+            ("SOMETHING_NEW", MergeState::Unknown),
+        ] {
+            let v: MergeState = serde_json::from_value(json!(s)).unwrap();
+            assert_eq!(v, expected, "failed for {s}");
+        }
+    }
+
+    #[test]
+    fn merge_state_labels() {
+        assert_eq!(MergeState::Clean.label(), "ready");
+        assert_eq!(MergeState::Dirty.label(), "conflict");
+        assert_eq!(MergeState::Unknown.label(), "unknown");
     }
 }

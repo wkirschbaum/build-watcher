@@ -242,6 +242,12 @@ pub struct RepoConfig {
     pub notifications: NotificationOverrides,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub branch_notifications: HashMap<String, BranchConfig>,
+    /// When true, poll open PRs for this repo and show merge-readiness in the TUI.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub watch_prs: bool,
+    /// Per-repo poll aggression override. Falls back to the global setting when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub poll_aggression: Option<PollAggression>,
 }
 
 /// Current schema version. Bump when making breaking changes to the config format.

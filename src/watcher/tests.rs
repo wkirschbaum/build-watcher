@@ -54,6 +54,7 @@ fn make_entry() -> WatchEntry {
         ]),
         failure_counts: HashMap::new(),
         last_builds: HashMap::new(),
+        pr: None,
         waiting: false,
     }
 }
@@ -64,6 +65,7 @@ fn idle_entry(last_seen: u64) -> WatchEntry {
         active_runs: HashMap::new(),
         failure_counts: HashMap::new(),
         last_builds: HashMap::new(),
+        pr: None,
         waiting: false,
     }
 }
@@ -90,6 +92,7 @@ fn make_last_build(run_id: u64, conclusion: &str) -> crate::github::LastBuild {
 struct MockGitHub {
     runs: Vec<RunInfo>,
     failure_msg: Option<String>,
+    prs: Vec<crate::github::PrInfo>,
 }
 
 impl MockGitHub {
@@ -97,6 +100,7 @@ impl MockGitHub {
         Arc::new(Self {
             runs,
             failure_msg: None,
+            prs: vec![],
         })
     }
 
@@ -107,6 +111,15 @@ impl MockGitHub {
         Arc::new(Self {
             runs,
             failure_msg: Some(failure_msg.to_string()),
+            prs: vec![],
+        })
+    }
+
+    fn with_prs(prs: Vec<crate::github::PrInfo>) -> Arc<dyn crate::github::GitHubClient> {
+        Arc::new(Self {
+            runs: vec![],
+            failure_msg: None,
+            prs,
         })
     }
 }
@@ -169,6 +182,9 @@ impl crate::github::GitHubClient for MockGitHub {
     async fn default_branch(&self, _: &str) -> Result<String, GhError> {
         Ok("main".to_string())
     }
+    async fn open_prs(&self, _: &str) -> Result<Vec<crate::github::PrInfo>, GhError> {
+        Ok(self.prs.clone())
+    }
 }
 
 // -- Test harness for async integration tests --
@@ -219,6 +235,7 @@ impl TestHarness {
             history: self.handle.history.clone(),
             config_changed: self.handle.config_changed.clone(),
             last_active_secs: 0,
+            pr_states: HashMap::new(),
         }
     }
 
@@ -1119,4 +1136,81 @@ async fn check_for_new_runs_ignores_rerun_with_same_conclusion() {
     assert!(changes.is_empty());
 
     h.cancel();
+}
+
+// -- PR polling tests --
+
+fn make_pr(number: u64, branch: &str, state: crate::github::MergeState) -> crate::github::PrInfo {
+    crate::github::PrInfo {
+        number,
+        title: format!("PR #{number}"),
+        branch: branch.to_string(),
+        url: format!("https://github.com/alice/app/pull/{number}"),
+        author: "alice".to_string(),
+        draft: false,
+        merge_state: state,
+        review_decision: String::new(),
+    }
+}
+
+#[tokio::test]
+async fn poll_prs_skips_when_not_enabled() {
+    let h = TestHarness::new(MockGitHub::with_prs(vec![make_pr(
+        1,
+        "main",
+        crate::github::MergeState::Clean,
+    )]));
+    h.seed(WatchKey::new("alice/app", "main"), idle_entry(100))
+        .await;
+
+    let mut rx = h.subscribe();
+    let mut poller = h.poller("alice/app");
+    poller.poll_prs().await;
+
+    // No events — watch_prs is not enabled.
+    assert!(rx.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn poll_prs_emits_on_transition() {
+    let prs = vec![make_pr(42, "feat/login", crate::github::MergeState::Clean)];
+    let h = TestHarness::with_config(MockGitHub::with_prs(prs), {
+        let mut cfg = Config::default();
+        cfg.repos
+            .entry("alice/app".to_string())
+            .or_default()
+            .watch_prs = true;
+        cfg
+    });
+    h.seed(WatchKey::new("alice/app", "main"), idle_entry(100))
+        .await;
+
+    let mut rx = h.subscribe();
+    let mut poller = h.poller("alice/app");
+
+    // First poll: records state, no event (first occurrence).
+    poller.poll_prs().await;
+    assert!(rx.try_recv().is_err());
+    assert_eq!(
+        poller.pr_states.get(&42),
+        Some(&crate::github::MergeState::Clean)
+    );
+
+    // Simulate state change by updating pr_states directly.
+    poller
+        .pr_states
+        .insert(42, crate::github::MergeState::Blocked);
+    poller.poll_prs().await;
+
+    // Now a transition event should be emitted.
+    match rx.try_recv() {
+        Ok(crate::events::WatchEvent::PrStateChanged {
+            number, from, to, ..
+        }) => {
+            assert_eq!(number, 42);
+            assert_eq!(from, crate::github::MergeState::Blocked);
+            assert_eq!(to, crate::github::MergeState::Clean);
+        }
+        other => panic!("expected PrStateChanged, got {other:?}"),
+    }
 }

@@ -9,7 +9,7 @@ use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table};
 use build_watcher::config::NotificationLevel;
 use build_watcher::format;
 use build_watcher::status::{
-    ActiveRunView, HistoryEntryView, LastBuildView, RunConclusion, WatchStatus,
+    ActiveRunView, HistoryEntryView, LastBuildView, PrView, RunConclusion, WatchStatus,
 };
 
 use super::app::{App, ExpandLevel, FormField, GroupBy, InputMode, SortColumn, SseState};
@@ -31,6 +31,28 @@ pub(crate) struct SingleBranchInfo<'a> {
     pub failing_job_id: Option<u64>,
     /// True until the first successful poll provides data.
     pub waiting: bool,
+    /// Compact PR merge-state badge (e.g. "PR:✓" or "PR:✗"), empty if no PR.
+    pub pr_badge: String,
+}
+
+/// Format a compact PR badge from a `PrView`, or empty string if no PR.
+fn pr_badge(pr: &Option<PrView>) -> String {
+    let Some(pr) = pr else {
+        return String::new();
+    };
+    let icon = match pr.merge_state {
+        build_watcher::github::MergeState::Clean => "✓",
+        build_watcher::github::MergeState::Blocked => "⊘",
+        build_watcher::github::MergeState::Unstable => "!",
+        build_watcher::github::MergeState::Behind => "↓",
+        build_watcher::github::MergeState::Dirty => "✗",
+        _ => "?",
+    };
+    if pr.draft {
+        format!("PR:{icon}~")
+    } else {
+        format!("PR:{icon}")
+    }
 }
 
 pub(crate) enum DisplayRow<'a> {
@@ -61,10 +83,8 @@ pub(crate) enum DisplayRow<'a> {
         extra_badge: String,
         muted: bool,
         tree_prefix: &'static str,
-        /// When true, this row is a child of a `BranchHeader`. The workflow
-        /// name is shown in the tree column instead of the branch name, and
-        /// the branch/workflow columns are left empty.
         is_workflow_child: bool,
+        pr_badge: String,
     },
     FailingSteps {
         steps: &'a str,
@@ -76,8 +96,8 @@ pub(crate) enum DisplayRow<'a> {
         build: &'a LastBuildView,
         muted: bool,
         tree_prefix: &'static str,
-        /// See `ActiveRun::is_workflow_child`.
         is_workflow_child: bool,
+        pr_badge: String,
     },
     NeverRan {
         repo: &'a str,
@@ -247,6 +267,7 @@ fn compute_single_branch_info<'a>(branches: &[&'a WatchStatus]) -> Option<Single
         failed,
         failing_job_id,
         waiting: w.waiting,
+        pr_badge: pr_badge(&w.pr),
     })
 }
 
@@ -466,6 +487,7 @@ fn emit_branch_workflow_rows<'a>(
                 muted: w.muted,
                 tree_prefix,
                 is_workflow_child: false,
+                pr_badge: pr_badge(&w.pr),
             });
         } else if let Some(b) = w.last_builds.first() {
             selectable.push(rows.len());
@@ -476,6 +498,7 @@ fn emit_branch_workflow_rows<'a>(
                 muted: w.muted,
                 tree_prefix,
                 is_workflow_child: false,
+                pr_badge: pr_badge(&w.pr),
             });
             if b.conclusion != RunConclusion::Success
                 && let Some(steps) = &b.failing_steps
@@ -551,6 +574,7 @@ fn emit_branch_workflow_rows<'a>(
                     muted: w.muted,
                     tree_prefix: wf_prefix,
                     is_workflow_child: true,
+                    pr_badge: String::new(), // badge shown on branch header, not workflow children
                 });
             }
             WorkflowItem::Completed(b) => {
@@ -562,6 +586,7 @@ fn emit_branch_workflow_rows<'a>(
                     muted: w.muted,
                     tree_prefix: wf_prefix,
                     is_workflow_child: true,
+                    pr_badge: String::new(),
                 });
                 if b.conclusion != RunConclusion::Success
                     && let Some(steps) = &b.failing_steps
@@ -1171,6 +1196,15 @@ pub(crate) fn render_body<'a>(
     }
 }
 
+/// Append a PR badge to the branch name if present.
+fn format_branch_with_pr(branch: &str, pr_badge: &str) -> String {
+    if pr_badge.is_empty() {
+        branch.to_string()
+    } else {
+        format!("{branch} {pr_badge}")
+    }
+}
+
 /// Build a 6-cell Row for a branch-level entry (ActiveRun, LastBuild, NeverRan).
 #[allow(clippy::too_many_arguments)]
 fn branch_row<'a>(
@@ -1261,9 +1295,14 @@ fn render_repo_header<'a>(
         } else {
             format!("{emoji} {}{sfx}", format::status(&sb.status_key))
         };
+        let branch_text = if sb.pr_badge.is_empty() {
+            sb.branch.to_string()
+        } else {
+            format!("{} {}", sb.branch, sb.pr_badge)
+        };
         Row::new(vec![
             Cell::from(format::truncate(&name, cw.repo)).style(repo_style),
-            Cell::from(format::truncate(sb.branch, cw.branch)),
+            Cell::from(format::truncate(&branch_text, cw.branch)),
             Cell::from(format::truncate(&inline_status, cw.status)).style(style),
             Cell::from(format::truncate(&sb.workflows, cw.workflow)),
             Cell::from(format::truncate(&sb.title, cw.title)),
@@ -1331,6 +1370,7 @@ fn render_active_run<'a>(
     muted: bool,
     tree_prefix: &str,
     is_workflow_child: bool,
+    pr_badge: &str,
     cw: &ColWidths,
     mute_indicator: &dyn Fn(bool) -> &'static str,
 ) -> Row<'a> {
@@ -1348,7 +1388,6 @@ fn render_active_run<'a>(
         format!("{emoji} {}{sfx} {extra_badge}", format::status(status_str))
     };
     if is_workflow_child {
-        // Show workflow name in tree, suppress branch/workflow columns.
         branch_row(
             &run.workflow,
             "",
@@ -1363,9 +1402,10 @@ fn render_active_run<'a>(
             mute_indicator,
         )
     } else {
+        let branch_text = format_branch_with_pr(branch, pr_badge);
         branch_row(
             branch,
-            branch,
+            &branch_text,
             muted,
             tree_prefix,
             &status_text,
@@ -1379,12 +1419,14 @@ fn render_active_run<'a>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_last_build<'a>(
     branch: &str,
     build: &LastBuildView,
     muted: bool,
     tree_prefix: &str,
     is_workflow_child: bool,
+    pr_badge: &str,
     cw: &ColWidths,
     mute_indicator: &dyn Fn(bool) -> &'static str,
 ) -> Row<'a> {
@@ -1412,9 +1454,10 @@ fn render_last_build<'a>(
             mute_indicator,
         )
     } else {
+        let branch_text = format_branch_with_pr(branch, pr_badge);
         branch_row(
             branch,
-            branch,
+            &branch_text,
             muted,
             tree_prefix,
             &status_text,
@@ -1522,6 +1565,7 @@ fn render_display_row<'a>(
             muted,
             tree_prefix,
             is_workflow_child,
+            pr_badge,
             ..
         } => render_active_run(
             branch,
@@ -1530,6 +1574,7 @@ fn render_display_row<'a>(
             *muted,
             tree_prefix,
             *is_workflow_child,
+            pr_badge,
             cw,
             mute_indicator,
         ),
@@ -1548,6 +1593,7 @@ fn render_display_row<'a>(
             muted,
             tree_prefix,
             is_workflow_child,
+            pr_badge,
             ..
         } => render_last_build(
             branch,
@@ -1555,6 +1601,7 @@ fn render_display_row<'a>(
             *muted,
             tree_prefix,
             *is_workflow_child,
+            pr_badge,
             cw,
             mute_indicator,
         ),
@@ -1999,6 +2046,7 @@ pub(crate) fn render(frame: &mut ratatui::Frame, app: &App) {
         title,
         fields,
         active,
+        ..
     } = &app.input_mode
     {
         render_form_popup(frame, title, fields, *active);

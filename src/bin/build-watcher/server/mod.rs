@@ -25,7 +25,7 @@ use build_watcher::config::SharedConfigManager;
 use build_watcher::config::unix_now;
 use build_watcher::dirs::state_dir;
 use build_watcher::status::{
-    ActiveRunView, LastBuildView, RunConclusion, StatusResponse, WatchStatus,
+    ActiveRunView, LastBuildView, PrView, RunConclusion, StatusResponse, WatchStatus,
 };
 use build_watcher::watcher::{
     PauseState, RateLimitState, WatchEntry, WatchKey, WatcherHandle, Watches, collect_persisted,
@@ -121,11 +121,21 @@ pub(crate) fn build_watch_snapshot(
             let muted = config
                 .is_some_and(|cfg| cfg.notifications_for(&key.repo, &key.branch).is_all_off());
 
+            let pr = entry.pr.as_ref().map(|pr| PrView {
+                number: pr.number,
+                title: pr.title.clone(),
+                url: pr.url.clone(),
+                author: pr.author.clone(),
+                merge_state: pr.merge_state.clone(),
+                draft: pr.draft,
+            });
+
             WatchStatus {
                 repo: key.repo.clone(),
                 branch: key.branch.clone(),
                 active_runs,
                 last_builds,
+                pr,
                 muted,
                 waiting: entry.waiting,
             }
@@ -215,6 +225,10 @@ fn build_router(state: DaemonState, ct: &CancellationToken) -> axum::Router {
         .route(
             "/defaults",
             axum::routing::get(rest::get_defaults_handler).post(rest::set_defaults_handler),
+        )
+        .route(
+            "/repo-config",
+            axum::routing::get(rest::get_repo_config_handler).post(rest::set_repo_config_handler),
         )
         .route("/history", get(rest::history_handler))
         .route("/history/all", get(rest::history_all_handler))

@@ -6,7 +6,7 @@ use build_watcher::config::NOTIFICATION_EVENT_COUNT;
 use build_watcher::github::{job_url, repo_url, run_url};
 use build_watcher::status::WatchStatus;
 
-use super::app::{App, ExpandLevel, QuitAction, SseUpdate};
+use super::app::{App, ExpandLevel, FormKind, QuitAction, SseUpdate};
 use super::client::{DaemonClient, open_browser};
 use super::forms::{InputMode, TextAction};
 use super::render::flatten_rows;
@@ -40,7 +40,12 @@ impl App {
                 }
                 true
             }
-            InputMode::Form { fields, active, .. } => {
+            InputMode::Form {
+                kind,
+                fields,
+                active,
+                ..
+            } => {
                 match code {
                     KeyCode::Esc => {
                         self.input_mode = InputMode::Normal;
@@ -78,9 +83,10 @@ impl App {
                             f.buffer.push(c);
                         }
                     }
-                    KeyCode::Enter => {
-                        self.submit_config_form(daemon);
-                    }
+                    KeyCode::Enter => match kind {
+                        FormKind::GlobalDefaults => self.submit_config_form(daemon),
+                        FormKind::RepoConfig { .. } => self.submit_repo_config_form(daemon),
+                    },
                     _ => {}
                 }
                 true
@@ -571,6 +577,11 @@ impl App {
                         false,
                         async move { d.rerun(&repo, run_id, failed_only).await },
                     );
+                }
+            }
+            KeyCode::Char('c') => {
+                if let Some((repo, _, _, _)) = selected {
+                    self.open_repo_config_form(daemon, repo);
                 }
             }
             KeyCode::Char('C') => {

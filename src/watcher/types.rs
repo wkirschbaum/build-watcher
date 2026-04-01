@@ -140,6 +140,8 @@ pub struct WatchEntry {
     pub(super) failure_counts: HashMap<u64, u8>,
     /// Last completed build per workflow name.
     pub last_builds: HashMap<String, LastBuild>,
+    /// Open PR targeting this branch (if watch_prs is enabled).
+    pub pr: Option<crate::github::PrInfo>,
     /// True until the first successful poll provides data.
     pub waiting: bool,
 }
@@ -151,6 +153,7 @@ impl WatchEntry {
             active_runs: HashMap::new(),
             failure_counts: HashMap::new(),
             last_builds: p.last_builds,
+            pr: None,
             waiting: false,
         }
     }

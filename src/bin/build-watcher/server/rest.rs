@@ -46,6 +46,7 @@ pub(crate) async fn events_handler(
                 WatchEvent::RunStarted(_) => "RunStarted",
                 WatchEvent::RunCompleted { .. } => "RunCompleted",
                 WatchEvent::StatusChanged { .. } => "StatusChanged",
+                WatchEvent::PrStateChanged { .. } => "PrStateChanged",
             };
             let data = match serde_json::to_string(&event) {
                 Ok(d) => d,
@@ -359,6 +360,90 @@ pub(crate) async fn set_defaults_handler(
     }
 }
 
+#[derive(Deserialize)]
+pub(crate) struct RepoQuery {
+    repo: String,
+}
+
+/// `GET /repo-config?repo=owner/name` — Read per-repo config.
+pub(crate) async fn get_repo_config_handler(
+    State(state): State<DaemonState>,
+    Query(q): Query<RepoQuery>,
+) -> axum::Json<build_watcher::status::RepoConfigView> {
+    let cfg = state.config.read().await;
+    let rc = cfg.repos.get(&q.repo);
+    axum::Json(build_watcher::status::RepoConfigView {
+        repo: q.repo,
+        alias: rc.and_then(|r| r.alias.clone()),
+        workflows: Some(rc.map(|r| r.workflows.clone()).unwrap_or_default()),
+        watch_prs: Some(rc.is_some_and(|r| r.watch_prs)),
+        poll_aggression: rc.and_then(|r| r.poll_aggression.map(|a| a.to_string())),
+    })
+}
+
+/// `POST /repo-config` — Update per-repo config fields.
+pub(crate) async fn set_repo_config_handler(
+    State(state): State<DaemonState>,
+    axum::Json(body): axum::Json<build_watcher::status::RepoConfigView>,
+) -> axum::response::Response {
+    if let Err(e) = validate_repo(&body.repo) {
+        return json_error(e);
+    }
+
+    let result = state
+        .config
+        .modify(|cfg| {
+            let rc = cfg.repos.entry(body.repo.clone()).or_default();
+            let mut messages = Vec::new();
+            if let Some(alias) = &body.alias {
+                if alias.is_empty() {
+                    rc.alias = None;
+                    messages.push("alias cleared".to_string());
+                } else {
+                    rc.alias = Some(alias.clone());
+                    messages.push(format!("alias: {alias}"));
+                }
+            }
+            if let Some(workflows) = &body.workflows {
+                rc.workflows = workflows.clone();
+                if workflows.is_empty() {
+                    messages.push("workflow filter cleared".to_string());
+                } else {
+                    messages.push(format!("workflows: {}", workflows.join(", ")));
+                }
+            }
+            if let Some(watch_prs) = body.watch_prs {
+                rc.watch_prs = watch_prs;
+                messages.push(format!(
+                    "watch PRs: {}",
+                    if watch_prs { "on" } else { "off" }
+                ));
+            }
+            if let Some(level) = &body.poll_aggression {
+                if level.is_empty() || level == "default" {
+                    rc.poll_aggression = None;
+                    messages.push("poll aggression: default (global)".to_string());
+                } else if let Ok(aggression) = level.parse::<PollAggression>() {
+                    rc.poll_aggression = Some(aggression);
+                    messages.push(format!("poll aggression: {aggression}"));
+                }
+            }
+            messages
+        })
+        .await;
+    match result {
+        Ok(messages) => {
+            axum::Json(serde_json::json!({ "ok": true, "messages": messages })).into_response()
+        }
+        Err(e) => {
+            let warning =
+                format!("\u{26a0}\u{fe0f} Warning: config could not be saved to disk: {e}");
+            axum::Json(serde_json::json!({ "ok": true, "messages": [], "warning": warning }))
+                .into_response()
+        }
+    }
+}
+
 /// `POST /shutdown` — Initiate graceful daemon shutdown.
 pub(crate) async fn shutdown_handler(
     State(state): State<DaemonState>,
@@ -531,6 +616,12 @@ mod tests {
         }
         async fn default_branch(&self, _: &str) -> Result<String, build_watcher::github::GhError> {
             Ok("main".to_string())
+        }
+        async fn open_prs(
+            &self,
+            _: &str,
+        ) -> Result<Vec<build_watcher::github::PrInfo>, build_watcher::github::GhError> {
+            Ok(vec![])
         }
     }
 
@@ -940,6 +1031,111 @@ mod tests {
         assert_eq!(
             bn.notifications.build_failure,
             Some(NotificationLevel::Critical)
+        );
+    }
+
+    // -- Repo config tests --
+
+    fn repo_config_router(config: SharedConfigManager) -> axum::Router {
+        let (watches, pause, _events) = empty_state();
+        let handle = stub_handle();
+        let app_state = super::super::DaemonState {
+            watches,
+            config,
+            handle,
+            pause,
+            rate_limit: Arc::new(Mutex::new(None)),
+            started_at: std::time::Instant::now(),
+        };
+        axum::Router::new()
+            .route(
+                "/repo-config",
+                axum::routing::get(super::get_repo_config_handler)
+                    .post(super::set_repo_config_handler),
+            )
+            .with_state(app_state)
+    }
+
+    async fn json_get(router: &axum::Router, path: &str) -> serde_json::Value {
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+        let req = http::Request::get(path)
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    async fn json_post(
+        router: &axum::Router,
+        path: &str,
+        body: &impl serde::Serialize,
+    ) -> serde_json::Value {
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+        let req = http::Request::post(path)
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(serde_json::to_vec(body).unwrap()))
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn get_repo_config_returns_defaults_for_unknown_repo() {
+        let router = repo_config_router(null_config(build_watcher::config::Config::default()));
+        let json = json_get(&router, "/repo-config?repo=alice/app").await;
+        assert_eq!(json["repo"], "alice/app");
+        assert_eq!(json["watch_prs"], false);
+        assert_eq!(json["workflows"], serde_json::json!([]));
+        assert!(json["alias"].is_null());
+    }
+
+    #[tokio::test]
+    async fn get_repo_config_returns_configured_values() {
+        let mut cfg = build_watcher::config::Config::default();
+        cfg.repos.insert(
+            "alice/app".to_string(),
+            build_watcher::config::RepoConfig {
+                alias: Some("myapp".to_string()),
+                workflows: vec!["CI".to_string()],
+                watch_prs: true,
+                ..Default::default()
+            },
+        );
+        let router = repo_config_router(null_config(cfg));
+        let json = json_get(&router, "/repo-config?repo=alice/app").await;
+        assert_eq!(json["alias"], "myapp");
+        assert_eq!(json["workflows"], serde_json::json!(["CI"]));
+        assert_eq!(json["watch_prs"], true);
+    }
+
+    #[tokio::test]
+    async fn set_repo_config_updates_fields() {
+        let config = null_config(build_watcher::config::Config::default());
+        let router = repo_config_router(config.clone());
+
+        let body = build_watcher::status::RepoConfigView {
+            repo: "alice/app".to_string(),
+            alias: Some("myapp".to_string()),
+            workflows: Some(vec!["CI".to_string(), "Deploy".to_string()]),
+            watch_prs: Some(true),
+            poll_aggression: Some("high".to_string()),
+        };
+        let resp = json_post(&router, "/repo-config", &body).await;
+        assert_eq!(resp["ok"], true);
+
+        // Verify the config was updated.
+        let cfg = config.read().await;
+        let rc = cfg.repos.get("alice/app").unwrap();
+        assert_eq!(rc.alias.as_deref(), Some("myapp"));
+        assert_eq!(rc.workflows, vec!["CI", "Deploy"]);
+        assert!(rc.watch_prs);
+        assert_eq!(
+            rc.poll_aggression,
+            Some(build_watcher::config::PollAggression::High)
         );
     }
 }

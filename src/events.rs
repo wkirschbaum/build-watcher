@@ -78,6 +78,17 @@ pub enum WatchEvent {
         from: RunStatus,
         to: RunStatus,
     },
+
+    /// A PR's merge-readiness state changed.
+    PrStateChanged {
+        repo: String,
+        branch: String,
+        number: u64,
+        title: String,
+        url: String,
+        from: crate::github::MergeState,
+        to: crate::github::MergeState,
+    },
 }
 
 /// Broadcast bus for watch events. Cloning shares the same underlying channel.

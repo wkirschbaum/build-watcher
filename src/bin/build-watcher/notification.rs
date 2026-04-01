@@ -41,7 +41,7 @@ impl EventKind {
                     Some(Self::Failed)
                 }
             }
-            WatchEvent::StatusChanged { .. } => None,
+            WatchEvent::StatusChanged { .. } | WatchEvent::PrStateChanged { .. } => None,
         }
     }
 
@@ -79,7 +79,7 @@ impl DebounceKey {
                 branch: run.branch.clone(),
                 kind,
             }),
-            WatchEvent::StatusChanged { .. } => None,
+            WatchEvent::StatusChanged { .. } | WatchEvent::PrStateChanged { .. } => None,
         }
     }
 }
@@ -115,7 +115,7 @@ fn event_repo(event: &WatchEvent) -> Option<&str> {
     match event {
         WatchEvent::RunStarted(run) => Some(&run.repo),
         WatchEvent::RunCompleted { run, .. } => Some(&run.repo),
-        WatchEvent::StatusChanged { .. } => None,
+        WatchEvent::StatusChanged { .. } | WatchEvent::PrStateChanged { .. } => None,
     }
 }
 
@@ -133,7 +133,9 @@ pub(crate) fn effective_level(event: &WatchEvent, cfg: &config::Config) -> Notif
                 notif.build_failure
             }
         }
-        WatchEvent::StatusChanged { .. } => NotificationLevel::Off,
+        WatchEvent::StatusChanged { .. } | WatchEvent::PrStateChanged { .. } => {
+            NotificationLevel::Off
+        }
     }
 }
 
@@ -220,7 +222,7 @@ impl NotificationPipeline {
                     EventKind::Failed
                 },
             ),
-            WatchEvent::StatusChanged { .. } => return false,
+            WatchEvent::StatusChanged { .. } | WatchEvent::PrStateChanged { .. } => return false,
         };
         let key = (run.repo.clone(), run.branch.clone());
         self.transitions.get(&key).is_none_or(|prev| *prev != kind)
@@ -434,8 +436,65 @@ async fn dispatch_single(
                 })
                 .await;
         }
-        WatchEvent::StatusChanged { .. } => {}
+        WatchEvent::StatusChanged { .. } | WatchEvent::PrStateChanged { .. } => {}
     }
+}
+
+// -- PR notification --
+
+/// Build and send a desktop notification for a PR state change.
+/// Returns immediately if paused, in quiet hours, or the state is uninteresting.
+async fn dispatch_pr_notification(
+    event: &WatchEvent,
+    config: &SharedConfigManager,
+    pause: &PauseState,
+    notifier: &dyn Notifier,
+) {
+    let WatchEvent::PrStateChanged {
+        repo,
+        number,
+        title,
+        url,
+        to,
+        ..
+    } = event
+    else {
+        return;
+    };
+
+    if is_paused(pause).await {
+        return;
+    }
+    let cfg = config.read().await;
+    if cfg.is_in_quiet_hours() {
+        return;
+    }
+    let repo_label = cfg.short_repo(repo).to_string();
+    drop(cfg);
+
+    let (emoji, label) = match to {
+        github::MergeState::Clean => ("\u{2705}", "ready to merge"),
+        github::MergeState::Blocked => ("\u{1f6d1}", "blocked"),
+        github::MergeState::Unstable => ("\u{26a0}\u{fe0f}", "unstable"),
+        github::MergeState::Behind => ("\u{2b07}\u{fe0f}", "behind"),
+        github::MergeState::Dirty => ("\u{274c}", "has conflicts"),
+        _ => return,
+    };
+
+    notifier
+        .send(&Notification {
+            title: format!("{emoji} PR #{number} {label}: {repo_label}"),
+            body: title.to_string(),
+            level: if *to == github::MergeState::Clean {
+                NotificationLevel::Normal
+            } else {
+                NotificationLevel::Low
+            },
+            url: Some(url.to_string()),
+            group: format!("{repo}#pr#{number}"),
+            app_name: repo.to_string(),
+        })
+        .await;
 }
 
 // -- Main handler --
@@ -459,7 +518,11 @@ pub async fn run_notification_handler(
             result = rx.recv() => {
                 match result {
                     Ok(event) => {
-                        pipeline.ingest(event, &config, &pause, Instant::now()).await;
+                        if matches!(event, WatchEvent::PrStateChanged { .. }) {
+                            dispatch_pr_notification(&event, &config, &pause, &*notifier).await;
+                        } else {
+                            pipeline.ingest(event, &config, &pause, Instant::now()).await;
+                        }
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         tracing::warn!("Notification handler dropped {n} events");

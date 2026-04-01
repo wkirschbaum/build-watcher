@@ -230,6 +230,29 @@ impl DaemonClient {
         self.post_json("/defaults", defaults).await
     }
 
+    pub(crate) async fn get_repo_config(
+        &self,
+        repo: &str,
+    ) -> Result<build_watcher::status::RepoConfigView, String> {
+        let resp = self
+            .client
+            .get(self.url("/repo-config"))
+            .query(&[("repo", repo)])
+            .send()
+            .await
+            .map_err(|e| format!("connect: {e}"))?;
+        resp.json::<build_watcher::status::RepoConfigView>()
+            .await
+            .map_err(|e| format!("parse: {e}"))
+    }
+
+    pub(crate) async fn set_repo_config(
+        &self,
+        config: &build_watcher::status::RepoConfigView,
+    ) -> Result<(), String> {
+        self.post_json("/repo-config", config).await
+    }
+
     pub(crate) async fn get_history(
         &self,
         repo: &str,
