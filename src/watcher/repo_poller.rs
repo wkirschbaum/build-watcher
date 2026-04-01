@@ -22,6 +22,8 @@ use super::{
 const MAX_FALLBACK_CALLS: usize = 10;
 /// Maximum `failing_steps` backfill calls per poll cycle to avoid rate-limit blowout.
 const MAX_BACKFILL_CALLS: usize = 5;
+/// Window (seconds) within which completed builds are eligible for failing-steps backfill.
+const BACKFILL_WINDOW_SECS: u64 = 600;
 
 /// Reason a `cancellable_sleep` call returned.
 enum WakeReason {
@@ -456,7 +458,9 @@ impl RepoPoller {
                     entry.last_builds.values().filter_map(move |lb| {
                         if lb.conclusion != "success"
                             && lb.failing_steps.is_none()
-                            && lb.completed_at.is_some_and(|t| now.saturating_sub(t) < 600)
+                            && lb
+                                .completed_at
+                                .is_some_and(|t| now.saturating_sub(t) < BACKFILL_WINDOW_SECS)
                         {
                             Some((k.clone(), lb.run_id, lb.workflow.clone()))
                         } else {
@@ -577,7 +581,6 @@ impl RepoPoller {
 
         let bpcfg = self.branch_poll_config().await;
         let mut any_changed = false;
-        let mut backfill_calls = 0usize;
 
         for key in &branches {
             let branch_runs = runs_for_branch(&all_runs, &key.branch);
@@ -770,46 +773,11 @@ impl RepoPoller {
                     push_build(&mut hist, key, lb);
                 }
             }
-
-            // Backfill: if any last_build is a failure with no failing_steps, fetch them now.
-            // Capped across all branches to avoid rate-limit blowout with many failures.
-            if backfill_calls < MAX_BACKFILL_CALLS {
-                let needs_backfill: Vec<(String, u64)> = {
-                    let w = self.watches.lock().await;
-                    w.get(key)
-                        .map(|e| {
-                            e.last_builds
-                                .iter()
-                                .filter(|(_, lb)| {
-                                    lb.conclusion != "success" && lb.failing_steps.is_none()
-                                })
-                                .map(|(wf, lb)| (wf.clone(), lb.run_id))
-                                .collect()
-                        })
-                        .unwrap_or_default()
-                };
-                for (wf_name, run_id) in needs_backfill {
-                    if backfill_calls >= MAX_BACKFILL_CALLS {
-                        break;
-                    }
-                    backfill_calls += 1;
-                    let info = self.github.failing_steps(&self.repo, run_id).await;
-                    if let Some(info) = info {
-                        let mut w = self.watches.lock().await;
-                        if let Some(entry) = w.get_mut(key)
-                            && let Some(lb) = entry.last_builds.get_mut(&wf_name)
-                        {
-                            tracing::info!(key = %key, run_id, "Backfilled failing steps");
-                            lb.failing_steps = Some(info.steps);
-                            lb.failing_job_id = info.first_job_id;
-                            any_changed = true;
-                        }
-                    }
-                }
-            }
         }
 
-        if any_changed {
+        let backfill_changed = self.backfill_failing_steps().await;
+
+        if any_changed || backfill_changed {
             let persisted = collect_persisted(&self.watches).await;
             let hist = self.history.lock().await.clone();
             self.persistence.save_state(&persisted, &hist).await;

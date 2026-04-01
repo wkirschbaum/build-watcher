@@ -387,7 +387,13 @@ pub(super) async fn recover_watches(
         let sem = semaphore.clone();
         let limit = super::scaled_repo_limit(branch_count);
         set.spawn(async move {
-            let _permit = sem.acquire().await;
+            let Ok(_permit) = sem.acquire().await else {
+                let msg = "recovery semaphore closed".to_string();
+                return (
+                    repo.clone(),
+                    Err(crate::github::GhError::CliError { repo, stderr: msg }),
+                );
+            };
             let result = gh.recent_runs_for_repo(&repo, limit).await;
             (repo, result)
         });

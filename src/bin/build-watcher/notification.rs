@@ -302,7 +302,10 @@ impl NotificationPipeline {
             if deadline > now {
                 break;
             }
-            let (_, key) = self.deadlines.pop_first().unwrap();
+            let (_, key) = self
+                .deadlines
+                .pop_first()
+                .expect("already verified non-empty");
             if let Some(events) = self.pending.remove(&key) {
                 self.dispatch_group(key, events, notifier).await;
             }
@@ -333,7 +336,10 @@ impl NotificationPipeline {
         }
 
         if is_single {
-            let e = events.into_iter().next().unwrap();
+            let e = events
+                .into_iter()
+                .next()
+                .expect("is_single guarantees non-empty");
             dispatch_single(e.event, &e.repo_label, e.level, notifier).await;
         } else {
             let repo_label = events

@@ -99,9 +99,10 @@ pub(crate) fn build_watch_snapshot(
                 })
                 .map(|lb| {
                     let age_secs = lb.completed_at.map(|t| now_unix.saturating_sub(t) as f64);
-                    let conclusion =
-                        serde_json::from_value(serde_json::Value::String(lb.conclusion.clone()))
-                            .unwrap_or(RunConclusion::Unknown);
+                    let conclusion = lb
+                        .conclusion
+                        .parse::<RunConclusion>()
+                        .unwrap_or(RunConclusion::Unknown);
                     LastBuildView {
                         run_id: lb.run_id,
                         conclusion,
@@ -266,20 +267,34 @@ pub async fn serve(
 
     tracing::info!("build-watcher listening on http://127.0.0.1:{port}/mcp");
 
-    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        .expect("failed to register SIGTERM handler");
+    let sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate());
 
     axum::serve(listener, router)
         .with_graceful_shutdown(async move {
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => {
-                    tracing::info!("Ctrl-C received, shutting down...");
+            match sigterm {
+                Ok(mut sig) => {
+                    tokio::select! {
+                        _ = tokio::signal::ctrl_c() => {
+                            tracing::info!("Ctrl-C received, shutting down...");
+                        }
+                        _ = sig.recv() => {
+                            tracing::info!("SIGTERM received, shutting down...");
+                        }
+                        _ = ct.cancelled() => {
+                            tracing::info!("Shutdown requested, shutting down...");
+                        }
+                    }
                 }
-                _ = sigterm.recv() => {
-                    tracing::info!("SIGTERM received, shutting down...");
-                }
-                _ = ct.cancelled() => {
-                    tracing::info!("Shutdown requested, shutting down...");
+                Err(e) => {
+                    tracing::warn!("Failed to register SIGTERM handler: {e}, using Ctrl-C only");
+                    tokio::select! {
+                        _ = tokio::signal::ctrl_c() => {
+                            tracing::info!("Ctrl-C received, shutting down...");
+                        }
+                        _ = ct.cancelled() => {
+                            tracing::info!("Shutdown requested, shutting down...");
+                        }
+                    }
                 }
             }
             ct.cancel();

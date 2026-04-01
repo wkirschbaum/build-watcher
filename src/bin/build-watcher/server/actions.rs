@@ -6,6 +6,9 @@ use build_watcher::watcher::{WatcherHandle, collect_persisted, last_failed_build
 
 use super::DaemonState;
 
+/// Duration (~136 years) used for indefinite pause when no minutes are specified.
+const PAUSE_INDEFINITE_SECS: u64 = u32::MAX as u64;
+
 /// Result of a single action on a repo or branch.
 pub(crate) struct ActionOutcome(Result<String, String>);
 
@@ -26,7 +29,7 @@ impl ActionOutcome {
 }
 
 /// Join all outcome messages into a single string.
-pub(crate) fn format_outcomes(outcomes: &[ActionOutcome], sep: &str) -> String {
+pub(super) fn format_outcomes(outcomes: &[ActionOutcome], sep: &str) -> String {
     outcomes
         .iter()
         .map(|o| o.message())
@@ -543,8 +546,10 @@ pub(crate) async fn apply_pause(
                 format!("Notifications paused for {mins} minutes")
             }
             _ => {
-                const INDEFINITE: u64 = u32::MAX as u64;
-                *p = Some(tokio::time::Instant::now() + std::time::Duration::from_secs(INDEFINITE));
+                *p = Some(
+                    tokio::time::Instant::now()
+                        + std::time::Duration::from_secs(PAUSE_INDEFINITE_SECS),
+                );
                 "Notifications paused indefinitely".to_string()
             }
         }

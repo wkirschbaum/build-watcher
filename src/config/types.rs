@@ -5,10 +5,13 @@ use serde::{Deserialize, Serialize};
 
 /// Current Unix epoch in seconds.
 pub fn unix_now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("system clock before Unix epoch")
-        .as_secs()
+    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => d.as_secs(),
+        Err(_) => {
+            tracing::warn!("System clock is before Unix epoch, returning 0");
+            0
+        }
+    }
 }
 
 // -- Configuration --

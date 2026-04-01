@@ -12,6 +12,8 @@ const DEFAULT_BRANCH_LIMIT: u32 = 10;
 const IN_PROGRESS_LIMIT: u32 = 100;
 /// Default limit for `recent_runs_for_repo` (new-run detection).
 pub const DEFAULT_REPO_LIMIT: u32 = 20;
+/// Maximum open PRs to fetch per repo.
+const MAX_OPEN_PRS: &str = "50";
 
 /// Truncates a hex SHA to 7 characters. Returns the full string if shorter.
 pub fn short_sha(sha: &str) -> &str {
@@ -181,7 +183,8 @@ impl RunInfo {
                     repo: repo.to_string(),
                 });
             } else {
-                serde_json::from_value(serde_json::Value::String(raw.status))
+                raw.status
+                    .parse::<RunStatus>()
                     .unwrap_or(RunStatus::Unknown)
             },
             conclusion: raw.conclusion,
@@ -228,7 +231,8 @@ impl RunInfo {
 
     /// Parse the conclusion string into a typed `RunConclusion`.
     pub fn run_conclusion(&self) -> crate::status::RunConclusion {
-        serde_json::from_value(serde_json::Value::String(self.conclusion.clone()))
+        self.conclusion
+            .parse::<crate::status::RunConclusion>()
             .unwrap_or(crate::status::RunConclusion::Unknown)
     }
 
@@ -562,7 +566,7 @@ impl GitHubClient for GhCliClient {
                 "--state",
                 "open",
                 "--limit",
-                "50",
+                MAX_OPEN_PRS,
                 "--json",
                 GH_PR_FIELDS,
             ],

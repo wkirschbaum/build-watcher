@@ -1,6 +1,8 @@
 /// HTTP response types for `GET /status` and `GET /stats`.
 ///
 /// Shared between the daemon (`server.rs`) and the TUI (`bin/bw.rs`).
+use std::str::FromStr;
+
 use serde::{Deserialize, Serialize};
 
 /// GitHub Actions run conclusion values.
@@ -33,6 +35,35 @@ pub enum RunStatus {
     #[default]
     #[serde(other)]
     Unknown,
+}
+
+impl FromStr for RunConclusion {
+    type Err = ();
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "success" => Ok(Self::Success),
+            "failure" => Ok(Self::Failure),
+            "cancelled" => Ok(Self::Cancelled),
+            "timed_out" => Ok(Self::TimedOut),
+            "startup_failure" => Ok(Self::StartupFailure),
+            _ => Ok(Self::Unknown),
+        }
+    }
+}
+
+impl FromStr for RunStatus {
+    type Err = ();
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "in_progress" => Ok(Self::InProgress),
+            "queued" => Ok(Self::Queued),
+            "waiting" => Ok(Self::Waiting),
+            "requested" => Ok(Self::Requested),
+            "pending" => Ok(Self::Pending),
+            "completed" => Ok(Self::Completed),
+            _ => Ok(Self::Unknown),
+        }
+    }
 }
 
 impl RunConclusion {

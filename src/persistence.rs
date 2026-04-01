@@ -92,7 +92,9 @@ pub fn load_json<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
     let bak = path.with_extension("json.bak");
     if let Some(val) = try_parse_file::<T>(&bak) {
         tracing::warn!("Primary {} corrupt, recovered from backup", path.display());
-        let _ = std::fs::copy(&bak, path);
+        if let Err(e) = std::fs::copy(&bak, path) {
+            tracing::warn!("Failed to restore {} from backup: {e}", path.display());
+        }
         return Some(val);
     }
 

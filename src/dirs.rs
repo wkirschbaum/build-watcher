@@ -40,10 +40,9 @@ fn default_config_dir() -> String {
     )
 }
 
-fn init_dir(dir: &Path) {
-    if let Err(e) = std::fs::create_dir_all(dir) {
-        tracing::error!("Failed to create directory {}: {e}", dir.display());
-    }
+fn init_dir(dir: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(dir)
+        .map_err(|e| format!("Failed to create directory {}: {e}", dir.display()))
 }
 
 pub fn state_dir() -> &'static Path {
@@ -54,7 +53,10 @@ pub fn state_dir() -> &'static Path {
             #[cfg(not(test))]
             default_state_dir()
         }));
-        init_dir(&dir);
+        if let Err(e) = init_dir(&dir) {
+            tracing::error!("{e}");
+            std::process::exit(1);
+        }
         dir
     })
 }
@@ -71,7 +73,10 @@ pub fn config_dir() -> &'static Path {
                 default_config_dir()
             }),
         );
-        init_dir(&dir);
+        if let Err(e) = init_dir(&dir) {
+            tracing::error!("{e}");
+            std::process::exit(1);
+        }
         dir
     })
 }

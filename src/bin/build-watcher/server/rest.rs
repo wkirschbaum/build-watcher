@@ -323,8 +323,9 @@ pub(crate) async fn set_defaults_handler(
                 }
             }
             if let Some(level) = body.poll_aggression {
-                // Already validated above, so unwrap is safe.
-                let aggression = level.parse::<PollAggression>().unwrap_or_default();
+                let aggression = level
+                    .parse::<PollAggression>()
+                    .expect("already validated above");
                 cfg.poll_aggression = aggression;
                 messages.push(format!("poll aggression: {aggression}"));
             }
