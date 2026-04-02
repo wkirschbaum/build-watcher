@@ -37,6 +37,10 @@ pub(crate) struct SingleBranchInfo<'a> {
     pub pr_badge: String,
     /// Failing step names from the last build, if any.
     pub failing_steps: Option<String>,
+    /// GitHub login of the user who triggered the run.
+    pub actor: Option<String>,
+    /// Name of the commit author.
+    pub commit_author: Option<String>,
 }
 
 /// Format a compact PR badge from a list of `PrView`s, or empty string if none.
@@ -227,30 +231,53 @@ fn compute_single_branch_info<'a>(branches: &[&'a WatchStatus]) -> Option<Single
     if workflow_count > 1 {
         return None; // multi-workflow: will expand into child rows
     }
-    let (title, status_key, attempt, run_id, failed, failing_job_id, failing_steps) =
-        if let Some(run) = w.active_runs.first() {
-            (
-                run.title.clone(),
-                run.status.as_str().to_string(),
-                run.attempt,
-                Some(run.run_id),
-                false,
-                None,
-                None,
-            )
-        } else if let Some(b) = newest_last_build(w) {
-            (
-                b.title.clone(),
-                b.conclusion.as_str().to_string(),
-                b.attempt,
-                Some(b.run_id),
-                b.conclusion != RunConclusion::Success,
-                b.failing_job_id,
-                b.failing_steps.clone(),
-            )
-        } else {
-            (String::new(), String::new(), 1, None, false, None, None)
-        };
+    let (
+        title,
+        status_key,
+        attempt,
+        run_id,
+        failed,
+        failing_job_id,
+        failing_steps,
+        actor,
+        commit_author,
+    ) = if let Some(run) = w.active_runs.first() {
+        (
+            run.title.clone(),
+            run.status.as_str().to_string(),
+            run.attempt,
+            Some(run.run_id),
+            false,
+            None,
+            None,
+            run.actor.clone(),
+            run.commit_author.clone(),
+        )
+    } else if let Some(b) = newest_last_build(w) {
+        (
+            b.title.clone(),
+            b.conclusion.as_str().to_string(),
+            b.attempt,
+            Some(b.run_id),
+            b.conclusion != RunConclusion::Success,
+            b.failing_job_id,
+            b.failing_steps.clone(),
+            b.actor.clone(),
+            b.commit_author.clone(),
+        )
+    } else {
+        (
+            String::new(),
+            String::new(),
+            1,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+        )
+    };
     let mut wf_set: Vec<&str> = Vec::new();
     for run in &w.active_runs {
         if !wf_set.contains(&run.workflow.as_str()) {
@@ -274,6 +301,8 @@ fn compute_single_branch_info<'a>(branches: &[&'a WatchStatus]) -> Option<Single
         waiting: w.waiting,
         pr_badge: pr_badge(&w.prs),
         failing_steps,
+        actor,
+        commit_author,
     })
 }
 
@@ -1728,6 +1757,16 @@ fn render_detail_bar(
                         steps.clone(),
                         Style::default().fg(COLOR_FAILURE),
                     ));
+                }
+                if let Some(actor) = &sb.actor {
+                    s.push(detail_sep());
+                    s.push(Span::styled("by ", label_style));
+                    s.push(Span::styled(actor.clone(), dim));
+                }
+                if let Some(author) = &sb.commit_author {
+                    s.push(detail_sep());
+                    s.push(Span::styled("author ", label_style));
+                    s.push(Span::styled(author.clone(), dim));
                 }
             } else {
                 s.push(detail_sep());
