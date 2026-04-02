@@ -537,6 +537,22 @@ pub(crate) enum InputMode {
         entries: Vec<HistoryEntryView>,
         selected: usize,
     },
+    /// PR picker popup (opened with `M` when multiple PRs exist).
+    PrPicker {
+        repo: String,
+        prs: Vec<PrPickerEntry>,
+        selected: usize,
+    },
+}
+
+/// Compact PR entry for the picker popup.
+#[derive(Debug, Clone)]
+pub(crate) struct PrPickerEntry {
+    pub number: u64,
+    pub title: String,
+    pub author: String,
+    pub merge_state: build_watcher::github::MergeState,
+    pub draft: bool,
 }
 
 impl App {

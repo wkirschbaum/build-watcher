@@ -15,7 +15,9 @@ use build_watcher::status::{HistoryEntryView, RunConclusion, StatsResponse, Stat
 use super::client::DaemonClient;
 
 // Re-export form types so existing imports from `app::` keep working.
-pub(crate) use super::forms::{FormField, FormKind, InputMode};
+pub(crate) use super::forms::{
+    FormField, FormKind, InputMode, LineEditor, PrPickerEntry, TextAction,
+};
 
 /// What to do when the user presses a quit key.
 pub(crate) enum QuitAction {
@@ -162,7 +164,7 @@ impl Default for TuiPrefs {
             group_by: GroupBy::default(),
             expand: HashMap::new(),
             workflow_collapsed: HashSet::new(),
-            show_help: true,
+            show_help: false,
             show_recent_panel: true,
         }
     }
@@ -421,6 +423,12 @@ pub(crate) enum SseUpdate {
         repo: String,
         branch: String,
         levels: [NotificationLevel; 3],
+    },
+    /// Open a text input prompt.
+    EnterTextInput {
+        prompt: String,
+        editor: LineEditor,
+        action: TextAction,
     },
     /// Open the build history popup.
     EnterHistory {

@@ -12,7 +12,9 @@ use build_watcher::status::{
     ActiveRunView, HistoryEntryView, LastBuildView, PrView, RunConclusion, WatchStatus,
 };
 
-use super::app::{App, ExpandLevel, FormField, GroupBy, InputMode, SortColumn, SseState};
+use super::app::{
+    App, ExpandLevel, FormField, GroupBy, InputMode, PrPickerEntry, SortColumn, SseState,
+};
 
 /// Inline info shown on the repo header when there's exactly one watched branch.
 pub(crate) struct SingleBranchInfo<'a> {
@@ -1889,13 +1891,19 @@ fn render_detail_bar(
     // Pad with a leading space to align with the body panel's inner content.
     let mut all_spans = vec![Span::raw(" ")];
     all_spans.extend(spans);
+
+    // Right-align "? help" hint.
+    let hint_style = Style::default().fg(Color::DarkGray);
+    let hint = "? help";
+    let content_len: usize = all_spans.iter().map(|s| s.content.len()).sum();
+    let pad = (area.width as usize).saturating_sub(content_len + hint.len());
+    all_spans.push(Span::raw(" ".repeat(pad)));
+    all_spans.push(Span::styled(hint, hint_style));
+
     frame.render_widget(Paragraph::new(Line::from(all_spans)), area);
 }
 
 pub(crate) fn render_footer(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &App) {
-    let key_style = Style::default()
-        .fg(Color::DarkGray)
-        .add_modifier(Modifier::BOLD);
     let footer = match &app.input_mode {
         InputMode::TextInput { prompt, editor, .. } => {
             let (before, cursor_ch, after) = editor.split_at_cursor();
@@ -1916,78 +1924,221 @@ pub(crate) fn render_footer(frame: &mut ratatui::Frame, area: ratatui::layout::R
         }
         InputMode::Form { .. }
         | InputMode::NotificationPicker { .. }
-        | InputMode::History { .. } => Paragraph::new(""),
-        InputMode::Normal => {
-            let sep = Span::styled("  │  ", Style::default().fg(Color::DarkGray));
-            let spans = vec![
-                // ── Navigate ──────────────────────────────────────────────
-                Span::styled("[↑↓/jk]", key_style),
-                Span::raw(" nav  "),
-                Span::styled("[Tab/⇧Tab]", key_style),
-                Span::raw(" expand"),
-                sep.clone(),
-                // ── Repos ─────────────────────────────────────────────────
-                Span::styled("[a]", key_style),
-                Span::raw(" add  "),
-                Span::styled("[b]", key_style),
-                Span::raw(" branch  "),
-                Span::styled("[d]", key_style),
-                Span::raw(" del  "),
-                Span::styled("[o/O]", key_style),
-                Span::raw(" open  "),
-                Span::styled("[r/R]", key_style),
-                Span::raw(" rerun"),
-                sep.clone(),
-                // ── Notifications ─────────────────────────────────────────
-                Span::styled("[n/N]", key_style),
-                Span::raw(" mute  "),
-                Span::styled("[p]", key_style),
-                Span::raw(" pause  "),
-                Span::styled("[h]", key_style),
-                Span::raw(" hist  "),
-                Span::styled("[H]", key_style),
-                Span::raw(" recent"),
-                sep.clone(),
-                // ── View ──────────────────────────────────────────────────
-                Span::styled("[s/S]", key_style),
-                Span::raw(" sort  "),
-                Span::styled("[g/G]", key_style),
-                Span::raw(" group  "),
-                Span::styled("[C]", key_style),
-                Span::raw(" config"),
-                sep.clone(),
-                // ── Quit ──────────────────────────────────────────────────
-                Span::styled("[q]", key_style),
-                Span::raw(" quit  "),
-                Span::styled("[Q]", key_style),
-                Span::raw(" stop  "),
-                Span::styled("[?]", key_style),
-                Span::raw(" hide"),
-            ];
-            Paragraph::new(Line::from(spans))
-        }
-        .style(Style::default().fg(Color::DarkGray)),
+        | InputMode::History { .. }
+        | InputMode::PrPicker { .. } => Paragraph::new(""),
+        InputMode::Normal => Paragraph::new(""),
     };
 
-    let use_border = app.show_help && matches!(app.input_mode, InputMode::Normal);
-    if use_border {
-        let border_style = Style::default().fg(Color::DarkGray);
-        let block = Block::default()
-            .borders(Borders::TOP)
-            .border_style(border_style);
-        let inner = block.inner(area);
-        let footer = footer.block(block);
-        frame.render_widget(footer, area);
+    frame.render_widget(footer, area);
+}
 
-        let version = Paragraph::new(Line::from(Span::styled(
-            concat!("v", env!("CARGO_PKG_VERSION")),
-            Style::default().fg(Color::DarkGray),
-        )))
-        .alignment(ratatui::layout::Alignment::Right);
-        frame.render_widget(version, inner);
-    } else {
-        frame.render_widget(footer, area);
+pub(crate) fn render_pr_picker_popup(
+    frame: &mut ratatui::Frame,
+    repo: &str,
+    prs: &[PrPickerEntry],
+    selected: usize,
+) {
+    let dim = Style::default().fg(Color::DarkGray);
+    let selected_style = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
+
+    // 1 row per PR + 1 top padding + 1 bottom padding + 2 borders + 1 hint
+    let inner_height = prs.len() as u16 + 3;
+    let popup_height = inner_height + 2;
+    let popup = centered_rect(70, popup_height, frame.area());
+
+    frame.render_widget(Clear, popup);
+
+    let block = Block::default()
+        .title(format!(" Merge PR — {repo} "))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let mut constraints: Vec<Constraint> = Vec::with_capacity(prs.len() + 3);
+    constraints.push(Constraint::Length(1)); // top padding
+    for _ in prs {
+        constraints.push(Constraint::Length(1));
     }
+    constraints.push(Constraint::Length(1)); // bottom padding
+    constraints.push(Constraint::Length(1)); // hint
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
+        .split(inner);
+
+    for (i, pr) in prs.iter().enumerate() {
+        let is_selected = i == selected;
+        let marker = if is_selected { "▸ " } else { "  " };
+        let style = if is_selected { selected_style } else { dim };
+        let draft = if pr.draft { " (draft)" } else { "" };
+
+        let line = Line::from(vec![
+            Span::styled(marker, style),
+            Span::styled(format!("#{} ", pr.number), style),
+            Span::styled(
+                pr.merge_state.icon(),
+                status_style_for_merge(&pr.merge_state),
+            ),
+            Span::styled(format!(" {}", pr.title), style),
+            Span::styled(format!("  @{}{draft}", pr.author), dim),
+        ]);
+        frame.render_widget(Paragraph::new(line), rows[i + 1]);
+    }
+
+    let hint = popup_hint(&[
+        ("[↑↓]", "select"),
+        ("[Enter]", "merge"),
+        ("[Esc]", "cancel"),
+    ]);
+    frame.render_widget(
+        Paragraph::new(hint).alignment(ratatui::layout::Alignment::Center),
+        rows[prs.len() + 2],
+    );
+}
+
+fn status_style_for_merge(state: &build_watcher::github::MergeState) -> Style {
+    use build_watcher::github::MergeState;
+    match state {
+        MergeState::Clean => Style::default().fg(COLOR_SUCCESS),
+        MergeState::Blocked | MergeState::Dirty => Style::default().fg(COLOR_FAILURE),
+        MergeState::Unstable | MergeState::Behind | MergeState::HasHooks => {
+            Style::default().fg(Color::Yellow)
+        }
+        _ => Style::default().fg(Color::DarkGray),
+    }
+}
+
+pub(crate) fn render_help_popup(frame: &mut ratatui::Frame) {
+    let key_style = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
+    let desc_style = Style::default().fg(Color::White);
+    let section_style = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
+
+    let lines = vec![
+        Line::from(""),
+        Line::from(Span::styled("  Navigation", section_style)),
+        Line::from(vec![
+            Span::styled("    ↑↓/jk     ", key_style),
+            Span::styled("Navigate rows", desc_style),
+        ]),
+        Line::from(vec![
+            Span::styled("    Tab/Enter ", key_style),
+            Span::styled("Expand/collapse selected", desc_style),
+        ]),
+        Line::from(vec![
+            Span::styled("    ⇧Tab/E    ", key_style),
+            Span::styled("Cycle expand level (all repos)", desc_style),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled("  Repos", section_style)),
+        Line::from(vec![
+            Span::styled("    a         ", key_style),
+            Span::styled("Add repo", desc_style),
+        ]),
+        Line::from(vec![
+            Span::styled("    b         ", key_style),
+            Span::styled("Configure branches", desc_style),
+        ]),
+        Line::from(vec![
+            Span::styled("    d         ", key_style),
+            Span::styled("Delete repo/branch", desc_style),
+        ]),
+        Line::from(vec![
+            Span::styled("    o/O       ", key_style),
+            Span::styled("Open run in browser / open repo", desc_style),
+        ]),
+        Line::from(vec![
+            Span::styled("    r/R       ", key_style),
+            Span::styled("Rerun failed jobs / rerun all jobs", desc_style),
+        ]),
+        Line::from(vec![
+            Span::styled("    M         ", key_style),
+            Span::styled("Merge PR", desc_style),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled("  Notifications", section_style)),
+        Line::from(vec![
+            Span::styled("    n         ", key_style),
+            Span::styled("Mute/unmute toggle", desc_style),
+        ]),
+        Line::from(vec![
+            Span::styled("    N         ", key_style),
+            Span::styled("Per-event notification picker", desc_style),
+        ]),
+        Line::from(vec![
+            Span::styled("    p         ", key_style),
+            Span::styled("Pause/resume notifications", desc_style),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled("  History", section_style)),
+        Line::from(vec![
+            Span::styled("    h         ", key_style),
+            Span::styled("Build history for selected", desc_style),
+        ]),
+        Line::from(vec![
+            Span::styled("    H         ", key_style),
+            Span::styled("Toggle recent builds panel", desc_style),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled("  Config & View", section_style)),
+        Line::from(vec![
+            Span::styled("    c         ", key_style),
+            Span::styled("Edit repo config", desc_style),
+        ]),
+        Line::from(vec![
+            Span::styled("    C         ", key_style),
+            Span::styled("Edit global config", desc_style),
+        ]),
+        Line::from(vec![
+            Span::styled("    s/S       ", key_style),
+            Span::styled("Cycle sort / reverse", desc_style),
+        ]),
+        Line::from(vec![
+            Span::styled("    g/G       ", key_style),
+            Span::styled("Cycle group / reverse", desc_style),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled("  General", section_style)),
+        Line::from(vec![
+            Span::styled("    q         ", key_style),
+            Span::styled("Quit", desc_style),
+        ]),
+        Line::from(vec![
+            Span::styled("    Q         ", key_style),
+            Span::styled("Stop daemon & quit", desc_style),
+        ]),
+        Line::from(""),
+    ];
+
+    let height = lines.len() as u16 + 2; // +2 for borders
+    let popup = centered_rect(50, height, frame.area());
+
+    frame.render_widget(Clear, popup);
+
+    let block = Block::default()
+        .title(format!(" Help — v{} ", env!("CARGO_PKG_VERSION")))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let text = Paragraph::new(lines);
+    frame.render_widget(text, inner);
+
+    // Hint at the bottom
+    let hint = popup_hint(&[("[?/Esc]", "close")]);
+    let hint_area = ratatui::layout::Rect::new(inner.x, popup.y + popup.height - 1, inner.width, 1);
+    frame.render_widget(
+        Paragraph::new(hint).alignment(ratatui::layout::Alignment::Center),
+        hint_area,
+    );
 }
 
 pub(crate) fn render(frame: &mut ratatui::Frame, app: &App) {
@@ -2011,9 +2162,7 @@ pub(crate) fn render(frame: &mut ratatui::Frame, app: &App) {
     let show_recent = app.show_recent_panel && recent_height > 0;
 
     let needs_input_line = matches!(app.input_mode, InputMode::TextInput { .. });
-    let footer_height = if app.show_help {
-        2 // top border + content line
-    } else if needs_input_line {
+    let footer_height = if needs_input_line {
         1 // just the text input prompt
     } else {
         0
@@ -2090,6 +2239,21 @@ pub(crate) fn render(frame: &mut ratatui::Frame, app: &App) {
     } = &app.input_mode
     {
         render_history_popup(frame, repo, branch.as_deref(), entries, *selected);
+    }
+
+    // Overlay the PR picker popup if active.
+    if let InputMode::PrPicker {
+        repo,
+        prs,
+        selected,
+    } = &app.input_mode
+    {
+        render_pr_picker_popup(frame, repo, prs, *selected);
+    }
+
+    // Overlay the help popup if active.
+    if app.show_help && matches!(app.input_mode, InputMode::Normal) {
+        render_help_popup(frame);
     }
 }
 

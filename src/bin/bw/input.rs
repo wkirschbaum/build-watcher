@@ -8,7 +8,7 @@ use build_watcher::status::WatchStatus;
 
 use super::app::{App, ExpandLevel, FormKind, QuitAction, SseUpdate};
 use super::client::{DaemonClient, open_browser};
-use super::forms::{InputMode, LineEditor, TextAction};
+use super::forms::{InputMode, LineEditor, PrPickerEntry, TextAction};
 use super::render::flatten_rows;
 
 impl App {
@@ -177,6 +177,40 @@ impl App {
                 }
                 true
             }
+            InputMode::PrPicker {
+                repo,
+                prs,
+                selected,
+            } => {
+                match code {
+                    KeyCode::Esc => {
+                        self.input_mode = InputMode::Normal;
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        *selected = selected.saturating_sub(1);
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        if !prs.is_empty() {
+                            *selected = (*selected + 1).min(prs.len() - 1);
+                        }
+                    }
+                    KeyCode::Enter => {
+                        if let Some(pr) = prs.get(*selected) {
+                            let number = pr.number;
+                            let repo = repo.clone();
+                            let d = daemon.clone();
+                            self.input_mode = InputMode::Normal;
+                            self.spawn_action(
+                                format!("Merging PR #{number} in {repo}…"),
+                                false,
+                                async move { d.merge_pr(&repo, number).await },
+                            );
+                        }
+                    }
+                    _ => {}
+                }
+                true
+            }
         }
     }
 
@@ -210,6 +244,11 @@ impl App {
         let failing_job_id = row.and_then(|r| r.failing_job_id());
 
         match code {
+            // -- Help dismiss --
+            KeyCode::Esc if self.show_help => {
+                self.show_help = false;
+                self.save_prefs();
+            }
             // -- Quit / Navigation --
             KeyCode::Char('q') => return QuitAction::Quit,
             KeyCode::Char('Q') => return QuitAction::QuitAndShutdown,
@@ -321,18 +360,35 @@ impl App {
             KeyCode::Char('b') => {
                 if let Some((repo, _, _, _)) = selected {
                     let repo = repo.to_string();
-                    let current: Vec<&str> = self
+                    let current: Vec<String> = self
                         .status
                         .watches
                         .iter()
                         .filter(|w| w.repo == repo)
-                        .map(|w| w.branch.as_str())
+                        .map(|w| w.branch.clone())
                         .collect();
-                    self.input_mode = InputMode::TextInput {
-                        prompt: format!("Branches for {repo}: "),
-                        editor: LineEditor::new(current.join(", ")),
-                        action: TextAction::SetBranches { repo },
-                    };
+                    let d = daemon.clone();
+                    let tx = self.bg_tx.clone();
+                    self.set_flash("Checking config…");
+                    tokio::spawn(async move {
+                        let auto = is_auto_discover(&d, &repo).await;
+                        if auto {
+                            let _ = tx
+                                .send(SseUpdate::BackgroundResult {
+                                    flash: "Cannot edit branches: auto-discover is enabled for this repo".to_string(),
+                                    resync: false,
+                                })
+                                .await;
+                        } else {
+                            let _ = tx
+                                .send(SseUpdate::EnterTextInput {
+                                    prompt: format!("Branches for {repo}: "),
+                                    editor: LineEditor::new(current.join(", ")),
+                                    action: TextAction::SetBranches { repo },
+                                })
+                                .await;
+                        }
+                    });
                 }
             }
             KeyCode::Char('d') => {
@@ -358,11 +414,19 @@ impl App {
                             });
                         } else {
                             let label = format!("{repo} [{branch}]");
-                            self.spawn_action(format!("Removing {label}…"), true, async move {
-                                d.set_branches(&repo, &remaining)
-                                    .await
-                                    .map(|()| format!("Removed {label}"))
-                            });
+                            self.spawn_action(
+                                format!("Removing {label}…"),
+                                true,
+                                async move {
+                                    if is_auto_discover(&d, &repo).await {
+                                        Err("Cannot delete branch: auto-discover is enabled for this repo".to_string())
+                                    } else {
+                                        d.set_branches(&repo, &remaining)
+                                            .await
+                                            .map(|()| format!("Removed {label}"))
+                                    }
+                                },
+                            );
                         }
                     }
                 }
@@ -486,24 +550,43 @@ impl App {
             }
             KeyCode::Char('M') => {
                 if let Some((repo, branch, _, _)) = selected {
-                    // Find the first PR targeting this branch.
-                    let pr = self
+                    let prs: Vec<_> = self
                         .status
                         .watches
                         .iter()
                         .find(|w| w.repo == repo && w.branch == branch)
-                        .and_then(|w| w.prs.first());
-                    if let Some(pr) = pr {
-                        let repo = repo.to_string();
-                        let number = pr.number;
-                        let d = daemon.clone();
-                        self.spawn_action(
-                            format!("Merging PR #{number} in {repo}…"),
-                            false,
-                            async move { d.merge_pr(&repo, number).await },
-                        );
-                    } else {
-                        self.set_flash("No PR found for this branch");
+                        .map(|w| &w.prs[..])
+                        .unwrap_or_default()
+                        .to_vec();
+                    match prs.len() {
+                        0 => self.set_flash("No PR found for this branch"),
+                        1 => {
+                            let number = prs[0].number;
+                            let repo = repo.to_string();
+                            let d = daemon.clone();
+                            self.spawn_action(
+                                format!("Merging PR #{number} in {repo}…"),
+                                false,
+                                async move { d.merge_pr(&repo, number).await },
+                            );
+                        }
+                        _ => {
+                            let entries = prs
+                                .iter()
+                                .map(|pr| PrPickerEntry {
+                                    number: pr.number,
+                                    title: pr.title.clone(),
+                                    author: pr.author.clone(),
+                                    merge_state: pr.merge_state.clone(),
+                                    draft: pr.draft,
+                                })
+                                .collect();
+                            self.input_mode = InputMode::PrPicker {
+                                repo: repo.to_string(),
+                                prs: entries,
+                                selected: 0,
+                            };
+                        }
                     }
                 }
             }
@@ -584,4 +667,19 @@ fn repo_has_multi_workflow_branch(watches: &[WatchStatus], repo: &str) -> bool {
             .count();
         active_wfs.len() + extra > 1
     })
+}
+
+/// Check whether auto-discover branches is enabled for a repo,
+/// falling back to the global default.
+async fn is_auto_discover(d: &DaemonClient, repo: &str) -> bool {
+    if let Ok(rc) = d.get_repo_config(repo).await
+        && let Some(val) = rc.auto_discover_branches
+    {
+        return val;
+    }
+    d.get_defaults()
+        .await
+        .ok()
+        .and_then(|defaults| defaults.auto_discover_branches)
+        .unwrap_or(false)
 }
