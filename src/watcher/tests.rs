@@ -1,6 +1,6 @@
 use super::*;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use tokio::sync::Mutex;
@@ -174,6 +174,11 @@ impl crate::github::GitHubClient for MockGitHub {
     }
     async fn list_tags(&self, _: &str) -> Result<Vec<String>, GhError> {
         Ok(vec![])
+    }
+    async fn list_branches(&self, _: &str) -> Result<Vec<String>, GhError> {
+        // Return branch names from the runs so tests behave as before.
+        let branches: HashSet<String> = self.runs.iter().map(|r| r.head_branch.clone()).collect();
+        Ok(branches.into_iter().collect())
     }
     async fn default_branch(&self, _: &str) -> Result<String, GhError> {
         Ok("main".to_string())

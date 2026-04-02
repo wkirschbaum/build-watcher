@@ -394,6 +394,8 @@ pub trait GitHubClient: Send + Sync + 'static {
     async fn rate_limit(&self) -> Result<RateLimit, GhError>;
     /// Fetch tag names for a repo (used to exclude tags from branch discovery).
     async fn list_tags(&self, repo: &str) -> Result<Vec<String>, GhError>;
+    /// Fetch branch names for a repo (used to prune deleted branches from discovery).
+    async fn list_branches(&self, repo: &str) -> Result<Vec<String>, GhError>;
     /// Fetch the default branch name for a repo (e.g. "main" or "master").
     async fn default_branch(&self, repo: &str) -> Result<String, GhError>;
     /// Fetch open PRs for a repo.
@@ -551,6 +553,27 @@ impl GitHubClient for GhCliClient {
             &[
                 "api",
                 &format!("repos/{repo}/tags"),
+                "--jq",
+                ".[].name",
+                "--paginate",
+            ],
+        )
+        .await?;
+        let text = String::from_utf8_lossy(&stdout);
+        Ok(text
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| l.to_string())
+            .collect())
+    }
+
+    #[tracing::instrument(skip_all, fields(%repo))]
+    async fn list_branches(&self, repo: &str) -> Result<Vec<String>, GhError> {
+        let stdout = gh_exec(
+            repo,
+            &[
+                "api",
+                &format!("repos/{repo}/branches"),
                 "--jq",
                 ".[].name",
                 "--paginate",

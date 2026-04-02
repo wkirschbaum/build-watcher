@@ -647,6 +647,12 @@ mod tests {
         async fn list_tags(&self, _: &str) -> Result<Vec<String>, build_watcher::github::GhError> {
             Ok(vec![])
         }
+        async fn list_branches(
+            &self,
+            _: &str,
+        ) -> Result<Vec<String>, build_watcher::github::GhError> {
+            Ok(vec!["main".to_string()])
+        }
         async fn default_branch(&self, _: &str) -> Result<String, build_watcher::github::GhError> {
             Ok("main".to_string())
         }

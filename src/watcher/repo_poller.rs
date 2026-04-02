@@ -589,10 +589,12 @@ impl RepoPoller {
             return current;
         }
 
-        // Fetch tags so we can exclude them from discovered "branches".
-        let tags: HashSet<String> = self
+        // Fetch existing branches from GitHub — this is the source of truth for
+        // which branches exist. Runs from deleted branches still appear in
+        // `gh run list` but should not keep a watch alive.
+        let existing_branches: HashSet<String> = self
             .github
-            .list_tags(&self.repo)
+            .list_branches(&self.repo)
             .await
             .unwrap_or_default()
             .into_iter()
@@ -601,7 +603,7 @@ impl RepoPoller {
         let active_branches: HashSet<&str> = all_runs
             .iter()
             .map(|r| r.head_branch.as_str())
-            .filter(|b| !tags.contains(*b))
+            .filter(|b| existing_branches.contains(*b))
             .filter(|b| filter_re.as_ref().is_none_or(|re| re.is_match(b)))
             .collect();
 
