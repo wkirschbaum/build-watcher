@@ -230,6 +230,8 @@ pub struct DefaultsConfig {
     pub auto_discover_branches: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch_filter: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub show_author: Option<bool>,
 }
 
 /// Per-repo config view used by `GET /repo-config` and `POST /repo-config`.

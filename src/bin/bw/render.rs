@@ -1799,6 +1799,11 @@ fn render_detail_bar(
                 s.push(Span::styled("by ", label_style));
                 s.push(Span::styled(actor.as_str(), dim));
             }
+            if let Some(author) = &run.commit_author {
+                s.push(detail_sep());
+                s.push(Span::styled("author ", label_style));
+                s.push(Span::styled(author.as_str(), dim));
+            }
             s
         }
         Some(DisplayRow::LastBuild {
@@ -1845,6 +1850,11 @@ fn render_detail_bar(
                 s.push(detail_sep());
                 s.push(Span::styled("by ", label_style));
                 s.push(Span::styled(actor.as_str(), dim));
+            }
+            if let Some(author) = &build.commit_author {
+                s.push(detail_sep());
+                s.push(Span::styled("author ", label_style));
+                s.push(Span::styled(author.as_str(), dim));
             }
             s
         }

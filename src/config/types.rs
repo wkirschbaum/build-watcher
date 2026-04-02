@@ -303,7 +303,7 @@ impl Default for Config {
             schema_version: CURRENT_SCHEMA_VERSION,
             ignored_workflows: Vec::new(),
             ignored_events: Vec::new(),
-            show_author: false,
+            show_author: true,
             notifications: NotificationConfig::default(),
             quiet_hours: None,
             poll_aggression: PollAggression::default(),

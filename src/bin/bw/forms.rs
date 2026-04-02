@@ -584,6 +584,10 @@ impl App {
             .iter()
             .find(|f| f.label == "Branch filter")
             .map(|f| f.buffer().to_string());
+        let show_author: Option<bool> = fields
+            .iter()
+            .find(|f| f.label == "Show author")
+            .map(|f| f.buffer() == "on");
 
         if let Some(ref filter) = branch_filter
             && !filter.is_empty()
@@ -601,6 +605,7 @@ impl App {
             poll_aggression: aggression,
             auto_discover_branches: auto_discover,
             branch_filter,
+            show_author,
         };
         self.spawn_action("Saving config…", true, async move {
             d.set_defaults(&defaults)
@@ -832,6 +837,15 @@ impl App {
                                 FormField::text(
                                     "Branch filter",
                                     defaults.branch_filter.unwrap_or_default(),
+                                ),
+                                FormField::cycle(
+                                    "Show author",
+                                    if defaults.show_author.unwrap_or(true) {
+                                        "on".to_string()
+                                    } else {
+                                        "off".to_string()
+                                    },
+                                    vec!["off", "on"],
                                 ),
                             ],
                         })

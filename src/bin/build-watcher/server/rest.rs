@@ -283,7 +283,7 @@ pub(crate) async fn notifications_handler(
     }
 }
 
-/// `GET /defaults` — Read global default config (ignored workflows, poll aggression, auto-discover, branch filter).
+/// `GET /defaults` — Read global default config.
 pub(crate) async fn get_defaults_handler(
     State(state): State<DaemonState>,
 ) -> axum::Json<DefaultsConfig> {
@@ -294,6 +294,7 @@ pub(crate) async fn get_defaults_handler(
         poll_aggression: Some(cfg.poll_aggression.to_string()),
         auto_discover_branches: Some(cfg.auto_discover_branches),
         branch_filter: cfg.branch_filter.clone(),
+        show_author: Some(cfg.show_author),
     })
 }
 
@@ -358,6 +359,13 @@ pub(crate) async fn set_defaults_handler(
                     cfg.branch_filter = Some(filter.clone());
                     messages.push(format!("branch filter: {filter}"));
                 }
+            }
+            if let Some(enabled) = body.show_author {
+                cfg.show_author = enabled;
+                messages.push(format!(
+                    "show author: {}",
+                    if enabled { "on" } else { "off" }
+                ));
             }
             messages
         })
