@@ -742,10 +742,21 @@ impl RepoPoller {
                 }
             };
 
-            // unseen = runs newer than high-water mark AND not already tracked as active
+            // unseen = runs newer than high-water mark AND not already tracked as active.
+            // On the initial seed after restart, use >= so that in-progress runs whose
+            // ID equals `last_seen_run_id` are recaptured (they were active when the
+            // daemon last stopped and their ID *is* the high-water mark).
             let unseen: Vec<&RunInfo> = branch_runs
                 .iter()
-                .filter(|r| r.id > last_seen && !active_ids.contains(&r.id))
+                .filter(|r| {
+                    let dominated = active_ids.contains(&r.id);
+                    let newer = if is_initial {
+                        r.id >= last_seen
+                    } else {
+                        r.id > last_seen
+                    };
+                    newer && !dominated
+                })
                 .copied()
                 .collect();
             let new_runs = run_filters.filter(&unseen);

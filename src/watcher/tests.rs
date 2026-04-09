@@ -1236,3 +1236,42 @@ async fn poll_prs_emits_on_transition() {
         other => panic!("expected PrStateChanged, got {other:?}"),
     }
 }
+
+// -- Restart recovery: in-progress runs at last_seen_run_id --
+
+#[tokio::test]
+async fn restart_recaptures_in_progress_run_at_last_seen_id() {
+    // Simulate a daemon restart: persisted state has last_seen_run_id = 200
+    // (the run that was in-progress when the daemon stopped). The mock returns
+    // that same run still in progress. After the first poll cycle the run should
+    // appear as an active run.
+    let run = make_run(200, RunStatus::InProgress, "");
+    let gh = MockGitHub::with_runs(vec![run]);
+
+    let mut cfg = Config::default();
+    cfg.repos
+        .insert("alice/app".to_string(), Default::default());
+    let h = TestHarness::with_config(gh, cfg);
+
+    // Seed with persisted state: waiting=true (initial seed), last_seen = 200.
+    let key = WatchKey::new("alice/app", "main");
+    h.seed(
+        key.clone(),
+        WatchEntry {
+            last_seen_run_id: 200,
+            waiting: true,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let poller = h.poller("alice/app");
+    poller.check_for_new_runs_repo_wide().await;
+
+    let entry = h.entry(&key).await;
+    assert!(
+        entry.active_runs.contains_key(&200),
+        "run 200 should be recaptured as active after restart"
+    );
+    assert!(!entry.waiting, "waiting flag should be cleared");
+}
