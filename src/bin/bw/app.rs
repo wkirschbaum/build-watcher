@@ -279,12 +279,10 @@ impl App {
     /// Build a terminal title string summarising build status counts.
     pub(crate) fn terminal_title(&self) -> String {
         if self.status.watches.is_empty() {
-            return "bw".to_string();
+            return "build-watcher".to_string();
         }
         let (n_active, n_failing, n_passing, n_idle) = self.branch_status_counts();
-        format!(
-            "bw · {n_active} pending · {n_passing} success · {n_failing} failure · {n_idle} idle"
-        )
+        format!("{n_active} pending · {n_passing} success · {n_failing} failure · {n_idle} idle")
     }
 
     pub(crate) fn set_flash(&mut self, msg: impl Into<String>) {

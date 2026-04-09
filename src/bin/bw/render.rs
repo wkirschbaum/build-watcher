@@ -1172,8 +1172,27 @@ pub(crate) fn render_body<'a>(
     let heading_table = Table::new(vec![col_header], widths).column_spacing(COL_SPACING);
     frame.render_widget(heading_table, heading_area);
 
-    let body_table = Table::new(rows, widths).column_spacing(COL_SPACING);
-    frame.render_widget(body_table, body_area);
+    if flat.rows.is_empty() {
+        let dim = Style::default().fg(Color::DarkGray);
+        let hint = if matches!(app.sse_state, SseState::Connecting) {
+            Line::from(Span::styled("  Loading watches…", dim))
+        } else {
+            Line::from(vec![
+                Span::styled("  No repos watched. Press ", dim),
+                Span::styled(
+                    "a",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" to add a repo.", dim),
+            ])
+        };
+        frame.render_widget(Paragraph::new(hint), body_area);
+    } else {
+        let body_table = Table::new(rows, widths).column_spacing(COL_SPACING);
+        frame.render_widget(body_table, body_area);
+    }
 
     // Overlay scroll indicators on the panel border when content overflows.
     // Rendered last so they appear on top of the border characters.
@@ -1205,22 +1224,32 @@ fn format_branch_with_pr(branch: &str, pr_badge: &str) -> String {
 }
 
 /// Build a styled title line, appending failing steps in red when present.
-fn title_line(title: &str, steps: Option<&str>, max_width: usize) -> Line<'static> {
-    match steps {
-        Some(s) if !s.is_empty() => {
-            let sep = " · ";
-            let available = max_width.saturating_sub(title.len() + sep.len());
-            Line::from(vec![
-                Span::raw(format::truncate(title, max_width)),
-                Span::styled(sep, Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    format::truncate(s, available),
-                    Style::default().fg(COLOR_FAILURE),
-                ),
-            ])
-        }
-        _ => Line::from(format::truncate(title, max_width)),
+fn title_line(
+    title: &str,
+    steps: Option<&str>,
+    author: Option<&str>,
+    max_width: usize,
+) -> Line<'static> {
+    let dim = Style::default().fg(Color::DarkGray);
+    let mut spans = vec![Span::raw(format::truncate(title, max_width))];
+    if let Some(s) = steps.filter(|s| !s.is_empty()) {
+        let sep = " · ";
+        let available = max_width.saturating_sub(title.len() + sep.len());
+        spans.push(Span::styled(sep.to_string(), dim));
+        spans.push(Span::styled(
+            format::truncate(s, available),
+            Style::default().fg(COLOR_FAILURE),
+        ));
     }
+    if let Some(a) = author.filter(|a| !a.is_empty()) {
+        let used: usize = spans.iter().map(|s| s.content.len()).sum();
+        let remaining = max_width.saturating_sub(used + 3); // " · " separator
+        if remaining > 3 {
+            spans.push(Span::styled(" · ".to_string(), dim));
+            spans.push(Span::styled(format::truncate(a, remaining), dim));
+        }
+    }
+    Line::from(spans)
 }
 
 /// Build a 6-cell Row for a branch-level entry (ActiveRun, LastBuild, NeverRan).
@@ -1318,7 +1347,8 @@ fn render_repo_header<'a>(
         } else {
             format!("{} {}", sb.branch, sb.pr_badge)
         };
-        let title = title_line(&sb.title, sb.failing_steps.as_deref(), cw.title);
+        let author = sb.commit_author.as_deref().or(sb.actor.as_deref());
+        let title = title_line(&sb.title, sb.failing_steps.as_deref(), author, cw.title);
         Row::new(vec![
             Cell::from(format::truncate(&name, cw.repo)).style(repo_style),
             Cell::from(format::truncate(&branch_text, cw.branch)),
@@ -1406,7 +1436,8 @@ fn render_active_run<'a>(
     } else {
         format!("{emoji} {}{sfx} {extra_badge}", format::status(status_str))
     };
-    let title = Line::from(format::truncate(&run.title, cw.title));
+    let author = run.commit_author.as_deref().or(run.actor.as_deref());
+    let title = title_line(&run.title, None, author, cw.title);
     if is_workflow_child {
         branch_row(
             &run.workflow,
@@ -1459,7 +1490,13 @@ fn render_last_build<'a>(
         .unwrap_or_default();
     let sfx = attempt_suffix(build.attempt);
     let status_text = format!("{emoji} {}{sfx}", format::status(conclusion_str));
-    let title = title_line(&build.title, build.failing_steps.as_deref(), cw.title);
+    let author = build.commit_author.as_deref().or(build.actor.as_deref());
+    let title = title_line(
+        &build.title,
+        build.failing_steps.as_deref(),
+        author,
+        cw.title,
+    );
     if is_workflow_child {
         branch_row(
             &build.workflow,
@@ -1699,6 +1736,35 @@ fn detail_sep() -> Span<'static> {
     Span::styled("  ·  ", Style::default().fg(Color::DarkGray))
 }
 
+/// Append author info to a detail bar span list.
+/// Shows commit author name; if the triggering actor differs, appends `[by actor]`.
+fn push_author<'a>(
+    s: &mut Vec<Span<'a>>,
+    actor: &Option<String>,
+    commit_author: &Option<String>,
+    label_style: Style,
+    dim: Style,
+) {
+    let author = commit_author.as_deref().filter(|a| !a.is_empty());
+    let actor = actor.as_deref().filter(|a| !a.is_empty());
+    match (author, actor) {
+        (Some(author), Some(actor)) if author != actor => {
+            s.push(detail_sep());
+            s.push(Span::styled(author.to_string(), dim));
+            s.push(Span::styled(format!(" [by {actor}]"), label_style));
+        }
+        (Some(author), _) => {
+            s.push(detail_sep());
+            s.push(Span::styled(author.to_string(), dim));
+        }
+        (None, Some(actor)) => {
+            s.push(detail_sep());
+            s.push(Span::styled(actor.to_string(), dim));
+        }
+        (None, None) => {}
+    }
+}
+
 /// Render a detail bar with a border showing contextual info for the currently selected row.
 fn render_detail_bar(
     frame: &mut ratatui::Frame,
@@ -1711,12 +1777,13 @@ fn render_detail_bar(
         .fg(Color::DarkGray)
         .add_modifier(Modifier::BOLD);
 
-    let row_idx = flat
+    let sel_idx = flat
         .selectable
         .get(app.selected)
-        .and_then(|&i| flat.rows.get(i));
+        .copied()
+        .and_then(|i| flat.rows.get(i));
 
-    let spans: Vec<Span> = match row_idx {
+    let spans: Vec<Span<'_>> = match sel_idx {
         Some(DisplayRow::RepoHeader {
             repo,
             branch_count,
@@ -1759,16 +1826,7 @@ fn render_detail_bar(
                         Style::default().fg(COLOR_FAILURE),
                     ));
                 }
-                if let Some(actor) = &sb.actor {
-                    s.push(detail_sep());
-                    s.push(Span::styled("by ", label_style));
-                    s.push(Span::styled(actor.clone(), dim));
-                }
-                if let Some(author) = &sb.commit_author {
-                    s.push(detail_sep());
-                    s.push(Span::styled("author ", label_style));
-                    s.push(Span::styled(author.clone(), dim));
-                }
+                push_author(&mut s, &sb.actor, &sb.commit_author, label_style, dim);
             } else {
                 s.push(detail_sep());
                 s.push(Span::styled(format!("{} branches", branch_count), dim));
@@ -1834,16 +1892,7 @@ fn render_detail_bar(
                 s.push(detail_sep());
                 s.push(Span::styled(format::age(elapsed as u64), dim));
             }
-            if let Some(actor) = &run.actor {
-                s.push(detail_sep());
-                s.push(Span::styled("by ", label_style));
-                s.push(Span::styled(actor.as_str(), dim));
-            }
-            if let Some(author) = &run.commit_author {
-                s.push(detail_sep());
-                s.push(Span::styled("author ", label_style));
-                s.push(Span::styled(author.as_str(), dim));
-            }
+            push_author(&mut s, &run.actor, &run.commit_author, label_style, dim);
             s
         }
         Some(DisplayRow::LastBuild {
@@ -1883,16 +1932,7 @@ fn render_detail_bar(
                 s.push(detail_sep());
                 s.push(Span::styled(format::age(age as u64), dim));
             }
-            if let Some(actor) = &build.actor {
-                s.push(detail_sep());
-                s.push(Span::styled("by ", label_style));
-                s.push(Span::styled(actor.as_str(), dim));
-            }
-            if let Some(author) = &build.commit_author {
-                s.push(detail_sep());
-                s.push(Span::styled("author ", label_style));
-                s.push(Span::styled(author.as_str(), dim));
-            }
+            push_author(&mut s, &build.actor, &build.commit_author, label_style, dim);
             s
         }
         Some(DisplayRow::NeverRan {
@@ -2163,12 +2203,20 @@ pub(crate) fn render_help_popup(frame: &mut ratatui::Frame) {
         Line::from(""),
         Line::from(Span::styled("  General", section_style)),
         Line::from(vec![
+            Span::styled("    ?         ", key_style),
+            Span::styled("Toggle this help", desc_style),
+        ]),
+        Line::from(vec![
             Span::styled("    q         ", key_style),
             Span::styled("Quit", desc_style),
         ]),
         Line::from(vec![
             Span::styled("    Q         ", key_style),
             Span::styled("Stop daemon & quit", desc_style),
+        ]),
+        Line::from(vec![
+            Span::styled("    U         ", key_style),
+            Span::styled("Self-update (when available)", desc_style),
         ]),
         Line::from(""),
     ];

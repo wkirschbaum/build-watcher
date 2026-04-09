@@ -30,7 +30,9 @@ A background daemon that monitors GitHub Actions builds and sends desktop notifi
 
 ## Requirements
 
-- **GitHub CLI (`gh`)** -- must be authenticated (`gh auth login`). Install: https://cli.github.com/
+- **GitHub authentication** -- either:
+  - **GitHub CLI (`gh`)** -- authenticated via `gh auth login`. Install: https://cli.github.com/
+  - **`GITHUB_TOKEN` environment variable** -- a personal access token with `repo` and `actions` scopes. Works without `gh` installed.
 - **Rust** -- only needed if building from source. Install via [rustup](https://rustup.rs/).
 
 #### Linux
@@ -79,11 +81,13 @@ Once installed, the MCP server is registered in `~/.claude.json` and available t
 | Tool | Description |
 | --- | --- |
 | `watch_builds` | Add repos to watch (`owner/repo` format) |
+| `watch_from_git_remote` | Auto-detect the GitHub repo from a local git repository's origin remote and start watching |
 | `stop_watches` | Remove repos and stop watching |
 | `list_watches` | Show all watched repos and their status |
 | `configure_branches` | Set branches for a repo, or omit repo to set global defaults. Supports `auto_discover_branches` and `branch_filter` (regex) |
-| `configure_repo` | Set per-repo workflow allow-list and/or display alias |
+| `configure_repo` | Set per-repo workflow allow-list, display alias, and PR watching |
 | `configure_ignored_workflows` | Add/remove from the global workflow ignore list |
+| `configure_ignored_events` | Add/remove from the global or per-repo event ignore list (e.g. `schedule`, `workflow_dispatch`) |
 | `update_notifications` | Set levels, quiet hours, and pause/resume in one call |
 | `rerun_build` | Rerun a failed build (specific ID or last failed) |
 | `build_history` | Show recent builds for a repo with duration and age |
@@ -138,25 +142,39 @@ Use `Tab`/`Enter` to cycle expand level on the selected row, or `Shift-Tab` to c
 | `Tab` / `Enter` | Cycle expand level (repo: Collapsed → Branches → Full; branch: toggle workflows) |
 | `Shift-Tab` / `E` | Cycle expand level for all repos |
 | `a` | Add a repo to watch |
-| `d` | Remove selected repo or branch |
 | `b` | Set branches for selected repo |
-| `r` / `R` | Rerun failed jobs / all jobs for selected build |
+| `d` | Remove selected repo or branch |
+| `o` / `O` | Open run in browser / open repo Actions page |
+| `r` / `R` | Rerun failed jobs / rerun all jobs |
 | `M` | Merge the first PR targeting the selected branch |
-| `o` | Open failed job or current run in browser |
-| `O` | Open repo Actions page in browser |
 | `n` | Toggle mute for selected repo/branch |
 | `N` | Open notification level picker (per-event levels) |
+| `p` | Toggle global notification pause |
 | `h` | Open build history popup for selected item |
 | `H` | Toggle the Recent builds panel |
-| `p` | Toggle global notification pause |
+| `t` | Build times for selected repo (avg/min/max by workflow) |
+| `T` | Build times across all repos (sorted slowest first) |
+| `c` | Edit per-repo config (alias, watch PRs, poll aggression) |
+| `C` | Edit global config (ignored workflows, auto-discover, branch filter) |
 | `s` / `S` | Cycle sort column forward / backward |
 | `g` / `G` | Cycle group-by forward / backward |
-| `C` | Edit global config (default branches, ignored workflows, auto-discover, branch filter) |
-| `?` | Toggle help bar |
+| `?` | Toggle help popup |
 | `q` | Quit |
 | `Q` | Quit and shut down daemon |
 | `U` | Quit and run self-update (shown when update available) |
 | `Ctrl-C` | Quit |
+
+#### PR Watch
+
+Enable per-repo with the `c` key (repo config → Watch PRs: yes). When enabled, the daemon polls open PRs targeting each watched branch and shows merge-readiness badges:
+
+| Badge | Meaning |
+| --- | --- |
+| `PR:✓` | Ready to merge (checks pass, reviews approved) |
+| `PR:⊘` | Blocked (pending reviews, failing checks, or merge conflicts) |
+| `PR:✗` | Conflict or dirty state |
+
+Desktop notifications fire when a PR transitions to "ready to merge". Press `M` on a branch row to merge the first ready PR.
 
 ## Configuration
 
@@ -164,10 +182,9 @@ Config lives at `~/.config/build-watcher/config.json`:
 
 ```json
 {
-  "default_branches": ["main"],
-  "auto_discover_branches": false,
-  "branch_filter": null,
   "poll_aggression": "medium",
+  "show_author": true,
+  "auto_discover_branches": false,
   "notifications": {
     "build_started": "normal",
     "build_success": "normal",
@@ -186,17 +203,9 @@ Config lives at `~/.config/build-watcher/config.json`:
     "wkirschbaum/elixir-ts-mode": {
       "alias": "ts-mode",
       "branches": ["main", "release"],
+      "watch_prs": true,
       "notifications": {
         "build_started": "off"
-      },
-      "branch_notifications": {
-        "release": {
-          "notifications": {
-            "build_started": "off",
-            "build_success": "normal",
-            "build_failure": "off"
-          }
-        }
       }
     }
   }
@@ -205,14 +214,14 @@ Config lives at `~/.config/build-watcher/config.json`:
 
 | Field | Description |
 | --- | --- |
-| `default_branches` | Branches watched when a repo has no explicit branch config (default: `["main"]`) |
 | `auto_discover_branches` | Automatically discover branches with active runs or open PRs (default: `false`) |
 | `branch_filter` | Regex pattern to filter discovered branches (only applies when auto-discover is enabled) |
 | `poll_aggression` | Rate-limit budget usage: `"low"` (<=15%), `"medium"` (<=40%, default), `"high"` (<=80%) |
 | `notifications` | Global per-event notification levels |
 | `quiet_hours` | Time window (local time, 24h format) during which non-critical notifications are suppressed |
 | `ignored_workflows` | Workflow names hidden from the TUI and excluded from notifications |
-| `repos` | Per-repo config: `branches`, `workflows` (allow-list), `alias` (display name), `notifications` (overrides), `branch_notifications` |
+| `show_author` | Show the commit author and triggering actor in the TUI and notifications (default: `true`). Costs one extra API call per new run |
+| `repos` | Per-repo config: `branches`, `workflows` (allow-list), `alias` (display name), `notifications` (overrides), `branch_notifications`, `watch_prs` |
 
 Notification levels: `"off"`, `"low"`, `"normal"`, `"critical"`. Branch overrides take priority over repo overrides, which take priority over global settings.
 

@@ -51,21 +51,21 @@ async fn gh_exec(repo: &str, args: &[&str]) -> Result<Vec<u8>, GhError> {
 
 #[derive(Debug, thiserror::Error)]
 pub enum GhError {
-    #[error("{repo}: gh timed out after {timeout_secs}s")]
+    #[error("{repo}: request timed out after {timeout_secs}s")]
     Timeout { repo: String, timeout_secs: u64 },
-    #[error("{repo}: failed to run gh: {source}")]
+    #[error("{repo}: failed to spawn gh CLI: {source}")]
     Spawn {
         repo: String,
         source: std::io::Error,
     },
-    #[error("{repo}: gh error: {stderr}")]
+    #[error("{repo}: GitHub API error: {stderr}")]
     CliError { repo: String, stderr: String },
-    #[error("{repo}: parse error: {source}")]
+    #[error("{repo}: failed to parse API response: {source}")]
     Parse {
         repo: String,
         source: serde_json::Error,
     },
-    #[error("{repo}: missing fields in response")]
+    #[error("{repo}: missing fields in API response")]
     MissingFields { repo: String },
 }
 
@@ -1022,8 +1022,19 @@ pub fn repo_url(repo: &str) -> String {
 
 const GITHUB_API_BASE: &str = "https://api.github.com";
 
-/// Get a GitHub OAuth token from the `gh` CLI (one-time call at startup).
+/// Resolve a GitHub API token. Checks `GITHUB_TOKEN` env var first, then
+/// falls back to `gh auth token`. Returns a helpful error if neither works.
 pub async fn gh_auth_token() -> Result<String, GhError> {
+    // 1. Check GITHUB_TOKEN env var (works without gh CLI installed).
+    if let Ok(token) = std::env::var("GITHUB_TOKEN") {
+        let token = token.trim().to_string();
+        if !token.is_empty() {
+            tracing::info!("Using GITHUB_TOKEN environment variable");
+            return Ok(token);
+        }
+    }
+
+    // 2. Try `gh auth token`.
     let output = tokio::time::timeout(
         Duration::from_secs(5),
         tokio::process::Command::new("gh")
@@ -1034,28 +1045,39 @@ pub async fn gh_auth_token() -> Result<String, GhError> {
     .map_err(|_| GhError::Timeout {
         repo: "auth".into(),
         timeout_secs: 5,
-    })?
-    .map_err(|e| GhError::Spawn {
-        repo: "auth".into(),
-        source: e,
     })?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-        return Err(GhError::CliError {
-            repo: "auth".into(),
-            stderr,
-        });
+    match output {
+        Ok(output) if output.status.success() => {
+            let token = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if token.is_empty() {
+                Err(GhError::CliError {
+                    repo: "auth".into(),
+                    stderr:
+                        "gh auth token returned empty — run `gh auth login` or set GITHUB_TOKEN"
+                            .into(),
+                })
+            } else {
+                Ok(token)
+            }
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+            Err(GhError::CliError {
+                repo: "auth".into(),
+                stderr: format!(
+                    "{stderr}\nHint: run `gh auth login` or set the GITHUB_TOKEN environment variable"
+                ),
+            })
+        }
+        Err(_) => {
+            // gh CLI not installed
+            Err(GhError::CliError {
+                repo: "auth".into(),
+                stderr: "GitHub CLI (gh) not found. Install it from https://cli.github.com/ or set the GITHUB_TOKEN environment variable".into(),
+            })
+        }
     }
-
-    let token = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if token.is_empty() {
-        return Err(GhError::CliError {
-            repo: "auth".into(),
-            stderr: "gh auth token returned empty".into(),
-        });
-    }
-    Ok(token)
 }
 
 /// Result of `cached_get_inner` — either the response body or a 401 signal.

@@ -268,8 +268,16 @@ impl WatchEntry {
         }
         for run in new_runs.iter().rev() {
             if run.is_completed() {
-                self.last_builds
-                    .insert(run.workflow.clone(), run.to_last_build());
+                // Don't overwrite an existing last_build for the same run_id —
+                // the persisted entry may have richer data (author, failing steps).
+                let dominated = self
+                    .last_builds
+                    .get(&run.workflow)
+                    .is_some_and(|lb| lb.run_id == run.id);
+                if !dominated {
+                    self.last_builds
+                        .insert(run.workflow.clone(), run.to_last_build());
+                }
             } else {
                 self.active_runs.insert(run.id, ActiveRun::from_run(run));
             }

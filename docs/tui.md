@@ -53,22 +53,23 @@ build-watcher — up 2h 15m                    poll 5s [medium]  API 4521/5000 (
 | `Tab` / `Enter` | Cycle expand level: repo row cycles Collapsed → Branches → Full; branch row toggles workflow visibility; no-op on workflow rows |
 | `Shift-Tab` / `E` | Cycle expand level for all repos simultaneously |
 | `a` | Add a repo to watch |
-| `d` | Remove selected repo or branch |
 | `b` | Set branches for selected repo |
-| `r` | Rerun failed jobs for selected build |
-| `R` | Rerun all jobs for selected build |
+| `d` | Remove selected repo or branch |
+| `o` / `O` | Open run in browser / open repo Actions page |
+| `r` / `R` | Rerun failed jobs / rerun all jobs |
 | `M` | Merge the first PR targeting the selected branch |
-| `o` | Open failed job or current run in browser |
-| `O` | Open repo Actions page in browser |
 | `n` | Toggle mute for selected repo/branch |
 | `N` | Open notification level picker (per-event levels) |
+| `p` | Toggle notification pause |
 | `h` | Open build history popup for selected item |
 | `H` | Toggle the Recent builds panel |
-| `p` | Toggle notification pause |
+| `t` | Build times for selected repo (avg/min/max by workflow) |
+| `T` | Build times across all repos (sorted slowest first) |
+| `c` | Edit per-repo config (alias, watch PRs, poll aggression) |
+| `C` | Edit global config (ignored workflows, ignored events, auto-discover, branch filter) |
 | `s` / `S` | Cycle sort column forward / backward |
 | `g` / `G` | Cycle group-by forward / backward |
-| `C` | Edit global config (ignored workflows, ignored events, poll aggression, auto-discover, branch filter) |
-| `?` | Toggle help bar |
+| `?` | Toggle help popup |
 | `q` | Quit |
 | `Q` | Quit and shut down daemon |
 | `U` | Quit and run self-update (shown when update available) |
