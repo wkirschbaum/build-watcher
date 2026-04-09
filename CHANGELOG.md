@@ -1,5 +1,62 @@
 # Changelog
 
+## [0.18.2] - 2026-04-09
+
+### Polish
+
+- Show commit author inline in the TUI title column (dimmed, after title text)
+- Deduplicate actor/author in detail bar — show author name, append `[by actor]` only when they differ
+- Preserve author info across daemon restarts (don't overwrite persisted data on initial seed)
+- Show "Loading watches…" during daemon startup instead of "No repos watched"
+- Drop `bw ·` prefix from terminal title
+- Support `GITHUB_TOKEN` environment variable as an alternative to `gh auth login`
+- Add missing keys to help popup (`?`, `U`)
+- Add Cargo.toml crates.io metadata
+
+### Docs
+
+- Fix README example config (remove non-existent `default_branches` field)
+- Add missing MCP tools to README (`watch_from_git_remote`, `configure_ignored_events`)
+- Add PR Watch section to README with badge meanings
+- Complete keybindings table in README and docs/tui.md (`c`, `C`, `t`/`T`)
+- Document `show_author` config field and API cost
+- Add 1.0 roadmap (`docs/todo-1.0.0.md`)
+
+## [0.18.1] - 2026-04-09
+
+### Fixed
+
+- Cancelled builds now use `build_success` notification level (normal) instead of `build_failure` (critical)
+- Cancelled builds show as gray `⊘` in TUI instead of red `✗`
+
+## [0.18.0] - 2026-04-09
+
+### Added
+
+- **Build times popup** — press `t` for per-repo build durations (by workflow, sorted slowest first), `T` for cross-repo summary from already-loaded history
+- Each row shows avg/min/max duration, run count, and colour-coded pass rate
+
+## [0.17.1] - 2026-04-09
+
+### Fixed
+
+- Auto-refresh GitHub token on `401 Unauthorized` — re-acquires via `gh auth token` and retries once
+- Applies to all request paths (GET, POST, PUT, GraphQL)
+
+## [0.17.0] - 2026-04-09
+
+### Changed
+
+- **Direct HTTP client** — replaced `gh` CLI process spawning with `reqwest` for all GitHub API calls. Eliminates fork/exec overhead and enables HTTP connection reuse.
+- **ETag caching** — conditional requests (`If-None-Match`) return `304 Not Modified` at zero rate-limit cost, making idle repo polling essentially free.
+- **Unified poll interval** — single interval (minimum 5s) replaces separate active/idle intervals, since ETags eliminate the cost difference.
+- Falls back to `gh` CLI if token acquisition fails at startup.
+
+### Fixed
+
+- "just now ago" double-suffix bug in TUI detail bar
+- Stale poll aggression percentages in docs and tool descriptions (Low is 15%, not 10%)
+
 ## [0.14.0] - 2026-04-09
 
 ### Added
@@ -172,6 +229,11 @@
 
 - Avoid unnecessary config re-save on reads; improve persistence error logging
 
+[0.18.2]: https://github.com/wkirschbaum/build-watcher/releases/tag/v0.18.2
+[0.18.1]: https://github.com/wkirschbaum/build-watcher/releases/tag/v0.18.1
+[0.18.0]: https://github.com/wkirschbaum/build-watcher/releases/tag/v0.18.0
+[0.17.1]: https://github.com/wkirschbaum/build-watcher/releases/tag/v0.17.1
+[0.17.0]: https://github.com/wkirschbaum/build-watcher/releases/tag/v0.17.0
 [0.14.0]: https://github.com/wkirschbaum/build-watcher/releases/tag/v0.14.0
 [0.13.0]: https://github.com/wkirschbaum/build-watcher/releases/tag/v0.13.0
 [0.12.1]: https://github.com/wkirschbaum/build-watcher/releases/tag/v0.12.1
