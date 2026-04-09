@@ -156,6 +156,9 @@ impl WatchEntry {
         Self {
             last_seen_run_id: p.last_seen_run_id,
             last_builds: p.last_builds,
+            // Mark as waiting so the first poll cycle uses >= for last_seen_run_id,
+            // recapturing in-progress runs that were active when the daemon stopped.
+            waiting: true,
             ..Default::default()
         }
     }

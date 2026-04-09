@@ -1253,17 +1253,15 @@ async fn restart_recaptures_in_progress_run_at_last_seen_id() {
         .insert("alice/app".to_string(), Default::default());
     let h = TestHarness::with_config(gh, cfg);
 
-    // Seed with persisted state: waiting=true (initial seed), last_seen = 200.
+    // Seed via from_persisted (the real startup path) — this must set waiting=true
+    // so the first poll cycle uses >= for the high-water mark.
     let key = WatchKey::new("alice/app", "main");
-    h.seed(
-        key.clone(),
-        WatchEntry {
-            last_seen_run_id: 200,
-            waiting: true,
-            ..Default::default()
-        },
-    )
-    .await;
+    let persisted = super::types::PersistedWatch {
+        last_seen_run_id: 200,
+        last_builds: Default::default(),
+    };
+    h.seed(key.clone(), WatchEntry::from_persisted(persisted))
+        .await;
 
     let poller = h.poller("alice/app");
     poller.check_for_new_runs_repo_wide().await;
