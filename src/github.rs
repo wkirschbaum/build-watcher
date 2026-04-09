@@ -1058,6 +1058,12 @@ pub async fn gh_auth_token() -> Result<String, GhError> {
     Ok(token)
 }
 
+/// Result of `cached_get_inner` — either the response body or a 401 signal.
+enum CachedGetResult {
+    Body(Vec<u8>),
+    Unauthorized,
+}
+
 /// Cached HTTP response for ETag-based conditional requests.
 struct CachedResponse {
     etag: String,
@@ -1068,9 +1074,12 @@ struct CachedResponse {
 /// overhead of the `gh` CLI, reuses connections via HTTP keep-alive, and
 /// supports ETag-based conditional requests (304 responses don't count
 /// against the GitHub rate limit).
+///
+/// On `401 Unauthorized`, the client automatically re-acquires the token
+/// via `gh auth token` and retries the request once.
 pub struct ReqwestClient {
     client: reqwest::Client,
-    token: String,
+    token: Mutex<String>,
     /// ETag cache: URL → (etag, response body). Protected by a std::sync::Mutex
     /// since it's only held briefly (never across await points).
     cache: Mutex<HashMap<String, CachedResponse>>,
@@ -1085,15 +1094,40 @@ impl ReqwestClient {
             .expect("failed to build reqwest client");
         Self {
             client,
-            token,
+            token: Mutex::new(token),
             cache: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn token(&self) -> String {
+        self.token.lock().unwrap().clone()
+    }
+
+    /// Try to refresh the token via `gh auth token`. Returns `true` if
+    /// a new (different) token was obtained.
+    async fn refresh_token(&self) -> bool {
+        match gh_auth_token().await {
+            Ok(new_token) => {
+                let mut current = self.token.lock().unwrap();
+                if *current != new_token {
+                    tracing::info!("GitHub token refreshed");
+                    *current = new_token;
+                    true
+                } else {
+                    false
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to refresh GitHub token");
+                false
+            }
         }
     }
 
     fn get(&self, url: &str) -> reqwest::RequestBuilder {
         self.client
             .get(url)
-            .bearer_auth(&self.token)
+            .bearer_auth(self.token())
             .header("Accept", "application/vnd.github+json")
             .header("X-GitHub-Api-Version", "2022-11-28")
     }
@@ -1101,7 +1135,7 @@ impl ReqwestClient {
     fn post_json(&self, url: &str, body: &impl Serialize) -> reqwest::RequestBuilder {
         self.client
             .post(url)
-            .bearer_auth(&self.token)
+            .bearer_auth(self.token())
             .header("Accept", "application/vnd.github+json")
             .header("X-GitHub-Api-Version", "2022-11-28")
             .json(body)
@@ -1110,7 +1144,7 @@ impl ReqwestClient {
     fn put_json(&self, url: &str, body: &impl Serialize) -> reqwest::RequestBuilder {
         self.client
             .put(url)
-            .bearer_auth(&self.token)
+            .bearer_auth(self.token())
             .header("Accept", "application/vnd.github+json")
             .header("X-GitHub-Api-Version", "2022-11-28")
             .json(body)
@@ -1118,7 +1152,34 @@ impl ReqwestClient {
 
     /// Core GET with ETag-based conditional requests.
     /// Returns raw response bytes, using cached body on 304.
+    /// On 401, refreshes the token and retries once.
     async fn cached_get(&self, url: &str, repo: &str) -> Result<Vec<u8>, GhError> {
+        let resp = self.cached_get_inner(url, repo).await?;
+        match resp {
+            CachedGetResult::Body(body) => Ok(body),
+            CachedGetResult::Unauthorized => {
+                // Token may have expired — try to refresh and retry once.
+                if self.refresh_token().await {
+                    // Clear ETag cache — stale tokens may have produced cached 401s.
+                    self.cache.lock().unwrap().clear();
+                    match self.cached_get_inner(url, repo).await? {
+                        CachedGetResult::Body(body) => Ok(body),
+                        CachedGetResult::Unauthorized => Err(GhError::CliError {
+                            repo: repo.into(),
+                            stderr: "HTTP 401: Unauthorized (after token refresh)".into(),
+                        }),
+                    }
+                } else {
+                    Err(GhError::CliError {
+                        repo: repo.into(),
+                        stderr: "HTTP 401: Unauthorized (token refresh failed)".into(),
+                    })
+                }
+            }
+        }
+    }
+
+    async fn cached_get_inner(&self, url: &str, repo: &str) -> Result<CachedGetResult, GhError> {
         let mut builder = self.get(url);
 
         // Attach If-None-Match if we have a cached ETag for this URL.
@@ -1137,13 +1198,16 @@ impl ReqwestClient {
             stderr: e.to_string(),
         })?;
 
+        if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+            return Ok(CachedGetResult::Unauthorized);
+        }
+
         if resp.status() == reqwest::StatusCode::NOT_MODIFIED {
             let cache = self.cache.lock().unwrap();
             if let Some(cached) = cache.get(url) {
                 tracing::trace!(url, "ETag cache hit (304)");
-                return Ok(cached.body.clone());
+                return Ok(CachedGetResult::Body(cached.body.clone()));
             }
-            // Should not happen, but fall through to error.
             if has_cache {
                 tracing::warn!(url, "304 but cached body missing");
             }
@@ -1183,7 +1247,7 @@ impl ReqwestClient {
             );
         }
 
-        Ok(body)
+        Ok(CachedGetResult::Body(body))
     }
 
     /// GET a JSON endpoint with ETag caching.
@@ -1230,14 +1294,7 @@ impl ReqwestClient {
         let mut url = Some(format!("{GITHUB_API_BASE}{path}?per_page=100"));
 
         while let Some(current_url) = url {
-            let resp = self
-                .get(&current_url)
-                .send()
-                .await
-                .map_err(|e| GhError::CliError {
-                    repo: repo.into(),
-                    stderr: e.to_string(),
-                })?;
+            let resp = self.send_with_retry(|s| s.get(&current_url), repo).await?;
             url = next_link_url(&resp);
             let page: Vec<T> = handle_response(resp, repo).await?;
             items.extend(page);
@@ -1266,21 +1323,47 @@ impl ReqwestClient {
             .collect())
     }
 
-    /// POST (empty body) to an endpoint and return the response text.
-    async fn api_post_empty(&self, repo: &str, path: &str) -> Result<String, GhError> {
-        let url = format!("{GITHUB_API_BASE}{path}");
-        let resp = self
-            .client
-            .post(&url)
-            .bearer_auth(&self.token)
-            .header("Accept", "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", "2022-11-28")
+    /// Send a request, retrying once on 401 after refreshing the token.
+    async fn send_with_retry(
+        &self,
+        build_request: impl Fn(&Self) -> reqwest::RequestBuilder,
+        repo: &str,
+    ) -> Result<reqwest::Response, GhError> {
+        let resp = build_request(self)
             .send()
             .await
             .map_err(|e| GhError::CliError {
                 repo: repo.into(),
                 stderr: e.to_string(),
             })?;
+        if resp.status() == reqwest::StatusCode::UNAUTHORIZED && self.refresh_token().await {
+            build_request(self)
+                .send()
+                .await
+                .map_err(|e| GhError::CliError {
+                    repo: repo.into(),
+                    stderr: e.to_string(),
+                })
+        } else {
+            Ok(resp)
+        }
+    }
+
+    /// POST (empty body) to an endpoint and return the response text.
+    async fn api_post_empty(&self, repo: &str, path: &str) -> Result<String, GhError> {
+        let url = format!("{GITHUB_API_BASE}{path}");
+        let resp = self
+            .send_with_retry(
+                |s| {
+                    s.client
+                        .post(&url)
+                        .bearer_auth(s.token())
+                        .header("Accept", "application/vnd.github+json")
+                        .header("X-GitHub-Api-Version", "2022-11-28")
+                },
+                repo,
+            )
+            .await?;
         if !resp.status().is_success() {
             return Err(response_error(resp, repo).await);
         }
@@ -1295,13 +1378,8 @@ impl ReqwestClient {
         let url = format!("{GITHUB_API_BASE}/graphql");
         let body = serde_json::json!({ "query": query });
         let resp = self
-            .post_json(&url, &body)
-            .send()
-            .await
-            .map_err(|e| GhError::CliError {
-                repo: repo.into(),
-                stderr: e.to_string(),
-            })?;
+            .send_with_retry(|s| s.post_json(&url, &body), repo)
+            .await?;
         handle_response(resp, repo).await
     }
 }
@@ -1706,13 +1784,8 @@ impl GitHubClient for ReqwestClient {
         let url = format!("{GITHUB_API_BASE}/repos/{repo}/pulls/{number}/merge");
         let body = serde_json::json!({ "merge_method": "merge" });
         let resp = self
-            .put_json(&url, &body)
-            .send()
-            .await
-            .map_err(|e| GhError::CliError {
-                repo: repo.into(),
-                stderr: e.to_string(),
-            })?;
+            .send_with_retry(|s| s.put_json(&url, &body), repo)
+            .await?;
         if !resp.status().is_success() {
             return Err(response_error(resp, repo).await);
         }
