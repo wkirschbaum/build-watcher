@@ -1941,9 +1941,9 @@ fn render_detail_bar(
     let mut all_spans = vec![Span::raw(" ")];
     all_spans.extend(spans);
 
-    // Right-align "? help" hint.
+    // Right-align "? help" hint with version.
     let hint_style = Style::default().fg(Color::DarkGray);
-    let hint = "? help";
+    let hint = format!("? help · v{}", env!("CARGO_PKG_VERSION"));
     let content_len: usize = all_spans.iter().map(|s| s.content.len()).sum();
     let pad = (area.width as usize).saturating_sub(content_len + hint.len());
     all_spans.push(Span::raw(" ".repeat(pad)));
