@@ -908,9 +908,8 @@ fn attempt_suffix(attempt: u32) -> String {
 pub(crate) fn status_style(conclusion_or_status: &str) -> Style {
     match conclusion_or_status {
         "success" => Style::default().fg(COLOR_SUCCESS),
-        "failure" | "cancelled" | "timed_out" | "startup_failure" => {
-            Style::default().fg(COLOR_FAILURE)
-        }
+        "cancelled" => Style::default().fg(Color::DarkGray),
+        "failure" | "timed_out" | "startup_failure" => Style::default().fg(COLOR_FAILURE),
         "in_progress" | "queued" | "waiting" | "requested" | "pending" => {
             Style::default().fg(COLOR_ACTIVE)
         }
@@ -921,7 +920,8 @@ pub(crate) fn status_style(conclusion_or_status: &str) -> Style {
 pub(crate) fn status_emoji(conclusion_or_status: &str) -> &'static str {
     match conclusion_or_status {
         "success" => "✓",
-        "failure" | "cancelled" | "timed_out" | "startup_failure" => "✗",
+        "cancelled" => "⊘",
+        "failure" | "timed_out" | "startup_failure" => "✗",
         "in_progress" => "⏳",
         "queued" | "waiting" | "requested" | "pending" => "⏸",
         _ => "·",

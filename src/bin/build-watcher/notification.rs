@@ -27,6 +27,7 @@ const THROTTLE_MAX: usize = 10;
 enum EventKind {
     Started,
     Succeeded,
+    Cancelled,
     Failed,
 }
 
@@ -34,13 +35,11 @@ impl EventKind {
     fn from_event(event: &WatchEvent) -> Option<Self> {
         match event {
             WatchEvent::RunStarted(_) => Some(Self::Started),
-            WatchEvent::RunCompleted { conclusion, .. } => {
-                if *conclusion == RunConclusion::Success {
-                    Some(Self::Succeeded)
-                } else {
-                    Some(Self::Failed)
-                }
-            }
+            WatchEvent::RunCompleted { conclusion, .. } => match conclusion {
+                RunConclusion::Success => Some(Self::Succeeded),
+                RunConclusion::Cancelled => Some(Self::Cancelled),
+                _ => Some(Self::Failed),
+            },
             WatchEvent::StatusChanged { .. } | WatchEvent::PrStateChanged { .. } => None,
         }
     }
@@ -49,6 +48,7 @@ impl EventKind {
         match self {
             Self::Started => "started",
             Self::Succeeded => "succeeded",
+            Self::Cancelled => "cancelled",
             Self::Failed => "failed",
         }
     }
@@ -57,6 +57,7 @@ impl EventKind {
         match self {
             Self::Started => "\u{1f528}",  // hammer
             Self::Succeeded => "\u{2705}", // check
+            Self::Cancelled => "\u{2298}", // circled division slash ⊘
             Self::Failed => "\u{274c}",    // cross
         }
     }
@@ -127,10 +128,9 @@ pub(crate) fn effective_level(event: &WatchEvent, cfg: &config::Config) -> Notif
             run, conclusion, ..
         } => {
             let notif = cfg.notifications_for(&run.repo, &run.branch);
-            if *conclusion == RunConclusion::Success {
-                notif.build_success
-            } else {
-                notif.build_failure
+            match conclusion {
+                RunConclusion::Success | RunConclusion::Cancelled => notif.build_success,
+                _ => notif.build_failure,
             }
         }
         WatchEvent::StatusChanged { .. } | WatchEvent::PrStateChanged { .. } => {
@@ -216,10 +216,10 @@ impl NotificationPipeline {
                 run, conclusion, ..
             } => (
                 run,
-                if *conclusion == RunConclusion::Success {
-                    EventKind::Succeeded
-                } else {
-                    EventKind::Failed
+                match conclusion {
+                    RunConclusion::Success => EventKind::Succeeded,
+                    RunConclusion::Cancelled => EventKind::Cancelled,
+                    _ => EventKind::Failed,
                 },
             ),
             WatchEvent::StatusChanged { .. } | WatchEvent::PrStateChanged { .. } => return false,
@@ -688,9 +688,13 @@ mod tests {
             EventKind::from_event(&completed(RunConclusion::Failure)),
             Some(EventKind::Failed)
         );
+    }
+
+    #[test]
+    fn event_kind_from_cancelled() {
         assert_eq!(
             EventKind::from_event(&completed(RunConclusion::Cancelled)),
-            Some(EventKind::Failed)
+            Some(EventKind::Cancelled)
         );
     }
 

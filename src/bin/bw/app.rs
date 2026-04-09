@@ -851,10 +851,7 @@ mod tests {
     fn status_style_colors() {
         assert_eq!(status_style("success").fg, Some(Color::Rgb(100, 180, 100)));
         assert_eq!(status_style("failure").fg, Some(Color::Rgb(220, 100, 100)));
-        assert_eq!(
-            status_style("cancelled").fg,
-            Some(Color::Rgb(220, 100, 100))
-        );
+        assert_eq!(status_style("cancelled").fg, Some(Color::DarkGray));
         assert_eq!(status_style("in_progress").fg, Some(Color::Yellow));
         assert_eq!(status_style("queued").fg, Some(Color::Yellow));
         assert_eq!(status_style("unknown").fg, None);
