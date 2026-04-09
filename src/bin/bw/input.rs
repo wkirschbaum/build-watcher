@@ -214,6 +214,23 @@ impl App {
                 }
                 true
             }
+            InputMode::BuildTimes { rows, selected, .. } => {
+                match code {
+                    KeyCode::Esc | KeyCode::Char('q') => {
+                        self.input_mode = InputMode::Normal;
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        *selected = selected.saturating_sub(1);
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        if !rows.is_empty() {
+                            *selected = (*selected + 1).min(rows.len() - 1);
+                        }
+                    }
+                    _ => {}
+                }
+                true
+            }
         }
     }
 
@@ -533,6 +550,14 @@ impl App {
             KeyCode::Char('H') => {
                 self.show_recent_panel = !self.show_recent_panel;
                 self.save_prefs();
+            }
+            KeyCode::Char('t') => {
+                if let Some((repo, _, _, _)) = selected {
+                    self.open_build_times(daemon, Some(repo));
+                }
+            }
+            KeyCode::Char('T') => {
+                self.open_build_times_from_recent();
             }
             KeyCode::Char('r') | KeyCode::Char('R') => {
                 if let Some((repo, _, run_id, _)) = selected {

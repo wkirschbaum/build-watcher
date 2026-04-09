@@ -326,6 +326,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 selected: 0,
                             };
                         }
+                        Some(SseUpdate::EnterBuildTimes { title, rows }) => {
+                            app.input_mode = InputMode::BuildTimes {
+                                title,
+                                rows,
+                                selected: 0,
+                            };
+                        }
                         Some(SseUpdate::UpdateAvailable(version)) => {
                             app.update_available = Some(version);
                         }

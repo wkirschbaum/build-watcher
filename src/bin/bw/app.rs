@@ -436,6 +436,11 @@ pub(crate) enum SseUpdate {
         branch: Option<String>,
         entries: Vec<HistoryEntryView>,
     },
+    /// Open the build times popup.
+    EnterBuildTimes {
+        title: String,
+        rows: Vec<crate::forms::BuildTimeRow>,
+    },
     /// Daemon became reachable after a background startup wait.
     DaemonReady(u16),
     /// A newer release was found; tag name to display in the header.

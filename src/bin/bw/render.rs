@@ -15,6 +15,7 @@ use build_watcher::status::{
 use super::app::{
     App, ExpandLevel, FormField, GroupBy, InputMode, PrPickerEntry, SortColumn, SseState,
 };
+use super::forms::BuildTimeRow;
 
 /// Inline info shown on the repo header when there's exactly one watched branch.
 pub(crate) struct SingleBranchInfo<'a> {
@@ -1971,7 +1972,8 @@ pub(crate) fn render_footer(frame: &mut ratatui::Frame, area: ratatui::layout::R
         InputMode::Form { .. }
         | InputMode::NotificationPicker { .. }
         | InputMode::History { .. }
-        | InputMode::PrPicker { .. } => Paragraph::new(""),
+        | InputMode::PrPicker { .. }
+        | InputMode::BuildTimes { .. } => Paragraph::new(""),
         InputMode::Normal => Paragraph::new(""),
     };
 
@@ -2123,7 +2125,7 @@ pub(crate) fn render_help_popup(frame: &mut ratatui::Frame) {
             Span::styled("Pause/resume notifications", desc_style),
         ]),
         Line::from(""),
-        Line::from(Span::styled("  History", section_style)),
+        Line::from(Span::styled("  History & Stats", section_style)),
         Line::from(vec![
             Span::styled("    h         ", key_style),
             Span::styled("Build history for selected", desc_style),
@@ -2131,6 +2133,14 @@ pub(crate) fn render_help_popup(frame: &mut ratatui::Frame) {
         Line::from(vec![
             Span::styled("    H         ", key_style),
             Span::styled("Toggle recent builds panel", desc_style),
+        ]),
+        Line::from(vec![
+            Span::styled("    t         ", key_style),
+            Span::styled("Build times for selected repo", desc_style),
+        ]),
+        Line::from(vec![
+            Span::styled("    T         ", key_style),
+            Span::styled("Build times across all repos", desc_style),
         ]),
         Line::from(""),
         Line::from(Span::styled("  Config & View", section_style)),
@@ -2295,6 +2305,16 @@ pub(crate) fn render(frame: &mut ratatui::Frame, app: &App) {
     } = &app.input_mode
     {
         render_pr_picker_popup(frame, repo, prs, *selected);
+    }
+
+    // Overlay the build times popup if active.
+    if let InputMode::BuildTimes {
+        title,
+        rows,
+        selected,
+    } = &app.input_mode
+    {
+        render_build_times_popup(frame, title, rows, *selected);
     }
 
     // Overlay the help popup if active.
@@ -2716,6 +2736,119 @@ pub(crate) fn render_history_popup(
             ("[r/R]", "rerun  "),
             ("[Esc]", "close"),
         ])),
+        rows_layout[hint_idx],
+    );
+}
+
+/// Render the build times popup (opened with `b`/`B`).
+pub(crate) fn render_build_times_popup(
+    frame: &mut ratatui::Frame,
+    title: &str,
+    rows: &[BuildTimeRow],
+    selected: usize,
+) {
+    let area = frame.area();
+    let data_rows = rows.len().max(1) as u16;
+    let popup_height = (data_rows + 5).min(area.height.saturating_sub(4));
+    let visible_rows = popup_height.saturating_sub(5) as usize;
+
+    let popup = centered_rect(80, popup_height, area);
+    frame.render_widget(Clear, popup);
+
+    let block = Block::default()
+        .title(title.to_string())
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let inner_height = inner.height as usize;
+    let mut constraints = vec![Constraint::Length(1)]; // header
+    for _ in 0..inner_height.saturating_sub(3) {
+        constraints.push(Constraint::Length(1));
+    }
+    constraints.push(Constraint::Length(1)); // blank
+    constraints.push(Constraint::Length(1)); // hint
+    let rows_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
+        .split(inner);
+
+    let w = inner.width as usize;
+    // Column widths: NAME (flexible), AVG, MIN, MAX, RUNS, PASS%
+    // Each numeric column gets 10 chars for breathing room.
+    let fixed = 10 + 10 + 10 + 8 + 8; // avg + min + max + runs + pass%
+    let name_w = w.saturating_sub(fixed).max(10);
+
+    let header_style = Style::default()
+        .fg(Color::DarkGray)
+        .add_modifier(Modifier::BOLD);
+    let header = Line::from(vec![
+        Span::styled(format!("{:<name_w$}", "NAME"), header_style),
+        Span::styled(format!("{:>10}", "AVG"), header_style),
+        Span::styled(format!("{:>10}", "MIN"), header_style),
+        Span::styled(format!("{:>10}", "MAX"), header_style),
+        Span::styled(format!("{:>8}", "RUNS"), header_style),
+        Span::styled(format!("{:>8}", "PASS%"), header_style),
+    ]);
+    frame.render_widget(Paragraph::new(header), rows_layout[0]);
+
+    if rows.is_empty() {
+        let dim = Style::default().fg(Color::DarkGray);
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled("  No build data", dim))),
+            rows_layout[1],
+        );
+    } else {
+        let scroll_offset = if selected >= visible_rows {
+            selected - visible_rows + 1
+        } else {
+            0
+        };
+        let dim = Style::default().fg(Color::DarkGray);
+        let selected_style = Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD);
+
+        for (i, row) in rows.iter().enumerate().skip(scroll_offset) {
+            let layout_idx = 1 + i - scroll_offset;
+            if layout_idx >= rows_layout.len() - 2 {
+                break;
+            }
+            let is_sel = i == selected;
+            let base_style = if is_sel { selected_style } else { dim };
+            let prefix = if is_sel { "▸ " } else { "  " };
+            let label = format::truncate(&row.label, name_w.saturating_sub(2));
+
+            // Color the pass rate: green ≥80%, yellow ≥50%, red <50%
+            let pass_color = if row.pass_rate >= 80 {
+                Color::Green
+            } else if row.pass_rate >= 50 {
+                Color::Yellow
+            } else {
+                Color::Red
+            };
+            let pass_style = if is_sel {
+                Style::default().fg(pass_color).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(pass_color)
+            };
+
+            let spans = vec![
+                Span::styled(format!("{prefix}{label:<w$}", w = name_w - 2), base_style),
+                Span::styled(format!("{:>10}", format::seconds(row.avg_secs)), base_style),
+                Span::styled(format!("{:>10}", format::seconds(row.min_secs)), base_style),
+                Span::styled(format!("{:>10}", format::seconds(row.max_secs)), base_style),
+                Span::styled(format!("{:>8}", row.count), base_style),
+                Span::styled(format!("{:>7}%", row.pass_rate), pass_style),
+            ];
+            frame.render_widget(Paragraph::new(Line::from(spans)), rows_layout[layout_idx]);
+        }
+    }
+
+    let hint_idx = rows_layout.len() - 1;
+    frame.render_widget(
+        Paragraph::new(popup_hint(&[("[↑↓]", "scroll  "), ("[Esc]", "close")])),
         rows_layout[hint_idx],
     );
 }

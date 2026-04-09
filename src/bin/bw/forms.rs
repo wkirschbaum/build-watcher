@@ -543,6 +543,77 @@ pub(crate) enum InputMode {
         prs: Vec<PrPickerEntry>,
         selected: usize,
     },
+    /// Build times popup (opened with `b`/`B`).
+    BuildTimes {
+        title: String,
+        rows: Vec<BuildTimeRow>,
+        selected: usize,
+    },
+}
+
+/// A row in the build-times popup: one group (repo or workflow) with aggregated stats.
+pub(crate) struct BuildTimeRow {
+    pub label: String,
+    pub avg_secs: u64,
+    pub min_secs: u64,
+    pub max_secs: u64,
+    pub count: usize,
+    pub pass_rate: u8,
+}
+
+/// Aggregate `HistoryEntryView`s into `BuildTimeRow`s, grouped by a key function.
+/// Rows are sorted slowest (highest avg) first.
+pub(crate) fn aggregate_build_times(
+    entries: &[HistoryEntryView],
+    key_fn: impl Fn(&HistoryEntryView) -> String,
+) -> Vec<BuildTimeRow> {
+    use std::collections::HashMap;
+    struct Acc {
+        durations: Vec<u64>,
+        successes: usize,
+        total: usize,
+    }
+    let mut groups: HashMap<String, Acc> = HashMap::new();
+    for e in entries {
+        let key = key_fn(e);
+        let acc = groups.entry(key).or_insert(Acc {
+            durations: Vec::new(),
+            successes: 0,
+            total: 0,
+        });
+        if let Some(d) = e.duration_secs {
+            acc.durations.push(d);
+        }
+        acc.total += 1;
+        if e.conclusion == "success" {
+            acc.successes += 1;
+        }
+    }
+    let mut rows: Vec<BuildTimeRow> = groups
+        .into_iter()
+        .filter(|(_, acc)| !acc.durations.is_empty())
+        .map(|(label, acc)| {
+            let sum: u64 = acc.durations.iter().sum();
+            let avg = sum / acc.durations.len() as u64;
+            let min = acc.durations.iter().copied().min().unwrap_or(0);
+            let max = acc.durations.iter().copied().max().unwrap_or(0);
+            let pass_rate = if acc.total > 0 {
+                (acc.successes * 100 / acc.total) as u8
+            } else {
+                0
+            };
+            BuildTimeRow {
+                label,
+                avg_secs: avg,
+                min_secs: min,
+                max_secs: max,
+                count: acc.durations.len(),
+                pass_rate,
+            }
+        })
+        .collect();
+    rows.sort_by(|a, b| b.avg_secs.cmp(&a.avg_secs));
+    rows
 }
 
 /// Compact PR entry for the picker popup.
@@ -642,6 +713,48 @@ impl App {
                 }
             }
         });
+    }
+
+    /// Open the build times popup for a single repo (fetches history from API).
+    pub(crate) fn open_build_times(&mut self, daemon: &DaemonClient, repo: Option<&str>) {
+        let Some(repo) = repo else { return };
+        let d = daemon.clone();
+        let repo = repo.to_string();
+        let tx = self.bg_tx.clone();
+        self.set_flash("Loading build times…");
+        tokio::spawn(async move {
+            match d.get_history(&repo, None, 50).await {
+                Ok(entries) => {
+                    let rows = aggregate_build_times(&entries, |e| {
+                        if e.workflow.is_empty() {
+                            e.branch.clone()
+                        } else {
+                            format!("{} / {}", e.branch, e.workflow)
+                        }
+                    });
+                    let title = format!(" Build Times: {repo} ");
+                    let _ = tx.send(SseUpdate::EnterBuildTimes { title, rows }).await;
+                }
+                Err(e) => {
+                    let _ = tx
+                        .send(SseUpdate::BackgroundResult {
+                            flash: e,
+                            resync: false,
+                        })
+                        .await;
+                }
+            }
+        });
+    }
+
+    /// Open the build times popup from already-loaded recent history (no API call).
+    pub(crate) fn open_build_times_from_recent(&mut self) {
+        let rows = aggregate_build_times(&self.recent_history, |e| e.repo.clone());
+        self.input_mode = InputMode::BuildTimes {
+            title: " Build Times: all repos ".to_string(),
+            rows,
+            selected: 0,
+        };
     }
 
     pub(crate) fn submit_text_input(
