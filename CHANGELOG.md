@@ -1,5 +1,55 @@
 # Changelog
 
+## [0.14.0] - 2026-04-09
+
+### Added
+
+- **Auto-discover from open PRs** -- branches with open pull requests are now discovered even when their CI runs have fallen outside the recent-runs window
+
+## [0.13.0] - 2026-04-02
+
+### Added
+
+- **Author info in detail bar** -- show triggering actor and commit author for the selected build
+- `show_author` toggle in global config form (`C` key) -- controls the extra API call per new run
+
+## [0.12.1] - 2026-04-02
+
+### Fixed
+
+- Prune deleted branches from auto-discover -- branches removed from GitHub are no longer kept as stale watches
+
+## [0.12.0] - 2026-04-02
+
+### Added
+
+- **Help popup** (`?` key) -- full keybinding reference overlay
+- **PR picker** -- select which PR to merge when multiple target the same branch
+- Auto-discover branch guards -- prevent watching branches that don't exist on GitHub
+
+## [0.11.1] - 2026-04-01
+
+### Changed
+
+- Simplify `start_watch` -- entries start in `waiting` state; the poller's first cycle fetches initial data
+- Remove `recover_watches` -- startup now uses a unified path through `startup_watches`
+
+## [0.11.0] - 2026-04-01
+
+### Added
+
+- **Auto-discover branches** -- automatically watch branches with active GitHub Actions runs, with optional regex filter (`branch_filter`)
+- **Per-repo auto-discover override** -- enable or disable branch discovery per repo
+- **Per-repo branch filter** -- regex pattern scoped to a single repo
+
+### Changed
+
+- Remove global `default_branches` config -- replaced by auto-discover and per-repo branch config
+
+### Fixed
+
+- Improve error handling throughout -- remove panics, use `Result` returns, and add proper error context
+
 ## [0.10.0] - 2026-04-01
 
 ### Added
@@ -122,6 +172,12 @@
 
 - Avoid unnecessary config re-save on reads; improve persistence error logging
 
+[0.14.0]: https://github.com/wkirschbaum/build-watcher/releases/tag/v0.14.0
+[0.13.0]: https://github.com/wkirschbaum/build-watcher/releases/tag/v0.13.0
+[0.12.1]: https://github.com/wkirschbaum/build-watcher/releases/tag/v0.12.1
+[0.12.0]: https://github.com/wkirschbaum/build-watcher/releases/tag/v0.12.0
+[0.11.1]: https://github.com/wkirschbaum/build-watcher/releases/tag/v0.11.1
+[0.11.0]: https://github.com/wkirschbaum/build-watcher/releases/tag/v0.11.0
 [0.10.0]: https://github.com/wkirschbaum/build-watcher/releases/tag/v0.10.0
 [0.9.0]: https://github.com/wkirschbaum/build-watcher/releases/tag/v0.9.0
 [0.8.8]: https://github.com/wkirschbaum/build-watcher/releases/tag/v0.8.8

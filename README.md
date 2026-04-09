@@ -23,7 +23,7 @@ A background daemon that monitors GitHub Actions builds and sends desktop notifi
 - Tracks multiple concurrent builds on the same branch
 - Hierarchical notification levels -- `off`/`low`/`normal`/`critical` per event, per repo, per branch
 - Dynamic rate-limit-aware polling -- speeds up when quota is plentiful, backs off as it depletes (minimum 15s active, 60s idle)
-- Auto-discover branches with active runs, with optional regex filter
+- Auto-discover branches with active runs or open pull requests, with optional regex filter
 - **MCP server** -- manage watches, rerun builds, and configure notifications from any MCP client
 - **Live TUI dashboard** (`bw`) -- top-like terminal UI with real-time SSE updates, sortable columns, grouping, and full watch management
 - **Self-update** -- background update checker with in-TUI upgrade (`U`) and `bw --update` CLI flag
@@ -206,7 +206,7 @@ Config lives at `~/.config/build-watcher/config.json`:
 | Field | Description |
 | --- | --- |
 | `default_branches` | Branches watched when a repo has no explicit branch config (default: `["main"]`) |
-| `auto_discover_branches` | Automatically discover branches with active runs (default: `false`) |
+| `auto_discover_branches` | Automatically discover branches with active runs or open PRs (default: `false`) |
 | `branch_filter` | Regex pattern to filter discovered branches (only applies when auto-discover is enabled) |
 | `poll_aggression` | Rate-limit budget usage: `"low"` (<=10%), `"medium"` (<=40%, default), `"high"` (<=80%) |
 | `notifications` | Global per-event notification levels |
