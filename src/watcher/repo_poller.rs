@@ -600,9 +600,21 @@ impl RepoPoller {
             .into_iter()
             .collect();
 
+        // Branches with open PRs should also be discoverable, even when their
+        // runs have fallen outside the recent-runs window.
+        let pr_branches: Vec<String> = self
+            .github
+            .open_prs(&self.repo)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|pr| pr.branch)
+            .collect();
+
         let active_branches: HashSet<&str> = all_runs
             .iter()
             .map(|r| r.head_branch.as_str())
+            .chain(pr_branches.iter().map(|b| b.as_str()))
             .filter(|b| existing_branches.contains(*b))
             .filter(|b| filter_re.as_ref().is_none_or(|re| re.is_match(b)))
             .collect();
