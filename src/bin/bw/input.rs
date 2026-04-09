@@ -38,6 +38,9 @@ impl App {
                             self.submit_text_input(input, action, daemon);
                         }
                     }
+                    KeyCode::Tab if matches!(action, TextAction::AddRepo) => {
+                        try_complete_org(editor, &self.status.watches);
+                    }
                     _ => handle_line_edit(editor, code, ctrl, alt),
                 }
                 true
@@ -624,6 +627,42 @@ impl App {
     }
 }
 
+/// Try to autocomplete an org name from watched repos.
+fn try_complete_org(editor: &mut LineEditor, watches: &[WatchStatus]) {
+    let orgs: Vec<&str> = watches
+        .iter()
+        .filter_map(|w| w.repo.split('/').next())
+        .collect();
+    if let Some(completed) = complete_org(&editor.buf, &orgs) {
+        editor.buf = completed;
+        editor.cursor = editor.buf.len();
+    }
+}
+
+/// Pure autocomplete: given the current input and a list of known orgs,
+/// return the completed string if exactly one org matches.
+/// Only completes the org part (before any `/`).
+fn complete_org(input: &str, orgs: &[&str]) -> Option<String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() || trimmed.contains('/') {
+        return None;
+    }
+    let input_lower = trimmed.to_lowercase();
+    let mut matches: Vec<&str> = orgs
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .filter(|org| org.to_lowercase().starts_with(&input_lower))
+        .collect();
+    matches.sort_unstable();
+    if matches.len() == 1 {
+        Some(format!("{}/", matches[0]))
+    } else {
+        None
+    }
+}
+
 /// Dispatch a key event to a `LineEditor` using readline-style shortcuts.
 fn handle_line_edit(ed: &mut LineEditor, code: KeyCode, ctrl: bool, alt: bool) {
     match code {
@@ -667,6 +706,64 @@ fn repo_has_multi_workflow_branch(watches: &[WatchStatus], repo: &str) -> bool {
             .count();
         active_wfs.len() + extra > 1
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn complete_org_single_match() {
+        let orgs = vec!["anthropics", "wkirschbaum"];
+        assert_eq!(complete_org("anth", &orgs), Some("anthropics/".to_string()));
+        assert_eq!(complete_org("wk", &orgs), Some("wkirschbaum/".to_string()));
+    }
+
+    #[test]
+    fn complete_org_case_insensitive() {
+        let orgs = vec!["Anthropics", "wkirschbaum"];
+        assert_eq!(complete_org("anth", &orgs), Some("Anthropics/".to_string()));
+    }
+
+    #[test]
+    fn complete_org_ambiguous_returns_none() {
+        let orgs = vec!["acme-a", "acme-b"];
+        assert_eq!(complete_org("acme", &orgs), None);
+    }
+
+    #[test]
+    fn complete_org_no_match() {
+        let orgs = vec!["anthropics"];
+        assert_eq!(complete_org("zz", &orgs), None);
+    }
+
+    #[test]
+    fn complete_org_already_has_slash() {
+        let orgs = vec!["anthropics"];
+        assert_eq!(complete_org("anthropics/", &orgs), None);
+    }
+
+    #[test]
+    fn complete_org_empty_input() {
+        let orgs = vec!["anthropics"];
+        assert_eq!(complete_org("", &orgs), None);
+    }
+
+    #[test]
+    fn complete_org_deduplicates() {
+        // Same org from multiple repos should still match as one.
+        let orgs = vec!["anthropics", "anthropics", "wkirschbaum"];
+        assert_eq!(complete_org("anth", &orgs), Some("anthropics/".to_string()));
+    }
+
+    #[test]
+    fn complete_org_exact_match() {
+        let orgs = vec!["anthropics"];
+        assert_eq!(
+            complete_org("anthropics", &orgs),
+            Some("anthropics/".to_string())
+        );
+    }
 }
 
 /// Check whether auto-discover branches is enabled for a repo,
