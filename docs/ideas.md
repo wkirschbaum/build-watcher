@@ -8,7 +8,7 @@ Personal desktop tool — all features should improve the local daily experience
 Snooze a specific repo or branch for N minutes without silencing all notifications globally. Finer control than the current global pause. (Branch-level mute and per-event level overrides are now supported via the TUI `n`/`N` keys and `POST /notifications`; timed snooze with automatic expiry is still unimplemented.) Natural TUI feature — a keybinding to snooze a selected repo for e.g. 30m.
 
 ### Author in notifications
-Show the commit author or triggering user in the notification body (e.g. last line: "by Kynan Ware"). **Limitation:** `gh run list --json` does not expose author or actor fields. The data is available via `gh api repos/{owner}/{repo}/actions/runs/{id}` (`head_commit.author.name` and `triggering_actor.login`), but that requires one extra API call per newly detected run — too expensive given rate-limit constraints. Feasible once we track per-run state and can batch the lookup.
+Show the commit author or triggering user in the notification body (e.g. last line: "by Kynan Ware"). The data is available from the run detail endpoint (`head_commit.author.name` and `triggering_actor.login`) at the cost of one extra API call per newly detected run. Now implemented behind the `show_author` config flag.
 
 ## Medium Effort
 

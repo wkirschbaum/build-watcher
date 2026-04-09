@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use build_watcher::config;
 use build_watcher::events::EventBus;
-use build_watcher::github::{GhCliClient, GitHubClient};
+use build_watcher::github::{GhCliClient, GitHubClient, ReqwestClient, gh_auth_token};
 use build_watcher::history::load_history;
 use build_watcher::persistence::FilePersistence;
 use build_watcher::watcher::{
@@ -62,7 +62,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ));
 
     let ct = CancellationToken::new();
-    let gh: Arc<dyn GitHubClient> = Arc::new(GhCliClient);
+    let gh: Arc<dyn GitHubClient> = match gh_auth_token().await {
+        Ok(token) => {
+            tracing::info!("Using direct HTTP client (reqwest)");
+            Arc::new(ReqwestClient::new(token))
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to get GitHub token, falling back to gh CLI");
+            Arc::new(GhCliClient)
+        }
+    };
     let persistence: Arc<dyn build_watcher::persistence::Persistence> = Arc::new(FilePersistence);
     let history = Arc::new(Mutex::new(load_history()));
     let handle = WatcherHandle::new(

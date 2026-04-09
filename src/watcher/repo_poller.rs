@@ -10,7 +10,7 @@ use crate::events::{EventBus, RunSnapshot, WatchEvent};
 use crate::github::{GitHubClient, LastBuild, RunInfo};
 use crate::history::push_build;
 use crate::persistence::Persistence;
-use crate::rate_limiter::{PollInput, compute_intervals};
+use crate::rate_limiter::{PollInput, compute_interval};
 use crate::status::{RunConclusion, RunStatus};
 
 use super::types::WatchKey;
@@ -137,8 +137,8 @@ impl RepoPoller {
         }
     }
 
-    /// Read config and compute poll intervals.
-    async fn read_config(&self) -> (u64, u64) {
+    /// Read config and compute the poll interval.
+    async fn read_config(&self) -> u64 {
         let rate_limit = self.rate_limit.lock().await.clone();
         let api_calls = {
             let w = self.watches.lock().await;
@@ -151,7 +151,7 @@ impl RepoPoller {
             .and_then(|rc| rc.poll_aggression)
             .unwrap_or(cfg.poll_aggression);
         drop(cfg);
-        compute_intervals(&PollInput {
+        compute_interval(&PollInput {
             rate_limit,
             calls_per_cycle: api_calls,
             now: unix_now(),
@@ -178,8 +178,7 @@ impl RepoPoller {
                 self.first_poll = false;
                 1
             } else {
-                let (active_secs, idle_secs) = self.read_config().await;
-                if has_active { active_secs } else { idle_secs }
+                self.read_config().await
             };
 
             match self.cancellable_sleep(Duration::from_secs(delay)).await {
@@ -207,7 +206,7 @@ impl RepoPoller {
                 }
             }
 
-            // PR polling — only on idle cycles for repos with watch_prs enabled.
+            // PR polling — only when no active runs exist for this repo.
             if !has_active {
                 self.poll_prs().await;
             }

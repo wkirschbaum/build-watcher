@@ -174,7 +174,7 @@ pub(crate) struct RerunBuildParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub(crate) struct SetPollAggressionParams {
-    /// Poll aggression level: "low" (≤10% of rate-limit/hour), "medium" (≤25%, default), or "high" (≤50%)
+    /// Poll aggression level: "low" (≤15% of rate-limit/hour), "medium" (≤40%, default), or "high" (≤80%)
     pub level: String,
 }
 

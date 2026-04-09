@@ -256,8 +256,7 @@ pub struct RepoConfigView {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct StatsResponse {
     pub uptime_secs: u64,
-    pub active_poll_secs: u64,
-    pub idle_poll_secs: u64,
+    pub poll_secs: u64,
     /// Current poll aggression level: "low", "medium", or "high".
     #[serde(default)]
     pub poll_aggression: String,

@@ -21,7 +21,7 @@
                           │       │            ├── startup.rs                            │
                           │       │            └── types.rs                              │
                           │       │                    │                                 │
-                          │       │                    │ github.rs ──► gh CLI ──► GitHub │
+                          │       │                    │ github.rs ──► reqwest ──► GitHub │
                           │       │                    │                                 │
                           │       │                    ▼                                 │
                           │       │            events.rs (broadcast EventBus)            │
@@ -53,11 +53,11 @@
                     │  GitHub  │
                     │   API    │
                     └────┬─────┘
-                         │ gh CLI
+                         │ reqwest (HTTP + ETag)
                          ▼
                   ┌──────────────┐
-                  │ repo_poller  │──── polls runs (15s active / 60s idle)
-                  │  (per repo)  │──── polls PRs (on idle cycles)
+                  │ repo_poller  │──── polls runs (min 5s, budget-scaled)
+                  │  (per repo)  │──── polls PRs (when no active runs)
                   └──────┬───────┘
                          │ emits
                          ▼
@@ -91,7 +91,7 @@ build_watcher (lib)              Shared types and logic
 │   ├── startup.rs               WatcherHandle, start_watch(), startup recovery
 │   └── tests.rs                 Mock GitHub client, unit and integration tests
 ├── events.rs                    EventBus (broadcast), WatchEvent, RunSnapshot
-├── github.rs                    GitHubClient trait, gh CLI impl, RunInfo, PrInfo, MergeState
+├── github.rs                    GitHubClient trait, ReqwestClient (primary), GhCliClient (fallback), RunInfo, PrInfo, MergeState
 ├── status.rs                    WatchStatus, PrView, StatusResponse, StatsResponse
 ├── history.rs                   Per-repo/branch build history (capped ring buffer)
 ├── persistence.rs               Crash-safe save_json/load_json, draft recovery
@@ -139,8 +139,8 @@ bw (TUI binary)                  Terminal dashboard
 | `EventBus` | `events` | Broadcast channel for `WatchEvent`s |
 | `WatchEvent` | `events` | `RunStarted`, `RunCompleted`, `StatusChanged`, `PrStateChanged` |
 | `RunSnapshot` | `events` | Immutable snapshot of a run's identity, carried by events |
-| `GitHubClient` | `github` | Trait abstracting the `gh` CLI (real impl + test mocks) |
-| `RunInfo` | `github` | A GitHub Actions run parsed from `gh` CLI output |
+| `GitHubClient` | `github` | Trait abstracting GitHub API access (ReqwestClient, GhCliClient, test mocks) |
+| `RunInfo` | `github` | A GitHub Actions run parsed from the GitHub API |
 | `PrInfo` | `github` | An open PR: number, branches, merge state, author, draft status |
 | `MergeState` | `github` | PR merge readiness: Clean, Blocked, Unstable, Behind, Dirty, HasHooks |
 | `StatusResponse` | `status` | JSON snapshot of all watches, used by `GET /status` and the TUI |
@@ -176,18 +176,18 @@ watch_builds (MCP/REST)
        └── spawn RepoPoller ──────────────┐
                                           │
                                    poll loop:
-                                   ├── sleep (15s active / 60s idle)
-                                   ├── poll_active_runs() — gh run view per active run
-                                   ├── check_for_new_runs() — gh run list, compare IDs
-                                   ├── poll_prs() — gh pr list (when idle, if enabled)
+                                   ├── sleep (min 5s, budget-scaled)
+                                   ├── poll_active_runs() — batch in-progress check
+                                   ├── check_for_new_runs() — list runs, compare IDs
+                                   ├── poll_prs() — GraphQL (when no active runs, if enabled)
                                    └── emit events → EventBus
 ```
 
 ### PR polling
 
-When `watch_prs` is enabled for a repo, `poll_prs()` runs on idle cycles:
+When `watch_prs` is enabled for a repo, `poll_prs()` runs when no active runs exist:
 
-1. Fetches all open PRs via `gh pr list` (up to 50).
+1. Fetches all open PRs via GraphQL (up to 50).
 2. Groups PRs by their **target branch** (baseRefName).
 3. Updates each `WatchEntry.prs` with PRs targeting that watched branch.
 4. Detects merge-state transitions and emits `PrStateChanged` events.
@@ -206,13 +206,18 @@ The `EventBus` (`events.rs`) is a `tokio::sync::broadcast` channel that decouple
 
 ## Polling strategy
 
-All pollers share a `RateLimitState` refreshed every 60 seconds via `gh api rate_limit`. `compute_intervals` derives dynamic sleep durations:
+All pollers share a `RateLimitState`. `compute_interval` derives a single poll interval from the rate-limit budget:
 
-- **Above 50% remaining** — floor speed (15s/60s), scaled by √(api_calls_per_cycle).
-- **Below 50% remaining** — spread remaining budget across seconds until reset.
-- **At zero** — wait out the full reset window.
+```
+remaining_budget = (target_fraction × limit) − used
+interval = time_left × calls_per_cycle / remaining_budget
+```
 
-Poll aggression (`low`/`medium`/`high`) controls what fraction of the hourly budget to use.
+When budget is plentiful the interval hits the 5s floor; as budget tightens the interval scales up; at zero remaining, the poller waits for the reset window.
+
+ETag-based conditional requests mean idle polls return `304 Not Modified` at zero rate-limit cost, so a single interval serves all states.
+
+Poll aggression (`low` ≤15% / `medium` ≤40% / `high` ≤80%) controls what fraction of the hourly budget to target.
 
 ## Configuration and state persistence
 
@@ -234,7 +239,7 @@ All JSON files use crash-safe writes:
 | Endpoint | Method | Purpose |
 |----------|--------|---------|
 | `/status` | GET | JSON snapshot of all watches, active runs, last builds, PRs |
-| `/stats` | GET | Daemon stats: uptime, polling intervals, API rate limit |
+| `/stats` | GET | Daemon stats: uptime, poll interval, API rate limit |
 | `/events` | GET | SSE stream of `WatchEvent`s |
 | `/notifications` | GET | Resolved notification config for `?repo=&branch=` |
 | `/notifications` | POST | Mute, unmute, or set per-event levels |
@@ -288,6 +293,6 @@ Triggered by SIGINT (ctrl-c) or `POST /shutdown`:
 ## Concurrency notes
 
 - One `RepoPoller` task per watched repo. The `Watches` mutex is held only for brief reads/writes — never across awaits or API calls.
-- `start_watch` uses double-checked locking: checks before the `gh` call, makes the call, re-checks before inserting.
+- `start_watch` uses double-checked locking: checks before the API call, makes the call, re-checks before inserting.
 - The D-Bus notification backend is fully async. `replaces_id` tracking and action click handling use `Arc<Mutex<_>>`.
 - Burst polling (1s, 5s, 10s) after rerun/merge triggers the pollers to pick up changes quickly without waiting for the normal interval.

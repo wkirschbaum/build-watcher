@@ -12,7 +12,7 @@ use build_watcher::config::{NotificationConfig, NotificationLevel, PollAggressio
 use build_watcher::events::WatchEvent;
 use build_watcher::github::{validate_branch, validate_repo};
 use build_watcher::history::{history_all, history_for};
-use build_watcher::rate_limiter::{PollInput, compute_intervals};
+use build_watcher::rate_limiter::{PollInput, compute_interval};
 use build_watcher::status::{DefaultsConfig, HistoryEntryView, StatsResponse};
 use build_watcher::watcher::{count_api_calls, is_paused};
 
@@ -71,7 +71,7 @@ pub(crate) async fn stats_handler(State(state): State<DaemonState>) -> axum::Jso
     let api_calls = count_api_calls(&*state.watches.lock().await);
     let rl = state.rate_limit.lock().await;
     let aggression = state.config.read().await.poll_aggression;
-    let (active_poll_secs, idle_poll_secs) = compute_intervals(&PollInput {
+    let poll_secs = compute_interval(&PollInput {
         rate_limit: rl.clone(),
         calls_per_cycle: api_calls,
         now: unix_now(),
@@ -88,8 +88,7 @@ pub(crate) async fn stats_handler(State(state): State<DaemonState>) -> axum::Jso
 
     axum::Json(StatsResponse {
         uptime_secs,
-        active_poll_secs,
-        idle_poll_secs,
+        poll_secs,
         poll_aggression: aggression.to_string(),
         rate_remaining,
         rate_limit,
@@ -575,7 +574,7 @@ mod tests {
         ConfigManager, ConfigPersistence, NotificationLevel, SharedConfigManager,
     };
     use build_watcher::events::{EventBus, RunSnapshot, WatchEvent};
-    use build_watcher::rate_limiter::{MIN_ACTIVE_SECS, MIN_IDLE_SECS};
+    use build_watcher::rate_limiter::MIN_POLL_SECS;
     use build_watcher::watcher::{PauseState, WatchEntry, WatchKey, Watches};
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -889,9 +888,8 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert!(json["uptime_secs"].as_u64().unwrap() < 5);
         // Default aggression is Medium: 40% of 5000 = 2000 budget.
-        // 1 call/cycle, 3600s → 3600/2000 < 1 → floor intervals.
-        assert_eq!(json["active_poll_secs"], MIN_ACTIVE_SECS);
-        assert_eq!(json["idle_poll_secs"], MIN_IDLE_SECS);
+        // 1 call/cycle, 3600s → 3600/2000 < 1 → floor interval.
+        assert_eq!(json["poll_secs"], MIN_POLL_SECS);
         assert!(json["rate_remaining"].is_null());
     }
 

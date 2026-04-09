@@ -61,7 +61,7 @@ cargo clippy                # Lint
   - `startup.rs` — `WatcherHandle`, `start_watch()`, `startup_watches()`, recovery logic
   - `tests.rs` — Mock GitHub client, unit and integration tests
 - `src/events.rs` — `EventBus` (broadcast channel), `WatchEvent` and `RunSnapshot` types (pure, no I/O)
-- `src/github.rs` — `gh` CLI wrappers, `RunInfo`/`HistoryEntry` types, input validation, GitHub URL helpers
+- `src/github.rs` — `GitHubClient` trait, `ReqwestClient` (direct HTTP with ETag caching, primary) and `GhCliClient` (fallback), `RunInfo`/`HistoryEntry` types, input validation, GitHub URL helpers
 - `src/format.rs` — Duration, age, and truncation formatting
 - `src/rate_limiter.rs` — API rate-limit budget computation and poll interval scaling
 - `src/history.rs` — Build history management (per repo/branch, capped ring buffer)
@@ -71,9 +71,9 @@ cargo clippy                # Lint
 
 ### How it works
 
-The `BuildWatcher` struct implements 13 MCP tools. When a repo is watched, it spawns an async tokio task per repo that polls GitHub via the `gh` CLI. Events are emitted onto a broadcast `EventBus`; a notification handler subscribes, debounces (3s per repo/branch/kind), coalesces multiple workflows into summary notifications, throttles (10/60s), and dispatches desktop notifications based on config and pause/quiet-hours state.
+The `BuildWatcher` struct implements 13 MCP tools. When a repo is watched, it spawns an async tokio task per repo that polls GitHub via direct HTTP (`reqwest` with connection pooling and ETag-based conditional requests). Falls back to the `gh` CLI if the OAuth token cannot be obtained at startup. Events are emitted onto a broadcast `EventBus`; a notification handler subscribes, debounces (3s per repo/branch/kind), coalesces multiple workflows into summary notifications, throttles (10/60s), and dispatches desktop notifications based on config and pause/quiet-hours state.
 
-**Polling intervals:** Minimum 15s when builds are active, 60s when idle. Intervals scale dynamically based on the GitHub API rate limit. The `gh` CLI must be authenticated (`gh auth login`).
+**Polling:** Single poll interval (minimum 5s) scales dynamically based on the GitHub API rate-limit budget and the configured aggression level. ETag caching means unchanged responses return `304 Not Modified` at zero rate-limit cost, so idle repos are essentially free to poll. The `gh` CLI must be authenticated (`gh auth login`) for token acquisition.
 
 **State persistence:**
 - Config: `~/.config/build-watcher/config.json` — repos, branches, notification levels (global → per-repo → per-branch), quiet hours, ignored workflows, aliases

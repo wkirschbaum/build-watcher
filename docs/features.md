@@ -2,7 +2,7 @@
 
 ## GitHub Actions Build Monitoring
 
-Watches GitHub Actions workflow runs for configured repositories by polling the `gh` CLI. Each repo/branch combination gets its own async polling task. The poller uses two speeds: fast polling (minimum 15s) when builds are actively running, and slow polling (minimum 60s) when idle. Fallback intervals before the first rate-limit fetch are 30s active / 120s idle. New workflow runs are detected by tracking a high-water mark of the most recent run ID seen per repo/branch. On startup, persisted watches are recovered from disk and in-progress runs are re-discovered from GitHub so no build completions are missed across daemon restarts.
+Watches GitHub Actions workflow runs for configured repositories by polling the GitHub REST API directly via `reqwest` (with `gh` CLI as fallback). Each repo gets its own async polling task. A single poll interval (minimum 5s) scales dynamically based on the rate-limit budget. ETag-based conditional requests mean idle polls return `304 Not Modified` at zero rate-limit cost. New workflow runs are detected by tracking a high-water mark of the most recent run ID seen per repo/branch. On startup, persisted watches are recovered from disk and in-progress runs are re-discovered from GitHub so no build completions are missed across daemon restarts.
 
 ## Desktop Notifications
 
@@ -55,12 +55,14 @@ Displays a formatted table of recent builds for a repo, showing conclusion, work
 
 ## Dynamic Rate-Limit-Aware Polling
 
-Polling intervals adapt in real time to the GitHub API rate limit. Each poller refreshes the shared rate-limit state every 60 seconds via `gh api rate_limit` (a free call). The daemon computes intervals based on remaining quota:
+Polling uses a single interval (minimum 5s) that scales dynamically based on the GitHub API rate-limit budget. The daemon computes the interval as:
 
-- **Above 50% remaining** — poll at floor speed, scaled by the square root of total API calls per cycle (15s active / 60s idle for 1 call, scaling gently with more watches).
-- **Below 50% remaining** — throttle: spread the remaining budget evenly across the seconds until the reset window expires, floored at the minimum values. At zero remaining, wait out the full reset window.
+```
+remaining_budget = (target_fraction × limit) − used
+interval = time_left × calls_per_cycle / remaining_budget
+```
 
-This keeps polling fast when quota is plentiful and backs off gracefully as it depletes, without ever hitting a hard API cap. The rate-limit state is shared across all pollers so they coordinate rather than each independently consuming quota.
+When budget is plentiful the interval hits the 5s floor; as budget tightens the interval grows; at zero remaining, the poller waits for the reset window. ETag-based conditional requests (`If-None-Match`) mean idle polls return `304 Not Modified` at zero rate-limit cost, eliminating the need for separate active/idle intervals. The rate-limit state is shared across all pollers so they coordinate rather than each independently consuming quota.
 
 ## Branch Configuration
 
@@ -113,7 +115,7 @@ A top-like live terminal dashboard for monitoring all watched builds. Run with `
 
 Features:
 - **Live build status table** with colour-coded status, failing steps sub-rows, and elapsed/age columns
-- **Top-like header** showing daemon uptime, polling intervals, and GitHub API rate limit
+- **Top-like header** showing daemon uptime, poll interval, and GitHub API rate limit
 - **Row selection** (`↑`/`↓`/`j`/`k`) with actions on the selected repo/branch
 - **Watch management** — add (`a`), remove (`d`), and configure branches (`b`) without leaving the TUI
 - **Sortable columns** — cycle through repo, branch, status, workflow, age with `s`/`S`
@@ -133,7 +135,7 @@ Features:
 The daemon exposes REST endpoints alongside the MCP server for the TUI and other consumers:
 
 - `GET /status` — JSON snapshot of all watches, active runs, and last builds
-- `GET /stats` — daemon stats (uptime, polling intervals, API rate limit)
+- `GET /stats` — daemon stats (uptime, poll interval, API rate limit)
 - `GET /events` — SSE stream of typed watch events
 - `GET /notifications?repo=&branch=` — resolved (merged) notification config for a specific repo/branch
 - `POST /notifications` — mute, unmute, or set per-event levels for a repo/branch; supports `action: "mute" | "unmute" | "set_levels"` and optional `branch`

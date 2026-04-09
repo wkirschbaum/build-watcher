@@ -991,7 +991,7 @@ pub(crate) fn render_header(frame: &mut ratatui::Frame, area: ratatui::layout::R
     } else {
         format!(" [{}]", s.poll_aggression)
     };
-    let poll = format!("poll {}s · {}s{aggr}", s.active_poll_secs, s.idle_poll_secs);
+    let poll = format!("poll {}s{aggr}", s.poll_secs);
     let api = match (s.rate_remaining, s.rate_limit) {
         (Some(rem), Some(lim)) => {
             let pct = if lim > 0 { rem * 100 / lim } else { 0 };
@@ -1880,10 +1880,7 @@ fn render_detail_bar(
             }
             if let Some(age) = build.age_secs {
                 s.push(detail_sep());
-                s.push(Span::styled(
-                    format!("{} ago", format::age(age as u64)),
-                    dim,
-                ));
+                s.push(Span::styled(format::age(age as u64), dim));
             }
             if let Some(actor) = &build.actor {
                 s.push(detail_sep());

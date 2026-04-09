@@ -22,7 +22,7 @@ A background daemon that monitors GitHub Actions builds and sends desktop notifi
 - Persistent watches that survive restarts
 - Tracks multiple concurrent builds on the same branch
 - Hierarchical notification levels -- `off`/`low`/`normal`/`critical` per event, per repo, per branch
-- Dynamic rate-limit-aware polling -- speeds up when quota is plentiful, backs off as it depletes (minimum 15s active, 60s idle)
+- Dynamic rate-limit-aware polling with ETag caching -- speeds up when quota is plentiful, backs off as it depletes (minimum 5s). Idle polls return `304 Not Modified` at zero rate-limit cost
 - Auto-discover branches with active runs or open pull requests, with optional regex filter
 - **MCP server** -- manage watches, rerun builds, and configure notifications from any MCP client
 - **Live TUI dashboard** (`bw`) -- top-like terminal UI with real-time SSE updates, sortable columns, grouping, and full watch management
@@ -99,7 +99,7 @@ bw
 ```
 
 ```
-build-watcher -- up 2h 15m                    poll 15s . 60s [medium]  API 4521 . 5000 (90%)  reset 42m
+build-watcher -- up 2h 15m                    poll 5s [medium]  API 4521 . 5000 (90%)  reset 42m
 +----------------------------------------------------------------------------------------------+
 | REPO ^              BRANCH    STATUS          WORKFLOW       TITLE             ELAPSED / AGE  |
 | floatpays/benefits  main      .. in_progress  CI             Fix login bug     1m 12s         |
@@ -110,7 +110,7 @@ build-watcher -- up 2h 15m                    poll 15s . 60s [medium]  API 4521 
 -[..../jk] nav  [Tab/⇧Tab] expand  |  [a] add  [b] branch  [d] del  [o/O] open  [r/R] rerun  |  [n/N] mute  [p] pause  [h] hist  [H] recent  |  [s/S] sort  [g/G] group  [C] config  |  [q] quit  [Q] stop  [?] hide
 ```
 
-The **header** shows daemon uptime, current poll intervals, API rate limit usage, and status indicators (paused, connecting, update available).
+The **header** shows daemon uptime, current poll interval, API rate limit usage, and status indicators (paused, connecting, update available).
 
 The **detail bar** below the table shows contextual information for the selected row -- repo/branch status summary, run ID, failing steps, duration, and age.
 
@@ -208,7 +208,7 @@ Config lives at `~/.config/build-watcher/config.json`:
 | `default_branches` | Branches watched when a repo has no explicit branch config (default: `["main"]`) |
 | `auto_discover_branches` | Automatically discover branches with active runs or open PRs (default: `false`) |
 | `branch_filter` | Regex pattern to filter discovered branches (only applies when auto-discover is enabled) |
-| `poll_aggression` | Rate-limit budget usage: `"low"` (<=10%), `"medium"` (<=40%, default), `"high"` (<=80%) |
+| `poll_aggression` | Rate-limit budget usage: `"low"` (<=15%), `"medium"` (<=40%, default), `"high"` (<=80%) |
 | `notifications` | Global per-event notification levels |
 | `quiet_hours` | Time window (local time, 24h format) during which non-critical notifications are suppressed |
 | `ignored_workflows` | Workflow names hidden from the TUI and excluded from notifications |
@@ -232,7 +232,7 @@ The daemon exposes REST endpoints on the same port for the TUI and other consume
 | Endpoint | Method | Description |
 | --- | --- | --- |
 | `/status` | GET | JSON snapshot of all watches, active runs, and last builds |
-| `/stats` | GET | Daemon stats: uptime, polling intervals, API rate limit |
+| `/stats` | GET | Daemon stats: uptime, poll interval, API rate limit |
 | `/events` | GET | SSE stream of watch events (RunStarted, RunCompleted, StatusChanged) |
 | `/notifications` | GET | Resolved notification config for `?repo=&branch=` |
 | `/notifications` | POST | Mute, unmute, or set per-event levels for a repo/branch |

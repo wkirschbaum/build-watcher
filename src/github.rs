@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -1012,6 +1014,735 @@ pub fn actions_url(repo: &str, branch: &str) -> String {
 /// URL for a repository.
 pub fn repo_url(repo: &str) -> String {
     format!("https://github.com/{repo}")
+}
+
+// ---------------------------------------------------------------------------
+// ReqwestClient — direct HTTP GitHub client (no `gh` CLI process spawning)
+// ---------------------------------------------------------------------------
+
+const GITHUB_API_BASE: &str = "https://api.github.com";
+
+/// Get a GitHub OAuth token from the `gh` CLI (one-time call at startup).
+pub async fn gh_auth_token() -> Result<String, GhError> {
+    let output = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::process::Command::new("gh")
+            .args(["auth", "token"])
+            .output(),
+    )
+    .await
+    .map_err(|_| GhError::Timeout {
+        repo: "auth".into(),
+        timeout_secs: 5,
+    })?
+    .map_err(|e| GhError::Spawn {
+        repo: "auth".into(),
+        source: e,
+    })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        return Err(GhError::CliError {
+            repo: "auth".into(),
+            stderr,
+        });
+    }
+
+    let token = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if token.is_empty() {
+        return Err(GhError::CliError {
+            repo: "auth".into(),
+            stderr: "gh auth token returned empty".into(),
+        });
+    }
+    Ok(token)
+}
+
+/// Cached HTTP response for ETag-based conditional requests.
+struct CachedResponse {
+    etag: String,
+    body: Vec<u8>,
+}
+
+/// GitHub client using direct HTTP via `reqwest`. Avoids the process-spawn
+/// overhead of the `gh` CLI, reuses connections via HTTP keep-alive, and
+/// supports ETag-based conditional requests (304 responses don't count
+/// against the GitHub rate limit).
+pub struct ReqwestClient {
+    client: reqwest::Client,
+    token: String,
+    /// ETag cache: URL → (etag, response body). Protected by a std::sync::Mutex
+    /// since it's only held briefly (never across await points).
+    cache: Mutex<HashMap<String, CachedResponse>>,
+}
+
+impl ReqwestClient {
+    pub fn new(token: String) -> Self {
+        let client = reqwest::Client::builder()
+            .timeout(GH_TIMEOUT)
+            .user_agent("build-watcher")
+            .build()
+            .expect("failed to build reqwest client");
+        Self {
+            client,
+            token,
+            cache: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn get(&self, url: &str) -> reqwest::RequestBuilder {
+        self.client
+            .get(url)
+            .bearer_auth(&self.token)
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+    }
+
+    fn post_json(&self, url: &str, body: &impl Serialize) -> reqwest::RequestBuilder {
+        self.client
+            .post(url)
+            .bearer_auth(&self.token)
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .json(body)
+    }
+
+    fn put_json(&self, url: &str, body: &impl Serialize) -> reqwest::RequestBuilder {
+        self.client
+            .put(url)
+            .bearer_auth(&self.token)
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .json(body)
+    }
+
+    /// Core GET with ETag-based conditional requests.
+    /// Returns raw response bytes, using cached body on 304.
+    async fn cached_get(&self, url: &str, repo: &str) -> Result<Vec<u8>, GhError> {
+        let mut builder = self.get(url);
+
+        // Attach If-None-Match if we have a cached ETag for this URL.
+        let has_cache = {
+            let cache = self.cache.lock().unwrap();
+            if let Some(cached) = cache.get(url) {
+                builder = builder.header("If-None-Match", &cached.etag);
+                true
+            } else {
+                false
+            }
+        };
+
+        let resp = builder.send().await.map_err(|e| GhError::CliError {
+            repo: repo.into(),
+            stderr: e.to_string(),
+        })?;
+
+        if resp.status() == reqwest::StatusCode::NOT_MODIFIED {
+            let cache = self.cache.lock().unwrap();
+            if let Some(cached) = cache.get(url) {
+                tracing::trace!(url, "ETag cache hit (304)");
+                return Ok(cached.body.clone());
+            }
+            // Should not happen, but fall through to error.
+            if has_cache {
+                tracing::warn!(url, "304 but cached body missing");
+            }
+            return Err(GhError::CliError {
+                repo: repo.into(),
+                stderr: "304 Not Modified but no cached body".into(),
+            });
+        }
+
+        if !resp.status().is_success() {
+            return Err(response_error(resp, repo).await);
+        }
+
+        let etag = resp
+            .headers()
+            .get("etag")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+
+        let body = resp
+            .bytes()
+            .await
+            .map_err(|e| GhError::CliError {
+                repo: repo.into(),
+                stderr: e.to_string(),
+            })?
+            .to_vec();
+
+        if let Some(etag) = etag {
+            let mut cache = self.cache.lock().unwrap();
+            cache.insert(
+                url.to_string(),
+                CachedResponse {
+                    etag,
+                    body: body.clone(),
+                },
+            );
+        }
+
+        Ok(body)
+    }
+
+    /// GET a JSON endpoint with ETag caching.
+    async fn api_get<T: serde::de::DeserializeOwned>(
+        &self,
+        repo: &str,
+        path: &str,
+    ) -> Result<T, GhError> {
+        let url = format!("{GITHUB_API_BASE}{path}");
+        let bytes = self.cached_get(&url, repo).await?;
+        serde_json::from_slice(&bytes).map_err(|e| GhError::Parse {
+            repo: repo.into(),
+            source: e,
+        })
+    }
+
+    /// GET with query parameters and ETag caching.
+    async fn api_get_query<T: serde::de::DeserializeOwned>(
+        &self,
+        repo: &str,
+        path: &str,
+        query: &[(&str, &str)],
+    ) -> Result<T, GhError> {
+        let base = format!("{GITHUB_API_BASE}{path}");
+        let url = reqwest::Url::parse_with_params(&base, query).map_err(|e| GhError::CliError {
+            repo: repo.into(),
+            stderr: e.to_string(),
+        })?;
+        let bytes = self.cached_get(url.as_str(), repo).await?;
+        serde_json::from_slice(&bytes).map_err(|e| GhError::Parse {
+            repo: repo.into(),
+            source: e,
+        })
+    }
+
+    /// Paginated GET that collects all pages of `Vec<T>`.
+    /// Pagination does not use ETag caching (each page has its own ETag).
+    async fn api_get_all_pages<T: serde::de::DeserializeOwned>(
+        &self,
+        repo: &str,
+        path: &str,
+    ) -> Result<Vec<T>, GhError> {
+        let mut items = Vec::new();
+        let mut url = Some(format!("{GITHUB_API_BASE}{path}?per_page=100"));
+
+        while let Some(current_url) = url {
+            let resp = self
+                .get(&current_url)
+                .send()
+                .await
+                .map_err(|e| GhError::CliError {
+                    repo: repo.into(),
+                    stderr: e.to_string(),
+                })?;
+            url = next_link_url(&resp);
+            let page: Vec<T> = handle_response(resp, repo).await?;
+            items.extend(page);
+        }
+
+        Ok(items)
+    }
+
+    /// Fetch workflow runs with optional filters, returning parsed `RunInfo`s.
+    async fn list_runs(
+        &self,
+        repo: &str,
+        limit: u32,
+        extra: &[(&str, &str)],
+    ) -> Result<Vec<RunInfo>, GhError> {
+        let limit_str = limit.to_string();
+        let mut query: Vec<(&str, &str)> = vec![("per_page", &limit_str)];
+        query.extend_from_slice(extra);
+        let resp: RestRunsResponse = self
+            .api_get_query(repo, &format!("/repos/{repo}/actions/runs"), &query)
+            .await?;
+        Ok(resp
+            .workflow_runs
+            .into_iter()
+            .filter_map(|r| r.into_run_info(repo).ok())
+            .collect())
+    }
+
+    /// POST (empty body) to an endpoint and return the response text.
+    async fn api_post_empty(&self, repo: &str, path: &str) -> Result<String, GhError> {
+        let url = format!("{GITHUB_API_BASE}{path}");
+        let resp = self
+            .client
+            .post(&url)
+            .bearer_auth(&self.token)
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .send()
+            .await
+            .map_err(|e| GhError::CliError {
+                repo: repo.into(),
+                stderr: e.to_string(),
+            })?;
+        if !resp.status().is_success() {
+            return Err(response_error(resp, repo).await);
+        }
+        resp.text().await.map_err(|e| GhError::CliError {
+            repo: repo.into(),
+            stderr: e.to_string(),
+        })
+    }
+
+    /// Execute a GraphQL query and return raw JSON bytes.
+    async fn graphql_query(&self, repo: &str, query: &str) -> Result<serde_json::Value, GhError> {
+        let url = format!("{GITHUB_API_BASE}/graphql");
+        let body = serde_json::json!({ "query": query });
+        let resp = self
+            .post_json(&url, &body)
+            .send()
+            .await
+            .map_err(|e| GhError::CliError {
+                repo: repo.into(),
+                stderr: e.to_string(),
+            })?;
+        handle_response(resp, repo).await
+    }
+}
+
+/// Parse the Link header for the `rel="next"` URL.
+fn next_link_url(resp: &reqwest::Response) -> Option<String> {
+    let link = resp.headers().get("link")?.to_str().ok()?;
+    for part in link.split(',') {
+        let part = part.trim();
+        if part.contains("rel=\"next\"") {
+            let url = part.split('>').next()?.trim_start_matches('<');
+            return Some(url.to_string());
+        }
+    }
+    None
+}
+
+/// Convert a non-success response into a `GhError`.
+async fn response_error(resp: reqwest::Response, repo: &str) -> GhError {
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    GhError::CliError {
+        repo: repo.into(),
+        stderr: if status.as_u16() == 404 {
+            format!("HTTP 404: Not Found - {body}")
+        } else {
+            format!("HTTP {status}: {body}")
+        },
+    }
+}
+
+/// Deserialize a successful response or return a `GhError`.
+async fn handle_response<T: serde::de::DeserializeOwned>(
+    resp: reqwest::Response,
+    repo: &str,
+) -> Result<T, GhError> {
+    if !resp.status().is_success() {
+        return Err(response_error(resp, repo).await);
+    }
+    let bytes = resp.bytes().await.map_err(|e| GhError::CliError {
+        repo: repo.into(),
+        stderr: e.to_string(),
+    })?;
+    serde_json::from_slice(&bytes).map_err(|e| GhError::Parse {
+        repo: repo.into(),
+        source: e,
+    })
+}
+
+// -- REST API response types --
+
+#[derive(Debug, Deserialize)]
+struct RestRunsResponse {
+    #[serde(default)]
+    workflow_runs: Vec<RestRunJson>,
+}
+
+/// Workflow run from the GitHub REST API.
+#[derive(Debug, Deserialize)]
+struct RestRunJson {
+    id: Option<u64>,
+    #[serde(default)]
+    status: String,
+    conclusion: Option<String>,
+    #[serde(default)]
+    display_title: String,
+    /// Workflow name (called `name` in REST, `workflowName` in GraphQL).
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    head_sha: String,
+    #[serde(default)]
+    event: String,
+    #[serde(default)]
+    head_branch: String,
+    #[serde(default = "default_attempt")]
+    run_attempt: u32,
+    #[serde(default)]
+    created_at: String,
+    #[serde(default)]
+    updated_at: String,
+    #[serde(default)]
+    html_url: String,
+    // Author fields — present on single-run detail, absent from list.
+    triggering_actor: Option<RestActorJson>,
+    head_commit: Option<RestHeadCommitJson>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RestActorJson {
+    #[serde(default)]
+    login: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RestHeadCommitJson {
+    author: Option<RestCommitAuthorJson>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RestCommitAuthorJson {
+    #[serde(default)]
+    name: String,
+}
+
+impl RestRunJson {
+    fn into_run_info(self, repo: &str) -> Result<RunInfo, GhError> {
+        let id = self
+            .id
+            .ok_or_else(|| GhError::MissingFields { repo: repo.into() })?;
+        if self.status.is_empty() || self.display_title.is_empty() || self.name.is_empty() {
+            return Err(GhError::MissingFields { repo: repo.into() });
+        }
+        Ok(RunInfo {
+            id,
+            status: self
+                .status
+                .parse::<RunStatus>()
+                .unwrap_or(RunStatus::Unknown),
+            conclusion: self.conclusion.unwrap_or_default(),
+            title: self.display_title,
+            workflow: self.name,
+            head_sha: self.head_sha,
+            event: self.event,
+            head_branch: self.head_branch,
+            attempt: self.run_attempt,
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+            url: self.html_url,
+        })
+    }
+
+    fn into_history_entry(self) -> Option<HistoryEntry> {
+        Some(HistoryEntry {
+            id: self.id?,
+            conclusion: if self.conclusion.as_deref().unwrap_or("").is_empty() {
+                "in_progress".to_string()
+            } else {
+                self.conclusion.unwrap_or_default()
+            },
+            workflow: self.name,
+            title: self.display_title,
+            branch: self.head_branch,
+            event: self.event,
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+        })
+    }
+}
+
+/// REST API jobs response.
+#[derive(Debug, Deserialize)]
+struct RestJobsResponse {
+    #[serde(default)]
+    jobs: Vec<RestJobJson>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RestJobJson {
+    id: Option<u64>,
+    #[serde(default)]
+    name: String,
+    conclusion: Option<String>,
+    #[serde(default)]
+    steps: Vec<RestStepJson>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RestStepJson {
+    #[serde(default)]
+    name: String,
+    conclusion: Option<String>,
+}
+
+/// Simple name-bearing JSON object (used for tags / branches pagination).
+#[derive(Deserialize)]
+struct NameJson {
+    name: String,
+}
+
+/// Minimal repo info from `GET /repos/{owner}/{repo}`.
+#[derive(Deserialize)]
+struct RestRepoJson {
+    #[serde(default)]
+    default_branch: String,
+}
+
+/// GraphQL PR query response wrappers.
+#[derive(Deserialize)]
+struct GraphqlPrResponse {
+    data: Option<GraphqlPrData>,
+    errors: Option<Vec<GraphqlErrorJson>>,
+}
+
+#[derive(Deserialize)]
+struct GraphqlPrData {
+    repository: Option<GraphqlPrRepo>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GraphqlPrRepo {
+    pull_requests: GraphqlPrConnection,
+}
+
+#[derive(Deserialize)]
+struct GraphqlPrConnection {
+    nodes: Vec<GhPrJson>,
+}
+
+#[derive(Deserialize)]
+struct GraphqlErrorJson {
+    #[serde(default)]
+    message: String,
+}
+
+#[async_trait::async_trait]
+impl GitHubClient for ReqwestClient {
+    #[tracing::instrument(skip_all, fields(%repo, %branch))]
+    async fn recent_runs(&self, repo: &str, branch: &str) -> Result<Vec<RunInfo>, GhError> {
+        self.list_runs(repo, DEFAULT_BRANCH_LIMIT, &[("branch", branch)])
+            .await
+    }
+
+    #[tracing::instrument(skip_all, fields(%repo, %limit))]
+    async fn recent_runs_for_repo(&self, repo: &str, limit: u32) -> Result<Vec<RunInfo>, GhError> {
+        self.list_runs(repo, limit, &[]).await
+    }
+
+    #[tracing::instrument(skip_all, fields(%repo))]
+    async fn in_progress_runs_for_repo(&self, repo: &str) -> Result<Vec<RunInfo>, GhError> {
+        self.list_runs(repo, IN_PROGRESS_LIMIT, &[("status", "in_progress")])
+            .await
+    }
+
+    #[tracing::instrument(skip_all, fields(%repo, %run_id))]
+    async fn run_status(&self, repo: &str, run_id: u64) -> Result<RunInfo, GhError> {
+        let raw: RestRunJson = self
+            .api_get(repo, &format!("/repos/{repo}/actions/runs/{run_id}"))
+            .await?;
+        raw.into_run_info(repo)
+    }
+
+    async fn failing_steps(&self, repo: &str, run_id: u64) -> Option<FailureInfo> {
+        let resp: RestJobsResponse = self
+            .api_get(repo, &format!("/repos/{repo}/actions/runs/{run_id}/jobs"))
+            .await
+            .map_err(|e| {
+                tracing::debug!(%repo, %run_id, error = %e, "Failed to fetch failing steps");
+            })
+            .ok()?;
+
+        // Convert REST job format to the internal GhJob format for extract_failing_steps.
+        let jobs: Vec<GhJob> = resp
+            .jobs
+            .into_iter()
+            .map(|j| GhJob {
+                database_id: j.id,
+                name: j.name,
+                conclusion: j.conclusion.unwrap_or_default(),
+                steps: j
+                    .steps
+                    .into_iter()
+                    .map(|s| GhStep {
+                        name: s.name,
+                        conclusion: s.conclusion.unwrap_or_default(),
+                    })
+                    .collect(),
+            })
+            .collect();
+        extract_failing_steps(&jobs)
+    }
+
+    async fn run_rerun(
+        &self,
+        repo: &str,
+        run_id: u64,
+        failed_only: bool,
+    ) -> Result<String, GhError> {
+        let path = if failed_only {
+            format!("/repos/{repo}/actions/runs/{run_id}/rerun-failed-jobs")
+        } else {
+            format!("/repos/{repo}/actions/runs/{run_id}/rerun")
+        };
+        self.api_post_empty(repo, &path).await
+    }
+
+    async fn run_list_history(
+        &self,
+        repo: &str,
+        branch: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<HistoryEntry>, GhError> {
+        let limit_str = limit.to_string();
+        let mut query: Vec<(&str, &str)> = vec![("per_page", &limit_str)];
+        if let Some(b) = branch {
+            query.push(("branch", b));
+        }
+        let resp: RestRunsResponse = self
+            .api_get_query(repo, &format!("/repos/{repo}/actions/runs"), &query)
+            .await?;
+        Ok(resp
+            .workflow_runs
+            .into_iter()
+            .filter_map(|r| r.into_history_entry())
+            .collect())
+    }
+
+    async fn rate_limit(&self) -> Result<RateLimit, GhError> {
+        #[derive(Deserialize)]
+        struct RateLimitResponse {
+            resources: RateLimitResources,
+        }
+        #[derive(Deserialize)]
+        struct RateLimitResources {
+            core: RateLimit,
+        }
+        let resp: RateLimitResponse = self.api_get("rate_limit", "/rate_limit").await?;
+        Ok(resp.resources.core)
+    }
+
+    async fn list_tags(&self, repo: &str) -> Result<Vec<String>, GhError> {
+        let items: Vec<NameJson> = self
+            .api_get_all_pages(repo, &format!("/repos/{repo}/tags"))
+            .await?;
+        Ok(items.into_iter().map(|n| n.name).collect())
+    }
+
+    #[tracing::instrument(skip_all, fields(%repo))]
+    async fn list_branches(&self, repo: &str) -> Result<Vec<String>, GhError> {
+        let items: Vec<NameJson> = self
+            .api_get_all_pages(repo, &format!("/repos/{repo}/branches"))
+            .await?;
+        Ok(items.into_iter().map(|n| n.name).collect())
+    }
+
+    #[tracing::instrument(skip_all, fields(%repo))]
+    async fn default_branch(&self, repo: &str) -> Result<String, GhError> {
+        let info: RestRepoJson = self.api_get(repo, &format!("/repos/{repo}")).await?;
+        if info.default_branch.is_empty() {
+            Err(GhError::MissingFields { repo: repo.into() })
+        } else {
+            Ok(info.default_branch)
+        }
+    }
+
+    #[tracing::instrument(skip_all, fields(%repo))]
+    async fn open_prs(&self, repo: &str) -> Result<Vec<PrInfo>, GhError> {
+        let (owner, name) = repo
+            .split_once('/')
+            .ok_or_else(|| GhError::MissingFields { repo: repo.into() })?;
+        let query = format!(
+            r#"{{ repository(owner: "{owner}", name: "{name}") {{ pullRequests(states: OPEN, first: {MAX_OPEN_PRS}) {{ nodes {{ number title headRefName baseRefName url isDraft mergeStateStatus reviewDecision author {{ login }} }} }} }} }}"#,
+        );
+        let resp: GraphqlPrResponse = self
+            .graphql_query(repo, &query)
+            .await
+            .map(|v| {
+                serde_json::from_value(v).map_err(|e| GhError::Parse {
+                    repo: repo.into(),
+                    source: e,
+                })
+            })?
+            .map_err(|e| {
+                tracing::debug!(%repo, error = %e, "GraphQL PR parse error");
+                e
+            })?;
+
+        if let Some(errors) = &resp.errors
+            && !errors.is_empty()
+        {
+            let msgs: Vec<&str> = errors.iter().map(|e| e.message.as_str()).collect();
+            return Err(GhError::CliError {
+                repo: repo.into(),
+                stderr: msgs.join("; "),
+            });
+        }
+
+        let nodes = resp
+            .data
+            .and_then(|d| d.repository)
+            .map(|r| r.pull_requests.nodes)
+            .unwrap_or_default();
+
+        Ok(nodes
+            .into_iter()
+            .map(|pr| PrInfo {
+                number: pr.number,
+                title: pr.title,
+                branch: pr.head_ref_name,
+                target_branch: pr.base_ref_name,
+                url: pr.url,
+                author: pr.author.map(|a| a.login).unwrap_or_default(),
+                draft: pr.is_draft,
+                merge_state: pr.merge_state_status,
+                review_decision: pr.review_decision,
+            })
+            .collect())
+    }
+
+    async fn pr_merge(&self, repo: &str, number: u64) -> Result<String, GhError> {
+        let url = format!("{GITHUB_API_BASE}/repos/{repo}/pulls/{number}/merge");
+        let body = serde_json::json!({ "merge_method": "merge" });
+        let resp = self
+            .put_json(&url, &body)
+            .send()
+            .await
+            .map_err(|e| GhError::CliError {
+                repo: repo.into(),
+                stderr: e.to_string(),
+            })?;
+        if !resp.status().is_success() {
+            return Err(response_error(resp, repo).await);
+        }
+        resp.text().await.map_err(|e| GhError::CliError {
+            repo: repo.into(),
+            stderr: e.to_string(),
+        })
+    }
+
+    async fn run_author(&self, repo: &str, run_id: u64) -> Option<RunAuthorInfo> {
+        let raw: RestRunJson = self
+            .api_get(repo, &format!("/repos/{repo}/actions/runs/{run_id}"))
+            .await
+            .map_err(|e| {
+                tracing::debug!(%repo, %run_id, error = %e, "Failed to fetch run author");
+            })
+            .ok()?;
+        let actor = raw.triggering_actor?.login;
+        if actor.is_empty() {
+            return None;
+        }
+        Some(RunAuthorInfo {
+            actor,
+            commit_author: raw
+                .head_commit
+                .and_then(|hc| hc.author)
+                .map(|a| a.name)
+                .filter(|s| !s.is_empty()),
+        })
+    }
 }
 
 #[cfg(test)]

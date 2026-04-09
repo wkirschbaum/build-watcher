@@ -10,7 +10,7 @@ use build_watcher::dirs::config_dir;
 use build_watcher::format;
 use build_watcher::github::{validate_branch, validate_repo};
 use build_watcher::history::history_for;
-use build_watcher::rate_limiter::{MIN_ACTIVE_SECS, MIN_IDLE_SECS, PollInput, compute_intervals};
+use build_watcher::rate_limiter::{MIN_POLL_SECS, PollInput, compute_interval};
 use build_watcher::watcher::{count_api_calls, is_paused};
 
 use super::DaemonState;
@@ -206,13 +206,13 @@ impl BuildWatcher {
             (snap, calls)
         };
         let aggression = self.state.config.read().await.poll_aggression;
-        let (active_secs, idle_secs) = compute_intervals(&PollInput {
+        let poll_secs = compute_interval(&PollInput {
             rate_limit: rl.clone(),
             calls_per_cycle: api_calls,
             now,
             aggression,
         });
-        let throttled = active_secs > MIN_ACTIVE_SECS || idle_secs > MIN_IDLE_SECS;
+        let throttled = poll_secs > MIN_POLL_SECS;
 
         let paused = is_paused(&self.state.pause).await;
         let (
@@ -249,9 +249,7 @@ impl BuildWatcher {
         ));
 
         let throttle_note = if throttled { " [throttled]" } else { "" };
-        lines.push(format!(
-            "Polling   : {active_secs}s active / {idle_secs}s idle{throttle_note}",
-        ));
+        lines.push(format!("Polling   : every {poll_secs}s{throttle_note}",));
 
         lines.push(String::new());
         lines.push("GitHub API rate limit".to_string());
@@ -732,7 +730,7 @@ impl BuildWatcher {
 
     #[tool(
         description = "Set poll aggression: how much of the GitHub rate-limit budget \
-            the daemon uses per hour. low=≤10%, medium=≤40% (default), high=≤80%."
+            the daemon uses per hour. low=≤15%, medium=≤40% (default), high=≤80%."
     )]
     async fn set_poll_aggression(
         &self,

@@ -78,7 +78,7 @@ impl NotificationLevel {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum PollAggression {
-    /// Target ≤10% of the rate-limit per reset window.
+    /// Target ≤15% of the rate-limit per reset window.
     Low,
     /// Target ≤40% of the rate-limit per reset window (default).
     #[default]

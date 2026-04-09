@@ -63,8 +63,8 @@ pub struct HistoryEntryView {
 
 ## Open Questions / Tradeoffs
 
-- **Latency:** `gh run list` can be slow — loading state in popup handles this.
+- **Latency:** API call may be slow — loading state in popup handles this.
 - **Error handling:** On failure, close popup and show flash message.
-- **Caching:** Fresh `gh` call per `h` press — acceptable for now; LRU cache (60s TTL) is a future improvement.
+- **Caching:** Fresh API call per `h` press — acceptable for now; LRU cache (60s TTL) is a future improvement.
 - **Scroll offset:** Store `scroll_offset: usize` in `InputMode::History` alongside `selected`; render function slices `entries` to only visible rows (pure render, no mutable widget state).
 - **`h`/`H` split:** `h` = this branch, `H` = whole repo (no branch filter).

@@ -17,7 +17,7 @@ bw --update    # Self-update to the latest release
 ## Layout
 
 ```
-build-watcher — up 2h 15m                    poll 15s/60s  API 4521/5000 (90%)  reset 42m
+build-watcher — up 2h 15m                    poll 5s [medium]  API 4521/5000 (90%)  reset 42m
 7 repos, 3 active
 ┌──────────────────────────────────────────────────────────────────────────────┐
 │ REPO ↑              BRANCH    STATUS          WORKFLOW       TITLE           ELAPSED / AGE │
@@ -32,7 +32,7 @@ build-watcher — up 2h 15m                    poll 15s/60s  API 4521/5000 (90%)
 ─[↑↓/jk] nav  [Tab/⇧Tab] expand  │  [a] add  [b] branch  [d] del  [o/O] open  [r/R] rerun  │  [n/N] mute  [p] pause  [h] hist  [H] recent  │  [s/S] sort  [g/G] group  [C] config  │  [q] quit  [Q] stop  [?] hide
 ```
 
-**Header line 1:** daemon uptime, polling intervals (active/idle), GitHub API rate limit and reset time.
+**Header line 1:** daemon uptime, poll interval, GitHub API rate limit and reset time.
 
 **Header line 2:** watch count, active build count, plus status indicators (paused, SSE connection state, errors, flash messages).
 
@@ -82,7 +82,7 @@ build-watcher — up 2h 15m                    poll 15s/60s  API 4521/5000 (90%)
 The TUI connects to the daemon via HTTP endpoints:
 
 - **`GET /status`** — Watch state snapshot (repos, active runs, last builds)
-- **`GET /stats`** — Daemon stats (uptime, polling intervals, rate limit)
+- **`GET /stats`** — Daemon stats (uptime, poll interval, rate limit)
 - **`GET /events`** — SSE stream of `WatchEvent`s for real-time updates
 - **`GET /history/all`** — Recent build history across all repos
 - **`GET /defaults`** and **`POST /defaults`** — Global config management
