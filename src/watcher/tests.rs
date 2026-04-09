@@ -241,7 +241,6 @@ impl TestHarness {
             persistence: self.handle.persistence.clone(),
             history: self.handle.history.clone(),
             config_changed: self.handle.config_changed.clone(),
-            last_active_secs: 0,
             first_poll: false,
             pr_states: HashMap::new(),
         }

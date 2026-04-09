@@ -2,114 +2,66 @@ use crate::config::PollAggression;
 use crate::github::RateLimit;
 
 /// Fastest permitted polling interval when active runs exist.
-pub const MIN_ACTIVE_SECS: u64 = 15;
+pub const MIN_ACTIVE_SECS: u64 = 5;
 /// Fastest permitted polling interval when no active runs exist.
-pub const MIN_IDLE_SECS: u64 = 30;
+pub const MIN_IDLE_SECS: u64 = 15;
 
-/// Assumed GitHub rate-limit window in seconds.
-const WINDOW_SECS: u64 = 3600;
-
-/// Compute active and idle poll intervals given the current rate-limit state.
-///
-/// # Strategy
-///
-/// 1. **No rate-limit data** → conservative fallback that scales with aggression.
-///
-/// 2. **Free zone** (`own_calls_so_far < half of target budget`): poll at floor
-///    speed with `sqrt(calls)` scaling, same as before — we have headroom.
-///
-/// 3. **Throttle zone**: project both our own future usage and external usage
-///    (other tools using the same GitHub token) forward to the window reset,
-///    then spread our remaining budget across the available seconds.
-///
-/// # External usage projection
-///
-/// `rl.used` includes API calls from all sources, not just this daemon.
-/// `last_active_secs` (the previous poll interval) lets us back-project our
-/// own historical contribution:
-///
-/// ```text
-/// own_calls_so_far = floor(elapsed / last_active_secs) × calls_per_cycle
-/// external_used    = rl.used − own_calls_so_far          (saturating)
-/// projected_ext    = external_used / elapsed × secs_to_reset
-/// available_to_us  = rl.remaining − projected_ext         (saturating)
-/// ```
-///
-/// On the first call (`last_active_secs = 0`) all of `rl.used` is attributed
-/// to external sources — conservative but correct for a fresh session.
-///
-/// # Hard floors
-///
-/// `MIN_ACTIVE_SECS` (15 s) and `MIN_IDLE_SECS` (60 s) are never violated.
-pub fn compute_intervals(
-    rate_limit: Option<&RateLimit>,
-    api_calls_per_cycle: u64,
-    now: u64,
-    aggression: PollAggression,
-    last_active_secs: u64,
-) -> (u64, u64) {
-    let calls = api_calls_per_cycle.max(1);
-
-    let Some(rl) = rate_limit else {
-        return fallback_intervals(aggression);
-    };
-
-    let target_calls = aggression.target_calls(rl.limit).max(1);
-
-    // Back-project our own calls since the window started.
-    let window_start = rl.reset.saturating_sub(WINDOW_SECS);
-    let elapsed = now.saturating_sub(window_start).max(1);
-    let own_calls_so_far = if last_active_secs > 0 {
-        (elapsed / last_active_secs).saturating_mul(calls)
-    } else {
-        0
-    };
-
-    // Free zone: own usage is under half the target → poll near floor speed,
-    // scaled by aggression level so the setting actually affects polling rate.
-    if own_calls_so_far * 2 < target_calls {
-        let scale = (calls as f64).sqrt() as u64;
-        let aggression_mult = aggression.interval_multiplier();
-        let active = ((MIN_ACTIVE_SECS * scale.max(1)) as f64 * aggression_mult) as u64;
-        let idle = ((MIN_IDLE_SECS * scale.max(1)) as f64 * aggression_mult) as u64;
-        return (active.max(MIN_ACTIVE_SECS), idle.max(MIN_IDLE_SECS));
-    }
-
-    // Throttle zone: project external usage forward and compute effective budget.
-    let secs_to_reset = rl.reset.saturating_sub(now).max(1);
-    let external_used = rl.used.saturating_sub(own_calls_so_far);
-    let projected_external =
-        (external_used as f64 / elapsed as f64 * secs_to_reset as f64).min(rl.limit as f64) as u64;
-
-    let available_to_us = rl.remaining.saturating_sub(projected_external);
-    let our_remaining_quota = target_calls.saturating_sub(own_calls_so_far);
-    let effective_budget = available_to_us.min(our_remaining_quota);
-
-    // Spread effective_budget across remaining seconds.
-    // checked_div: if budget == 0, wait out the full reset window.
-    let rate_limited_secs = (calls * secs_to_reset)
-        .checked_div(effective_budget)
-        .unwrap_or(secs_to_reset);
-
-    (
-        MIN_ACTIVE_SECS.max(rate_limited_secs),
-        MIN_IDLE_SECS.max(rate_limited_secs),
-    )
+/// All inputs needed to compute poll intervals.
+pub struct PollInput {
+    pub rate_limit: Option<RateLimit>,
+    pub calls_per_cycle: u64,
+    pub now: u64,
+    pub aggression: PollAggression,
 }
 
-fn fallback_intervals(aggression: PollAggression) -> (u64, u64) {
-    let m = aggression.interval_multiplier();
-    let active = ((MIN_ACTIVE_SECS as f64) * m) as u64;
-    let idle = ((MIN_IDLE_SECS as f64) * m) as u64;
-    (active.max(MIN_ACTIVE_SECS), idle.max(MIN_IDLE_SECS))
+/// Compute active and idle poll intervals.
+///
+/// Uses `time_left` (seconds until reset), `limit` (total calls per window),
+/// `used` (calls consumed so far), and `aggression` (target fraction).
+///
+/// ```text
+/// remaining_budget = (target_fraction × limit) − used
+/// interval = time_left × calls_per_cycle / remaining_budget
+/// ```
+///
+/// Target fractions: High = 80%, Medium = 40%, Low = 15%.
+pub fn compute_intervals(input: &PollInput) -> (u64, u64) {
+    let calls = input.calls_per_cycle.max(1);
+
+    let Some(ref rl) = input.rate_limit else {
+        // No data yet — assume 5000 limit, full window remaining.
+        let budget = input.aggression.target_calls(5000).max(1);
+        let interval = calls * 3600 / budget;
+        return (interval.max(MIN_ACTIVE_SECS), interval.max(MIN_IDLE_SECS));
+    };
+
+    let time_left = rl.reset.saturating_sub(input.now).max(1);
+    let target_budget = input.aggression.target_calls(rl.limit);
+    let remaining_budget = target_budget.saturating_sub(rl.used);
+
+    let interval = if remaining_budget == 0 {
+        time_left
+    } else {
+        calls * time_left / remaining_budget
+    };
+
+    (interval.max(MIN_ACTIVE_SECS), interval.max(MIN_IDLE_SECS))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Fixed "now" for deterministic tests — middle of a rate-limit window.
     const T: u64 = 1_000_000;
+
+    fn input(rl: Option<RateLimit>, calls: u64, aggression: PollAggression) -> PollInput {
+        PollInput {
+            rate_limit: rl,
+            calls_per_cycle: calls,
+            now: T,
+            aggression,
+        }
+    }
 
     fn make_rl(remaining: u64, limit: u64, secs_until_reset: u64) -> RateLimit {
         RateLimit {
@@ -123,168 +75,157 @@ mod tests {
     // -- Fallback (no rate-limit data) --
 
     #[test]
-    fn fallback_by_aggression() {
-        assert_eq!(
-            compute_intervals(None, 1, T, PollAggression::Low, 0),
-            (75, 150) // 15×5, 30×5
-        );
-        assert_eq!(
-            compute_intervals(None, 1, T, PollAggression::Medium, 0),
-            (22, 45) // 15×1.5, 30×1.5
-        );
-        assert_eq!(
-            compute_intervals(None, 1, T, PollAggression::High, 0),
-            (MIN_ACTIVE_SECS, MIN_IDLE_SECS) // 15×1, 30×1
-        );
+    fn fallback_polls_at_floor_for_single_call() {
+        for agg in [
+            PollAggression::Low,
+            PollAggression::Medium,
+            PollAggression::High,
+        ] {
+            let (active, idle) = compute_intervals(&input(None, 1, agg));
+            assert_eq!(active, MIN_ACTIVE_SECS, "{agg:?}");
+            assert_eq!(idle, MIN_IDLE_SECS, "{agg:?}");
+        }
     }
 
-    // -- Free zone --
+    #[test]
+    fn fallback_scales_with_calls_per_cycle() {
+        // Low: 15% of 5000 = 750 budget. 10 calls/cycle → 10×3600/750 = 48s.
+        let (active, idle) = compute_intervals(&input(None, 10, PollAggression::Low));
+        assert_eq!(active, 48);
+        assert_eq!(idle, 48);
+    }
+
+    // -- Fresh window --
 
     #[test]
-    fn free_zone_high_aggression_at_floor() {
-        // High aggression (mult=1.0): target = 70% of 5000 = 3500. own_calls=0 → free zone → floor.
+    fn fresh_window_polls_at_floor() {
         let rl = make_rl(5000, 5000, 3600);
-        let (active, idle) = compute_intervals(Some(&rl), 1, T, PollAggression::High, 0);
+        let (active, idle) = compute_intervals(&input(Some(rl), 1, PollAggression::High));
         assert_eq!(active, MIN_ACTIVE_SECS);
         assert_eq!(idle, MIN_IDLE_SECS);
     }
 
-    #[test]
-    fn free_zone_medium_aggression_scaled() {
-        // Medium aggression (mult=1.5): free zone → floor × 1.5.
-        let rl = make_rl(5000, 5000, 3600);
-        let (active, idle) = compute_intervals(Some(&rl), 1, T, PollAggression::Medium, 0);
-        assert_eq!(active, (MIN_ACTIVE_SECS as f64 * 1.5) as u64); // 22
-        assert_eq!(idle, (MIN_IDLE_SECS as f64 * 1.5) as u64); // 45
-    }
+    // -- Budget tracks actual usage --
 
     #[test]
-    fn free_zone_low_aggression_scaled() {
-        // Low aggression (mult=5.0): free zone → floor × 5.
-        let rl = make_rl(5000, 5000, 3600);
-        let (active, idle) = compute_intervals(Some(&rl), 1, T, PollAggression::Low, 0);
-        assert_eq!(active, MIN_ACTIVE_SECS * 5); // 75
-        assert_eq!(idle, MIN_IDLE_SECS * 5); // 150
-    }
-
-    #[test]
-    fn free_zone_sqrt_scaling() {
-        // High aggression, fresh window, 6 calls → sqrt(6) = 2 → ×2 (mult=1.0)
-        let rl = make_rl(5000, 5000, 3600);
-        let (active, idle) = compute_intervals(Some(&rl), 6, T, PollAggression::High, 0);
-        assert_eq!(active, MIN_ACTIVE_SECS * 2);
-        assert_eq!(idle, MIN_IDLE_SECS * 2);
-    }
-
-    #[test]
-    fn free_zone_while_own_calls_under_half_target() {
-        // High: target = 3500. If we're 1800s into a 3600s window polling at 30s
-        // intervals with 1 call/cycle → own_calls = 1800/30 * 1 = 60. 60*2=120 < 3500 → free.
-        let rl = make_rl(4000, 5000, 1800);
-        let last = 30;
-        let (active, idle) = compute_intervals(Some(&rl), 1, T, PollAggression::High, last);
+    fn half_used_budget_doubles_interval() {
+        // High: target = 4000. used = 2000 → remaining = 2000.
+        // 1 call/cycle, 1800s left → 1800/2000 < 1 → floor.
+        let rl = make_rl(3000, 5000, 1800);
+        let (active, _) = compute_intervals(&input(Some(rl), 1, PollAggression::High));
         assert_eq!(active, MIN_ACTIVE_SECS);
-        assert_eq!(idle, MIN_IDLE_SECS);
     }
 
-    // -- Throttle zone --
-
     #[test]
-    fn throttle_when_own_calls_exceed_half_target() {
-        // Medium: target = 1250. 900s into window, polling at 30s/cycle, 1 call/cycle.
-        // own_calls = 900/30 = 30. 30*2 = 60... still in free zone.
-        // Use a smaller target: Low with limit=1000 → target=100.
-        // 900s elapsed, 30s interval, 1 call → own=30. 30*2=60 >= 100? No, 60 < 100 → free.
-        // Adjust: elapsed=1800, last=30 → own=60. 60*2=120 >= 100 → throttle!
-        let rl = make_rl(900, 1000, 1800); // 1800s left, used=100, limit=1000
-        // now=T, window_start = T+1800-3600 = T-1800, elapsed=1800
-        // own = 1800/30 * 1 = 60. target=Low→100. 60*2=120 >= 100 → throttle.
-        // external_used = 100 - 60 = 40. projected_ext = 40/1800 * 1800 = 40.
-        // available = 900 - 40 = 860. our_remaining_quota = 100 - 60 = 40.
-        // effective_budget = min(860, 40) = 40.
-        // rate_limited = 1 * 1800 / 40 = 45s.
-        let (active, idle) = compute_intervals(Some(&rl), 1, T, PollAggression::Low, 30);
-        assert_eq!(active, 45);
-        assert_eq!(idle, 45); // 45 > MIN_IDLE_SECS (30)
+    fn tight_budget_slows_down() {
+        // Low: target = 750. used = 700 → remaining = 50.
+        // 1 call/cycle, 1800s left → 1800/50 = 36.
+        let rl = make_rl(4300, 5000, 1800);
+        let (active, idle) = compute_intervals(&input(Some(rl), 1, PollAggression::Low));
+        assert_eq!(active, 36);
+        assert_eq!(idle, 36);
     }
 
     #[test]
     fn budget_exhausted_waits_for_reset() {
-        // own_calls >= target_calls → our_remaining_quota = 0 → effective_budget = 0 → wait.
-        // Low, limit=1000, target=100. Elapsed=3600s, last=30 → own=120 > 100.
-        let rl = make_rl(800, 1000, 1800);
-        // own = 1800/30 = 60... need more. Use last=10: own = 1800/10 = 180 > 100.
-        let (active, idle) = compute_intervals(Some(&rl), 1, T, PollAggression::Low, 10);
-        // effective_budget = min(available_to_us, 0) = 0 → wait (1800s), floored at MIN.
+        // Low: target = 750. used = 800 → remaining = 0. Wait out window.
+        let rl = make_rl(4200, 5000, 1800);
+        let (active, idle) = compute_intervals(&input(Some(rl), 1, PollAggression::Low));
         assert_eq!(active, 1800);
         assert_eq!(idle, 1800);
     }
 
-    #[test]
-    fn external_usage_reduces_available_budget() {
-        // High: target = 80% of 4500 = 3600. Window half elapsed (1800s left).
-        // last=1, elapsed=1800 → own = 1800. 1800*2=3600 >= 3600 → throttle zone.
-        // remaining=100, used=4400. external_used = 4400 - 1800 = 2600.
-        // projected_ext = 2600 / 1800 * 1800 = 2600. available = 100 - 2600 = 0 (saturating).
-        // our_remaining_quota = 3600 - 1800 = 1800. effective_budget = min(0, 1800) = 0 → wait.
-        let rl = make_rl(100, 4500, 1800); // remaining=100, used=4400
-        let (active, idle) = compute_intervals(Some(&rl), 1, T, PollAggression::High, 1);
-        assert_eq!(active, 1800);
-        assert_eq!(idle, 1800);
-    }
+    // -- Aggression ordering --
 
     #[test]
-    fn first_call_attributes_all_used_to_external() {
-        // last_active_secs = 0 → own_calls = 0 → free zone (own*2 < target).
-        // High: target=2500. Even with lots of rl.used, we're in free zone.
-        let rl = make_rl(1000, 5000, 3600); // used=4000
-        let (active, idle) = compute_intervals(Some(&rl), 1, T, PollAggression::High, 0);
-        // own=0, 0*2=0 < 2500 → free zone → floor (High mult=1.0)
-        assert_eq!(active, MIN_ACTIVE_SECS);
-        assert_eq!(idle, MIN_IDLE_SECS);
+    fn aggression_ordering() {
+        let rl = make_rl(3000, 5000, 1800); // used = 2000
+        let (low_a, _) = compute_intervals(&input(Some(rl.clone()), 3, PollAggression::Low));
+        let (med_a, _) = compute_intervals(&input(Some(rl.clone()), 3, PollAggression::Medium));
+        let (high_a, _) = compute_intervals(&input(Some(rl), 3, PollAggression::High));
+        assert!(
+            low_a >= med_a,
+            "Low ({low_a}) should be >= Medium ({med_a})"
+        );
+        assert!(
+            med_a >= high_a,
+            "Medium ({med_a}) should be >= High ({high_a})"
+        );
     }
+
+    // -- Edge cases --
 
     #[test]
     fn zero_calls_treated_as_one() {
         let rl = make_rl(5000, 5000, 3600);
-        let (a0, i0) = compute_intervals(Some(&rl), 0, T, PollAggression::High, 0);
-        let (a1, i1) = compute_intervals(Some(&rl), 1, T, PollAggression::High, 0);
+        let (a0, i0) = compute_intervals(&input(Some(rl.clone()), 0, PollAggression::High));
+        let (a1, i1) = compute_intervals(&input(Some(rl), 1, PollAggression::High));
         assert_eq!(a0, a1);
         assert_eq!(i0, i1);
     }
 
     #[test]
     fn min_floors_never_violated() {
-        // Even with a tiny budget, floors hold.
-        let _rl = make_rl(1, 5000, 3600); // nearly exhausted
-        // Low: target=500. last=1, elapsed=3600 → own=3600 >> 500 → budget=0 → wait 3600.
-        // Floor: max(15, 3600) = 3600 and max(60, 3600) = 3600. No floor violation.
-        // Verify floors hold in free zone:
-        let rl2 = make_rl(5000, 5000, 3600);
-        let (active, idle) = compute_intervals(Some(&rl2), 1, T, PollAggression::High, 0);
-        assert!(active >= MIN_ACTIVE_SECS);
-        assert!(idle >= MIN_IDLE_SECS);
+        for agg in [
+            PollAggression::Low,
+            PollAggression::Medium,
+            PollAggression::High,
+        ] {
+            let rl = make_rl(5000, 5000, 3600);
+            let (active, idle) = compute_intervals(&input(Some(rl), 1, agg));
+            assert!(active >= MIN_ACTIVE_SECS, "{agg:?}: active={active}");
+            assert!(idle >= MIN_IDLE_SECS, "{agg:?}: idle={idle}");
+        }
+    }
+
+    // -- Realistic scenarios --
+
+    #[test]
+    fn realistic_high_aggression_4_repos() {
+        // 4 repos = ~4 calls/cycle. High: target = 4000. Fresh window.
+        // interval = 4×3600/4000 = 3.6 → floor.
+        let rl = make_rl(5000, 5000, 3600);
+        let (active, idle) = compute_intervals(&input(Some(rl), 4, PollAggression::High));
+        assert_eq!(active, MIN_ACTIVE_SECS);
+        assert_eq!(idle, MIN_IDLE_SECS);
     }
 
     #[test]
-    fn low_aggression_is_more_conservative_than_medium() {
-        // Both in free zone with fresh window — Low mult=3.0, Medium mult=1.5.
+    fn realistic_low_aggression_many_repos() {
+        // 20 repos = ~20 calls/cycle. Low: target = 750.
+        // interval = 20×3600/750 = 96s.
         let rl = make_rl(5000, 5000, 3600);
-        let (low_a, low_i) = compute_intervals(Some(&rl), 1, T, PollAggression::Low, 0);
-        let (med_a, med_i) = compute_intervals(Some(&rl), 1, T, PollAggression::Medium, 0);
-        let (high_a, high_i) = compute_intervals(Some(&rl), 1, T, PollAggression::High, 0);
-        assert!(low_a > med_a, "Low should be more conservative than Medium");
-        assert!(
-            med_a > high_a,
-            "Medium should be more conservative than High"
-        );
-        assert!(
-            low_i > med_i,
-            "Low idle should be more conservative than Medium"
-        );
-        assert!(
-            med_i > high_i,
-            "Medium idle should be more conservative than High"
-        );
+        let (active, idle) = compute_intervals(&input(Some(rl), 20, PollAggression::Low));
+        assert_eq!(active, 96);
+        assert_eq!(idle, 96);
+    }
+
+    #[test]
+    fn external_usage_eats_into_our_budget() {
+        // High: target = 4000. External tools used 3900 → remaining = 100.
+        // 1 call/cycle, 1800s left → 1800/100 = 18s.
+        let rl = make_rl(1100, 5000, 1800); // used = 3900
+        let (active, idle) = compute_intervals(&input(Some(rl), 1, PollAggression::High));
+        assert_eq!(active, 18);
+        assert_eq!(idle, 18);
+    }
+
+    #[test]
+    fn external_usage_exceeds_our_target() {
+        // Low: target = 750. External tools used 800 → remaining = 0. Back off.
+        let rl = make_rl(4200, 5000, 1800); // used = 800
+        let (active, idle) = compute_intervals(&input(Some(rl), 1, PollAggression::Low));
+        assert_eq!(active, 1800);
+        assert_eq!(idle, 1800);
+    }
+
+    #[test]
+    fn stale_rate_limit_past_reset_polls_at_floor() {
+        // now is past rl.reset → time_left = max(0,1) = 1.
+        let mut rl = make_rl(5000, 5000, 0);
+        rl.reset = T.saturating_sub(100); // reset was 100s ago
+        let (active, idle) = compute_intervals(&input(Some(rl), 1, PollAggression::High));
+        assert_eq!(active, MIN_ACTIVE_SECS);
+        assert_eq!(idle, MIN_IDLE_SECS);
     }
 }

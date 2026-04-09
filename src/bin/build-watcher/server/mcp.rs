@@ -10,7 +10,7 @@ use build_watcher::dirs::config_dir;
 use build_watcher::format;
 use build_watcher::github::{validate_branch, validate_repo};
 use build_watcher::history::history_for;
-use build_watcher::rate_limiter::{MIN_ACTIVE_SECS, MIN_IDLE_SECS, compute_intervals};
+use build_watcher::rate_limiter::{MIN_ACTIVE_SECS, MIN_IDLE_SECS, PollInput, compute_intervals};
 use build_watcher::watcher::{count_api_calls, is_paused};
 
 use super::DaemonState;
@@ -206,8 +206,12 @@ impl BuildWatcher {
             (snap, calls)
         };
         let aggression = self.state.config.read().await.poll_aggression;
-        let (active_secs, idle_secs) =
-            compute_intervals(rl.as_ref(), api_calls, now, aggression, 0);
+        let (active_secs, idle_secs) = compute_intervals(&PollInput {
+            rate_limit: rl.clone(),
+            calls_per_cycle: api_calls,
+            now,
+            aggression,
+        });
         let throttled = active_secs > MIN_ACTIVE_SECS || idle_secs > MIN_IDLE_SECS;
 
         let paused = is_paused(&self.state.pause).await;

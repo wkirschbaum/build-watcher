@@ -12,7 +12,7 @@ use build_watcher::config::{NotificationConfig, NotificationLevel, PollAggressio
 use build_watcher::events::WatchEvent;
 use build_watcher::github::{validate_branch, validate_repo};
 use build_watcher::history::{history_all, history_for};
-use build_watcher::rate_limiter::compute_intervals;
+use build_watcher::rate_limiter::{PollInput, compute_intervals};
 use build_watcher::status::{DefaultsConfig, HistoryEntryView, StatsResponse};
 use build_watcher::watcher::{count_api_calls, is_paused};
 
@@ -71,8 +71,12 @@ pub(crate) async fn stats_handler(State(state): State<DaemonState>) -> axum::Jso
     let api_calls = count_api_calls(&*state.watches.lock().await);
     let rl = state.rate_limit.lock().await;
     let aggression = state.config.read().await.poll_aggression;
-    let (active_poll_secs, idle_poll_secs) =
-        compute_intervals(rl.as_ref(), api_calls, unix_now(), aggression, 0);
+    let (active_poll_secs, idle_poll_secs) = compute_intervals(&PollInput {
+        rate_limit: rl.clone(),
+        calls_per_cycle: api_calls,
+        now: unix_now(),
+        aggression,
+    });
 
     let (rate_remaining, rate_limit, rate_reset_mins) = match rl.as_ref() {
         Some(r) => {
@@ -571,7 +575,7 @@ mod tests {
         ConfigManager, ConfigPersistence, NotificationLevel, SharedConfigManager,
     };
     use build_watcher::events::{EventBus, RunSnapshot, WatchEvent};
-    use build_watcher::rate_limiter::MIN_ACTIVE_SECS;
+    use build_watcher::rate_limiter::{MIN_ACTIVE_SECS, MIN_IDLE_SECS};
     use build_watcher::watcher::{PauseState, WatchEntry, WatchKey, Watches};
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -884,12 +888,10 @@ mod tests {
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert!(json["uptime_secs"].as_u64().unwrap() < 5);
-        // Default aggression is Medium (mult=1.5): fallback = (15×1.5, 30×1.5) = (22, 45)
-        assert_eq!(
-            json["active_poll_secs"],
-            (MIN_ACTIVE_SECS as f64 * 1.5) as u64
-        );
-        assert_eq!(json["idle_poll_secs"], (30f64 * 1.5) as u64);
+        // Default aggression is Medium: 40% of 5000 = 2000 budget.
+        // 1 call/cycle, 3600s → 3600/2000 < 1 → floor intervals.
+        assert_eq!(json["active_poll_secs"], MIN_ACTIVE_SECS);
+        assert_eq!(json["idle_poll_secs"], MIN_IDLE_SECS);
         assert!(json["rate_remaining"].is_null());
     }
 

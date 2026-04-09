@@ -143,9 +143,10 @@ impl PollAggression {
     }
 
     /// The fraction of the GitHub rate-limit budget this level targets per window.
+    /// High = 80%, Medium = 40%, Low = 15%.
     pub fn target_fraction(self) -> f64 {
         match self {
-            Self::Low => 0.10,
+            Self::Low => 0.15,
             Self::Medium => 0.40,
             Self::High => 0.80,
         }
@@ -154,16 +155,6 @@ impl PollAggression {
     /// The number of API calls this level allows per rate-limit window.
     pub fn target_calls(self, limit: u64) -> u64 {
         (self.target_fraction() * limit as f64) as u64
-    }
-
-    /// Multiplier applied to poll intervals in the free zone.
-    /// High = 1.0 (floor speed), Medium = 1.5×, Low = 5×.
-    pub fn interval_multiplier(self) -> f64 {
-        match self {
-            Self::High => 1.0,
-            Self::Medium => 1.5,
-            Self::Low => 5.0,
-        }
     }
 }
 

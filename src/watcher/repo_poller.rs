@@ -10,7 +10,7 @@ use crate::events::{EventBus, RunSnapshot, WatchEvent};
 use crate::github::{GitHubClient, LastBuild, RunInfo};
 use crate::history::push_build;
 use crate::persistence::Persistence;
-use crate::rate_limiter::compute_intervals;
+use crate::rate_limiter::{PollInput, compute_intervals};
 use crate::status::{RunConclusion, RunStatus};
 
 use super::types::WatchKey;
@@ -97,7 +97,6 @@ pub(super) struct RepoPoller {
     pub(super) persistence: Arc<dyn Persistence>,
     pub(super) history: crate::history::SharedHistory,
     pub(super) config_changed: Arc<Notify>,
-    pub(super) last_active_secs: u64,
     /// True until the first poll cycle completes — triggers a 1 s initial delay.
     pub(super) first_poll: bool,
     /// Last known merge state per PR number — used to detect transitions.
@@ -152,13 +151,12 @@ impl RepoPoller {
             .and_then(|rc| rc.poll_aggression)
             .unwrap_or(cfg.poll_aggression);
         drop(cfg);
-        compute_intervals(
-            rate_limit.as_ref(),
-            api_calls,
-            unix_now(),
+        compute_intervals(&PollInput {
+            rate_limit,
+            calls_per_cycle: api_calls,
+            now: unix_now(),
             aggression,
-            self.last_active_secs,
-        )
+        })
     }
 
     /// Read run-filtering config for this repo.
@@ -181,7 +179,6 @@ impl RepoPoller {
                 1
             } else {
                 let (active_secs, idle_secs) = self.read_config().await;
-                self.last_active_secs = active_secs;
                 if has_active { active_secs } else { idle_secs }
             };
 

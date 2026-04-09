@@ -127,7 +127,6 @@ pub(super) async fn spawn_repo_poller(
         persistence: handle.persistence.clone(),
         history: handle.history.clone(),
         config_changed: handle.config_changed.clone(),
-        last_active_secs: 0,
         first_poll: true,
         pr_states: std::collections::HashMap::new(),
     };
