@@ -132,7 +132,8 @@ if [ ! -f "$CONFIG_FILE" ]; then
     echo "==> Creating default config at $CONFIG_FILE..."
     cat > "$CONFIG_FILE" <<'CONFJSON'
 {
-  "default_branches": ["main"],
+  "poll_aggression": "medium",
+  "show_author": true,
   "notifications": {
     "build_started": "normal",
     "build_success": "normal",
@@ -142,6 +143,7 @@ if [ ! -f "$CONFIG_FILE" ]; then
 }
 CONFJSON
     echo "  Edit $CONFIG_FILE to add repos, or use the watch_builds MCP tool."
+    echo "  Run 'bw' to launch the TUI dashboard."
   fi
 else
   echo "==> Config already exists at $CONFIG_FILE (preserved)"

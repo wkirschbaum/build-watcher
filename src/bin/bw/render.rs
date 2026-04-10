@@ -1147,7 +1147,10 @@ pub(crate) fn render_body<'a>(
             .min(total_rows - body_height)
     };
 
-    let highlight_style = Style::default().bg(Color::DarkGray);
+    // Use a subtle dark background for the selected row. Rgb avoids
+    // terminal palette remapping that can override foreground colours
+    // on some Mac terminals (Terminal.app, some iTerm2 themes).
+    let highlight_style = Style::default().bg(Color::Rgb(40, 40, 50));
 
     let mute_indicator = |muted: bool| -> &'static str { if muted { " 🔇" } else { "" } };
 
