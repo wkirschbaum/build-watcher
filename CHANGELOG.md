@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.18.3] - 2026-04-10
+
+### Fixed
+
+- Use explicit RGB background for selected row highlight instead of named `DarkGray` palette colour — avoids foreground colour remapping on Mac terminals (Terminal.app, some iTerm2 themes)
+- Fix install.sh default config: remove non-existent `default_branches` field, add `show_author` and `poll_aggression`
+
 ## [0.18.2] - 2026-04-09
 
 ### Polish
@@ -229,6 +236,7 @@
 
 - Avoid unnecessary config re-save on reads; improve persistence error logging
 
+[0.18.3]: https://github.com/wkirschbaum/build-watcher/releases/tag/v0.18.3
 [0.18.2]: https://github.com/wkirschbaum/build-watcher/releases/tag/v0.18.2
 [0.18.1]: https://github.com/wkirschbaum/build-watcher/releases/tag/v0.18.1
 [0.18.0]: https://github.com/wkirschbaum/build-watcher/releases/tag/v0.18.0
