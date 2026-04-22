@@ -624,11 +624,13 @@ impl RepoPoller {
             .map(|b| b.to_string())
             .collect();
 
-        // Remove stale branches (no recent runs, not pinned, no active runs).
+        // Remove discovered branches that no longer exist on GitHub (deleted).
+        // Branches that still exist are kept even if quiet — they'll become active again.
         let to_remove: Vec<WatchKey> = current
             .iter()
             .filter(|k| !active_branches.contains(k.branch.as_str()))
             .filter(|k| !pinned.contains(&k.branch))
+            .filter(|k| !existing_branches.contains(&k.branch))
             .cloned()
             .collect();
 

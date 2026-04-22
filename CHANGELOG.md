@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.18.4] - 2026-04-22
+
+### Fixed
+
+- Auto-discovered branches are now only removed when they are deleted on GitHub — branches that still exist but have no recent activity are kept, preventing valid branches from flapping out of the watch list
+
 ## [0.18.3] - 2026-04-10
 
 ### Fixed
