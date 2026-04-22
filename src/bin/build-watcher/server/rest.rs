@@ -934,7 +934,6 @@ mod tests {
     #[tokio::test]
     async fn status_with_active_runs() {
         use build_watcher::watcher::ActiveRun;
-        use tokio::time::Instant;
 
         let (watches, pause, events) = empty_state();
         let key = WatchKey::new("alice/app", "main");

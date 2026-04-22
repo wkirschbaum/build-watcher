@@ -4,6 +4,7 @@ use std::sync::OnceLock;
 static STATE_DIR: OnceLock<PathBuf> = OnceLock::new();
 static CONFIG_DIR: OnceLock<PathBuf> = OnceLock::new();
 
+#[cfg(not(test))]
 fn home_dir() -> String {
     std::env::var("HOME").unwrap_or_else(|_| {
         tracing::warn!("HOME is not set; falling back to /tmp for state/config directories");
@@ -14,17 +15,17 @@ fn home_dir() -> String {
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 compile_error!("Unsupported platform: only Linux and macOS are supported");
 
-#[cfg(target_os = "linux")]
+#[cfg(all(not(test), target_os = "linux"))]
 fn default_state_dir() -> String {
     format!("{}/.local/state/build-watcher", home_dir())
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(not(test), target_os = "linux"))]
 fn default_config_dir() -> String {
     format!("{}/.config/build-watcher", home_dir())
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(not(test), target_os = "macos"))]
 fn default_state_dir() -> String {
     format!(
         "{}/Library/Application Support/build-watcher/state",
@@ -32,7 +33,7 @@ fn default_state_dir() -> String {
     )
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(not(test), target_os = "macos"))]
 fn default_config_dir() -> String {
     format!(
         "{}/Library/Application Support/build-watcher/config",

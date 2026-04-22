@@ -208,13 +208,11 @@ pub fn acquire_instance_lock() -> Result<std::fs::File, ServerError> {
 
 /// Build the axum router with the MCP `StreamableHttpService` and SSE/status routes.
 fn build_router(state: DaemonState, ct: &CancellationToken) -> axum::Router {
-    let http_config = StreamableHttpServerConfig {
-        stateful_mode: false,
-        json_response: true,
-        sse_keep_alive: None,
-        cancellation_token: ct.child_token(),
-        ..Default::default()
-    };
+    let http_config = StreamableHttpServerConfig::default()
+        .with_stateful_mode(false)
+        .with_json_response(true)
+        .with_sse_keep_alive(None)
+        .with_cancellation_token(ct.child_token());
 
     let mcp_state = state.clone();
     let service: StreamableHttpService<BuildWatcher, LocalSessionManager> =

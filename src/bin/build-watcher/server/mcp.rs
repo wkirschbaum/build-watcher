@@ -1,6 +1,5 @@
 use std::time::Duration;
 
-use rmcp::handler::server::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, Content, Implementation, ServerCapabilities, ServerInfo};
 use rmcp::{ErrorData as McpError, ServerHandler, tool, tool_handler, tool_router};
@@ -27,17 +26,13 @@ use super::schema::{
 
 #[derive(Clone)]
 pub struct BuildWatcher {
-    tool_router: ToolRouter<Self>,
     state: DaemonState,
 }
 
 #[tool_router]
 impl BuildWatcher {
     pub(crate) fn new(state: DaemonState) -> Self {
-        Self {
-            tool_router: Self::tool_router(),
-            state,
-        }
+        Self { state }
     }
 
     #[tool(
