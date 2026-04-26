@@ -588,13 +588,20 @@ impl RepoPoller {
         // Fetch existing branches from GitHub — this is the source of truth for
         // which branches exist. Runs from deleted branches still appear in
         // `gh run list` but should not keep a watch alive.
-        let existing_branches: HashSet<String> = self
-            .github
-            .list_branches(&self.repo)
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .collect();
+        // If the API call fails, skip sync entirely: treating the result as empty
+        // would incorrectly remove all non-pinned branches, including the startup-
+        // resolved default branch, causing the repo to vanish from the TUI.
+        let existing_branches: HashSet<String> = match self.github.list_branches(&self.repo).await
+        {
+            Ok(branches) => branches.into_iter().collect(),
+            Err(e) => {
+                tracing::debug!(
+                    repo = %self.repo, error = %e,
+                    "Failed to list branches, skipping branch sync"
+                );
+                return current;
+            }
+        };
 
         // Branches with open PRs should also be discoverable, even when their
         // runs have fallen outside the recent-runs window.
