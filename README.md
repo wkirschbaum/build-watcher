@@ -177,7 +177,7 @@ Enable per-repo with the `c` key (repo config → Watch PRs: yes). When enabled,
 | `↓` | Yellow | Behind base branch |
 | `~` | Gray suffix | Draft PR |
 
-Multiple open PRs are shown individually. Desktop notifications fire when a PR transitions to "ready to merge". Press `M` on a branch row to merge the first ready PR.
+Multiple open PRs are shown individually. Desktop notifications fire when a PR transitions to "ready to merge". Press `m` on a branch row to open the merge popup — a single PR shows a confirmation dialog, multiple PRs show a picker first. Press `Enter` to confirm or `Esc` to cancel.
 
 ## Configuration
 

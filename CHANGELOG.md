@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.19.1] - 2026-04-29
+
+### Changed
+
+- **Merge always confirms** — pressing `m` now always shows a popup before merging, even when there is only one open PR. Single-PR popup shows "Confirm Merge" with `Enter`/`Esc` only; multi-PR popup shows "Select PR to Merge" with `↑↓` navigation as before.
+
 ## [0.19.0] - 2026-04-29
 
 ### Added
