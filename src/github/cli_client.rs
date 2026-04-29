@@ -51,6 +51,11 @@ async fn gh_exec(repo: &str, args: &[&str]) -> Result<Vec<u8>, GhError> {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        if stderr.contains("Could not resolve to a Repository") || stderr.contains("Not Found") {
+            return Err(GhError::NotFound {
+                repo: repo.to_string(),
+            });
+        }
         return Err(GhError::CliError {
             repo: repo.to_string(),
             stderr,

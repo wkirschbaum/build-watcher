@@ -46,24 +46,6 @@ pub(crate) struct DaemonState {
     pub started_at: std::time::Instant,
 }
 
-/// Check if a run should be hidden based on ignored workflow and event lists.
-fn is_ignored(
-    cfg: Option<&build_watcher::config::Config>,
-    repo: &str,
-    workflow: &str,
-    event: &str,
-) -> bool {
-    cfg.is_some_and(|cfg| {
-        cfg.ignored_workflows
-            .iter()
-            .any(|i| workflow.eq_ignore_ascii_case(i))
-            || cfg
-                .ignored_events_for(repo)
-                .iter()
-                .any(|i| event.eq_ignore_ascii_case(i))
-    })
-}
-
 /// Build a snapshot of all current watches from already-locked state.
 ///
 /// Pure function (no async, no locks) — callers acquire the locks and pass
@@ -81,7 +63,17 @@ pub(crate) fn build_watch_snapshot(
             let mut active_runs: Vec<ActiveRunView> = entry
                 .active_runs
                 .iter()
-                .filter(|(_, run)| !is_ignored(config, &key.repo, &run.workflow, &run.event))
+                .filter(|(_, run)| {
+                    !config.is_some_and(|cfg| {
+                        cfg.ignored_workflows
+                            .iter()
+                            .any(|i| run.workflow.eq_ignore_ascii_case(i))
+                            || cfg
+                                .ignored_events_for(&key.repo)
+                                .iter()
+                                .any(|i| run.event.eq_ignore_ascii_case(i))
+                    })
+                })
                 .map(|(run_id, run)| {
                     let elapsed_secs =
                         build_watcher::github::elapsed_since(&run.created_at, now_unix);
@@ -104,7 +96,17 @@ pub(crate) fn build_watch_snapshot(
             let mut last_builds: Vec<LastBuildView> = entry
                 .last_builds
                 .values()
-                .filter(|lb| !is_ignored(config, &key.repo, &lb.workflow, &lb.event))
+                .filter(|lb| {
+                    !config.is_some_and(|cfg| {
+                        cfg.ignored_workflows
+                            .iter()
+                            .any(|i| lb.workflow.eq_ignore_ascii_case(i))
+                            || cfg
+                                .ignored_events_for(&key.repo)
+                                .iter()
+                                .any(|i| lb.event.eq_ignore_ascii_case(i))
+                    })
+                })
                 .map(|lb| {
                     let age_secs = lb.completed_at.map(|t| now_unix.saturating_sub(t) as f64);
                     let conclusion = lb

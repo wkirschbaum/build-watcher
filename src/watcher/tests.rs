@@ -11,7 +11,7 @@ use crate::events::WatchEvent;
 use crate::github::{GhError, RunInfo};
 use crate::status::{RunConclusion, RunStatus};
 
-use super::repo_poller::{RepoPoller, RunChange};
+use super::repo_poller::{IgnoreFilter, RepoPoller, RunChange, filter_runs};
 
 // -- Test helpers --
 
@@ -136,9 +136,8 @@ impl crate::github::GitHubClient for MockGitHub {
     }
     async fn recent_runs_for_repo(&self, repo: &str, _: u32) -> Result<Vec<RunInfo>, GhError> {
         if self.repo_not_found {
-            return Err(GhError::CliError {
+            return Err(GhError::NotFound {
                 repo: repo.to_string(),
-                stderr: "HTTP 404: Not Found".to_string(),
             });
         }
         Ok(self.runs.clone())

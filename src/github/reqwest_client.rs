@@ -343,14 +343,13 @@ fn next_link_url(resp: &reqwest::Response) -> Option<String> {
 
 async fn response_error(resp: reqwest::Response, repo: &str) -> GhError {
     let status = resp.status();
+    if status.as_u16() == 404 {
+        return GhError::NotFound { repo: repo.into() };
+    }
     let body = resp.text().await.unwrap_or_default();
     GhError::CliError {
         repo: repo.into(),
-        stderr: if status.as_u16() == 404 {
-            format!("HTTP 404: Not Found - {body}")
-        } else {
-            format!("HTTP {status}: {body}")
-        },
+        stderr: format!("HTTP {status}: {body}"),
     }
 }
 

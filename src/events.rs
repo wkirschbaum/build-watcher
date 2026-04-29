@@ -61,10 +61,6 @@ impl RunSnapshot {
     pub fn display_title(&self) -> String {
         crate::github::display_title(&self.event, &self.title)
     }
-
-    pub fn notification_group(&self) -> String {
-        format!("{}#{}#{}", self.repo, self.branch, self.workflow)
-    }
 }
 
 /// Events emitted by the watcher polling loop.
@@ -179,7 +175,6 @@ mod tests {
         let s = snap();
         assert_eq!(s.url, "https://github.com/alice/app/actions/runs/12345");
         assert_eq!(s.display_title(), "Fix login bug");
-        assert_eq!(s.notification_group(), "alice/app#main#CI");
 
         let mut pr = snap();
         pr.event = "pull_request".to_string();

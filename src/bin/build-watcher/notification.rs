@@ -404,7 +404,7 @@ async fn dispatch_single(
                     body,
                     level,
                     url: Some(run.url.clone()),
-                    group: run.notification_group(),
+                    group: format!("{}#{}#{}", run.repo, run.branch, run.workflow),
                     app_name: run.repo,
                 })
                 .await;
@@ -444,7 +444,7 @@ async fn dispatch_single(
                     body,
                     level,
                     url: Some(run.url.clone()),
-                    group: run.notification_group(),
+                    group: format!("{}#{}#{}", run.repo, run.branch, run.workflow),
                     app_name: run.repo,
                 })
                 .await;
