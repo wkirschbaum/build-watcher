@@ -129,6 +129,7 @@ pub(super) async fn spawn_repo_poller(
         config_changed: handle.config_changed.clone(),
         first_poll: true,
         pr_states: std::collections::HashMap::new(),
+        not_found_count: 0,
     };
     handle.tracker.spawn(async move {
         poller.run().await;
@@ -215,6 +216,29 @@ fn spawn_rate_limit_refresher(handle: &WatcherHandle, rate_limit: &RateLimitStat
     });
 }
 
+/// Resolve the branch list for a single repo: GitHub default branch first,
+/// then any configured/discovered branches not already in the list.
+pub async fn resolve_branches_for_repo(
+    github: &dyn GitHubClient,
+    repo: &str,
+    configured: &[String],
+) -> Vec<String> {
+    let mut branches = Vec::new();
+    match github.default_branch(repo).await {
+        Ok(gh_default) => {
+            tracing::info!(repo = %repo, branch = %gh_default, "Resolved default branch");
+            branches.push(gh_default);
+        }
+        Err(e) => tracing::warn!(repo = %repo, error = %e, "Failed to resolve default branch"),
+    }
+    for b in configured {
+        if !branches.contains(b) {
+            branches.push(b.clone());
+        }
+    }
+    branches
+}
+
 /// Resolve the complete set of WatchKeys from config, querying GitHub for
 /// default branches where needed.
 async fn resolve_config_keys(config: &SharedConfig, handle: &WatcherHandle) -> Vec<WatchKey> {
@@ -222,42 +246,20 @@ async fn resolve_config_keys(config: &SharedConfig, handle: &WatcherHandle) -> V
         let cfg = config.read().await;
         cfg.watched_repos()
             .into_iter()
-            .map(|repo| {
-                let branches = cfg.branches_for(repo);
-                (repo.to_string(), branches)
-            })
+            .map(|repo| (repo.to_string(), cfg.branches_for(repo)))
             .collect()
     };
 
     let mut keys = Vec::new();
     for (repo, configured_branches) in &repos {
-        let mut branches = Vec::new();
-
-        // Always resolve the GitHub default branch.
-        match handle.github.default_branch(repo).await {
-            Ok(gh_default) => branches.push(gh_default),
-            Err(e) => {
-                tracing::warn!(
-                    repo = %repo, error = %e,
-                    "Failed to resolve default branch on startup"
-                );
-            }
-        }
-
-        // Add any explicitly configured branches.
-        for b in configured_branches {
-            if !branches.contains(b) {
-                branches.push(b.clone());
-            }
-        }
-
-        for branch in &branches {
-            let key = WatchKey::new(repo, branch);
+        for branch in
+            resolve_branches_for_repo(&*handle.github, repo, &configured_branches[..]).await
+        {
+            let key = WatchKey::new(repo, &branch);
             if !keys.contains(&key) {
                 keys.push(key);
             }
         }
     }
-
     keys
 }

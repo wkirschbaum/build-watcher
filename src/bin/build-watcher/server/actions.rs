@@ -1,6 +1,8 @@
 use build_watcher::config::{NotificationLevel, NotificationOverrides};
 use build_watcher::github::run_url;
-use build_watcher::watcher::{collect_persisted, last_failed_build, start_watch};
+use build_watcher::watcher::{
+    collect_persisted, last_failed_build, resolve_branches_for_repo, start_watch,
+};
 
 use super::DaemonState;
 
@@ -37,39 +39,23 @@ pub(super) fn format_outcomes(outcomes: &[ActionOutcome], sep: &str) -> String {
 
 /// Shared logic for adding repos to watch — used by both the MCP tool and REST endpoint.
 pub(crate) async fn do_watch_builds(state: &DaemonState, repos: &[String]) -> Vec<ActionOutcome> {
-    let repo_branches: Vec<(String, Vec<String>)> = {
+    // Collect per-repo configured branches from config, then drop the lock
+    // before making any network calls (GitHub API can take up to 30s).
+    let configured = {
         let cfg = state.config.read().await;
-        let mut pairs = Vec::new();
-        for repo in repos {
-            let mut branches = Vec::new();
-
-            // Always resolve the GitHub default branch as the primary.
-            match state.handle.github.default_branch(repo).await {
-                Ok(gh_default) => {
-                    tracing::info!(repo = %repo, branch = %gh_default, "Resolved default branch");
-                    branches.push(gh_default);
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        repo = %repo, error = %e,
-                        "Failed to resolve default branch"
-                    );
-                }
-            }
-
-            // Add configured + discovered branches.
-            for b in cfg.branches_for(repo) {
-                if !branches.contains(&b) {
-                    branches.push(b);
-                }
-            }
-
-            pairs.push((repo.clone(), branches));
-        }
-        pairs
+        repos
+            .iter()
+            .map(|repo| (repo.clone(), cfg.branches_for(repo)))
+            .collect::<std::collections::HashMap<_, _>>()
     };
 
-    // Auto-discovered branches are handled by the poller's sync_branches() on each cycle.
+    let mut repo_branches: Vec<(String, Vec<String>)> = Vec::new();
+    for repo in repos {
+        let configured_for_repo = configured.get(repo).map_or(&[][..], Vec::as_slice);
+        let branches =
+            resolve_branches_for_repo(&*state.handle.github, repo, configured_for_repo).await;
+        repo_branches.push((repo.clone(), branches));
+    }
 
     let mut results = Vec::new();
     let mut started_repos: Vec<String> = Vec::new();
@@ -234,6 +220,9 @@ pub(crate) async fn do_configure_branches(
         .config
         .modify(|cfg| {
             let rc = cfg.repos.entry(repo_owned).or_default();
+            // Remove any discovered branches that the user is explicitly dropping,
+            // so they don't resurface via branches_for() on the next restart.
+            rc.discovered_branches.retain(|b| new_branches.contains(b));
             rc.branches = new_branches;
         })
         .await

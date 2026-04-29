@@ -18,6 +18,9 @@ use super::{
     RateLimitState, RunFilters, SharedConfig, Watches, collect_persisted, runs_for_branch,
 };
 
+/// Consecutive "repo not found" responses required before the repo is removed.
+/// Guards against transient 404s triggering permanent repo deletion.
+pub(super) const NOT_FOUND_THRESHOLD: u32 = 3;
 /// Maximum individual `run_status` fallback calls when the batch endpoint misses runs.
 const MAX_FALLBACK_CALLS: usize = 10;
 /// Maximum `failing_steps` backfill calls per poll cycle to avoid rate-limit blowout.
@@ -101,6 +104,10 @@ pub(super) struct RepoPoller {
     pub(super) first_poll: bool,
     /// Last known merge state per PR number — used to detect transitions.
     pub(super) pr_states: HashMap<u64, crate::github::MergeState>,
+    /// Consecutive "repo not found" responses from `recent_runs_for_repo`.
+    /// Repo is only removed after `NOT_FOUND_THRESHOLD` consecutive 404s to
+    /// avoid permanent deletion on a transient API error.
+    pub(super) not_found_count: u32,
 }
 
 impl RepoPoller {
@@ -318,6 +325,9 @@ impl RepoPoller {
             }
         }
         // Apply all fallback results in a single lock acquisition.
+        // Runs dropped after MAX_GH_FAILURES get an "unknown" last_build record so
+        // they don't silently vanish from the TUI without any trace.
+        let mut abandoned: Vec<(WatchKey, LastBuild)> = Vec::new();
         {
             let mut w = self.watches.lock().await;
             for (run, key) in &found_runs[found_in_batch..] {
@@ -326,8 +336,12 @@ impl RepoPoller {
                 }
             }
             for (run_id, key, e) in &fallback_errors {
-                if let Some(entry) = w.get_mut(key) {
-                    entry.record_failure(*run_id, e);
+                if let Some(entry) = w.get_mut(key)
+                    && let Some(active) = entry.record_failure(*run_id, e)
+                {
+                    let lb = active.to_abandoned_last_build(*run_id);
+                    entry.last_builds.insert(lb.workflow.clone(), lb.clone());
+                    abandoned.push((key.clone(), lb));
                 }
             }
         }
@@ -335,9 +349,16 @@ impl RepoPoller {
         let (run_changes, changed) = self.process_resolved_runs(&found_runs).await;
         changes.extend(run_changes);
 
+        if !abandoned.is_empty() {
+            let mut hist = self.history.lock().await;
+            for (key, lb) in abandoned.iter().rev() {
+                push_build(&mut hist, key, lb.clone());
+            }
+        }
+
         let backfill_changed = self.backfill_failing_steps().await;
 
-        if changed || backfill_changed {
+        if changed || backfill_changed || !abandoned.is_empty() {
             let persisted = collect_persisted(&self.watches).await;
             let hist = self.history.lock().await.clone();
             self.persistence.save_state(&persisted, &hist).await;
@@ -585,14 +606,14 @@ impl RepoPoller {
             return current;
         }
 
-        // Fetch existing branches from GitHub — this is the source of truth for
-        // which branches exist. Runs from deleted branches still appear in
-        // `gh run list` but should not keep a watch alive.
-        // If the API call fails, skip sync entirely: treating the result as empty
-        // would incorrectly remove all non-pinned branches, including the startup-
-        // resolved default branch, causing the repo to vanish from the TUI.
-        let existing_branches: HashSet<String> = match self.github.list_branches(&self.repo).await
-        {
+        // Fetch existing branches and open PRs concurrently.
+        // list_branches is the source of truth for which branches exist — if it
+        // fails, skip sync entirely to avoid incorrectly removing non-pinned branches.
+        let (branches_result, prs_result) = tokio::join!(
+            self.github.list_branches(&self.repo),
+            self.github.open_prs(&self.repo)
+        );
+        let existing_branches: HashSet<String> = match branches_result {
             Ok(branches) => branches.into_iter().collect(),
             Err(e) => {
                 tracing::debug!(
@@ -605,10 +626,7 @@ impl RepoPoller {
 
         // Branches with open PRs should also be discoverable, even when their
         // runs have fallen outside the recent-runs window.
-        let pr_branches: Vec<String> = self
-            .github
-            .open_prs(&self.repo)
-            .await
+        let pr_branches: Vec<String> = prs_result
             .unwrap_or_default()
             .into_iter()
             .map(|pr| pr.branch)
@@ -661,7 +679,30 @@ impl RepoPoller {
             );
         }
 
-        // Update watches.
+        // Persist to config first. If save fails, skip the in-memory update so
+        // watches and config stay in sync — the next cycle will retry.
+        let repo = self.repo.clone();
+        let add_names = to_add.clone();
+        let remove_names: HashSet<String> = to_remove.iter().map(|k| k.branch.clone()).collect();
+        if let Err(e) = self
+            .config
+            .modify(|cfg| {
+                if let Some(rc) = cfg.repos.get_mut(&repo) {
+                    for branch in &add_names {
+                        if !rc.discovered_branches.contains(branch) {
+                            rc.discovered_branches.push(branch.clone());
+                        }
+                    }
+                    rc.discovered_branches.retain(|b| !remove_names.contains(b));
+                }
+            })
+            .await
+        {
+            tracing::error!(error = %e, "Failed to persist branch discovery changes");
+            return current;
+        }
+
+        // Config saved — apply the same changes to in-memory watches.
         {
             let mut w = self.watches.lock().await;
             for key in &to_remove {
@@ -669,29 +710,11 @@ impl RepoPoller {
             }
             for branch in &to_add {
                 let key = WatchKey::new(&self.repo, branch);
-                w.entry(key).or_default();
+                w.entry(key).or_insert_with(|| super::types::WatchEntry {
+                    waiting: true,
+                    ..Default::default()
+                });
             }
-        }
-
-        // Persist to discovered_branches so they survive restarts.
-        let repo = self.repo.clone();
-        let add = to_add;
-        let remove: HashSet<String> = to_remove.iter().map(|k| k.branch.clone()).collect();
-        if let Err(e) = self
-            .config
-            .modify(|cfg| {
-                if let Some(rc) = cfg.repos.get_mut(&repo) {
-                    for branch in &add {
-                        if !rc.discovered_branches.contains(branch) {
-                            rc.discovered_branches.push(branch.clone());
-                        }
-                    }
-                    rc.discovered_branches.retain(|b| !remove.contains(b));
-                }
-            })
-            .await
-        {
-            tracing::error!(error = %e, "Failed to persist branch discovery changes");
         }
 
         // Return the updated branch list.
@@ -699,7 +722,7 @@ impl RepoPoller {
     }
 
     /// Check for new runs across all watched branches using a single repo-wide API call.
-    pub(super) async fn check_for_new_runs_repo_wide(&self) -> Vec<RunChange> {
+    pub(super) async fn check_for_new_runs_repo_wide(&mut self) -> Vec<RunChange> {
         let mut changes = Vec::new();
 
         let branches = self.watched_branches().await;
@@ -709,10 +732,27 @@ impl RepoPoller {
 
         let limit = super::scaled_repo_limit(branches.len() as u32);
         let all_runs = match self.github.recent_runs_for_repo(&self.repo, limit).await {
-            Ok(r) => r,
+            Ok(r) => {
+                self.not_found_count = 0;
+                r
+            }
             Err(e) if e.is_repo_not_found() => {
-                tracing::warn!(repo = %self.repo, error = %e, "Repo not found, removing watches");
-                self.remove_dead_repo().await;
+                self.not_found_count += 1;
+                if self.not_found_count >= NOT_FOUND_THRESHOLD {
+                    tracing::warn!(
+                        repo = %self.repo, count = self.not_found_count,
+                        "Repo not found on {} consecutive polls, removing watches",
+                        NOT_FOUND_THRESHOLD
+                    );
+                    self.remove_dead_repo().await;
+                } else {
+                    tracing::warn!(
+                        repo = %self.repo, count = self.not_found_count,
+                        error = %e,
+                        "Repo not found (attempt {}/{}), will retry",
+                        self.not_found_count, NOT_FOUND_THRESHOLD
+                    );
+                }
                 return changes;
             }
             Err(e) => {

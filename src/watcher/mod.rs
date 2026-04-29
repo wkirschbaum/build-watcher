@@ -19,7 +19,7 @@ pub type Watches = Arc<Mutex<HashMap<WatchKey, WatchEntry>>>;
 pub type PauseState = Arc<Mutex<Option<Instant>>>;
 pub type RateLimitState = Arc<Mutex<Option<RateLimit>>>;
 
-pub use startup::{WatcherHandle, start_watch, startup_watches};
+pub use startup::{WatcherHandle, resolve_branches_for_repo, start_watch, startup_watches};
 pub use types::{
     ActiveRun, PersistedWatch, WatchEntry, WatchKey, collect_persisted, last_failed_build,
     load_persisted_watches,

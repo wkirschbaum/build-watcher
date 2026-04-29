@@ -91,12 +91,21 @@ struct MockGitHub {
     runs: Vec<RunInfo>,
     failure_msg: Option<String>,
     prs: Vec<crate::github::PrInfo>,
+    /// If true, `recent_runs_for_repo` returns a "Not Found" 404 error.
+    repo_not_found: bool,
 }
 
 impl MockGitHub {
     fn with_runs(runs: Vec<RunInfo>) -> Arc<dyn crate::github::GitHubClient> {
         Arc::new(Self {
             runs,
+            ..Default::default()
+        })
+    }
+
+    fn not_found() -> Arc<dyn crate::github::GitHubClient> {
+        Arc::new(Self {
+            repo_not_found: true,
             ..Default::default()
         })
     }
@@ -125,7 +134,13 @@ impl crate::github::GitHubClient for MockGitHub {
     async fn recent_runs(&self, _: &str, _: &str) -> Result<Vec<RunInfo>, GhError> {
         Ok(self.runs.clone())
     }
-    async fn recent_runs_for_repo(&self, _: &str, _: u32) -> Result<Vec<RunInfo>, GhError> {
+    async fn recent_runs_for_repo(&self, repo: &str, _: u32) -> Result<Vec<RunInfo>, GhError> {
+        if self.repo_not_found {
+            return Err(GhError::CliError {
+                repo: repo.to_string(),
+                stderr: "HTTP 404: Not Found".to_string(),
+            });
+        }
         Ok(self.runs.clone())
     }
     async fn in_progress_runs_for_repo(&self, _: &str) -> Result<Vec<RunInfo>, GhError> {
@@ -243,6 +258,7 @@ impl TestHarness {
             config_changed: self.handle.config_changed.clone(),
             first_poll: false,
             pr_states: HashMap::new(),
+            not_found_count: 0,
         }
     }
 
@@ -361,7 +377,7 @@ fn record_failure_increments_count() {
         repo: "test".to_string(),
         timeout_secs: 30,
     };
-    assert!(!entry.record_failure(101, &error));
+    assert!(entry.record_failure(101, &error).is_none());
     assert_eq!(entry.failure_counts[&101], 1);
     assert!(entry.active_runs.contains_key(&101));
 }
@@ -374,7 +390,9 @@ fn record_failure_removes_run_at_max_failures() {
         repo: "test".to_string(),
         timeout_secs: 30,
     };
-    assert!(entry.record_failure(101, &error));
+    let removed = entry.record_failure(101, &error);
+    assert!(removed.is_some());
+    assert_eq!(removed.unwrap().workflow, "CI");
     assert!(!entry.active_runs.contains_key(&101));
     assert!(!entry.failure_counts.contains_key(&101));
 }
@@ -1262,7 +1280,7 @@ async fn restart_recaptures_in_progress_run_at_last_seen_id() {
     h.seed(key.clone(), WatchEntry::from_persisted(persisted))
         .await;
 
-    let poller = h.poller("alice/app");
+    let mut poller = h.poller("alice/app");
     poller.check_for_new_runs_repo_wide().await;
 
     let entry = h.entry(&key).await;
@@ -1271,4 +1289,153 @@ async fn restart_recaptures_in_progress_run_at_last_seen_id() {
         "run 200 should be recaptured as active after restart"
     );
     assert!(!entry.waiting, "waiting flag should be cleared");
+}
+
+// -- not_found_count: transient 404s don't immediately remove the repo --
+
+#[tokio::test]
+async fn not_found_does_not_remove_repo_before_threshold() {
+    let gh = MockGitHub::not_found();
+    let mut cfg = Config::default();
+    cfg.repos
+        .insert("alice/app".to_string(), Default::default());
+    let h = TestHarness::with_config(gh, cfg);
+    h.seed(WatchKey::new("alice/app", "main"), WatchEntry::default())
+        .await;
+
+    let mut poller = h.poller("alice/app");
+    // First and second 404 — repo should still be watched.
+    poller.check_for_new_runs_repo_wide().await;
+    poller.check_for_new_runs_repo_wide().await;
+
+    let w = h.watches.lock().await;
+    assert!(
+        w.contains_key(&WatchKey::new("alice/app", "main")),
+        "repo should survive the first two 404s"
+    );
+}
+
+#[tokio::test]
+async fn not_found_removes_repo_at_threshold() {
+    let gh = MockGitHub::not_found();
+    let mut cfg = Config::default();
+    cfg.repos
+        .insert("alice/app".to_string(), Default::default());
+    let h = TestHarness::with_config(gh, cfg);
+    h.seed(WatchKey::new("alice/app", "main"), WatchEntry::default())
+        .await;
+
+    let mut poller = h.poller("alice/app");
+    for _ in 0..repo_poller::NOT_FOUND_THRESHOLD {
+        poller.check_for_new_runs_repo_wide().await;
+    }
+
+    let w = h.watches.lock().await;
+    assert!(
+        !w.contains_key(&WatchKey::new("alice/app", "main")),
+        "repo should be removed after {} consecutive 404s",
+        repo_poller::NOT_FOUND_THRESHOLD
+    );
+}
+
+// -- auto-discovered branches start in waiting state (no notification flood) --
+
+#[tokio::test]
+async fn auto_discovered_branch_suppresses_historical_notifications() {
+    // Two completed runs exist on "feature-x", a branch that is not yet watched.
+    // These should NOT fire notifications when the branch is first auto-discovered.
+    let mut r1 = make_run(100, RunStatus::Completed, "success");
+    r1.head_branch = "feature-x".to_string();
+    let mut r2 = make_run(101, RunStatus::Completed, "failure");
+    r2.head_branch = "feature-x".to_string();
+    let mut r3 = make_run(102, RunStatus::Completed, "success");
+    r3.head_branch = "main".to_string();
+
+    let mut cfg = Config::default();
+    let mut rc = crate::config::RepoConfig::default();
+    rc.auto_discover_branches = Some(true);
+    cfg.repos.insert("alice/app".to_string(), rc);
+
+    let h = TestHarness::with_config(MockGitHub::with_runs(vec![r1, r2, r3]), cfg);
+    // Only "main" is initially watched.
+    h.seed(WatchKey::new("alice/app", "main"), idle_entry(102))
+        .await;
+
+    let mut rx = h.subscribe();
+    let mut poller = h.poller("alice/app");
+    poller.check_for_new_runs_repo_wide().await;
+
+    // "feature-x" should have been auto-discovered.
+    assert!(
+        h.watches
+            .lock()
+            .await
+            .contains_key(&WatchKey::new("alice/app", "feature-x")),
+        "feature-x should be auto-discovered"
+    );
+
+    // The waiting flag is cleared at the end of the poll cycle, but the key
+    // observable guarantee is that no events were emitted for the historical runs.
+    let mut events = vec![];
+    while let Ok(e) = rx.try_recv() {
+        events.push(e);
+    }
+    assert!(
+        !events.iter().any(|e| matches!(
+            e,
+            WatchEvent::RunStarted(s) | WatchEvent::RunCompleted { run: s, .. }
+            if s.branch == "feature-x"
+        )),
+        "no notifications should fire for historical runs on a newly discovered branch: {events:?}"
+    );
+
+    // The high-water mark should have been advanced so the runs aren't re-detected
+    // on the next poll cycle either.
+    let entry = h.entry(&WatchKey::new("alice/app", "feature-x")).await;
+    assert_eq!(
+        entry.last_seen_run_id, 101,
+        "last_seen_run_id should be advanced past historical runs"
+    );
+
+    h.cancel();
+}
+
+// -- abandoned runs: last_builds record written on MAX_GH_FAILURES --
+
+#[tokio::test]
+async fn abandoned_run_writes_last_build() {
+    // Mock returns no in-progress runs (so run 101 is "missing" from batch)
+    // and run_status fails (returns MissingFields for unknown IDs).
+    let gh = MockGitHub::with_runs(vec![]);
+    let h = TestHarness::new(gh);
+    let key = WatchKey::new("alice/app", "main");
+
+    let mut entry = WatchEntry {
+        last_seen_run_id: 100,
+        ..Default::default()
+    };
+    entry
+        .active_runs
+        .insert(101, make_active(RunStatus::InProgress));
+    // Pre-seed failure count so one more failure hits the threshold.
+    entry.failure_counts.insert(101, types::MAX_GH_FAILURES - 1);
+    h.seed(key.clone(), entry).await;
+
+    let poller = h.poller("alice/app");
+    poller.poll_active_runs_batch().await;
+
+    let entry = h.entry(&key).await;
+    assert!(
+        !entry.active_runs.contains_key(&101),
+        "run should be dropped from active"
+    );
+    let lb = entry
+        .last_builds
+        .get("CI")
+        .expect("last_build should be written for abandoned run");
+    assert_eq!(lb.run_id, 101);
+    assert!(
+        lb.conclusion.is_empty(),
+        "conclusion should be empty (unknown)"
+    );
 }

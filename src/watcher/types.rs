@@ -44,6 +44,28 @@ impl ActiveRun {
     pub fn display_title(&self) -> String {
         crate::github::display_title(&self.event, &self.title)
     }
+
+    /// Build a `LastBuild` record for a run dropped after repeated API failures.
+    /// Uses an empty conclusion (maps to `RunConclusion::Unknown` in the TUI) because
+    /// we never learned the actual outcome.
+    pub(super) fn to_abandoned_last_build(&self, run_id: u64) -> LastBuild {
+        LastBuild {
+            run_id,
+            conclusion: String::new(),
+            workflow: self.workflow.clone(),
+            title: self.title.clone(),
+            head_sha: String::new(),
+            event: self.event.clone(),
+            failing_steps: None,
+            failing_job_id: None,
+            completed_at: None,
+            duration_secs: None,
+            attempt: self.attempt,
+            url: self.url.clone(),
+            actor: self.actor.clone(),
+            commit_author: self.commit_author.clone(),
+        }
+    }
 }
 
 // -- Watch key --
@@ -209,18 +231,18 @@ impl WatchEntry {
         self.failure_counts.remove(&run_id);
     }
 
-    /// Record a poll failure. Returns `true` if the run was removed after too many failures.
-    pub(super) fn record_failure(&mut self, run_id: u64, error: &GhError) -> bool {
+    /// Record a poll failure. Returns the removed `ActiveRun` when the run is dropped
+    /// after too many consecutive failures, `None` otherwise.
+    pub(super) fn record_failure(&mut self, run_id: u64, error: &GhError) -> Option<ActiveRun> {
         let count = self.failure_counts.entry(run_id).or_insert(0);
         *count += 1;
         if *count >= MAX_GH_FAILURES {
             tracing::warn!(run_id, count, "Removing run after consecutive failures");
-            self.active_runs.remove(&run_id);
             self.failure_counts.remove(&run_id);
-            true
+            self.active_runs.remove(&run_id)
         } else {
             tracing::error!(run_id, count, error = %error, "Poll failure");
-            false
+            None
         }
     }
 

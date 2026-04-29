@@ -99,9 +99,11 @@ impl Config {
             .get(repo)
             .and_then(|r| r.branch_filter.as_ref())
             .or(self.branch_filter.as_ref());
-        pattern
-            .filter(|p| !p.is_empty())
-            .and_then(|p| regex::Regex::new(p).ok())
+        pattern.filter(|p| !p.is_empty()).and_then(|p| {
+            regex::Regex::new(p)
+                .inspect_err(|e| tracing::warn!(pattern = %p, error = %e, "Invalid branch_filter regex, ignoring"))
+                .ok()
+        })
     }
 }
 
