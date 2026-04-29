@@ -610,7 +610,7 @@ impl RepoPoller {
     /// Update PR display state and emit state-change events.
     /// Uses `cached_prs` when provided; falls back to an API call when `None`.
     /// No-ops when `watch_prs` is not enabled for this repo.
-    async fn poll_prs_with(&mut self, cached_prs: Option<Vec<crate::github::PrInfo>>) {
+    pub(super) async fn poll_prs_with(&mut self, cached_prs: Option<Vec<crate::github::PrInfo>>) {
         let watch_prs = {
             let cfg = self.config.read().await;
             cfg.repos.get(&self.repo).is_some_and(|rc| rc.watch_prs)
@@ -670,11 +670,6 @@ impl RepoPoller {
                     .unwrap_or_default();
             }
         }
-    }
-
-    /// Backward-compatible wrapper used by tests.
-    pub(super) async fn poll_prs(&mut self) {
-        self.poll_prs_with(None).await;
     }
 
     /// Sync watched branches based on recent runs: add newly discovered branches,

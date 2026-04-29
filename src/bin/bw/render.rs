@@ -34,8 +34,8 @@ pub(crate) struct SingleBranchInfo<'a> {
     pub failing_job_id: Option<u64>,
     /// True until the first successful poll provides data.
     pub waiting: bool,
-    /// Compact PR merge-state badge (e.g. "PR:✓" or "PR:✗"), empty if no PR.
-    pub pr_badge: String,
+    /// Compact PR merge-state badge with per-state colors, empty if no PRs.
+    pub pr_badge: Line<'static>,
     /// Failing step names from the last build, if any.
     pub failing_steps: Option<String>,
     /// GitHub login of the user who triggered the run.
@@ -44,27 +44,33 @@ pub(crate) struct SingleBranchInfo<'a> {
     pub commit_author: Option<String>,
 }
 
-/// Format a compact PR badge from a list of `PrView`s, or empty string if none.
-fn pr_badge(prs: &[PrView]) -> String {
-    match prs.len() {
-        0 => String::new(),
-        1 => {
-            let pr = &prs[0];
-            let draft = if pr.draft { "~" } else { "" };
-            format!("[PR#{} {}{draft}]", pr.number, pr.merge_state.icon())
-        }
-        n => {
-            let ready = prs
-                .iter()
-                .filter(|p| p.merge_state == build_watcher::github::MergeState::Clean)
-                .count();
-            if ready > 0 {
-                format!("[{n} PRs, {ready}✓]")
-            } else {
-                format!("[{n} PRs]")
-            }
-        }
+/// Format a compact colored PR badge from a list of `PrView`s.
+fn pr_badge(prs: &[PrView]) -> Line<'static> {
+    use build_watcher::github::MergeState;
+    if prs.is_empty() {
+        return Line::default();
     }
+    let state_style = |ms: &MergeState| -> Style {
+        match ms {
+            MergeState::Clean => Style::default().fg(COLOR_SUCCESS),
+            MergeState::Dirty | MergeState::Blocked => Style::default().fg(COLOR_FAILURE),
+            MergeState::Behind | MergeState::Unstable | MergeState::HasHooks => {
+                Style::default().fg(Color::Yellow)
+            }
+            _ => Style::default().fg(Color::DarkGray),
+        }
+    };
+    let mut spans: Vec<Span<'static>> = vec![Span::raw("[")];
+    for (i, pr) in prs.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw(" "));
+        }
+        let draft_suffix = if pr.draft { "~" } else { "" };
+        let label = format!("#{}{}{draft_suffix}", pr.number, pr.merge_state.icon());
+        spans.push(Span::styled(label, state_style(&pr.merge_state)));
+    }
+    spans.push(Span::raw("]"));
+    Line::from(spans)
 }
 
 pub(crate) enum DisplayRow<'a> {
@@ -96,7 +102,7 @@ pub(crate) enum DisplayRow<'a> {
         muted: bool,
         tree_prefix: &'static str,
         is_workflow_child: bool,
-        pr_badge: String,
+        pr_badge: Line<'static>,
     },
     LastBuild {
         repo: &'a str,
@@ -105,7 +111,7 @@ pub(crate) enum DisplayRow<'a> {
         muted: bool,
         tree_prefix: &'static str,
         is_workflow_child: bool,
-        pr_badge: String,
+        pr_badge: Line<'static>,
     },
     NeverRan {
         repo: &'a str,
@@ -131,6 +137,8 @@ pub(crate) enum DisplayRow<'a> {
         age_or_elapsed: String,
         /// Style matching the worst status.
         style: Style,
+        /// Colored PR badge line, empty if no PRs.
+        pr_badge: Line<'static>,
     },
 }
 
@@ -545,6 +553,7 @@ fn emit_branch_workflow_rows<'a>(
         status_text,
         age_or_elapsed,
         style,
+        pr_badge: pr_badge(&w.prs),
     });
 
     if !show_workflows {
@@ -578,7 +587,7 @@ fn emit_branch_workflow_rows<'a>(
                     muted: w.muted,
                     tree_prefix: wf_prefix,
                     is_workflow_child: true,
-                    pr_badge: String::new(), // badge shown on branch header, not workflow children
+                    pr_badge: Line::default(),
                 });
             }
             WorkflowItem::Completed(b) => {
@@ -590,7 +599,7 @@ fn emit_branch_workflow_rows<'a>(
                     muted: w.muted,
                     tree_prefix: wf_prefix,
                     is_workflow_child: true,
-                    pr_badge: String::new(),
+                    pr_badge: Line::default(),
                 });
             }
         }
@@ -1217,12 +1226,14 @@ pub(crate) fn render_body<'a>(
     }
 }
 
-/// Append a PR badge to the branch name if present.
-fn format_branch_with_pr(branch: &str, pr_badge: &str) -> String {
-    if pr_badge.is_empty() {
-        branch.to_string()
+/// Combine branch name with a colored PR badge into a single styled line.
+fn format_branch_with_pr(branch: &str, pr_badge: Line<'static>) -> Line<'static> {
+    if pr_badge.spans.is_empty() {
+        Line::from(branch.to_string())
     } else {
-        format!("{branch} {pr_badge}")
+        let mut spans = vec![Span::raw(branch.to_string()), Span::raw(" ")];
+        spans.extend(pr_badge.spans);
+        Line::from(spans)
     }
 }
 
@@ -1259,7 +1270,7 @@ fn title_line(
 #[allow(clippy::too_many_arguments)]
 fn branch_row<'a>(
     tree_label: &str,
-    branch_col: &str,
+    branch_col: Line<'static>,
     muted: bool,
     tree_prefix: &str,
     status_text: &str,
@@ -1273,7 +1284,7 @@ fn branch_row<'a>(
     let tree_name = format!("  {tree_prefix}{}{}", tree_label, mute_indicator(muted));
     Row::new(vec![
         Cell::from(format::truncate(&tree_name, cw.repo)),
-        Cell::from(format::truncate(branch_col, cw.branch)),
+        Cell::from(branch_col),
         Cell::from(format::truncate(status_text, cw.status)).style(style),
         Cell::from(format::truncate(workflow, cw.workflow)),
         Cell::from(title),
@@ -1345,16 +1356,12 @@ fn render_repo_header<'a>(
         } else {
             format!("{emoji} {}{sfx}", format::status(&sb.status_key))
         };
-        let branch_text = if sb.pr_badge.is_empty() {
-            sb.branch.to_string()
-        } else {
-            format!("{} {}", sb.branch, sb.pr_badge)
-        };
+        let branch_cell = format_branch_with_pr(sb.branch, sb.pr_badge.clone());
         let author = sb.commit_author.as_deref().or(sb.actor.as_deref());
         let title = title_line(&sb.title, sb.failing_steps.as_deref(), author, cw.title);
         Row::new(vec![
             Cell::from(format::truncate(&name, cw.repo)).style(repo_style),
-            Cell::from(format::truncate(&branch_text, cw.branch)),
+            Cell::from(branch_cell),
             Cell::from(format::truncate(&inline_status, cw.status)).style(style),
             Cell::from(format::truncate(&sb.workflows, cw.workflow)),
             Cell::from(title),
@@ -1422,7 +1429,7 @@ fn render_active_run<'a>(
     muted: bool,
     tree_prefix: &str,
     is_workflow_child: bool,
-    pr_badge: &str,
+    pr_badge: &Line<'static>,
     cw: &ColWidths,
     mute_indicator: &dyn Fn(bool) -> &'static str,
 ) -> Row<'a> {
@@ -1444,7 +1451,7 @@ fn render_active_run<'a>(
     if is_workflow_child {
         branch_row(
             &run.workflow,
-            "",
+            Line::default(),
             false,
             tree_prefix,
             &status_text,
@@ -1456,10 +1463,9 @@ fn render_active_run<'a>(
             mute_indicator,
         )
     } else {
-        let branch_text = format_branch_with_pr(branch, pr_badge);
         branch_row(
             branch,
-            &branch_text,
+            format_branch_with_pr(branch, pr_badge.clone()),
             muted,
             tree_prefix,
             &status_text,
@@ -1480,7 +1486,7 @@ fn render_last_build<'a>(
     muted: bool,
     tree_prefix: &str,
     is_workflow_child: bool,
-    pr_badge: &str,
+    pr_badge: &Line<'static>,
     cw: &ColWidths,
     mute_indicator: &dyn Fn(bool) -> &'static str,
 ) -> Row<'a> {
@@ -1503,7 +1509,7 @@ fn render_last_build<'a>(
     if is_workflow_child {
         branch_row(
             &build.workflow,
-            "",
+            Line::default(),
             false,
             tree_prefix,
             &status_text,
@@ -1515,10 +1521,9 @@ fn render_last_build<'a>(
             mute_indicator,
         )
     } else {
-        let branch_text = format_branch_with_pr(branch, pr_badge);
         branch_row(
             branch,
-            &branch_text,
+            format_branch_with_pr(branch, pr_badge.clone()),
             muted,
             tree_prefix,
             &status_text,
@@ -1542,7 +1547,7 @@ fn render_never_ran<'a>(
 ) -> Row<'a> {
     branch_row(
         branch,
-        branch,
+        Line::from(branch.to_string()),
         muted,
         tree_prefix,
         if waiting { "⏳ waiting" } else { "· idle" },
@@ -1565,6 +1570,7 @@ fn render_branch_header<'a>(
     status_text: &str,
     age_or_elapsed: &str,
     style: Style,
+    pr_badge: &Line<'static>,
     cw: &ColWidths,
     mute_indicator: &dyn Fn(bool) -> &'static str,
 ) -> Row<'a> {
@@ -1572,7 +1578,7 @@ fn render_branch_header<'a>(
     let wf_label = format!("{expand_indicator} {workflow_count} workflows");
     branch_row(
         branch,
-        branch,
+        format_branch_with_pr(branch, pr_badge.clone()),
         muted,
         tree_prefix,
         status_text,
@@ -1673,6 +1679,7 @@ fn render_display_row<'a>(
             status_text,
             age_or_elapsed,
             style,
+            pr_badge,
             ..
         } => render_branch_header(
             branch,
@@ -1683,6 +1690,7 @@ fn render_display_row<'a>(
             status_text,
             age_or_elapsed,
             *style,
+            pr_badge,
             cw,
             mute_indicator,
         ),

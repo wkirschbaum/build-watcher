@@ -1223,7 +1223,7 @@ async fn poll_prs_skips_when_not_enabled() {
 
     let mut rx = h.subscribe();
     let mut poller = h.poller("alice/app");
-    poller.poll_prs().await;
+    poller.poll_prs_with(None).await;
 
     // No events — watch_prs is not enabled.
     assert!(rx.try_recv().is_err());
@@ -1247,7 +1247,7 @@ async fn poll_prs_emits_on_transition() {
     let mut poller = h.poller("alice/app");
 
     // First poll: records state, no event (first occurrence).
-    poller.poll_prs().await;
+    poller.poll_prs_with(None).await;
     assert!(rx.try_recv().is_err());
     assert_eq!(
         poller.pr_states.get(&42),
@@ -1258,7 +1258,7 @@ async fn poll_prs_emits_on_transition() {
     poller
         .pr_states
         .insert(42, crate::github::MergeState::Blocked);
-    poller.poll_prs().await;
+    poller.poll_prs_with(None).await;
 
     // Now a transition event should be emitted.
     match rx.try_recv() {
