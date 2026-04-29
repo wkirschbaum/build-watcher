@@ -229,6 +229,23 @@ Config lives at `~/.config/build-watcher/config.json`:
 
 Notification levels: `"off"`, `"low"`, `"normal"`, `"critical"`. Branch overrides take priority over repo overrides, which take priority over global settings.
 
+> **Note:** `discovered_branches` may appear inside per-repo entries in `config.json`. This field is auto-managed by the daemon when `auto_discover_branches` is enabled — do not edit it by hand. It is persisted so discovered branches survive restarts, and pruned automatically when branches are deleted on GitHub.
+
+### Poll aggression tuning
+
+The default `"medium"` aggression targets ≤40% of GitHub's 5000 req/hr rate-limit budget, giving a minimum poll interval of 5 seconds under ideal conditions.
+
+**When to lower to `"low"` (≤15%):**
+- You watch many repos (10+) and regularly hit the rate limit
+- You share a GitHub token with other tools that also consume API quota
+- You only need near-real-time updates during business hours (pair with quiet hours)
+
+**When to raise to `"high"` (≤80%):**
+- You need the fastest possible notification latency (e.g. you're actively waiting on a build)
+- You watch only a handful of repos and have plenty of quota headroom
+
+**When the rate limit hits 0:** The daemon does not stop — it pauses polling and waits for the limit to reset (GitHub resets every hour). The TUI header shows the remaining quota and reset countdown. No builds are missed; the daemon catches up on the next poll cycle after the reset. To check current usage: `get_stats` via MCP, or read the header bar in `bw`.
+
 ### Environment variables
 
 | Variable | Default | Description |

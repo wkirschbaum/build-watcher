@@ -14,8 +14,8 @@
 - [x] **Troubleshooting section in README** — covers auth, daemon not running, rate limit, Linux notification daemon, macOS terminal-notifier, and stale state.
 - [x] **Make `default_branches` settable via REST/MCP** — added `default_branches` to `Config`, `/defaults` GET/POST, TUI global config form (`C` key), and `branches_for` fallback.
 - [x] **Standardize MCP tool descriptions** — all 13 tools now follow: summary line + defaults + gotchas format.
-- [ ] **Hide auto-managed config fields** — `discovered_branches` in `RepoConfig` is not user-editable but appears in `config.json`. Document it as auto-managed or move it to state.
-- [ ] **Poll aggression guidance** — README should explain when to change from "medium" default, what happens at 0% remaining, and how to tune for many repos.
+- [x] **Hide auto-managed config fields** — added note in README explaining `discovered_branches` is auto-managed and should not be edited by hand.
+- [x] **Poll aggression guidance** — README now explains when to use low/high, what happens at 0% remaining, and reset behavior.
 
 ## Nice to have (post-1.0)
 

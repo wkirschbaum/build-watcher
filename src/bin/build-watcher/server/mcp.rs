@@ -35,12 +35,10 @@ impl BuildWatcher {
         Self { state }
     }
 
-    #[tool(
-        description = "Watch GitHub Actions builds for one or more repos. \
+    #[tool(description = "Watch GitHub Actions builds for one or more repos. \
                        Repos must be in 'owner/repo' format. \
                        Default: watches only the repo's GitHub default branch unless branches are pre-configured. \
-                       To watch additional branches, call configure_branches after adding."
-    )]
+                       To watch additional branches, call configure_branches after adding.")]
     async fn watch_builds(
         &self,
         Parameters(params): Parameters<ReposParams>,
@@ -98,8 +96,10 @@ impl BuildWatcher {
         )]))
     }
 
-    #[tool(description = "List all currently watched repos and branches with their latest build status. \
-                          Shows active runs (workflow, title, status, elapsed) and last completed build per branch.")]
+    #[tool(
+        description = "List all currently watched repos and branches with their latest build status. \
+                          Shows active runs (workflow, title, status, elapsed) and last completed build per branch."
+    )]
     async fn list_watches(&self) -> Result<CallToolResult, McpError> {
         let paused = is_paused(&self.state.pause).await;
         let watches = self.state.watches.lock().await;
@@ -326,12 +326,10 @@ impl BuildWatcher {
         )]))
     }
 
-    #[tool(
-        description = "Configure per-repo settings. \
+    #[tool(description = "Configure per-repo settings. \
                        workflows: allow-list of workflow names to track (empty = all; omit = no change); matching is case-insensitive. \
                        alias: display name shown in TUI and notifications (omit = no change; use clear_alias=true to remove). \
-                       At least one of workflows, alias, or clear_alias must be provided."
-    )]
+                       At least one of workflows, alias, or clear_alias must be provided.")]
     async fn configure_repo(
         &self,
         Parameters(params): Parameters<ConfigureRepoParams>,
@@ -474,11 +472,9 @@ impl BuildWatcher {
         )]))
     }
 
-    #[tool(
-        description = "Rerun a GitHub Actions build. \
+    #[tool(description = "Rerun a GitHub Actions build. \
                        Default: reruns the last failed build for the repo when run_id is omitted. \
-                       Set failed_only=true to rerun only the failed jobs (faster); omit or false to rerun all jobs."
-    )]
+                       Set failed_only=true to rerun only the failed jobs (faster); omit or false to rerun all jobs.")]
     async fn rerun_build(
         &self,
         Parameters(params): Parameters<RerunBuildParams>,
@@ -493,11 +489,9 @@ impl BuildWatcher {
         }
     }
 
-    #[tool(
-        description = "Show recent build history for a repo. \
+    #[tool(description = "Show recent build history for a repo. \
                        Displays conclusion, workflow, title, duration, and age per run. \
-                       Default: last 10 runs across all branches; pass branch to filter, limit to change count (max 50)."
-    )]
+                       Default: last 10 runs across all branches; pass branch to filter, limit to change count (max 50).")]
     async fn build_history(
         &self,
         Parameters(params): Parameters<BuildHistoryParams>,
