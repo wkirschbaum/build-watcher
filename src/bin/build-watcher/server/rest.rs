@@ -297,6 +297,7 @@ pub(crate) async fn get_defaults_handler(
         poll_aggression: Some(cfg.poll_aggression.to_string()),
         auto_discover_branches: Some(cfg.auto_discover_branches),
         branch_filter: cfg.branch_filter.clone(),
+        default_branches: Some(cfg.default_branches.clone()),
         show_author: Some(cfg.show_author),
     })
 }
@@ -361,6 +362,14 @@ pub(crate) async fn set_defaults_handler(
                 } else {
                     cfg.branch_filter = Some(filter.clone());
                     messages.push(format!("branch filter: {filter}"));
+                }
+            }
+            if let Some(branches) = body.default_branches {
+                cfg.default_branches = branches.clone();
+                if branches.is_empty() {
+                    messages.push("default branches cleared".to_string());
+                } else {
+                    messages.push(format!("default branches: {}", branches.join(", ")));
                 }
             }
             if let Some(enabled) = body.show_author {

@@ -131,6 +131,8 @@ pub struct DefaultsConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch_filter: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_branches: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub show_author: Option<bool>,
 }
 

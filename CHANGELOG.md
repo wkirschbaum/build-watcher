@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.19.2] - 2026-04-29
+
+### Added
+
+- **`default_branches` config** — global fallback branch list for repos with no per-repo branch config. Settable via the `C` key in TUI, the `/defaults` REST endpoint, and `config.json`. When set, new repos will automatically watch these branches instead of only the GitHub default branch.
+
+### Changed
+
+- **Standardized MCP tool descriptions** — all 13 tools now follow a consistent format: summary line + defaults + gotchas. Improves discoverability when browsing tools from any MCP client.
+
+### Docs
+
+- **Troubleshooting section in README** — covers: no notifications (auth, daemon not running), rate limit exhausted, Linux notification daemon setup, macOS `terminal-notifier` for clickable links, and stale state after restart.
+- Document `default_branches` config field in README configuration table.
+
 ## [0.19.1] - 2026-04-29
 
 ### Changed
@@ -260,6 +275,7 @@
 
 - Avoid unnecessary config re-save on reads; improve persistence error logging
 
+[0.19.2]: https://github.com/wkirschbaum/build-watcher/releases/tag/v0.19.2
 [0.18.3]: https://github.com/wkirschbaum/build-watcher/releases/tag/v0.18.3
 [0.18.2]: https://github.com/wkirschbaum/build-watcher/releases/tag/v0.18.2
 [0.18.1]: https://github.com/wkirschbaum/build-watcher/releases/tag/v0.18.1

@@ -284,6 +284,10 @@ pub struct Config {
     pub auto_discover_branches: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch_filter: Option<String>,
+    /// Default branches watched for repos with no per-repo branch config.
+    /// When empty, only the repo's GitHub default branch is watched.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub default_branches: Vec<String>,
     #[serde(default)]
     pub repos: HashMap<String, RepoConfig>,
 }
@@ -300,6 +304,7 @@ impl Default for Config {
             poll_aggression: PollAggression::default(),
             auto_discover_branches: false,
             branch_filter: None,
+            default_branches: Vec::new(),
             repos: HashMap::new(),
         }
     }

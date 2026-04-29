@@ -655,6 +655,10 @@ impl App {
             .iter()
             .find(|f| f.label == "Branch filter")
             .map(|f| f.buffer().to_string());
+        let default_branches: Option<Vec<String>> = fields
+            .iter()
+            .find(|f| f.label == "Default branches")
+            .map(|f| parse_csv(f.buffer()));
         let show_author: Option<bool> = fields
             .iter()
             .find(|f| f.label == "Show author")
@@ -676,6 +680,7 @@ impl App {
             poll_aggression: aggression,
             auto_discover_branches: auto_discover,
             branch_filter,
+            default_branches,
             show_author,
         };
         self.spawn_action("Saving config…", true, async move {
@@ -950,6 +955,10 @@ impl App {
                                 FormField::text(
                                     "Branch filter",
                                     defaults.branch_filter.unwrap_or_default(),
+                                ),
+                                FormField::text(
+                                    "Default branches",
+                                    defaults.default_branches.unwrap_or_default().join(", "),
                                 ),
                                 FormField::cycle(
                                     "Show author",

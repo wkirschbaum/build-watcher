@@ -55,12 +55,17 @@ impl Config {
         events
     }
 
-    /// All branches for a repo: user-configured + auto-discovered.
+    /// All branches for a repo: user-configured (or global defaults) + auto-discovered.
     pub fn branches_for(&self, repo: &str) -> Vec<String> {
         let Some(rc) = self.repos.get(repo) else {
-            return Vec::new();
+            return self.default_branches.clone();
         };
-        let mut all = rc.branches.clone();
+        let base = if rc.branches.is_empty() {
+            self.default_branches.clone()
+        } else {
+            rc.branches.clone()
+        };
+        let mut all = base;
         for b in &rc.discovered_branches {
             if !all.contains(b) {
                 all.push(b.clone());

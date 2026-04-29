@@ -36,7 +36,10 @@ impl BuildWatcher {
     }
 
     #[tool(
-        description = "Persistently watch GitHub Actions builds for one or more repos. Watches configured branches (default: main). Sends desktop notifications when builds start and complete. Repos should be in owner/repo format."
+        description = "Watch GitHub Actions builds for one or more repos. \
+                       Repos must be in 'owner/repo' format. \
+                       Default: watches only the repo's GitHub default branch unless branches are pre-configured. \
+                       To watch additional branches, call configure_branches after adding."
     )]
     async fn watch_builds(
         &self,
@@ -56,8 +59,9 @@ impl BuildWatcher {
     }
 
     #[tool(
-        description = "Detect the GitHub repo from the origin remote of a local git repository \
-                       and start watching it. Pass the absolute path to the repo directory."
+        description = "Detect the GitHub repo from a local git repository's origin remote and start watching it. \
+                       Pass the absolute path to the repo directory. \
+                       Equivalent to calling watch_builds with the detected 'owner/repo' slug."
     )]
     async fn watch_from_git_remote(
         &self,
@@ -80,7 +84,9 @@ impl BuildWatcher {
     }
 
     #[tool(
-        description = "Stop watching builds for one or more repos. Stops all branches and removes from config. Repos should be in owner/repo format."
+        description = "Stop watching builds for one or more repos and remove them from config. \
+                       Repos must be in 'owner/repo' format. \
+                       Stops all branches for each repo; per-repo config (alias, notifications) is also cleared."
     )]
     async fn stop_watches(
         &self,
@@ -92,7 +98,8 @@ impl BuildWatcher {
         )]))
     }
 
-    #[tool(description = "List all currently watched builds and their status")]
+    #[tool(description = "List all currently watched repos and branches with their latest build status. \
+                          Shows active runs (workflow, title, status, elapsed) and last completed build per branch.")]
     async fn list_watches(&self) -> Result<CallToolResult, McpError> {
         let paused = is_paused(&self.state.pause).await;
         let watches = self.state.watches.lock().await;
@@ -159,7 +166,9 @@ impl BuildWatcher {
         )]))
     }
 
-    #[tool(description = "Configure which branches to watch for a specific repo.")]
+    #[tool(description = "Set the branch list for a specific repo. \
+                          Replaces any previously configured branches. \
+                          Gotcha: omitting a branch here stops watching it; use watch_builds first if the repo is new.")]
     async fn configure_branches(
         &self,
         Parameters(params): Parameters<ConfigureBranchesParams>,
@@ -184,8 +193,9 @@ impl BuildWatcher {
     }
 
     #[tool(
-        description = "Show a live stats snapshot: active builds, polling intervals, \
-                       GitHub API rate limit, and notification state (paused / quiet hours)."
+        description = "Show a live stats snapshot: uptime, active builds, poll interval, \
+                       GitHub API rate limit (remaining/limit/reset), notification state (paused/quiet hours/levels), \
+                       and config file path."
     )]
     async fn get_stats(&self) -> Result<CallToolResult, McpError> {
         // Lock order: rate_limit → watches → pause → config (matches poller order).
@@ -317,10 +327,10 @@ impl BuildWatcher {
     }
 
     #[tool(
-        description = "Configure per-repo settings: workflow allow-list and display alias. \
-                       workflows: names to watch (empty = all; omit = no change). \
-                       alias: display name in notifications (omit = no change; use clear_alias=true to remove). \
-                       Workflow matching is case-insensitive."
+        description = "Configure per-repo settings. \
+                       workflows: allow-list of workflow names to track (empty = all; omit = no change); matching is case-insensitive. \
+                       alias: display name shown in TUI and notifications (omit = no change; use clear_alias=true to remove). \
+                       At least one of workflows, alias, or clear_alias must be provided."
     )]
     async fn configure_repo(
         &self,
@@ -376,9 +386,10 @@ impl BuildWatcher {
     }
 
     #[tool(
-        description = "Add to or remove from the global workflow ignore list. Ignored workflows are \
-                       never tracked or notified across all repos. Case-insensitive. \
-                       Pass add and/or remove — at least one must be non-empty."
+        description = "Add to or remove from the global workflow ignore list. \
+                       Ignored workflows are never tracked or notified across all repos; matching is case-insensitive. \
+                       Pass add and/or remove — at least one must be non-empty. \
+                       Common candidates: 'Semgrep', 'Dependabot', 'CodeQL'."
     )]
     async fn configure_ignored_workflows(
         &self,
@@ -412,10 +423,11 @@ impl BuildWatcher {
     }
 
     #[tool(
-        description = "Add to or remove from the ignored event types list. Runs triggered by ignored \
-                       events are never tracked or notified. Case-insensitive. Common events: push, \
-                       pull_request, schedule, workflow_dispatch. Pass add and/or remove — at least \
-                       one must be non-empty. Optionally scope to a repo (global if omitted)."
+        description = "Add to or remove from the ignored GitHub event type list. \
+                       Runs triggered by ignored events are never tracked or notified; matching is case-insensitive. \
+                       Common events: push, pull_request, schedule, workflow_dispatch. \
+                       Pass add and/or remove — at least one must be non-empty. \
+                       Default: global scope; pass repo to scope to a single repo."
     )]
     async fn configure_ignored_events(
         &self,
@@ -463,7 +475,9 @@ impl BuildWatcher {
     }
 
     #[tool(
-        description = "Rerun a GitHub Actions build. Specify a run_id, or omit to rerun the last failed build for the repo. Set failed_only to only rerun failed jobs."
+        description = "Rerun a GitHub Actions build. \
+                       Default: reruns the last failed build for the repo when run_id is omitted. \
+                       Set failed_only=true to rerun only the failed jobs (faster); omit or false to rerun all jobs."
     )]
     async fn rerun_build(
         &self,
@@ -480,7 +494,9 @@ impl BuildWatcher {
     }
 
     #[tool(
-        description = "Show recent build history for a repo. Displays conclusion, workflow, title, duration, and age. Optionally filter by branch."
+        description = "Show recent build history for a repo. \
+                       Displays conclusion, workflow, title, duration, and age per run. \
+                       Default: last 10 runs across all branches; pass branch to filter, limit to change count (max 50)."
     )]
     async fn build_history(
         &self,
@@ -583,11 +599,11 @@ impl BuildWatcher {
     }
 
     #[tool(
-        description = "Update notification settings in one call — any combination of params. \
-                       Levels: set build_started/success/failure with optional repo/branch scope (global if omitted). \
-                       Quiet hours: quiet_start + quiet_end in HH:MM local time (defaults 22:00–06:00), or quiet_clear=true to disable. \
-                       Pause: pause=true to pause (add pause_minutes for timed), pause=false to resume. \
-                       Levels: off, low, normal, critical."
+        description = "Update notification settings — any combination of params in one call. \
+                       Levels: build_started/build_success/build_failure accept off/low/normal/critical; \
+                         default scope is global, pass repo and/or branch to narrow. \
+                       Quiet hours: quiet_start + quiet_end in HH:MM (24h local time); use quiet_clear=true to disable. \
+                       Pause: pause=true to silence all notifications (add pause_minutes for a timed pause), pause=false to resume."
     )]
     async fn update_notifications(
         &self,
@@ -724,8 +740,9 @@ impl BuildWatcher {
     }
 
     #[tool(
-        description = "Set poll aggression: how much of the GitHub rate-limit budget \
-            the daemon uses per hour. low=≤15%, medium=≤40% (default), high=≤80%."
+        description = "Set how aggressively the daemon polls GitHub relative to the rate-limit budget. \
+                       low=≤15%, medium=≤40% (default), high=≤80% of the 5000 req/hr budget. \
+                       Lower aggression when watching many repos or when rate limit is frequently exhausted."
     )]
     async fn set_poll_aggression(
         &self,

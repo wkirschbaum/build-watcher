@@ -219,6 +219,7 @@ Config lives at `~/.config/build-watcher/config.json`:
 | --- | --- |
 | `auto_discover_branches` | Automatically discover branches with active runs or open PRs (default: `false`) |
 | `branch_filter` | Regex pattern to filter discovered branches (only applies when auto-discover is enabled) |
+| `default_branches` | Branch names watched for repos with no per-repo branch config. When empty, only the repo's GitHub default branch is watched. Settable via the `C` key in TUI or `/defaults` REST endpoint. |
 | `poll_aggression` | Rate-limit budget usage: `"low"` (<=15%), `"medium"` (<=40%, default), `"high"` (<=80%) |
 | `notifications` | Global per-event notification levels |
 | `quiet_hours` | Time window (local time, 24h format) during which non-critical notifications are suppressed |
@@ -278,6 +279,45 @@ tail -f ~/Library/Logs/build-watcher.log
 launchctl kickstart -k "gui/$(id -u)/com.build-watcher"
 launchctl bootout "gui/$(id -u)" ~/Library/LaunchAgents/com.build-watcher.plist
 ```
+
+## Troubleshooting
+
+### No builds appearing / no notifications
+
+1. **Check authentication** — run `gh auth status` to confirm `gh` is authenticated, or verify `GITHUB_TOKEN` is set and has `repo` + `actions` scopes. The daemon logs a clear error on startup if no token is found.
+2. **Check the daemon is running** — run `bw` to open the TUI; it auto-starts the daemon. Or check the service: `systemctl --user status build-watcher` (Linux) / `launchctl list com.build-watcher` (macOS).
+3. **Check the logs** for errors:
+   - Linux: `journalctl --user -u build-watcher -n 50`
+   - macOS: `tail -n 50 ~/Library/Logs/build-watcher.log`
+   - Set `RUST_LOG=build_watcher=debug` in the service environment for verbose output.
+
+### Rate limit exhausted
+
+When the GitHub API rate limit hits 0, the daemon backs off automatically and resumes polling once the limit resets (typically within an hour). Check `get_stats` from the MCP server or the header in `bw` to see current usage and reset time.
+
+To reduce usage: lower `poll_aggression` to `low` (targets ≤15% of 5000/hr), watch fewer repos, or enable `auto_discover_branches: false` to avoid polling for new branches.
+
+### Notifications not appearing (Linux)
+
+Notifications are sent via D-Bus (`org.freedesktop.Notifications`). A notification daemon must be running:
+
+- **GNOME / KDE / XFCE** — built-in, should work out of the box.
+- **Standalone WM** (i3, sway, etc.) — install and start `dunst`, `mako`, or `notification-daemon`.
+- Test with: `notify-send "test" "hello"` — if that works, build-watcher notifications should too.
+
+### Notifications not clickable (macOS)
+
+By default, notifications use `osascript` and show the GitHub URL in the notification body. Install [`terminal-notifier`](https://github.com/julienXX/terminal-notifier) for clickable links that open directly in the browser:
+
+```sh
+brew install terminal-notifier
+```
+
+The daemon auto-detects `terminal-notifier` on startup; restart the service after installing.
+
+### Builds showing stale / missing after restart
+
+Run `bw --reset-state` to clear cached run state (active runs and build history) while keeping your config. The daemon will re-fetch current build state on the next poll cycle.
 
 ## Updating
 
