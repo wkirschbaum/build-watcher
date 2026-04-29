@@ -586,37 +586,26 @@ impl App {
                         .map(|w| &w.prs[..])
                         .unwrap_or_default()
                         .to_vec();
-                    match prs.len() {
-                        0 => self.set_flash(
+                    if prs.is_empty() {
+                        self.set_flash(
                             "No open PRs targeting this branch  (enable Watch PRs via 'c')",
-                        ),
-                        1 => {
-                            let number = prs[0].number;
-                            let repo = repo.to_string();
-                            let d = daemon.clone();
-                            self.spawn_action(
-                                format!("Merging PR #{number} in {repo}…"),
-                                false,
-                                async move { d.merge_pr(&repo, number).await },
-                            );
-                        }
-                        _ => {
-                            let entries = prs
-                                .iter()
-                                .map(|pr| PrPickerEntry {
-                                    number: pr.number,
-                                    title: pr.title.clone(),
-                                    author: pr.author.clone(),
-                                    merge_state: pr.merge_state.clone(),
-                                    draft: pr.draft,
-                                })
-                                .collect();
-                            self.input_mode = InputMode::PrPicker {
-                                repo: repo.to_string(),
-                                prs: entries,
-                                selected: 0,
-                            };
-                        }
+                        );
+                    } else {
+                        let entries = prs
+                            .iter()
+                            .map(|pr| PrPickerEntry {
+                                number: pr.number,
+                                title: pr.title.clone(),
+                                author: pr.author.clone(),
+                                merge_state: pr.merge_state.clone(),
+                                draft: pr.draft,
+                            })
+                            .collect();
+                        self.input_mode = InputMode::PrPicker {
+                            repo: repo.to_string(),
+                            prs: entries,
+                            selected: 0,
+                        };
                     }
                 }
             }

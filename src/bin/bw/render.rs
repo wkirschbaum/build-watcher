@@ -2049,8 +2049,13 @@ pub(crate) fn render_pr_picker_popup(
 
     frame.render_widget(Clear, popup);
 
+    let title = if prs.len() == 1 {
+        format!(" Confirm Merge — {repo} ")
+    } else {
+        format!(" Select PR to Merge — {repo} ")
+    };
     let block = Block::default()
-        .title(format!(" Merge PR — {repo} "))
+        .title(title)
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan));
     let inner = block.inner(popup);
@@ -2088,11 +2093,15 @@ pub(crate) fn render_pr_picker_popup(
         frame.render_widget(Paragraph::new(line), rows[i + 1]);
     }
 
-    let hint = popup_hint(&[
-        ("[↑↓]", "select"),
-        ("[Enter]", "merge"),
-        ("[Esc]", "cancel"),
-    ]);
+    let hint = if prs.len() == 1 {
+        popup_hint(&[("[Enter]", "merge"), ("[Esc]", "cancel")])
+    } else {
+        popup_hint(&[
+            ("[↑↓]", "select"),
+            ("[Enter]", "merge"),
+            ("[Esc]", "cancel"),
+        ])
+    };
     frame.render_widget(
         Paragraph::new(hint).alignment(ratatui::layout::Alignment::Center),
         rows[prs.len() + 2],
