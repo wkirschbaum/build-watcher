@@ -1207,7 +1207,7 @@ fn make_pr(number: u64, branch: &str, state: crate::github::MergeState) -> crate
         author: "alice".to_string(),
         draft: false,
         merge_state: state,
-        review_decision: String::new(),
+        review_decision: None,
     }
 }
 

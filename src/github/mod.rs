@@ -411,7 +411,7 @@ pub(super) struct GhPrJson {
     #[serde(default)]
     pub(super) merge_state_status: MergeState,
     #[serde(default)]
-    pub(super) review_decision: String,
+    pub(super) review_decision: Option<String>,
     pub(super) author: Option<GhAuthorJson>,
 }
 
@@ -432,7 +432,7 @@ pub struct PrInfo {
     pub author: String,
     pub draft: bool,
     pub merge_state: MergeState,
-    pub review_decision: String,
+    pub review_decision: Option<String>,
 }
 
 /// Abstraction over the GitHub API.
