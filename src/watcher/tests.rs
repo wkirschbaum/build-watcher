@@ -821,7 +821,10 @@ async fn check_for_new_runs_detects_new_builds() {
     h.seed(key.clone(), idle_entry(100)).await;
 
     let mut rx = h.subscribe();
-    let changes = h.poller("alice/app").check_for_new_runs_repo_wide().await;
+    let changes = h
+        .poller("alice/app")
+        .check_for_new_runs_repo_wide(None)
+        .await;
 
     let entry = h.entry(&key).await;
     assert_eq!(entry.last_seen_run_id, 102);
@@ -858,7 +861,9 @@ async fn check_for_new_runs_applies_workflow_filter() {
     let h = TestHarness::with_config(MockGitHub::with_runs(vec![ci, semgrep]), cfg);
     h.seed(key.clone(), idle_entry(100)).await;
 
-    h.poller("alice/app").check_for_new_runs_repo_wide().await;
+    h.poller("alice/app")
+        .check_for_new_runs_repo_wide(None)
+        .await;
 
     let entry = h.entry(&key).await;
     assert!(entry.active_runs.contains_key(&101));
@@ -1002,7 +1007,10 @@ async fn check_for_new_runs_skips_already_active() {
     )
     .await;
 
-    let changes = h.poller("alice/app").check_for_new_runs_repo_wide().await;
+    let changes = h
+        .poller("alice/app")
+        .check_for_new_runs_repo_wide(None)
+        .await;
     assert!(
         changes.is_empty(),
         "expected no changes for already-active run"
@@ -1100,7 +1108,10 @@ async fn check_for_new_runs_detects_rerun_with_different_conclusion() {
     )
     .await;
 
-    let changes = h.poller("alice/app").check_for_new_runs_repo_wide().await;
+    let changes = h
+        .poller("alice/app")
+        .check_for_new_runs_repo_wide(None)
+        .await;
 
     assert_eq!(changes.len(), 1);
     match &changes[0] {
@@ -1138,7 +1149,10 @@ async fn check_for_new_runs_detects_rerun_in_progress() {
     )
     .await;
 
-    let changes = h.poller("alice/app").check_for_new_runs_repo_wide().await;
+    let changes = h
+        .poller("alice/app")
+        .check_for_new_runs_repo_wide(None)
+        .await;
 
     assert_eq!(changes.len(), 1);
     match &changes[0] {
@@ -1149,7 +1163,10 @@ async fn check_for_new_runs_detects_rerun_in_progress() {
     assert!(h.entry(&key).await.active_runs.contains_key(&200));
 
     // Second call: run 200 already active, no re-emit.
-    let changes2 = h.poller("alice/app").check_for_new_runs_repo_wide().await;
+    let changes2 = h
+        .poller("alice/app")
+        .check_for_new_runs_repo_wide(None)
+        .await;
     assert!(changes2.is_empty());
 
     h.cancel();
@@ -1169,7 +1186,10 @@ async fn check_for_new_runs_ignores_rerun_with_same_conclusion() {
     )
     .await;
 
-    let changes = h.poller("alice/app").check_for_new_runs_repo_wide().await;
+    let changes = h
+        .poller("alice/app")
+        .check_for_new_runs_repo_wide(None)
+        .await;
     assert!(changes.is_empty());
 
     h.cancel();
@@ -1280,7 +1300,7 @@ async fn restart_recaptures_in_progress_run_at_last_seen_id() {
         .await;
 
     let mut poller = h.poller("alice/app");
-    poller.check_for_new_runs_repo_wide().await;
+    poller.check_for_new_runs_repo_wide(None).await;
 
     let entry = h.entry(&key).await;
     assert!(
@@ -1304,8 +1324,8 @@ async fn not_found_does_not_remove_repo_before_threshold() {
 
     let mut poller = h.poller("alice/app");
     // First and second 404 — repo should still be watched.
-    poller.check_for_new_runs_repo_wide().await;
-    poller.check_for_new_runs_repo_wide().await;
+    poller.check_for_new_runs_repo_wide(None).await;
+    poller.check_for_new_runs_repo_wide(None).await;
 
     let w = h.watches.lock().await;
     assert!(
@@ -1326,7 +1346,7 @@ async fn not_found_removes_repo_at_threshold() {
 
     let mut poller = h.poller("alice/app");
     for _ in 0..repo_poller::NOT_FOUND_THRESHOLD {
-        poller.check_for_new_runs_repo_wide().await;
+        poller.check_for_new_runs_repo_wide(None).await;
     }
 
     let w = h.watches.lock().await;
@@ -1362,7 +1382,7 @@ async fn auto_discovered_branch_suppresses_historical_notifications() {
 
     let mut rx = h.subscribe();
     let mut poller = h.poller("alice/app");
-    poller.check_for_new_runs_repo_wide().await;
+    poller.check_for_new_runs_repo_wide(None).await;
 
     // "feature-x" should have been auto-discovered.
     assert!(

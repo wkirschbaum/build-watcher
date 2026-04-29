@@ -187,13 +187,6 @@ impl RepoPoller {
             .collect()
     }
 
-    /// Returns `true` if ANY branch for this repo has active runs.
-    async fn has_any_active(&self) -> bool {
-        let w = self.watches.lock().await;
-        w.iter()
-            .any(|(k, e)| k.matches_repo(&self.repo) && e.has_active_runs())
-    }
-
     /// Returns `true` if at least one branch is still being watched for this repo.
     async fn has_any_watches(&self) -> bool {
         let w = self.watches.lock().await;
@@ -247,7 +240,6 @@ impl RepoPoller {
                 return;
             }
 
-            let has_active = self.has_any_active().await;
             let delay = if self.first_poll {
                 self.first_poll = false;
                 1
@@ -265,11 +257,16 @@ impl RepoPoller {
                 return;
             }
 
+            // Fetch open PRs once if watch_prs or auto_discover needs them.
+            // Shared by both sync_branches (source-branch discovery) and poll_prs
+            // (display/events) so we never call open_prs twice in one cycle.
+            let open_prs = self.maybe_fetch_open_prs().await;
+
             // Collect changes from both poll methods, then deduplicate by run_id
             // before emitting. This prevents double notifications when a run completes
             // between the two API calls within a single cycle.
             let mut changes = self.poll_active_runs_batch().await;
-            changes.extend(self.check_for_new_runs_repo_wide().await);
+            changes.extend(self.check_for_new_runs_repo_wide(open_prs.as_deref()).await);
 
             let mut seen = HashSet::new();
             for change in changes {
@@ -280,10 +277,8 @@ impl RepoPoller {
                 }
             }
 
-            // PR polling — only when no active runs exist for this repo.
-            if !has_active {
-                self.poll_prs().await;
-            }
+            // PR display update — every cycle regardless of whether builds are active.
+            self.poll_prs_with(open_prs).await;
         }
     }
 
@@ -592,8 +587,30 @@ impl RepoPoller {
         changed
     }
 
-    /// Poll open PRs and emit events when merge state transitions.
-    pub(super) async fn poll_prs(&mut self) {
+    /// Fetch open PRs if `watch_prs` or `auto_discover_branches` is enabled for this repo.
+    /// Returns `None` when neither feature is active (skips the API call entirely).
+    async fn maybe_fetch_open_prs(&self) -> Option<Vec<crate::github::PrInfo>> {
+        let needs_prs = {
+            let cfg = self.config.read().await;
+            cfg.auto_discover_for(&self.repo)
+                || cfg.repos.get(&self.repo).is_some_and(|rc| rc.watch_prs)
+        };
+        if !needs_prs {
+            return None;
+        }
+        match self.github.open_prs(&self.repo).await {
+            Ok(prs) => Some(prs),
+            Err(e) => {
+                tracing::debug!(repo = %self.repo, error = %e, "Failed to fetch open PRs");
+                None
+            }
+        }
+    }
+
+    /// Update PR display state and emit state-change events.
+    /// Uses `cached_prs` when provided; falls back to an API call when `None`.
+    /// No-ops when `watch_prs` is not enabled for this repo.
+    async fn poll_prs_with(&mut self, cached_prs: Option<Vec<crate::github::PrInfo>>) {
         let watch_prs = {
             let cfg = self.config.read().await;
             cfg.repos.get(&self.repo).is_some_and(|rc| rc.watch_prs)
@@ -602,12 +619,15 @@ impl RepoPoller {
             return;
         }
 
-        let prs = match self.github.open_prs(&self.repo).await {
-            Ok(prs) => prs,
-            Err(e) => {
-                tracing::debug!(repo = %self.repo, error = %e, "Failed to poll PRs");
-                return;
-            }
+        let prs = match cached_prs {
+            Some(p) => p,
+            None => match self.github.open_prs(&self.repo).await {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::debug!(repo = %self.repo, error = %e, "Failed to poll PRs");
+                    return;
+                }
+            },
         };
 
         // Detect transitions and emit events.
@@ -635,7 +655,6 @@ impl RepoPoller {
 
         // Update watch entries with PR data for display.
         let mut w = self.watches.lock().await;
-        // Build a map of target_branch → PRs for this repo's PRs.
         let mut prs_by_target: HashMap<&str, Vec<&crate::github::PrInfo>> = HashMap::new();
         for pr in &prs {
             prs_by_target
@@ -653,10 +672,20 @@ impl RepoPoller {
         }
     }
 
+    /// Backward-compatible wrapper used by tests.
+    pub(super) async fn poll_prs(&mut self) {
+        self.poll_prs_with(None).await;
+    }
+
     /// Sync watched branches based on recent runs: add newly discovered branches,
     /// remove stale branches that no longer have runs. Never removes branches that
     /// are explicitly configured for the repo.
-    async fn sync_branches(&self, all_runs: &[RunInfo], current: Vec<WatchKey>) -> Vec<WatchKey> {
+    async fn sync_branches(
+        &self,
+        all_runs: &[RunInfo],
+        current: Vec<WatchKey>,
+        cached_prs: Option<&[crate::github::PrInfo]>,
+    ) -> Vec<WatchKey> {
         let (enabled, filter_re, pinned) = {
             let cfg = self.config.read().await;
             let enabled = cfg.auto_discover_for(&self.repo);
@@ -673,14 +702,9 @@ impl RepoPoller {
             return current;
         }
 
-        // Fetch existing branches and open PRs concurrently.
         // list_branches is the source of truth for which branches exist — if it
         // fails, skip sync entirely to avoid incorrectly removing non-pinned branches.
-        let (branches_result, prs_result) = tokio::join!(
-            self.github.list_branches(&self.repo),
-            self.github.open_prs(&self.repo)
-        );
-        let existing_branches: HashSet<String> = match branches_result {
+        let existing_branches: HashSet<String> = match self.github.list_branches(&self.repo).await {
             Ok(branches) => branches.into_iter().collect(),
             Err(e) => {
                 tracing::debug!(
@@ -693,10 +717,11 @@ impl RepoPoller {
 
         // Branches with open PRs should also be discoverable, even when their
         // runs have fallen outside the recent-runs window.
-        let pr_branches: Vec<String> = prs_result
+        // Use cached PR data fetched earlier in the cycle (no extra API call).
+        let pr_branches: Vec<String> = cached_prs
             .unwrap_or_default()
-            .into_iter()
-            .map(|pr| pr.branch)
+            .iter()
+            .map(|pr| pr.branch.clone())
             .collect();
 
         let active_branches: HashSet<&str> = all_runs
@@ -789,7 +814,10 @@ impl RepoPoller {
     }
 
     /// Check for new runs across all watched branches using a single repo-wide API call.
-    pub(super) async fn check_for_new_runs_repo_wide(&mut self) -> Vec<RunChange> {
+    pub(super) async fn check_for_new_runs_repo_wide(
+        &mut self,
+        cached_prs: Option<&[crate::github::PrInfo]>,
+    ) -> Vec<RunChange> {
         let mut changes = Vec::new();
 
         let branches = self.watched_branches().await;
@@ -829,7 +857,7 @@ impl RepoPoller {
         };
 
         // Sync discovered branches: add new, remove stale.
-        let branches = self.sync_branches(&all_runs, branches).await;
+        let branches = self.sync_branches(&all_runs, branches, cached_prs).await;
 
         let run_filters = self.run_filters().await;
         let show_author = self.config.read().await.show_author;

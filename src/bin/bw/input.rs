@@ -587,7 +587,9 @@ impl App {
                         .unwrap_or_default()
                         .to_vec();
                     match prs.len() {
-                        0 => self.set_flash("No PR found for this branch"),
+                        0 => self.set_flash(
+                            "No open PRs targeting this branch  (enable Watch PRs via 'c')",
+                        ),
                         1 => {
                             let number = prs[0].number;
                             let repo = repo.to_string();
