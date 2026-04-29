@@ -12,7 +12,7 @@ A background daemon that monitors GitHub Actions builds and sends desktop notifi
 - Build duration shown in completion notifications
 - Failing job/step context included in failure notifications
 - PR titles displayed for pull request events; compact event prefixes (`PR:`, `cron:`, `manual:`)
-- **PR watch** -- opt-in per-repo polling of open PRs with merge-readiness badges (`PR:✓`/`PR:⊘`/`PR:✗`) and notifications when PRs become ready to merge
+- **PR watch** -- opt-in per-repo polling of open PRs with color-coded merge-readiness badges (e.g. `[#42✓ #43⊘]`) and notifications when PRs become ready to merge
 - **Per-repo config** -- `c` key in TUI to configure alias, watch PRs, and poll aggression per repo
 - Per-repo poll aggression override (falls back to global when unset)
 - Per-repo workflow filtering and global workflow ignore list
@@ -166,15 +166,18 @@ Use `Tab`/`Enter` to cycle expand level on the selected row, or `Shift-Tab` to c
 
 #### PR Watch
 
-Enable per-repo with the `c` key (repo config → Watch PRs: yes). When enabled, the daemon polls open PRs targeting each watched branch and shows merge-readiness badges:
+Enable per-repo with the `c` key (repo config → Watch PRs: yes). When enabled, the daemon polls open PRs targeting each watched branch and shows color-coded merge-readiness badges in the branch column (e.g. `[#42✓ #43⊘]`):
 
-| Badge | Meaning |
-| --- | --- |
-| `PR:✓` | Ready to merge (checks pass, reviews approved) |
-| `PR:⊘` | Blocked (pending reviews, failing checks, or merge conflicts) |
-| `PR:✗` | Conflict or dirty state |
+| Icon | Color | Meaning |
+| --- | --- | --- |
+| `✓` | Green | Ready to merge (checks pass, no blocking reviews) |
+| `⊘` | Red | Blocked (pending reviews or failing checks) |
+| `✗` | Red | Merge conflict |
+| `!` | Yellow | Unstable |
+| `↓` | Yellow | Behind base branch |
+| `~` | Gray suffix | Draft PR |
 
-Desktop notifications fire when a PR transitions to "ready to merge". Press `M` on a branch row to merge the first ready PR.
+Multiple open PRs are shown individually. Desktop notifications fire when a PR transitions to "ready to merge". Press `M` on a branch row to merge the first ready PR.
 
 ## Configuration
 

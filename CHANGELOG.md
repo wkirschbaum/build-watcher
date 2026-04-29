@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.19.0] - 2026-04-29
+
+### Added
+
+- **Colored PR badges** — each open PR now shows `#<number><icon>` in the branch column, color-coded by merge state: green for ready (✓), red for blocked/conflict (⊘/✗), yellow for behind/unstable (!). Multiple PRs are shown individually (`[#42✓ #43⊘]`) instead of a count. The badge now also appears on multi-workflow branch header rows.
+
+### Fixed
+
+- **PR polling always runs** — previously PRs were only polled when no builds were active, so a branch with a long-running CI job would never show its PR state. PR polling now runs every cycle regardless of build activity.
+- **PRs now appear for repos without review requirements** — GitHub returns `null` for `reviewDecision` when no review policy is configured. The field was typed as `String` with `#[serde(default)]` which handles absent fields but not explicit JSON `null`, silently dropping all PR data. Changed to `Option<String>`.
+- **Branch sync safety** — skip auto-branch sync when the GitHub `list_branches` API fails, preventing valid branches from being removed due to a transient API error.
+
 ## [0.18.4] - 2026-04-22
 
 ### Fixed
