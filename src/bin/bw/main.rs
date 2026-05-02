@@ -29,14 +29,23 @@ use app::{App, InputMode, QuitAction, SseState, SseUpdate, TuiPrefs};
 use client::{DaemonClient, sse_task};
 use render::render;
 
-/// Try to connect to an existing daemon. Returns the port if reachable, or `None`.
-fn try_existing_daemon() -> Option<u16> {
+/// Try to connect to an existing daemon. Returns a ready `DaemonClient` or `None`.
+fn try_existing_daemon() -> Option<DaemonClient> {
+    // Prefer Unix socket when available.
+    #[cfg(unix)]
+    {
+        let socket_path = state_dir().join("daemon.sock");
+        if std::os::unix::net::UnixStream::connect(&socket_path).is_ok() {
+            return Some(DaemonClient::new_unix(socket_path));
+        }
+    }
+
     let port_file = state_dir().join("port");
     let contents = std::fs::read_to_string(&port_file).ok()?;
     let port = contents.trim().parse::<u16>().ok()?;
     std::net::TcpStream::connect(format!("127.0.0.1:{port}"))
         .ok()
-        .map(|_| port)
+        .map(|_| DaemonClient::new(port))
 }
 
 /// Start the daemon process (fire and forget).
@@ -66,10 +75,19 @@ fn start_daemon() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Background task: poll until the daemon is reachable, then send `DaemonReady`.
 async fn wait_for_daemon(tx: mpsc::Sender<SseUpdate>) {
+    let socket_path = state_dir().join("daemon.sock");
     let port_file = state_dir().join("port");
     for _ in 0..300 {
         // up to 30 seconds
         tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Prefer Unix socket — it appears before the port file is written.
+        #[cfg(unix)]
+        if tokio::net::UnixStream::connect(&socket_path).await.is_ok() {
+            let _ = tx.send(SseUpdate::DaemonReady(0)).await;
+            return;
+        }
+
         if let Ok(contents) = tokio::fs::read_to_string(&port_file).await
             && let Ok(port) = contents.trim().parse::<u16>()
         {
@@ -142,8 +160,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (sse_tx, mut sse_rx) = mpsc::channel::<SseUpdate>(64);
 
     // Try to connect to an existing daemon, or start one and poll in the background.
-    let daemon: Option<DaemonClient> = if let Some(port) = try_existing_daemon() {
-        Some(DaemonClient::new(port))
+    let daemon: Option<DaemonClient> = if let Some(client) = try_existing_daemon() {
+        Some(client)
     } else {
         eprintln!("Daemon not running, starting build-watcher…");
         start_daemon()?;
@@ -265,7 +283,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 maybe_update = sse_rx.recv() => {
                     match maybe_update {
                         Some(SseUpdate::DaemonReady(port)) => {
-                            let d = DaemonClient::new(port);
+                            let d = DaemonClient::connect(port);
                             app.resync(&d).await;
                             app.set_flash("Daemon connected");
                             tokio::spawn(sse_task(d.clone(), sse_tx.clone()));

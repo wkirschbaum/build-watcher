@@ -29,6 +29,7 @@ pub struct WatcherHandle {
     pub github: Arc<dyn GitHubClient>,
     pub persistence: Arc<dyn Persistence>,
     pub history: SharedHistory,
+    pub discovered: super::DiscoveredBranches,
     /// Notified when config changes so pollers wake early and recompute intervals.
     pub config_changed: Arc<Notify>,
     /// Tracks which repos have an active `RepoPoller` to avoid spawning duplicates.
@@ -42,6 +43,7 @@ impl WatcherHandle {
         github: Arc<dyn GitHubClient>,
         persistence: Arc<dyn Persistence>,
         history: SharedHistory,
+        discovered: super::DiscoveredBranches,
         config_changed: Arc<Notify>,
     ) -> Self {
         Self {
@@ -51,6 +53,7 @@ impl WatcherHandle {
             github,
             persistence,
             history,
+            discovered,
             config_changed,
             active_repo_pollers: Arc::new(Mutex::new(HashSet::new())),
         }
@@ -126,6 +129,7 @@ pub(super) async fn spawn_repo_poller(
         github: handle.github.clone(),
         persistence: handle.persistence.clone(),
         history: handle.history.clone(),
+        discovered: handle.discovered.clone(),
         config_changed: handle.config_changed.clone(),
         first_poll: true,
         pr_states: std::collections::HashMap::new(),
@@ -239,16 +243,28 @@ pub async fn resolve_branches_for_repo(
     branches
 }
 
-/// Resolve the complete set of WatchKeys from config, querying GitHub for
-/// default branches where needed.
+/// Resolve the complete set of WatchKeys from config + discovered state,
+/// querying GitHub for the repo default branch where needed.
 async fn resolve_config_keys(config: &SharedConfig, handle: &WatcherHandle) -> Vec<WatchKey> {
+    let discovered = handle.discovered.lock().await;
     let repos: Vec<(String, Vec<String>)> = {
         let cfg = config.read().await;
         cfg.watched_repos()
             .into_iter()
-            .map(|repo| (repo.to_string(), cfg.branches_for(repo)))
+            .map(|repo| {
+                let mut branches = cfg.branches_for(repo);
+                if let Some(disc) = discovered.get(repo) {
+                    for b in disc {
+                        if !branches.contains(b) {
+                            branches.push(b.clone());
+                        }
+                    }
+                }
+                (repo.to_string(), branches)
+            })
             .collect()
     };
+    drop(discovered);
 
     let mut keys = Vec::new();
     for (repo, configured_branches) in &repos {

@@ -229,6 +229,7 @@ impl TestHarness {
             gh,
             Arc::new(crate::persistence::NullPersistence),
             Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(HashMap::new())),
             Arc::new(tokio::sync::Notify::new()),
         );
         Self {
@@ -254,6 +255,7 @@ impl TestHarness {
             github: self.handle.github.clone(),
             persistence: self.handle.persistence.clone(),
             history: self.handle.history.clone(),
+            discovered: self.handle.discovered.clone(),
             config_changed: self.handle.config_changed.clone(),
             first_poll: false,
             pr_states: HashMap::new(),

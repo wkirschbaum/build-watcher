@@ -215,14 +215,20 @@ pub(crate) async fn do_configure_branches(
     if let Err(e) = state.handle.persistence.save_watches(&persisted).await {
         tracing::error!(error = %e, "Failed to persist watches");
     }
+    // Remove discovered branches the user is explicitly dropping so they
+    // don't resurface on the next restart.
+    {
+        let mut disc = state.discovered.lock().await;
+        if let Some(entry) = disc.get_mut(repo) {
+            entry.retain(|b| new_branches.contains(b));
+        }
+        let _ = state.handle.persistence.save_discovered(&disc).await;
+    }
     let repo_owned = repo.to_string();
     if let Err(e) = state
         .config
         .modify(|cfg| {
             let rc = cfg.repos.entry(repo_owned).or_default();
-            // Remove any discovered branches that the user is explicitly dropping,
-            // so they don't resurface via branches_for() on the next restart.
-            rc.discovered_branches.retain(|b| new_branches.contains(b));
             rc.branches = new_branches;
         })
         .await

@@ -251,10 +251,6 @@ pub struct RepoConfig {
     /// Per-repo branch filter regex override. Falls back to the global setting when `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch_filter: Option<String>,
-    /// Branches found by auto-discover. Managed by the poller, not the user.
-    /// Persisted so they survive restarts, but pruned when no longer active.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub discovered_branches: Vec<String>,
 }
 
 /// Current schema version. Bump when making breaking changes to the config format.

@@ -55,23 +55,18 @@ impl Config {
         events
     }
 
-    /// All branches for a repo: user-configured (or global defaults) + auto-discovered.
+    /// Pinned (user-configured) branches for a repo, falling back to global default_branches.
+    /// Does not include auto-discovered branches — those are stored in `discovered.json`
+    /// and merged externally (see `startup::resolve_config_keys`).
     pub fn branches_for(&self, repo: &str) -> Vec<String> {
         let Some(rc) = self.repos.get(repo) else {
             return self.default_branches.clone();
         };
-        let base = if rc.branches.is_empty() {
+        if rc.branches.is_empty() {
             self.default_branches.clone()
         } else {
             rc.branches.clone()
-        };
-        let mut all = base;
-        for b in &rc.discovered_branches {
-            if !all.contains(b) {
-                all.push(b.clone());
-            }
         }
-        all
     }
 
     /// Only user-configured branches (not auto-discovered). These are "pinned"

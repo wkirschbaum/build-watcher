@@ -9,35 +9,122 @@ use tokio_stream::StreamExt as _;
 
 use super::app::SseUpdate;
 
-#[derive(Clone)]
+// -- Transport --
+
+enum Transport {
+    Tcp {
+        client: reqwest::Client,
+        port: u16,
+    },
+    #[cfg(unix)]
+    Unix {
+        socket_path: std::path::PathBuf,
+    },
+}
+
+// -- DaemonClient --
+
 pub(crate) struct DaemonClient {
-    pub(crate) client: reqwest::Client,
-    port: u16,
+    transport: Transport,
 }
 
 impl DaemonClient {
     pub(crate) fn new(port: u16) -> Self {
         Self {
-            client: reqwest::Client::new(),
-            port,
+            transport: Transport::Tcp {
+                client: reqwest::Client::new(),
+                port,
+            },
         }
     }
 
-    pub(crate) fn url(&self, path: &str) -> String {
-        format!("http://127.0.0.1:{}{path}", self.port)
+    #[cfg(unix)]
+    pub(crate) fn new_unix(socket_path: std::path::PathBuf) -> Self {
+        Self {
+            transport: Transport::Unix { socket_path },
+        }
     }
+
+    /// Smart constructor: prefers Unix socket if available, falls back to TCP.
+    pub(crate) fn connect(port: u16) -> Self {
+        #[cfg(unix)]
+        {
+            let socket_path = build_watcher::dirs::state_dir().join("daemon.sock");
+            if socket_path.exists() {
+                return Self::new_unix(socket_path);
+            }
+        }
+        Self::new(port)
+    }
+
+    // -- Internal primitives --
+
+    async fn raw_get(&self, path: &str) -> Result<(u16, bytes::Bytes), String> {
+        match &self.transport {
+            Transport::Tcp { client, port } => {
+                let resp = client
+                    .get(format!("http://127.0.0.1:{port}{path}"))
+                    .send()
+                    .await
+                    .map_err(|e| format!("connect: {e}"))?;
+                let status = resp.status().as_u16();
+                let body = resp.bytes().await.map_err(|e| format!("body: {e}"))?;
+                Ok((status, body))
+            }
+            #[cfg(unix)]
+            Transport::Unix { socket_path } => unix_get(socket_path, path, &[]).await,
+        }
+    }
+
+    async fn raw_get_q(
+        &self,
+        path: &str,
+        params: &[(&str, &str)],
+    ) -> Result<(u16, bytes::Bytes), String> {
+        match &self.transport {
+            Transport::Tcp { client, port } => {
+                let resp = client
+                    .get(format!("http://127.0.0.1:{port}{path}"))
+                    .query(params)
+                    .send()
+                    .await
+                    .map_err(|e| format!("connect: {e}"))?;
+                let status = resp.status().as_u16();
+                let body = resp.bytes().await.map_err(|e| format!("body: {e}"))?;
+                Ok((status, body))
+            }
+            #[cfg(unix)]
+            Transport::Unix { socket_path } => unix_get(socket_path, path, params).await,
+        }
+    }
+
+    async fn raw_post(&self, path: &str, json: Vec<u8>) -> Result<(u16, bytes::Bytes), String> {
+        match &self.transport {
+            Transport::Tcp { client, port } => {
+                let resp = client
+                    .post(format!("http://127.0.0.1:{port}{path}"))
+                    .header("content-type", "application/json")
+                    .body(json)
+                    .send()
+                    .await
+                    .map_err(|e| format!("{path}: {e}"))?;
+                let status = resp.status().as_u16();
+                let body = resp.bytes().await.map_err(|e| format!("{path}: {e}"))?;
+                Ok((status, body))
+            }
+            #[cfg(unix)]
+            Transport::Unix { socket_path } => unix_post(socket_path, path, json).await,
+        }
+    }
+
+    // -- Shared higher-level helpers --
 
     pub(crate) async fn get_json<T: serde::de::DeserializeOwned>(
         &self,
         path: &str,
     ) -> Result<T, String> {
-        let resp = self
-            .client
-            .get(self.url(path))
-            .send()
-            .await
-            .map_err(|e| format!("connect: {e}"))?;
-        resp.json::<T>().await.map_err(|e| format!("parse: {e}"))
+        let (_, body) = self.raw_get(path).await?;
+        serde_json::from_slice(&body).map_err(|e| format!("parse: {e}"))
     }
 
     async fn post_response<T: Serialize>(
@@ -45,21 +132,17 @@ impl DaemonClient {
         path: &str,
         body: &T,
     ) -> Result<serde_json::Value, String> {
-        let resp = self
-            .client
-            .post(self.url(path))
-            .json(body)
-            .send()
-            .await
-            .map_err(|e| format!("{path}: {e}"))?;
-        if !resp.status().is_success() {
-            return Err(format!("{path}: HTTP {}", resp.status()));
+        let json = serde_json::to_vec(body).map_err(|e| format!("serialize: {e}"))?;
+        let (status, bytes) = self.raw_post(path, json).await?;
+        if !(200..300).contains(&status) {
+            return Err(format!("{path}: HTTP {status}"));
         }
-        let json: serde_json::Value = resp.json().await.map_err(|e| format!("{path}: {e}"))?;
-        if let Some(err) = json.get("error").and_then(|v| v.as_str()) {
+        let val: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(|e| format!("{path}: {e}"))?;
+        if let Some(err) = val.get("error").and_then(|v| v.as_str()) {
             return Err(err.to_string());
         }
-        Ok(json)
+        Ok(val)
     }
 
     async fn post_json<T: Serialize>(&self, path: &str, body: &T) -> Result<(), String> {
@@ -79,6 +162,8 @@ impl DaemonClient {
             .unwrap_or(default_msg)
             .to_string())
     }
+
+    // -- Public API --
 
     pub(crate) async fn pause(&self, pause: bool) -> Result<(), String> {
         #[derive(Serialize)]
@@ -146,16 +231,10 @@ impl DaemonClient {
         repo: &str,
         branch: &str,
     ) -> Result<NotificationConfig, String> {
-        let resp = self
-            .client
-            .get(self.url("/notifications"))
-            .query(&[("repo", repo), ("branch", branch)])
-            .send()
-            .await
-            .map_err(|e| format!("connect: {e}"))?;
-        resp.json::<NotificationConfig>()
-            .await
-            .map_err(|e| format!("parse: {e}"))
+        let (_, body) = self
+            .raw_get_q("/notifications", &[("repo", repo), ("branch", branch)])
+            .await?;
+        serde_json::from_slice(&body).map_err(|e| format!("parse: {e}"))
     }
 
     pub(crate) async fn set_notification_levels(
@@ -251,16 +330,8 @@ impl DaemonClient {
         &self,
         repo: &str,
     ) -> Result<build_watcher::status::RepoConfigView, String> {
-        let resp = self
-            .client
-            .get(self.url("/repo-config"))
-            .query(&[("repo", repo)])
-            .send()
-            .await
-            .map_err(|e| format!("connect: {e}"))?;
-        resp.json::<build_watcher::status::RepoConfigView>()
-            .await
-            .map_err(|e| format!("parse: {e}"))
+        let (_, body) = self.raw_get_q("/repo-config", &[("repo", repo)]).await?;
+        serde_json::from_slice(&body).map_err(|e| format!("parse: {e}"))
     }
 
     pub(crate) async fn set_repo_config(
@@ -276,27 +347,22 @@ impl DaemonClient {
         branch: Option<&str>,
         limit: u32,
     ) -> Result<Vec<HistoryEntryView>, String> {
-        let mut query = vec![("repo", repo.to_string()), ("limit", limit.to_string())];
+        let limit_str = limit.to_string();
+        let mut params = vec![("repo", repo), ("limit", &limit_str)];
+        let branch_owned;
         if let Some(b) = branch {
-            query.push(("branch", b.to_string()));
+            branch_owned = b;
+            params.push(("branch", branch_owned));
         }
-        let resp = self
-            .client
-            .get(self.url("/history"))
-            .query(&query)
-            .send()
-            .await
-            .map_err(|e| e.to_string())?;
-        if !resp.status().is_success() {
-            let body = resp.text().await.unwrap_or_default();
+        let (status, bytes) = self.raw_get_q("/history", &params).await?;
+        if !(200..300).contains(&status) {
+            let body = String::from_utf8_lossy(&bytes);
             return Err(format!(
                 "history: {}",
                 build_watcher::format::truncate(&body, 200)
             ));
         }
-        resp.json::<Vec<HistoryEntryView>>()
-            .await
-            .map_err(|e| e.to_string())
+        serde_json::from_slice(&bytes).map_err(|e| e.to_string())
     }
 
     pub(crate) async fn get_all_history(
@@ -308,6 +374,134 @@ impl DaemonClient {
     }
 }
 
+impl Clone for DaemonClient {
+    fn clone(&self) -> Self {
+        Self {
+            transport: match &self.transport {
+                Transport::Tcp { client, port } => Transport::Tcp {
+                    client: client.clone(),
+                    port: *port,
+                },
+                #[cfg(unix)]
+                Transport::Unix { socket_path } => Transport::Unix {
+                    socket_path: socket_path.clone(),
+                },
+            },
+        }
+    }
+}
+
+// -- Unix socket helpers --
+
+/// Percent-encode a single query parameter value.
+#[cfg(unix)]
+fn pct_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            b => {
+                out.push('%');
+                out.push_str(&format!("{b:02X}"));
+            }
+        }
+    }
+    out
+}
+
+/// Build path + query string (e.g. `/notifications?repo=org%2Frepo&branch=main`).
+#[cfg(unix)]
+fn build_path(path: &str, params: &[(&str, &str)]) -> String {
+    if params.is_empty() {
+        return path.to_string();
+    }
+    let qs = params
+        .iter()
+        .map(|(k, v)| format!("{}={}", k, pct_encode(v)))
+        .collect::<Vec<_>>()
+        .join("&");
+    format!("{path}?{qs}")
+}
+
+#[cfg(unix)]
+async fn unix_handshake(
+    socket_path: &std::path::Path,
+) -> Result<hyper::client::conn::http1::SendRequest<http_body_util::Full<bytes::Bytes>>, String> {
+    use hyper_util::rt::TokioIo;
+
+    let stream = tokio::net::UnixStream::connect(socket_path)
+        .await
+        .map_err(|e| format!("connect: {e}"))?;
+
+    let (sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+        .await
+        .map_err(|e| format!("handshake: {e}"))?;
+
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    Ok(sender)
+}
+
+#[cfg(unix)]
+async fn unix_get(
+    socket_path: &std::path::Path,
+    path: &str,
+    params: &[(&str, &str)],
+) -> Result<(u16, bytes::Bytes), String> {
+    use http_body_util::BodyExt as _;
+
+    let mut sender = unix_handshake(socket_path).await?;
+    let req = http::Request::get(build_path(path, params))
+        .header("host", "localhost")
+        .body(http_body_util::Full::<bytes::Bytes>::default())
+        .map_err(|e| format!("build: {e}"))?;
+    let resp = sender
+        .send_request(req)
+        .await
+        .map_err(|e| format!("send: {e}"))?;
+    let status = resp.status().as_u16();
+    let body = resp
+        .into_body()
+        .collect()
+        .await
+        .map_err(|e| format!("body: {e}"))?
+        .to_bytes();
+    Ok((status, body))
+}
+
+#[cfg(unix)]
+async fn unix_post(
+    socket_path: &std::path::Path,
+    path: &str,
+    json: Vec<u8>,
+) -> Result<(u16, bytes::Bytes), String> {
+    use http_body_util::BodyExt as _;
+
+    let mut sender = unix_handshake(socket_path).await?;
+    let req = http::Request::post(path)
+        .header("host", "localhost")
+        .header("content-type", "application/json")
+        .header("content-length", json.len().to_string())
+        .body(http_body_util::Full::new(bytes::Bytes::from(json)))
+        .map_err(|e| format!("build: {e}"))?;
+    let resp = sender
+        .send_request(req)
+        .await
+        .map_err(|e| format!("send: {e}"))?;
+    let status = resp.status().as_u16();
+    let body = resp
+        .into_body()
+        .collect()
+        .await
+        .map_err(|e| format!("body: {e}"))?
+        .to_bytes();
+    Ok((status, body))
+}
+
 // -- SSE streaming --
 
 async fn stream_sse(
@@ -315,7 +509,23 @@ async fn stream_sse(
     tx: &mpsc::Sender<SseUpdate>,
     connected: &mut bool,
 ) -> bool {
-    let response = match daemon.client.get(daemon.url("/events")).send().await {
+    match &daemon.transport {
+        Transport::Tcp { client, port } => {
+            let url = format!("http://127.0.0.1:{port}/events");
+            stream_sse_tcp(client, &url, tx, connected).await
+        }
+        #[cfg(unix)]
+        Transport::Unix { socket_path } => stream_sse_unix(socket_path, tx, connected).await,
+    }
+}
+
+async fn stream_sse_tcp(
+    client: &reqwest::Client,
+    url: &str,
+    tx: &mpsc::Sender<SseUpdate>,
+    connected: &mut bool,
+) -> bool {
+    let response = match client.get(url).send().await {
         Ok(r) => r,
         Err(e) => {
             tracing::debug!("SSE connect failed: {e}");
@@ -325,7 +535,7 @@ async fn stream_sse(
 
     *connected = true;
     if tx.send(SseUpdate::Connected).await.is_err() {
-        return true; // channel closed — main task exited
+        return true;
     }
 
     let mut stream = response.bytes_stream();
@@ -340,34 +550,120 @@ async fn stream_sse(
                 return false;
             }
         };
-        buf.push_str(&String::from_utf8_lossy(&bytes));
+        if let Some(done) = feed_sse_chunk(&bytes, &mut buf, &mut pending_data, tx).await {
+            return done;
+        }
+    }
 
-        while let Some(pos) = buf.find('\n') {
-            let line = buf[..pos].trim_end_matches('\r').to_string();
-            buf.drain(..=pos);
+    false
+}
 
-            if line.is_empty() {
-                // End of SSE frame — dispatch accumulated data.
-                if let Some(data) = pending_data.take() {
-                    match serde_json::from_str::<WatchEvent>(&data) {
-                        Ok(event) => {
-                            if tx.send(SseUpdate::Event(Box::new(event))).await.is_err() {
-                                return true;
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!("SSE parse error: {e}");
-                        }
-                    }
+#[cfg(unix)]
+async fn stream_sse_unix(
+    socket_path: &std::path::Path,
+    tx: &mpsc::Sender<SseUpdate>,
+    connected: &mut bool,
+) -> bool {
+    use http_body_util::BodyExt as _;
+    use hyper_util::rt::TokioIo;
+
+    let stream = match tokio::net::UnixStream::connect(socket_path).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::debug!("SSE connect failed: {e}");
+            return false;
+        }
+    };
+
+    let (mut sender, conn) = match hyper::client::conn::http1::handshake(TokioIo::new(stream)).await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::debug!("SSE handshake failed: {e}");
+            return false;
+        }
+    };
+
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    let req = http::Request::get("/events")
+        .header("host", "localhost")
+        .body(http_body_util::Full::<bytes::Bytes>::default())
+        .unwrap();
+
+    let response = match sender.send_request(req).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::debug!("SSE connect failed: {e}");
+            return false;
+        }
+    };
+
+    *connected = true;
+    if tx.send(SseUpdate::Connected).await.is_err() {
+        return true;
+    }
+
+    let mut body = response.into_body();
+    let mut buf = String::new();
+    let mut pending_data: Option<String> = None;
+
+    loop {
+        match body.frame().await {
+            None => break,
+            Some(Err(e)) => {
+                tracing::debug!("SSE stream error: {e}");
+                return false;
+            }
+            Some(Ok(frame)) => {
+                let Ok(bytes) = frame.into_data() else {
+                    continue;
+                };
+                if let Some(done) = feed_sse_chunk(&bytes, &mut buf, &mut pending_data, tx).await {
+                    return done;
                 }
-            } else if let Some(data) = line.strip_prefix("data: ") {
-                pending_data = Some(data.to_string());
-                // Lines starting with "event:", "id:", or ":" (comments) are ignored.
             }
         }
     }
 
-    false // stream ended cleanly
+    false
+}
+
+/// Parse one chunk of SSE data into `buf`, dispatch complete events to `tx`.
+/// Returns `Some(true)` if the channel closed, `Some(false)` for error, `None` to continue.
+async fn feed_sse_chunk(
+    chunk: &[u8],
+    buf: &mut String,
+    pending_data: &mut Option<String>,
+    tx: &mpsc::Sender<SseUpdate>,
+) -> Option<bool> {
+    buf.push_str(&String::from_utf8_lossy(chunk));
+
+    while let Some(pos) = buf.find('\n') {
+        let line = buf[..pos].trim_end_matches('\r').to_string();
+        buf.drain(..=pos);
+
+        if line.is_empty() {
+            if let Some(data) = pending_data.take() {
+                match serde_json::from_str::<WatchEvent>(&data) {
+                    Ok(event) => {
+                        if tx.send(SseUpdate::Event(Box::new(event))).await.is_err() {
+                            return Some(true);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("SSE parse error: {e}");
+                    }
+                }
+            }
+        } else if let Some(data) = line.strip_prefix("data: ") {
+            *pending_data = Some(data.to_string());
+        }
+    }
+
+    None
 }
 
 /// SSE background task: connects, streams events, reconnects with exponential backoff.
@@ -376,13 +672,13 @@ pub(crate) async fn sse_task(daemon: DaemonClient, tx: mpsc::Sender<SseUpdate>) 
     loop {
         let mut connected = false;
         if stream_sse(&daemon, &tx, &mut connected).await {
-            break; // channel closed
+            break;
         }
         if tx.send(SseUpdate::Disconnected).await.is_err() {
             break;
         }
         if connected {
-            backoff_secs = 1; // successful connection — reset backoff
+            backoff_secs = 1;
         } else {
             backoff_secs = (backoff_secs * 2).min(30);
         }

@@ -9,6 +9,12 @@ use crate::dirs::state_dir;
 use crate::history::BuildHistory;
 use crate::watcher::{PersistedWatch, WatchKey};
 
+pub type DiscoveredMap = HashMap<String, Vec<String>>;
+
+pub fn load_discovered() -> DiscoveredMap {
+    load_json(&state_dir().join("discovered.json")).unwrap_or_default()
+}
+
 // -- Safe JSON persistence --
 //
 // Crash-safe write sequence:
@@ -210,6 +216,7 @@ pub trait Persistence: Send + Sync {
         watches: &HashMap<WatchKey, PersistedWatch>,
     ) -> Result<(), PersistError>;
     async fn save_history(&self, history: &BuildHistory) -> Result<(), PersistError>;
+    async fn save_discovered(&self, discovered: &DiscoveredMap) -> Result<(), PersistError>;
 
     /// Save both watches and history together. Logs errors without failing.
     async fn save_state(
@@ -243,6 +250,11 @@ impl Persistence for FilePersistence {
         let path = state_dir().join("history.json");
         save_json_async(path, crate::history::pruned(history)).await
     }
+
+    async fn save_discovered(&self, discovered: &DiscoveredMap) -> Result<(), PersistError> {
+        let path = state_dir().join("discovered.json");
+        save_json_async(path, discovered.clone()).await
+    }
 }
 
 /// No-op persistence for tests.
@@ -257,6 +269,9 @@ impl Persistence for NullPersistence {
         Ok(())
     }
     async fn save_history(&self, _history: &BuildHistory) -> Result<(), PersistError> {
+        Ok(())
+    }
+    async fn save_discovered(&self, _discovered: &DiscoveredMap) -> Result<(), PersistError> {
         Ok(())
     }
 }

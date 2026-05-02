@@ -28,7 +28,8 @@ use build_watcher::status::{
     ActiveRunView, LastBuildView, PrView, RunConclusion, StatusResponse, WatchStatus,
 };
 use build_watcher::watcher::{
-    PauseState, RateLimitState, WatchEntry, WatchKey, WatcherHandle, Watches, collect_persisted,
+    DiscoveredBranches, PauseState, RateLimitState, WatchEntry, WatchKey, WatcherHandle, Watches,
+    collect_persisted,
 };
 
 pub use mcp::BuildWatcher;
@@ -44,6 +45,7 @@ pub(crate) struct DaemonState {
     pub pause: PauseState,
     pub rate_limit: RateLimitState,
     pub started_at: std::time::Instant,
+    pub discovered: DiscoveredBranches,
 }
 
 /// Build a snapshot of all current watches from already-locked state.
@@ -225,6 +227,7 @@ fn build_router(state: DaemonState, ct: &CancellationToken) -> axum::Router {
         );
 
     axum::Router::new()
+        .route("/version", get(rest::version_handler))
         .route("/status", get(rest::status_handler))
         .route("/stats", get(rest::stats_handler))
         .route("/events", get(rest::events_handler))
@@ -272,6 +275,31 @@ pub async fn serve(
         .await
         .map_err(ServerError::Io)?;
 
+    // Bind a Unix domain socket alongside TCP for faster local client connections.
+    #[cfg(unix)]
+    let (unix_sock_path, unix_task) = {
+        let socket_path = state_dir().join("daemon.sock");
+        let _ = std::fs::remove_file(&socket_path);
+        match tokio::net::UnixListener::bind(&socket_path) {
+            Ok(unix_listener) => {
+                let router_unix = router.clone();
+                let ct_unix = ct.clone();
+                let task = tokio::spawn(async move {
+                    axum::serve(unix_listener, router_unix)
+                        .with_graceful_shutdown(ct_unix.cancelled_owned())
+                        .await
+                        .ok();
+                });
+                tracing::info!("build-watcher also listening on {}", socket_path.display());
+                (Some(socket_path), Some(task))
+            }
+            Err(e) => {
+                tracing::warn!("Unix socket unavailable: {e}");
+                (None, None)
+            }
+        }
+    };
+
     let port_file = state_dir().join("port");
     std::fs::write(&port_file, port.to_string()).map_err(|e| {
         ServerError::Other(format!(
@@ -317,11 +345,22 @@ pub async fn serve(
         .await
         .map_err(ServerError::Io)?;
 
+    // Wait for the Unix socket server to finish draining in-flight requests before
+    // we save state, so no concurrent mutations are lost.
+    #[cfg(unix)]
+    if let Some(task) = unix_task {
+        let _ = task.await;
+    }
+
     state.handle.shutdown().await;
     let persisted = collect_persisted(&state.watches).await;
     let hist = state.handle.history.lock().await.clone();
     state.handle.persistence.save_state(&persisted, &hist).await;
     let _ = std::fs::remove_file(&port_file);
+    #[cfg(unix)]
+    if let Some(path) = unix_sock_path {
+        let _ = std::fs::remove_file(&path);
+    }
     tracing::info!("State saved, goodbye.");
 
     Ok(())

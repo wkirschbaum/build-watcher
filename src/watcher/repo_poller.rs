@@ -166,6 +166,7 @@ pub(super) struct RepoPoller {
     pub(super) github: Arc<dyn GitHubClient>,
     pub(super) persistence: Arc<dyn Persistence>,
     pub(super) history: crate::history::SharedHistory,
+    pub(super) discovered: super::DiscoveredBranches,
     pub(super) config_changed: Arc<Notify>,
     /// True until the first poll cycle completes — triggers a 1 s initial delay.
     pub(super) first_poll: bool,
@@ -766,26 +767,32 @@ impl RepoPoller {
             );
         }
 
-        // Persist to config first. If save fails, skip the in-memory update so
-        // watches and config stay in sync — the next cycle will retry.
-        let repo = self.repo.clone();
-        let add_names = to_add.clone();
+        // Persist discovered state. If save fails, skip the in-memory update so
+        // watches and discovered stay in sync — the next cycle will retry.
         let remove_names: HashSet<String> = to_remove.iter().map(|k| k.branch.clone()).collect();
-        if let Err(e) = self
-            .config
-            .modify(|cfg| {
-                if let Some(rc) = cfg.repos.get_mut(&repo) {
-                    for branch in &add_names {
-                        if !rc.discovered_branches.contains(branch) {
-                            rc.discovered_branches.push(branch.clone());
-                        }
-                    }
-                    rc.discovered_branches.retain(|b| !remove_names.contains(b));
+        let snapshot = {
+            let mut disc = self.discovered.lock().await;
+            let entry = disc.entry(self.repo.clone()).or_default();
+            for branch in &to_add {
+                if !entry.contains(branch) {
+                    entry.push(branch.clone());
                 }
-            })
-            .await
-        {
+            }
+            entry.retain(|b| !remove_names.contains(b));
+            disc.clone()
+        };
+        if let Err(e) = self.persistence.save_discovered(&snapshot).await {
             tracing::error!(error = %e, "Failed to persist branch discovery changes");
+            // Undo the in-memory change so next cycle retries.
+            let mut disc = self.discovered.lock().await;
+            if let Some(entry) = disc.get_mut(&self.repo) {
+                for branch in &to_add {
+                    entry.retain(|b| b != branch);
+                }
+                for name in &remove_names {
+                    entry.push(name.clone());
+                }
+            }
             return current;
         }
 

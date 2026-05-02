@@ -65,6 +65,14 @@ pub(crate) async fn events_handler(
     Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(30)))
 }
 
+/// `GET /version` — Daemon version and API version for client compatibility checks.
+pub(crate) async fn version_handler() -> axum::Json<serde_json::Value> {
+    axum::Json(serde_json::json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "api_version": 1
+    }))
+}
+
 /// `GET /stats` — Daemon stats: uptime, polling intervals, rate limit.
 pub(crate) async fn stats_handler(State(state): State<DaemonState>) -> axum::Json<StatsResponse> {
     let uptime_secs = state.started_at.elapsed().as_secs();
@@ -705,6 +713,7 @@ mod tests {
             Arc::new(StubGitHub),
             Arc::new(build_watcher::persistence::NullPersistence),
             Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(HashMap::new())),
             Arc::new(tokio::sync::Notify::new()),
         )
     }
@@ -725,6 +734,7 @@ mod tests {
             pause,
             rate_limit: Arc::new(Mutex::new(None)),
             started_at: std::time::Instant::now(),
+            discovered: Arc::new(Mutex::new(HashMap::new())),
         };
         axum::Router::new()
             .route("/status", axum::routing::get(super::status_handler))
@@ -742,6 +752,7 @@ mod tests {
             pause,
             rate_limit: Arc::new(Mutex::new(None)),
             started_at: std::time::Instant::now(),
+            discovered: Arc::new(Mutex::new(HashMap::new())),
         };
         axum::Router::new()
             .route(
@@ -872,6 +883,7 @@ mod tests {
             pause,
             rate_limit: Arc::new(Mutex::new(None)),
             started_at: std::time::Instant::now(),
+            discovered: Arc::new(Mutex::new(HashMap::new())),
         };
         axum::Router::new()
             .route("/status", axum::routing::get(super::status_handler))
@@ -1121,6 +1133,7 @@ mod tests {
             pause,
             rate_limit: Arc::new(Mutex::new(None)),
             started_at: std::time::Instant::now(),
+            discovered: Arc::new(Mutex::new(HashMap::new())),
         };
         axum::Router::new()
             .route(
