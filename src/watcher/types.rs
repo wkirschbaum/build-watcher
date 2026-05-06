@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::dirs::state_dir;
 use crate::github::{GhError, LastBuild, RunInfo};
-use crate::persistence::load_json;
+use crate::persistence::{recover_draft, try_parse_file};
 use crate::status::RunStatus;
 
 use super::Watches;
@@ -139,12 +139,47 @@ pub struct PersistedWatch {
 
 pub(crate) type PersistedWatches = HashMap<WatchKey, PersistedWatch>;
 
+/// Current schema version for `watches.json`. Bump when making breaking changes.
+pub const CURRENT_STATE_VERSION: u32 = 1;
+
+/// Versioned wrapper for `watches.json`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PersistedState {
+    #[serde(default)]
+    pub schema_version: u32,
+    pub watches: PersistedWatches,
+}
+
 /// Load persisted watch state as a lookup table.
 ///
-/// Used at startup so config-driven watches can recover runtime state
-/// (last_seen_run_id, last_builds) from the previous session.
+/// Handles two formats transparently:
+/// - New (v1+): `{ "schema_version": 1, "watches": { ... } }`
+/// - Legacy: `{ "owner/repo#branch": { ... } }` (plain flat map, no version)
 pub fn load_persisted_watches() -> PersistedWatches {
-    load_json(&state_dir().join("watches.json")).unwrap_or_default()
+    let path = state_dir().join("watches.json");
+    recover_draft(&path);
+
+    // Try the new versioned format first.
+    if let Some(state) = try_parse_file::<PersistedState>(&path) {
+        return state.watches;
+    }
+
+    // Fall back to the legacy flat-map format and log the one-time migration.
+    if let Some(watches) = try_parse_file::<PersistedWatches>(&path) {
+        tracing::info!("Migrating watches.json from legacy format to versioned PersistedState");
+        return watches;
+    }
+
+    // Try backup file for both formats.
+    let bak = path.with_extension("json.bak");
+    if let Some(state) = try_parse_file::<PersistedState>(&bak) {
+        return state.watches;
+    }
+    if let Some(watches) = try_parse_file::<PersistedWatches>(&bak) {
+        return watches;
+    }
+
+    PersistedWatches::default()
 }
 
 /// Collect the persisted representation of all watches (acquires the lock).

@@ -7,7 +7,7 @@ use serde::Serialize;
 
 use crate::dirs::state_dir;
 use crate::history::BuildHistory;
-use crate::watcher::{PersistedWatch, WatchKey};
+use crate::watcher::{CURRENT_STATE_VERSION, PersistedState, PersistedWatch, WatchKey};
 
 pub type DiscoveredMap = HashMap<String, Vec<String>>;
 
@@ -243,7 +243,11 @@ impl Persistence for FilePersistence {
         watches: &HashMap<WatchKey, PersistedWatch>,
     ) -> Result<(), PersistError> {
         let path = state_dir().join("watches.json");
-        save_json_async(path, watches.clone()).await
+        let state = PersistedState {
+            schema_version: CURRENT_STATE_VERSION,
+            watches: watches.clone(),
+        };
+        save_json_async(path, state).await
     }
 
     async fn save_history(&self, history: &BuildHistory) -> Result<(), PersistError> {

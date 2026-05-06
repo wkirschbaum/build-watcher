@@ -23,8 +23,8 @@ pub type DiscoveredBranches = Arc<Mutex<crate::persistence::DiscoveredMap>>;
 pub use crate::persistence::load_discovered;
 pub use startup::{WatcherHandle, resolve_branches_for_repo, start_watch, startup_watches};
 pub use types::{
-    ActiveRun, PersistedWatch, WatchEntry, WatchKey, collect_persisted, last_failed_build,
-    load_persisted_watches,
+    ActiveRun, CURRENT_STATE_VERSION, PersistedState, PersistedWatch, WatchEntry, WatchKey,
+    collect_persisted, last_failed_build, load_persisted_watches,
 };
 
 /// Returns `true` if notifications are currently paused (deadline is in the future).

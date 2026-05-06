@@ -97,7 +97,7 @@ pub(crate) async fn stats_handler(State(state): State<DaemonState>) -> axum::Jso
     axum::Json(StatsResponse {
         uptime_secs,
         poll_secs,
-        poll_aggression: aggression.to_string(),
+        poll_aggression: aggression,
         rate_remaining,
         rate_limit,
         rate_reset_mins,
@@ -302,7 +302,7 @@ pub(crate) async fn get_defaults_handler(
     axum::Json(DefaultsConfig {
         ignored_workflows: Some(cfg.ignored_workflows.clone()),
         ignored_events: Some(cfg.ignored_events.clone()),
-        poll_aggression: Some(cfg.poll_aggression.to_string()),
+        poll_aggression: Some(cfg.poll_aggression),
         auto_discover_branches: Some(cfg.auto_discover_branches),
         branch_filter: cfg.branch_filter.clone(),
         default_branches: Some(cfg.default_branches.clone()),
@@ -317,11 +317,6 @@ pub(crate) async fn set_defaults_handler(
     axum::Json(body): axum::Json<DefaultsConfig>,
 ) -> axum::response::Response {
     // Validate inputs before taking the config lock.
-    if let Some(level) = &body.poll_aggression
-        && let Err(e) = level.parse::<PollAggression>()
-    {
-        return json_error(e);
-    }
     if let Some(filter) = &body.branch_filter
         && !filter.is_empty()
         && let Err(e) = regex::Regex::new(filter)
@@ -349,10 +344,7 @@ pub(crate) async fn set_defaults_handler(
                     messages.push(format!("ignored events: {}", events.join(", ")));
                 }
             }
-            if let Some(level) = body.poll_aggression {
-                let aggression = level
-                    .parse::<PollAggression>()
-                    .expect("already validated above");
+            if let Some(aggression) = body.poll_aggression {
                 cfg.poll_aggression = aggression;
                 messages.push(format!("poll aggression: {aggression}"));
             }
@@ -423,6 +415,9 @@ pub(crate) async fn get_repo_config_handler(
         poll_aggression: rc.and_then(|r| r.poll_aggression.map(|a| a.to_string())),
         auto_discover_branches: rc.and_then(|r| r.auto_discover_branches),
         branch_filter: rc.and_then(|r| r.branch_filter.clone()),
+        ignored_events: Some(rc.map(|r| r.ignored_events.clone()).unwrap_or_default()),
+        branches: Some(rc.map(|r| r.branches.clone()).unwrap_or_default()),
+        notifications: rc.map(|r| r.notifications.clone()),
     })
 }
 
@@ -487,6 +482,14 @@ pub(crate) async fn set_repo_config_handler(
                 } else {
                     rc.branch_filter = Some(filter.clone());
                     messages.push(format!("branch filter: {filter}"));
+                }
+            }
+            if let Some(events) = &body.ignored_events {
+                rc.ignored_events = events.clone();
+                if events.is_empty() {
+                    messages.push("ignored events cleared".to_string());
+                } else {
+                    messages.push(format!("ignored events: {}", events.join(", ")));
                 }
             }
             messages
@@ -1213,6 +1216,9 @@ mod tests {
             poll_aggression: Some("high".to_string()),
             auto_discover_branches: None,
             branch_filter: None,
+            ignored_events: None,
+            branches: None,
+            notifications: None,
         };
         let resp = json_post(&router, "/repo-config", &body).await;
         assert_eq!(resp["ok"], true);

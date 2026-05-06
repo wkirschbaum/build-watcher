@@ -597,8 +597,7 @@ pub(crate) fn aggregate_build_times(
             let avg = sum / acc.durations.len() as u64;
             let min = acc.durations.iter().copied().min().unwrap_or(0);
             let max = acc.durations.iter().copied().max().unwrap_or(0);
-            let pass_rate =
-                (acc.successes * 100).checked_div(acc.total).unwrap_or(0) as u8;
+            let pass_rate = (acc.successes * 100).checked_div(acc.total).unwrap_or(0) as u8;
             BuildTimeRow {
                 label,
                 avg_secs: avg,
@@ -640,10 +639,14 @@ impl App {
             .find(|f| f.label == "Ignored events")
             .map(|f| parse_csv(f.buffer()))
             .unwrap_or_default();
-        let aggression: Option<String> = fields
+        let aggression = fields
             .iter()
             .find(|f| f.label == "Poll aggression")
-            .map(|f| f.buffer().to_string());
+            .and_then(|f| {
+                f.buffer()
+                    .parse::<build_watcher::config::PollAggression>()
+                    .ok()
+            });
         let auto_discover: Option<bool> = fields
             .iter()
             .find(|f| f.label == "Auto-discover branches")
@@ -842,6 +845,10 @@ impl App {
                                     "Branch filter",
                                     rc.branch_filter.unwrap_or_default(),
                                 ),
+                                FormField::text(
+                                    "Ignored events",
+                                    rc.ignored_events.unwrap_or_default().join(", "),
+                                ),
                             ],
                         })
                         .await;
@@ -894,6 +901,10 @@ impl App {
             .iter()
             .find(|f| f.label == "Branch filter")
             .map(|f| f.buffer().to_string());
+        let ignored_events: Option<Vec<String>> = fields
+            .iter()
+            .find(|f| f.label == "Ignored events")
+            .map(|f| parse_csv(f.buffer()));
 
         let config = build_watcher::status::RepoConfigView {
             repo,
@@ -903,6 +914,9 @@ impl App {
             poll_aggression,
             auto_discover_branches,
             branch_filter,
+            ignored_events,
+            branches: None,
+            notifications: None,
         };
 
         let d = daemon.clone();
@@ -937,7 +951,7 @@ impl App {
                                 ),
                                 FormField::cycle(
                                     "Poll aggression",
-                                    defaults.poll_aggression.unwrap_or_default(),
+                                    defaults.poll_aggression.unwrap_or_default().to_string(),
                                     vec!["low", "medium", "high"],
                                 ),
                                 FormField::cycle(

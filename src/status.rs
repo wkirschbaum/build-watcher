@@ -3,6 +3,7 @@
 /// Shared between the daemon (`server.rs`) and the TUI (`bin/bw.rs`).
 use serde::{Deserialize, Serialize};
 
+pub use crate::config::{NotificationOverrides, PollAggression};
 // Re-exported here for backward compatibility — defined in github module.
 pub use crate::github::{RunConclusion, RunStatus};
 
@@ -125,7 +126,7 @@ pub struct DefaultsConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ignored_events: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub poll_aggression: Option<String>,
+    pub poll_aggression: Option<PollAggression>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_discover_branches: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -137,6 +138,9 @@ pub struct DefaultsConfig {
 }
 
 /// Per-repo config view used by `GET /repo-config` and `POST /repo-config`.
+///
+/// `branches` and `notifications` are read-only in responses — use `POST /branches`
+/// and `POST /notifications` respectively to mutate those.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepoConfigView {
     pub repo: String,
@@ -146,12 +150,22 @@ pub struct RepoConfigView {
     pub workflows: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub watch_prs: Option<bool>,
+    /// Per-repo poll aggression override. `None` = inherit global. `"default"` clears the override.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub poll_aggression: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_discover_branches: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch_filter: Option<String>,
+    /// Per-repo events to ignore (merged with global `ignored_events`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ignored_events: Option<Vec<String>>,
+    /// Watched branches for this repo (read-only; use `POST /branches` to update).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branches: Option<Vec<String>>,
+    /// Per-repo notification overrides (read-only; use `POST /notifications` to update).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notifications: Option<NotificationOverrides>,
 }
 
 /// Daemon stats returned by `GET /stats`.
@@ -159,9 +173,9 @@ pub struct RepoConfigView {
 pub struct StatsResponse {
     pub uptime_secs: u64,
     pub poll_secs: u64,
-    /// Current poll aggression level: "low", "medium", or "high".
+    /// Current poll aggression level.
     #[serde(default)]
-    pub poll_aggression: String,
+    pub poll_aggression: PollAggression,
     pub rate_remaining: Option<u64>,
     pub rate_limit: Option<u64>,
     pub rate_reset_mins: Option<u64>,

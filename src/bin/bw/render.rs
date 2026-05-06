@@ -996,11 +996,7 @@ pub(crate) fn render_header(frame: &mut ratatui::Frame, area: ratatui::layout::R
 
     let s = &app.stats;
     let uptime = format::seconds(s.uptime_secs);
-    let aggr = if s.poll_aggression.is_empty() {
-        String::new()
-    } else {
-        format!(" [{}]", s.poll_aggression)
-    };
+    let aggr = format!(" [{}]", s.poll_aggression);
     let poll = format!("poll {}s{aggr}", s.poll_secs);
     let api = match (s.rate_remaining, s.rate_limit) {
         (Some(rem), Some(lim)) => {
