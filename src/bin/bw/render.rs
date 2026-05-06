@@ -1004,7 +1004,7 @@ pub(crate) fn render_header(frame: &mut ratatui::Frame, area: ratatui::layout::R
     let poll = format!("poll {}s{aggr}", s.poll_secs);
     let api = match (s.rate_remaining, s.rate_limit) {
         (Some(rem), Some(lim)) => {
-            let pct = if lim > 0 { rem * 100 / lim } else { 0 };
+            let pct = (rem * 100).checked_div(lim).unwrap_or(0);
             let reset = s
                 .rate_reset_mins
                 .map(|m| format!("  reset {m}m"))

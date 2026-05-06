@@ -597,11 +597,8 @@ pub(crate) fn aggregate_build_times(
             let avg = sum / acc.durations.len() as u64;
             let min = acc.durations.iter().copied().min().unwrap_or(0);
             let max = acc.durations.iter().copied().max().unwrap_or(0);
-            let pass_rate = if acc.total > 0 {
-                (acc.successes * 100 / acc.total) as u8
-            } else {
-                0
-            };
+            let pass_rate =
+                (acc.successes * 100).checked_div(acc.total).unwrap_or(0) as u8;
             BuildTimeRow {
                 label,
                 avg_secs: avg,
@@ -612,7 +609,7 @@ pub(crate) fn aggregate_build_times(
             }
         })
         .collect();
-    rows.sort_by(|a, b| b.avg_secs.cmp(&a.avg_secs));
+    rows.sort_by_key(|b| std::cmp::Reverse(b.avg_secs));
     rows
 }
 

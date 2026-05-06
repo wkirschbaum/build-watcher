@@ -39,7 +39,7 @@ pub fn history_for(
         .flat_map(|(key, builds)| builds.iter().map(move |b| (key.branch.clone(), b.clone())))
         .collect();
 
-    entries.sort_by(|a, b| b.1.completed_at.cmp(&a.1.completed_at));
+    entries.sort_by_key(|b| std::cmp::Reverse(b.1.completed_at));
     entries.truncate(limit);
     entries
 }
@@ -55,7 +55,7 @@ pub fn history_all(history: &BuildHistory, limit: usize) -> Vec<(String, String,
         })
         .collect();
 
-    entries.sort_by(|a, b| b.2.completed_at.cmp(&a.2.completed_at));
+    entries.sort_by_key(|b| std::cmp::Reverse(b.2.completed_at));
     entries.truncate(limit);
     entries
 }

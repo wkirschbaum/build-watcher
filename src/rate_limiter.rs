@@ -38,11 +38,9 @@ pub fn compute_interval(input: &PollInput) -> u64 {
     let target_budget = input.aggression.target_calls(rl.limit);
     let remaining_budget = target_budget.saturating_sub(rl.used);
 
-    let interval = if remaining_budget == 0 {
-        time_left
-    } else {
-        calls * time_left / remaining_budget
-    };
+    let interval = (calls * time_left)
+        .checked_div(remaining_budget)
+        .unwrap_or(time_left);
 
     interval.max(MIN_POLL_SECS)
 }

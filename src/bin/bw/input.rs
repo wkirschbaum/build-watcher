@@ -143,10 +143,8 @@ impl App {
                     KeyCode::Up | KeyCode::Char('k') => {
                         *selected = selected.saturating_sub(1);
                     }
-                    KeyCode::Down | KeyCode::Char('j') => {
-                        if !entries.is_empty() {
-                            *selected = (*selected + 1).min(entries.len() - 1);
-                        }
+                    KeyCode::Down | KeyCode::Char('j') if !entries.is_empty() => {
+                        *selected = (*selected + 1).min(entries.len() - 1);
                     }
                     KeyCode::Char('o') => {
                         if let Some(entry) = entries.get(*selected) {
@@ -192,10 +190,8 @@ impl App {
                     KeyCode::Up | KeyCode::Char('k') => {
                         *selected = selected.saturating_sub(1);
                     }
-                    KeyCode::Down | KeyCode::Char('j') => {
-                        if !prs.is_empty() {
-                            *selected = (*selected + 1).min(prs.len() - 1);
-                        }
+                    KeyCode::Down | KeyCode::Char('j') if !prs.is_empty() => {
+                        *selected = (*selected + 1).min(prs.len() - 1);
                     }
                     KeyCode::Enter => {
                         if let Some(pr) = prs.get(*selected) {
@@ -222,10 +218,8 @@ impl App {
                     KeyCode::Up | KeyCode::Char('k') => {
                         *selected = selected.saturating_sub(1);
                     }
-                    KeyCode::Down | KeyCode::Char('j') => {
-                        if !rows.is_empty() {
-                            *selected = (*selected + 1).min(rows.len() - 1);
-                        }
+                    KeyCode::Down | KeyCode::Char('j') if !rows.is_empty() => {
+                        *selected = (*selected + 1).min(rows.len() - 1);
                     }
                     _ => {}
                 }
