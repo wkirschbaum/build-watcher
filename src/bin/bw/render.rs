@@ -1714,11 +1714,11 @@ pub(crate) fn render_recent_panel(
         .iter()
         .take(inner.height as usize)
         .map(|entry| {
-            let style = status_style(&entry.conclusion);
-            let emoji = status_emoji(&entry.conclusion);
+            let style = status_style(entry.conclusion.as_str());
+            let emoji = status_emoji(entry.conclusion.as_str());
             let repo = format::truncate(&entry.repo, cw.repo);
             let branch = format::truncate(&entry.branch, cw.branch);
-            let status_cell = format!("{emoji} {}", format::status(&entry.conclusion));
+            let status_cell = format!("{emoji} {}", format::status(entry.conclusion.as_str()));
             let workflow = format::truncate(&entry.workflow, cw.workflow);
             let title = format::truncate(&entry.title, cw.title);
             let age = entry.age_secs.map(format::age).unwrap_or_default();
@@ -2739,11 +2739,11 @@ pub(crate) fn render_history_popup(
             let sstyle = if is_selected {
                 base_style
             } else {
-                status_style(&entry.conclusion)
+                status_style(entry.conclusion.as_str())
             };
             let arrow = if is_selected { "▸ " } else { "  " };
-            let emoji = status_emoji(&entry.conclusion);
-            let status_str = format::status(&entry.conclusion);
+            let emoji = status_emoji(entry.conclusion.as_str());
+            let status_str = format::status(entry.conclusion.as_str());
             let duration = entry
                 .duration_secs
                 .map(format::seconds)

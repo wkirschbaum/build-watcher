@@ -65,10 +65,13 @@ fn idle_entry(last_seen: u64) -> WatchEntry {
     }
 }
 
-fn make_last_build(run_id: u64, conclusion: &str) -> crate::github::LastBuild {
+fn make_last_build(
+    run_id: u64,
+    conclusion: crate::github::RunConclusion,
+) -> crate::github::LastBuild {
     crate::github::LastBuild {
         run_id,
-        conclusion: conclusion.to_string(),
+        conclusion,
         workflow: "CI".to_string(),
         title: "Test PR".to_string(),
         head_sha: "abc1234".to_string(),
@@ -343,7 +346,7 @@ fn record_completion_removes_run_and_sets_last_build() {
     assert!(entry.active_runs.contains_key(&102));
     let lb = entry.last_builds.get("CI").unwrap();
     assert_eq!(lb.run_id, 101);
-    assert_eq!(lb.conclusion, "success");
+    assert_eq!(lb.conclusion, RunConclusion::Success);
 }
 
 #[test]
@@ -461,7 +464,7 @@ fn incorporate_new_runs_newest_completed_wins_last_build() {
     assert_eq!(entry.last_seen_run_id, 201);
     let lb = entry.last_builds.get("CI").unwrap();
     assert_eq!(lb.run_id, 201);
-    assert_eq!(lb.conclusion, "success");
+    assert_eq!(lb.conclusion, RunConclusion::Success);
 }
 
 #[test]
@@ -898,7 +901,7 @@ async fn poll_active_runs_detects_completion() {
     assert!(!entry.active_runs.contains_key(&101));
     let lb = entry.last_builds.get("CI").unwrap();
     assert_eq!(lb.run_id, 101);
-    assert_eq!(lb.conclusion, "success");
+    assert_eq!(lb.conclusion, RunConclusion::Success);
 
     assert_eq!(changes.len(), 1);
     for c in changes {
@@ -1100,7 +1103,7 @@ async fn check_for_new_runs_detects_rerun_with_different_conclusion() {
         key.clone(),
         WatchEntry {
             last_builds: HashMap::from([("CI".to_string(), {
-                let mut lb = make_last_build(200, "failure");
+                let mut lb = make_last_build(200, RunConclusion::Failure);
                 lb.failing_steps = Some("Build / Run tests".to_string());
                 lb.duration_secs = Some(60);
                 lb
@@ -1127,7 +1130,7 @@ async fn check_for_new_runs_detects_rerun_with_different_conclusion() {
     }
 
     let lb = h.entry(&key).await.last_builds.get("CI").unwrap().clone();
-    assert_eq!(lb.conclusion, "success");
+    assert_eq!(lb.conclusion, RunConclusion::Success);
 
     h.cancel();
 }
@@ -1141,7 +1144,7 @@ async fn check_for_new_runs_detects_rerun_in_progress() {
         key.clone(),
         WatchEntry {
             last_builds: HashMap::from([("CI".to_string(), {
-                let mut lb = make_last_build(200, "failure");
+                let mut lb = make_last_build(200, RunConclusion::Failure);
                 lb.failing_steps = Some("Build / Run tests".to_string());
                 lb.duration_secs = Some(60);
                 lb
@@ -1182,7 +1185,10 @@ async fn check_for_new_runs_ignores_rerun_with_same_conclusion() {
     h.seed(
         key.clone(),
         WatchEntry {
-            last_builds: HashMap::from([("CI".to_string(), make_last_build(200, "failure"))]),
+            last_builds: HashMap::from([(
+                "CI".to_string(),
+                make_last_build(200, RunConclusion::Failure),
+            )]),
             ..idle_entry(200)
         },
     )
@@ -1456,7 +1462,7 @@ async fn abandoned_run_writes_last_build() {
         .expect("last_build should be written for abandoned run");
     assert_eq!(lb.run_id, 101);
     assert!(
-        lb.conclusion.is_empty(),
-        "conclusion should be empty (unknown)"
+        lb.conclusion == RunConclusion::Unknown,
+        "conclusion should be unknown"
     );
 }

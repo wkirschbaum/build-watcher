@@ -103,7 +103,7 @@ pub struct StatusResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HistoryEntryView {
     pub id: u64,
-    pub conclusion: String,
+    pub conclusion: RunConclusion,
     pub workflow: String,
     pub title: String,
     /// Repo in `owner/name` format (populated by `/history/all`, empty for per-repo `/history`).
@@ -150,9 +150,12 @@ pub struct RepoConfigView {
     pub workflows: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub watch_prs: Option<bool>,
-    /// Per-repo poll aggression override. `None` = inherit global. `"default"` clears the override.
+    /// Per-repo poll aggression override. `None` = inherit global.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub poll_aggression: Option<String>,
+    pub poll_aggression: Option<PollAggression>,
+    /// Set `true` to clear the per-repo poll aggression override (revert to global).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clear_poll_aggression: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_discover_branches: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

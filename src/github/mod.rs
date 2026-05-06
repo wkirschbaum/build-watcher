@@ -85,6 +85,12 @@ impl FromStr for RunStatus {
     }
 }
 
+impl std::fmt::Display for RunConclusion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 impl RunConclusion {
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -93,7 +99,7 @@ impl RunConclusion {
             RunConclusion::Cancelled => "cancelled",
             RunConclusion::TimedOut => "timed_out",
             RunConclusion::StartupFailure => "startup_failure",
-            RunConclusion::Unknown => "",
+            RunConclusion::Unknown => "unknown",
         }
     }
 
@@ -165,7 +171,7 @@ impl GhError {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LastBuild {
     pub run_id: u64,
-    pub conclusion: String,
+    pub conclusion: RunConclusion,
     pub workflow: String,
     pub title: String,
     #[serde(default)]
@@ -328,7 +334,7 @@ impl RunInfo {
     pub fn to_last_build(&self) -> LastBuild {
         LastBuild {
             run_id: self.id,
-            conclusion: self.conclusion.clone(),
+            conclusion: self.run_conclusion(),
             workflow: self.workflow.clone(),
             title: self.title.clone(),
             head_sha: self.head_sha.clone(),
@@ -844,7 +850,7 @@ mod tests {
     fn to_last_build_copies_fields() {
         let lb = run_from_value(&sample_json()).unwrap().to_last_build();
         assert_eq!(lb.run_id, 123456789);
-        assert_eq!(lb.conclusion, "success");
+        assert_eq!(lb.conclusion, RunConclusion::Success);
         assert_eq!(lb.workflow, "Lint and Test");
         assert_eq!(lb.title, "Fix login bug");
     }

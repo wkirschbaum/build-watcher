@@ -329,7 +329,11 @@ impl BuildWatcher {
     #[tool(description = "Configure per-repo settings. \
                        workflows: allow-list of workflow names to track (empty = all; omit = no change); matching is case-insensitive. \
                        alias: display name shown in TUI and notifications (omit = no change; use clear_alias=true to remove). \
-                       At least one of workflows, alias, or clear_alias must be provided.")]
+                       watch_prs: whether to poll open PRs for merge-readiness (true/false). \
+                       poll_aggression: per-repo rate-limit aggression (low/medium/high); use clear_poll_aggression=true to revert to global. \
+                       auto_discover_branches: override global branch auto-discovery for this repo. \
+                       branch_filter: regex to filter auto-discovered branches; empty string clears. \
+                       At least one field must be provided.")]
     async fn configure_repo(
         &self,
         Parameters(params): Parameters<ConfigureRepoParams>,
@@ -337,24 +341,28 @@ impl BuildWatcher {
         if let Err(e) = validate_repo(&params.repo) {
             return Ok(CallToolResult::error(vec![Content::text(e)]));
         }
-        if params.workflows.is_none() && params.alias.is_none() && params.clear_alias != Some(true)
+        if params.workflows.is_none()
+            && params.alias.is_none()
+            && params.clear_alias != Some(true)
+            && params.watch_prs.is_none()
+            && params.poll_aggression.is_none()
+            && params.clear_poll_aggression != Some(true)
+            && params.auto_discover_branches.is_none()
+            && params.branch_filter.is_none()
         {
             return Ok(CallToolResult::error(vec![Content::text(
-                "at least one of workflows, alias, or clear_alias must be set",
+                "at least one field must be set",
             )]));
         }
 
         let repo = params.repo;
-        let workflows = params.workflows;
-        let clear_alias = params.clear_alias;
-        let alias = params.alias;
         let result = self
             .state
             .config
             .modify(|config| {
                 let rc = config.repos.entry(repo.clone()).or_default();
                 let mut msgs = Vec::new();
-                if let Some(workflows) = &workflows {
+                if let Some(workflows) = &params.workflows {
                     rc.workflows.clone_from(workflows);
                     if workflows.is_empty() {
                         msgs.push(format!("{repo}: watching all workflows"));
@@ -362,12 +370,42 @@ impl BuildWatcher {
                         msgs.push(format!("{repo}: watching workflows {workflows:?}"));
                     }
                 }
-                if clear_alias == Some(true) {
+                if params.clear_alias == Some(true) {
                     rc.alias = None;
                     msgs.push(format!("{repo}: alias cleared"));
-                } else if let Some(alias) = &alias {
+                } else if let Some(alias) = &params.alias {
                     rc.alias = Some(alias.clone());
                     msgs.push(format!("{repo}: alias set to \"{alias}\""));
+                }
+                if let Some(watch_prs) = params.watch_prs {
+                    rc.watch_prs = watch_prs;
+                    msgs.push(format!(
+                        "{repo}: PR watching {}",
+                        if watch_prs { "enabled" } else { "disabled" }
+                    ));
+                }
+                if params.clear_poll_aggression == Some(true) {
+                    rc.poll_aggression = None;
+                    msgs.push(format!("{repo}: poll aggression reset to global default"));
+                } else if let Some(aggression) = params.poll_aggression {
+                    rc.poll_aggression = Some(aggression);
+                    msgs.push(format!("{repo}: poll aggression set to {aggression}"));
+                }
+                if let Some(enabled) = params.auto_discover_branches {
+                    rc.auto_discover_branches = Some(enabled);
+                    msgs.push(format!(
+                        "{repo}: auto-discover branches {}",
+                        if enabled { "enabled" } else { "disabled" }
+                    ));
+                }
+                if let Some(filter) = &params.branch_filter {
+                    if filter.is_empty() {
+                        rc.branch_filter = None;
+                        msgs.push(format!("{repo}: branch filter cleared"));
+                    } else {
+                        rc.branch_filter = Some(filter.clone());
+                        msgs.push(format!("{repo}: branch filter set to {filter:?}"));
+                    }
                 }
                 msgs
             })
@@ -776,7 +814,7 @@ impl ServerHandler for BuildWatcher {
                  Use watch_builds with one or more repos in 'owner/repo' format to start watching. \
                  Use watch_from_git_remote with a local repo path to auto-detect and watch the GitHub repo from its origin remote. \
                  Use configure_branches to set which branches to watch for a specific repo. \
-                 Use configure_repo to set per-repo workflow allow-list and/or display alias. \
+                 Use configure_repo to set per-repo workflow allow-list, alias, watch_prs, poll_aggression, auto_discover_branches, or branch_filter. \
                  Use configure_ignored_workflows(add/remove) to manage the global workflow ignore list (e.g. Semgrep, Dependabot). \
                  Use configure_ignored_events(add/remove) to ignore runs by GitHub event type (e.g. schedule, workflow_dispatch) globally or per-repo. \
                  Use update_notifications to set notification levels (off/low/normal/critical, per event and scope), \

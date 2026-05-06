@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::dirs::state_dir;
-use crate::github::{GhError, LastBuild, RunInfo};
+use crate::github::{GhError, LastBuild, RunConclusion, RunInfo};
 use crate::persistence::{recover_draft, try_parse_file};
 use crate::status::RunStatus;
 
@@ -51,7 +51,7 @@ impl ActiveRun {
     pub(super) fn to_abandoned_last_build(&self, run_id: u64) -> LastBuild {
         LastBuild {
             run_id,
-            conclusion: String::new(),
+            conclusion: RunConclusion::Unknown,
             workflow: self.workflow.clone(),
             title: self.title.clone(),
             head_sha: String::new(),
@@ -354,7 +354,7 @@ pub fn last_failed_build<'a>(
             entry
                 .last_builds
                 .values()
-                .filter(|b| b.conclusion != "success")
+                .filter(|b| b.conclusion != RunConclusion::Success)
                 .map(move |b| (k, b))
         })
         .max_by_key(|(_, b)| b.run_id)

@@ -1,7 +1,7 @@
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-use build_watcher::config::NotificationLevel;
+use build_watcher::config::{NotificationLevel, PollAggression};
 
 /// Visitor that deserializes a `Vec<String>` from either a JSON array or a
 /// JSON-encoded string (e.g. `"[\"a\",\"b\"]"`). Some MCP clients double-encode
@@ -130,6 +130,16 @@ pub(crate) struct ConfigureRepoParams {
     pub alias: Option<String>,
     /// Set true to clear the alias entirely.
     pub clear_alias: Option<bool>,
+    /// Whether to poll open PRs for this repo (default: true). Omit to leave unchanged.
+    pub watch_prs: Option<bool>,
+    /// Per-repo poll aggression override: low, medium, or high. Omit to leave unchanged.
+    pub poll_aggression: Option<PollAggression>,
+    /// Set true to clear the per-repo poll aggression override (revert to global).
+    pub clear_poll_aggression: Option<bool>,
+    /// Per-repo auto-discover branches override. Omit to leave unchanged.
+    pub auto_discover_branches: Option<bool>,
+    /// Per-repo branch filter regex. Empty string clears the filter. Omit to leave unchanged.
+    pub branch_filter: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]

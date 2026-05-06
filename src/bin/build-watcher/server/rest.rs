@@ -8,7 +8,7 @@ use serde::Deserialize;
 use tokio_stream::StreamExt as _;
 use tokio_stream::wrappers::BroadcastStream;
 
-use build_watcher::config::{NotificationConfig, NotificationLevel, PollAggression, unix_now};
+use build_watcher::config::{NotificationConfig, NotificationLevel, unix_now};
 use build_watcher::events::WatchEvent;
 use build_watcher::github::{validate_branch, validate_repo};
 use build_watcher::history::{history_all, history_for};
@@ -412,7 +412,8 @@ pub(crate) async fn get_repo_config_handler(
         alias: rc.alias,
         workflows: Some(rc.workflows),
         watch_prs: Some(rc.watch_prs),
-        poll_aggression: rc.poll_aggression.map(|a| a.to_string()),
+        poll_aggression: rc.poll_aggression,
+        clear_poll_aggression: None,
         auto_discover_branches: rc.auto_discover_branches,
         branch_filter: rc.branch_filter,
         ignored_events: Some(rc.ignored_events),
@@ -459,14 +460,12 @@ pub(crate) async fn set_repo_config_handler(
                     if watch_prs { "on" } else { "off" }
                 ));
             }
-            if let Some(level) = &body.poll_aggression {
-                if level.is_empty() || level == "default" {
-                    rc.poll_aggression = None;
-                    messages.push("poll aggression: default (global)".to_string());
-                } else if let Ok(aggression) = level.parse::<PollAggression>() {
-                    rc.poll_aggression = Some(aggression);
-                    messages.push(format!("poll aggression: {aggression}"));
-                }
+            if body.clear_poll_aggression == Some(true) {
+                rc.poll_aggression = None;
+                messages.push("poll aggression: default (global)".to_string());
+            } else if let Some(aggression) = body.poll_aggression {
+                rc.poll_aggression = Some(aggression);
+                messages.push(format!("poll aggression: {aggression}"));
             }
             if let Some(enabled) = body.auto_discover_branches {
                 rc.auto_discover_branches = Some(enabled);
@@ -823,7 +822,7 @@ mod tests {
             "CI".to_string(),
             LastBuild {
                 run_id: 99,
-                conclusion: "failure".to_string(),
+                conclusion: build_watcher::github::RunConclusion::Failure,
                 workflow: "CI".to_string(),
                 title: "Initial commit".to_string(),
                 head_sha: "abc1234".to_string(),
@@ -1213,7 +1212,8 @@ mod tests {
             alias: Some("myapp".to_string()),
             workflows: Some(vec!["CI".to_string(), "Deploy".to_string()]),
             watch_prs: Some(true),
-            poll_aggression: Some("high".to_string()),
+            poll_aggression: Some(build_watcher::config::PollAggression::High),
+            clear_poll_aggression: None,
             auto_discover_branches: None,
             branch_filter: None,
             ignored_events: None,

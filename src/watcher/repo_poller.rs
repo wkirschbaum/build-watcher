@@ -542,7 +542,7 @@ impl RepoPoller {
                 .filter(|(k, _)| k.repo == self.repo)
                 .flat_map(|(k, entry)| {
                     entry.last_builds.values().filter_map(move |lb| {
-                        if lb.conclusion != "success"
+                        if lb.conclusion != crate::github::RunConclusion::Success
                             && lb.failing_steps.is_none()
                             && lb
                                 .completed_at
@@ -910,7 +910,7 @@ impl RepoPoller {
                 .filter_map(|lb| {
                     let r = branch_runs.iter().find(|r| r.id == lb.run_id)?;
                     let dominated = active_ids.contains(&r.id);
-                    let changed = !r.is_completed() || r.conclusion != lb.conclusion;
+                    let changed = !r.is_completed() || r.run_conclusion() != lb.conclusion;
                     (!dominated && changed).then_some((*r, lb))
                 })
                 .collect();

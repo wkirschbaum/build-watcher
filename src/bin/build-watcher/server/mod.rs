@@ -24,9 +24,7 @@ use tokio_util::sync::CancellationToken;
 use build_watcher::config::SharedConfigManager;
 use build_watcher::config::unix_now;
 use build_watcher::dirs::state_dir;
-use build_watcher::status::{
-    ActiveRunView, LastBuildView, PrView, RunConclusion, StatusResponse, WatchStatus,
-};
+use build_watcher::status::{ActiveRunView, LastBuildView, PrView, StatusResponse, WatchStatus};
 use build_watcher::watcher::{
     DiscoveredBranches, PauseState, RateLimitState, WatchEntry, WatchKey, WatcherHandle, Watches,
     collect_persisted,
@@ -111,13 +109,9 @@ pub(crate) fn build_watch_snapshot(
                 })
                 .map(|lb| {
                     let age_secs = lb.completed_at.map(|t| now_unix.saturating_sub(t) as f64);
-                    let conclusion = lb
-                        .conclusion
-                        .parse::<RunConclusion>()
-                        .unwrap_or(RunConclusion::Unknown);
                     LastBuildView {
                         run_id: lb.run_id,
-                        conclusion,
+                        conclusion: lb.conclusion.clone(),
                         workflow: lb.workflow.clone(),
                         title: lb.display_title(),
                         failing_steps: lb.failing_steps.clone(),

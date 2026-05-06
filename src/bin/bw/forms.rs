@@ -1,6 +1,6 @@
 use build_watcher::config::NotificationLevel;
 use build_watcher::github::{validate_branch, validate_repo};
-use build_watcher::status::{DefaultsConfig, HistoryEntryView};
+use build_watcher::status::{DefaultsConfig, HistoryEntryView, RunConclusion};
 
 use super::app::{App, SseUpdate};
 use super::client::DaemonClient;
@@ -585,7 +585,7 @@ pub(crate) fn aggregate_build_times(
             acc.durations.push(d);
         }
         acc.total += 1;
-        if e.conclusion == "success" {
+        if e.conclusion == RunConclusion::Success {
             acc.successes += 1;
         }
     }
@@ -829,7 +829,9 @@ impl App {
                                 ),
                                 FormField::cycle(
                                     "Poll aggression",
-                                    rc.poll_aggression.unwrap_or_else(|| "default".to_string()),
+                                    rc.poll_aggression
+                                        .map(|a| a.to_string())
+                                        .unwrap_or_else(|| "default".to_string()),
                                     vec!["default", "low", "medium", "high"],
                                 ),
                                 FormField::cycle(
@@ -885,10 +887,16 @@ impl App {
             .iter()
             .find(|f| f.label == "Watch PRs")
             .map(|f| f.buffer() == "on");
-        let poll_aggression: Option<String> = fields
+        let poll_aggression_buf: Option<String> = fields
             .iter()
             .find(|f| f.label == "Poll aggression")
             .map(|f| f.buffer().to_string());
+        let clear_poll_aggression: Option<bool> = poll_aggression_buf
+            .as_deref()
+            .and_then(|s| (s == "default").then_some(true));
+        let poll_aggression = poll_aggression_buf
+            .as_deref()
+            .and_then(|s| s.parse::<build_watcher::config::PollAggression>().ok());
         let auto_discover_branches: Option<bool> = fields
             .iter()
             .find(|f| f.label == "Auto-discover branches")
@@ -912,6 +920,7 @@ impl App {
             workflows: None,
             watch_prs,
             poll_aggression,
+            clear_poll_aggression,
             auto_discover_branches,
             branch_filter,
             ignored_events,

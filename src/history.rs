@@ -75,7 +75,7 @@ mod tests {
     fn make_build(run_id: u64, completed_at: Option<u64>) -> LastBuild {
         LastBuild {
             run_id,
-            conclusion: "success".to_string(),
+            conclusion: crate::github::RunConclusion::Success,
             workflow: "CI".to_string(),
             title: "test".to_string(),
             head_sha: String::new(),
