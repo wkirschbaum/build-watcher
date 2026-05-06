@@ -187,7 +187,7 @@ Config lives at `~/.config/build-watcher/config.json`:
 {
   "poll_aggression": "medium",
   "show_author": true,
-  "auto_discover_branches": false,
+  "auto_discover_branches": true,
   "notifications": {
     "build_started": "normal",
     "build_success": "normal",
@@ -217,7 +217,7 @@ Config lives at `~/.config/build-watcher/config.json`:
 
 | Field | Description |
 | --- | --- |
-| `auto_discover_branches` | Automatically discover branches with active runs or open PRs (default: `false`) |
+| `auto_discover_branches` | Automatically discover branches with active runs or open PRs (default: `true`) |
 | `branch_filter` | Regex pattern to filter discovered branches (only applies when auto-discover is enabled) |
 | `default_branches` | Branch names watched for repos with no per-repo branch config. When empty, only the repo's GitHub default branch is watched. Settable via the `C` key in TUI or `/defaults` REST endpoint. |
 | `poll_aggression` | Rate-limit budget usage: `"low"` (<=15%), `"medium"` (<=40%, default), `"high"` (<=80%) |
@@ -312,7 +312,7 @@ launchctl bootout "gui/$(id -u)" ~/Library/LaunchAgents/com.build-watcher.plist
 
 When the GitHub API rate limit hits 0, the daemon backs off automatically and resumes polling once the limit resets (typically within an hour). Check `get_stats` from the MCP server or the header in `bw` to see current usage and reset time.
 
-To reduce usage: lower `poll_aggression` to `low` (targets ≤15% of 5000/hr), watch fewer repos, or enable `auto_discover_branches: false` to avoid polling for new branches.
+To reduce usage: lower `poll_aggression` to `low` (targets ≤15% of 5000/hr), watch fewer repos, or set `auto_discover_branches: false` to avoid polling for new branches.
 
 ### Notifications not appearing (Linux)
 

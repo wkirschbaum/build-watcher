@@ -406,18 +406,18 @@ pub(crate) async fn get_repo_config_handler(
     Query(q): Query<RepoQuery>,
 ) -> axum::Json<build_watcher::status::RepoConfigView> {
     let cfg = state.config.read().await;
-    let rc = cfg.repos.get(&q.repo);
+    let rc = cfg.repos.get(&q.repo).cloned().unwrap_or_default();
     axum::Json(build_watcher::status::RepoConfigView {
         repo: q.repo,
-        alias: rc.and_then(|r| r.alias.clone()),
-        workflows: Some(rc.map(|r| r.workflows.clone()).unwrap_or_default()),
-        watch_prs: Some(rc.is_some_and(|r| r.watch_prs)),
-        poll_aggression: rc.and_then(|r| r.poll_aggression.map(|a| a.to_string())),
-        auto_discover_branches: rc.and_then(|r| r.auto_discover_branches),
-        branch_filter: rc.and_then(|r| r.branch_filter.clone()),
-        ignored_events: Some(rc.map(|r| r.ignored_events.clone()).unwrap_or_default()),
-        branches: Some(rc.map(|r| r.branches.clone()).unwrap_or_default()),
-        notifications: rc.map(|r| r.notifications.clone()),
+        alias: rc.alias,
+        workflows: Some(rc.workflows),
+        watch_prs: Some(rc.watch_prs),
+        poll_aggression: rc.poll_aggression.map(|a| a.to_string()),
+        auto_discover_branches: rc.auto_discover_branches,
+        branch_filter: rc.branch_filter,
+        ignored_events: Some(rc.ignored_events),
+        branches: Some(rc.branches),
+        notifications: Some(rc.notifications),
     })
 }
 
@@ -1179,7 +1179,7 @@ mod tests {
         let router = repo_config_router(null_config(build_watcher::config::Config::default()));
         let json = json_get(&router, "/repo-config?repo=alice/app").await;
         assert_eq!(json["repo"], "alice/app");
-        assert_eq!(json["watch_prs"], false);
+        assert_eq!(json["watch_prs"], true);
         assert_eq!(json["workflows"], serde_json::json!([]));
         assert!(json["alias"].is_null());
     }

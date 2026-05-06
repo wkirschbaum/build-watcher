@@ -16,6 +16,14 @@ pub fn unix_now() -> u64 {
 
 // -- Configuration --
 
+fn default_true() -> bool {
+    true
+}
+
+fn is_true(x: &bool) -> bool {
+    *x
+}
+
 /// Notification urgency level.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
@@ -224,7 +232,7 @@ pub struct BranchConfig {
 }
 
 /// Per-repo settings. Presence in the map means the repo is watched.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepoConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub alias: Option<String>,
@@ -240,7 +248,7 @@ pub struct RepoConfig {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub branch_notifications: HashMap<String, BranchConfig>,
     /// When true, poll open PRs for this repo and show merge-readiness in the TUI.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub watch_prs: bool,
     /// Per-repo poll aggression override. Falls back to the global setting when `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -251,6 +259,23 @@ pub struct RepoConfig {
     /// Per-repo branch filter regex override. Falls back to the global setting when `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch_filter: Option<String>,
+}
+
+impl Default for RepoConfig {
+    fn default() -> Self {
+        Self {
+            alias: None,
+            branches: Vec::new(),
+            workflows: Vec::new(),
+            ignored_events: Vec::new(),
+            notifications: NotificationOverrides::default(),
+            branch_notifications: HashMap::new(),
+            watch_prs: true,
+            poll_aggression: None,
+            auto_discover_branches: None,
+            branch_filter: None,
+        }
+    }
 }
 
 /// Current schema version. Bump when making breaking changes to the config format.
@@ -276,7 +301,7 @@ pub struct Config {
     /// (costs 1 extra API call per newly detected run).
     #[serde(default)]
     pub show_author: bool,
-    #[serde(default)]
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub auto_discover_branches: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch_filter: Option<String>,
@@ -298,7 +323,7 @@ impl Default for Config {
             notifications: NotificationConfig::default(),
             quiet_hours: None,
             poll_aggression: PollAggression::default(),
-            auto_discover_branches: false,
+            auto_discover_branches: true,
             branch_filter: None,
             default_branches: Vec::new(),
             repos: HashMap::new(),
