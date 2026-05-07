@@ -154,7 +154,7 @@ checksum = "c4512299f36f043ab09a583e57bceb5a5aab7a73db1805848e8fef3c9e8c78b3"
 
 [[package]]
 name = "build-watcher"
-version = "0.19.2"
+version = "0.20.0"
 dependencies = [
  "async-trait",
  "axum",

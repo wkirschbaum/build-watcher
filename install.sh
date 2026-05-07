@@ -14,8 +14,10 @@
 #   - gh (GitHub CLI), authenticated (unless --local): https://cli.github.com
 #
 # Usage: curl -fsSL https://raw.githubusercontent.com/wkirschbaum/build-watcher/main/install.sh | bash
-#        ./install.sh            # install from latest GitHub release (from repo checkout)
-#        ./install.sh --local    # build from source and install (from repo checkout)
+#        ./install.sh                        # install from latest GitHub release
+#        ./install.sh --local                # build from source and install
+#        ./install.sh --with-claude          # also register MCP server in ~/.claude.json
+#        ./install.sh --local --with-claude  # build from source + register MCP server
 
 set -euo pipefail
 
@@ -29,10 +31,12 @@ PORT=8417
 OS="$(uname -s)"
 ARCH="$(uname -m)"
 LOCAL=false
+WITH_CLAUDE=false
 
 for arg in "$@"; do
   case "$arg" in
     --local) LOCAL=true ;;
+    --with-claude) WITH_CLAUDE=true ;;
     *) echo "Unknown option: $arg"; exit 1 ;;
   esac
 done
@@ -195,21 +199,26 @@ else
 fi
 
 # -- Claude Code MCP registration ---------------------------------------------
-# Writes the MCP server entry into ~/.claude.json so Claude Code can discover
-# the running daemon. Safe to run on upgrades — the binary handles idempotency.
+# Only when --with-claude is passed. Writes the MCP server entry into
+# ~/.claude.json and adds permissions to ~/.claude/settings.json.
 
-echo "==> Configuring Claude Code MCP server..."
-"$BINARY_PATH" --register --port "$PORT"
+if [ "$WITH_CLAUDE" = true ]; then
+  echo "==> Configuring Claude Code MCP server..."
+  "$BINARY_PATH" --register --port "$PORT"
+fi
 
 echo ""
 echo "Done! build-watcher is installed and running."
 echo ""
 echo "  Daemon:   $INSTALL_DIR/$BINARY_NAME"
 echo "  CLI:      $INSTALL_DIR/bw"
-echo "  MCP:      http://127.0.0.1:$PORT/mcp"
 echo "  Config:   $CONFIG_FILE"
 echo "  State:    ~/.local/state/build-watcher/watches.json"
-echo ""
-echo "All Claude Code sessions share the same watcher daemon."
-echo "Watches persist across restarts."
-echo "Restart Claude Code to pick up the new MCP server."
+if [ "$WITH_CLAUDE" = true ]; then
+  echo "  MCP:      http://127.0.0.1:$PORT/mcp (registered in Claude Code)"
+  echo ""
+  echo "Restart Claude Code to pick up the MCP server."
+else
+  echo ""
+  echo "To register the MCP server with Claude Code, re-run with --with-claude."
+fi
