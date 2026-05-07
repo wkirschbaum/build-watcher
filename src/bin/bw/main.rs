@@ -48,8 +48,8 @@ fn try_existing_daemon() -> Option<DaemonClient> {
         .map(|_| DaemonClient::new(port))
 }
 
-/// Start the daemon process (fire and forget).
-fn start_daemon() -> Result<(), Box<dyn std::error::Error>> {
+/// Start the daemon process (fire and forget). Forwards `--config-dir` when given.
+fn start_daemon(config_dir: Option<&std::path::Path>) -> Result<(), Box<dyn std::error::Error>> {
     let exe = std::env::current_exe()?;
     let daemon_bin = exe
         .parent()
@@ -64,8 +64,11 @@ fn start_daemon() -> Result<(), Box<dyn std::error::Error>> {
         .into());
     }
 
-    std::process::Command::new(&daemon_bin)
-        .stdin(std::process::Stdio::null())
+    let mut cmd = std::process::Command::new(&daemon_bin);
+    if let Some(d) = config_dir {
+        cmd.args(["--config-dir", &d.to_string_lossy()]);
+    }
+    cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
@@ -146,15 +149,36 @@ fn run_remote_script(script: &str, label: &str) -> Result<(), Box<dyn std::error
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    if std::env::args().any(|a| a == "--reset-state") {
+    let args: Vec<String> = std::env::args().collect();
+
+    // Parse --config-dir first so state_dir()/config_dir() point to the right
+    // location before any other flag (including --reset-state) accesses them.
+    let config_dir_arg: Option<std::path::PathBuf> = args
+        .windows(2)
+        .find(|w| w[0] == "--config-dir")
+        .map(|w| std::path::PathBuf::from(&w[1]));
+
+    if let Some(ref d) = config_dir_arg
+        && let Err(e) = build_watcher::dirs::init(d.clone(), d.join("state"))
+    {
+        eprintln!("error: {e}");
+        std::process::exit(1);
+    }
+
+    if args.iter().any(|a| a == "--reset-state") {
         return reset_state();
     }
-    if std::env::args().any(|a| a == "--uninstall") {
+    if args.iter().any(|a| a == "--uninstall") {
         return run_remote_script("uninstall.sh", "uninstall");
     }
-    if std::env::args().any(|a| a == "--update") {
+    if args.iter().any(|a| a == "--update") {
         return run_remote_script("install.sh", "update");
     }
+
+    let config_dir_label = config_dir_arg
+        .as_ref()
+        .and_then(|d| d.file_name())
+        .map(|n| n.to_string_lossy().into_owned());
 
     // Shared channel for SSE events and background action results.
     let (sse_tx, mut sse_rx) = mpsc::channel::<SseUpdate>(64);
@@ -164,7 +188,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(client)
     } else {
         eprintln!("Daemon not running, starting build-watcher…");
-        start_daemon()?;
+        start_daemon(config_dir_arg.as_deref())?;
         tokio::spawn(wait_for_daemon(sse_tx.clone()));
         None
     };
@@ -220,6 +244,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         initial_history,
         prefs,
         sse_tx.clone(),
+        config_dir_label,
     );
 
     if daemon.is_none() {

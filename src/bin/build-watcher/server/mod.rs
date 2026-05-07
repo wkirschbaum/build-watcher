@@ -194,7 +194,7 @@ pub fn acquire_instance_lock() -> Result<std::fs::File, ServerError> {
         let os_err = std::io::Error::last_os_error();
         return Err(ServerError::Other(format!(
             "Another build-watcher instance is already running ({os_err}). \
-             Stop it first, or set BUILD_WATCHER_PORT to run a separate instance."
+             Stop it first, or use --config-dir to run a separate instance."
         )));
     }
 
@@ -254,16 +254,14 @@ fn build_router(state: DaemonState, ct: &CancellationToken) -> axum::Router {
 ///
 /// Binds to the configured port, writes a port-discovery file, serves until
 /// ctrl-c, then shuts down pollers and persists state.
+///
+/// Pass `port = 0` to let the OS pick a free port (used for `--config-dir` instances).
 pub async fn serve(
     state: DaemonState,
     ct: CancellationToken,
     _lock: std::fs::File,
+    port: u16,
 ) -> Result<(), ServerError> {
-    let port: u16 = std::env::var("BUILD_WATCHER_PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(DEFAULT_PORT);
-
     let router = build_router(state.clone(), &ct);
     let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{port}"))
         .await
@@ -294,15 +292,21 @@ pub async fn serve(
         }
     };
 
+    // After binding, resolve the real port (important when port=0, where the OS picks).
+    let bound_port = listener
+        .local_addr()
+        .map(|a| a.port())
+        .unwrap_or(port);
+
     let port_file = state_dir().join("port");
-    std::fs::write(&port_file, port.to_string()).map_err(|e| {
+    std::fs::write(&port_file, bound_port.to_string()).map_err(|e| {
         ServerError::Other(format!(
             "Failed to write port file {}: {e}",
             port_file.display()
         ))
     })?;
 
-    tracing::info!("build-watcher listening on http://127.0.0.1:{port}/mcp");
+    tracing::info!("build-watcher listening on http://127.0.0.1:{bound_port}/mcp");
 
     let sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate());
 

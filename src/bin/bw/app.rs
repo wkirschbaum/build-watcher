@@ -218,6 +218,8 @@ pub(crate) struct App {
     pub(crate) show_help: bool,
     /// Whether to show the recent builds panel at the bottom.
     pub(crate) show_recent_panel: bool,
+    /// Basename of the `--config-dir` when a non-default instance is in use.
+    pub(crate) config_dir_label: Option<String>,
 }
 
 impl App {
@@ -227,6 +229,7 @@ impl App {
         recent_history: Vec<HistoryEntryView>,
         prefs: TuiPrefs,
         bg_tx: mpsc::Sender<SseUpdate>,
+        config_dir_label: Option<String>,
     ) -> Self {
         Self {
             status,
@@ -248,6 +251,7 @@ impl App {
             update_available: None,
             show_help: prefs.show_help,
             show_recent_panel: prefs.show_recent_panel,
+            config_dir_label,
         }
     }
 

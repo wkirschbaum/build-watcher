@@ -1056,15 +1056,21 @@ pub(crate) fn render_header(frame: &mut ratatui::Frame, area: ratatui::layout::R
             Style::default().fg(Color::Yellow),
         ));
     }
+    let instance_label = app
+        .config_dir_label
+        .as_deref()
+        .map(|l| format!(" [{l}]"))
+        .unwrap_or_default();
+    let left_prefix = format!("build-watcher{instance_label}");
     let left_suffix = format!(" — up {uptime}");
     let right = format!("{poll}  {api}");
     let indicators_len: usize = indicators.iter().map(|s| s.content.len()).sum();
-    let left_len = "build-watcher".len() + left_suffix.len();
+    let left_len = left_prefix.len() + left_suffix.len();
     let gap = w.saturating_sub(left_len + right.len() + indicators_len);
 
     let mut spans = vec![
         Span::styled(
-            "build-watcher",
+            left_prefix,
             Style::default().add_modifier(Modifier::BOLD),
         ),
         Span::raw(left_suffix),

@@ -62,6 +62,18 @@ pub fn state_dir() -> &'static Path {
     })
 }
 
+/// Pre-initialise both directories from explicit paths (e.g. from `--config-dir`).
+///
+/// Must be called before any `state_dir()` or `config_dir()` access. Creates the
+/// directories on disk. Returns an error if creation fails.
+pub fn init(config_dir: PathBuf, state_dir: PathBuf) -> Result<(), String> {
+    init_dir(&config_dir)?;
+    init_dir(&state_dir)?;
+    let _ = CONFIG_DIR.set(config_dir);
+    let _ = STATE_DIR.set(state_dir);
+    Ok(())
+}
+
 pub fn config_dir() -> &'static Path {
     CONFIG_DIR.get_or_init(|| {
         let dir = PathBuf::from(
