@@ -293,10 +293,7 @@ pub async fn serve(
     };
 
     // After binding, resolve the real port (important when port=0, where the OS picks).
-    let bound_port = listener
-        .local_addr()
-        .map(|a| a.port())
-        .unwrap_or(port);
+    let bound_port = listener.local_addr().map(|a| a.port()).unwrap_or(port);
 
     let port_file = state_dir().join("port");
     std::fs::write(&port_file, bound_port.to_string()).map_err(|e| {

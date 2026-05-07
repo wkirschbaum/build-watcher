@@ -85,9 +85,8 @@ Once installed, the MCP server is registered in `~/.claude.json` and available t
 | `stop_watches` | Remove repos and stop watching |
 | `list_watches` | Show all watched repos and their status |
 | `configure_branches` | Set branches for a repo, or omit repo to set global defaults. Supports `auto_discover_branches` and `branch_filter` (regex) |
-| `configure_repo` | Set per-repo workflow allow-list, display alias, and PR watching |
-| `configure_ignored_workflows` | Add/remove from the global workflow ignore list |
-| `configure_ignored_events` | Add/remove from the global or per-repo event ignore list (e.g. `schedule`, `workflow_dispatch`) |
+| `configure_repo` | Set per-repo workflow allow-list, display alias, PR watching, branch filter, and ignored events |
+| `configure_ignored_events` | Add/remove workflow names (`kind: "workflow"`) or GitHub event types (`kind: "event"`, e.g. `schedule`, `workflow_dispatch`) from the global or per-repo ignore list |
 | `update_notifications` | Set levels, quiet hours, and pause/resume in one call |
 | `rerun_build` | Rerun a failed build (specific ID or last failed) |
 | `build_history` | Show recent builds for a repo with duration and age |
@@ -177,7 +176,7 @@ Enable per-repo with the `c` key (repo config → Watch PRs: yes). When enabled,
 | `↓` | Yellow | Behind base branch |
 | `~` | Gray suffix | Draft PR |
 
-Multiple open PRs are shown individually. Desktop notifications fire when a PR transitions to "ready to merge". Press `m` on a branch row to open the merge popup — a single PR shows a confirmation dialog, multiple PRs show a picker first. Press `Enter` to confirm or `Esc` to cancel.
+Multiple open PRs are shown individually. Desktop notifications fire when a PR transitions to "ready to merge". Press `M` on a branch row to open the merge popup — a single PR shows a confirmation dialog, multiple PRs show a picker first. Press `Enter` to confirm or `Esc` to cancel.
 
 ## Configuration
 
@@ -250,10 +249,27 @@ The default `"medium"` aggression targets ≤40% of GitHub's 5000 req/hr rate-li
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `BUILD_WATCHER_PORT` | `8417` | HTTP port for the MCP server |
-| `STATE_DIRECTORY` | `~/.local/state/build-watcher/` | Runtime state directory |
-| `CONFIGURATION_DIRECTORY` | `~/.config/build-watcher/` | Config directory |
+| `BUILD_WATCHER_PORT` | `8417` | HTTP port for the default daemon instance (ignored when `--config-dir` is used) |
+| `STATE_DIRECTORY` | `~/.local/state/build-watcher/` | Runtime state directory (overridden by `--config-dir`) |
+| `CONFIGURATION_DIRECTORY` | `~/.config/build-watcher/` | Config directory (overridden by `--config-dir`) |
 | `RUST_LOG` | `build_watcher=info` | Log level |
+
+### Multiple instances
+
+Run separate `build-watcher` instances simultaneously — useful for watching repos across multiple GitHub accounts or for isolated project sets:
+
+```sh
+build-watcher --config-dir ~/.config/build-watcher-work
+build-watcher --config-dir ~/.config/build-watcher-personal
+```
+
+Each instance gets its own `config.json` and a `state/` subdirectory containing the socket, lock, port file, and watch state. Custom instances use an OS-assigned port so there are no collisions. Connect `bw` to a specific instance:
+
+```sh
+bw --config-dir ~/.config/build-watcher-work
+```
+
+The TUI header shows `build-watcher [work]` when a non-default instance is active. `bw --reset-state --config-dir <path>` resets state for the specified instance.
 
 ## REST API
 
@@ -261,6 +277,7 @@ The daemon exposes REST endpoints on the same port for the TUI and other consume
 
 | Endpoint | Method | Description |
 | --- | --- | --- |
+| `/version` | GET | Daemon version and API version |
 | `/status` | GET | JSON snapshot of all watches, active runs, and last builds |
 | `/stats` | GET | Daemon stats: uptime, poll interval, API rate limit |
 | `/events` | GET | SSE stream of watch events (RunStarted, RunCompleted, StatusChanged) |
@@ -268,6 +285,8 @@ The daemon exposes REST endpoints on the same port for the TUI and other consume
 | `/notifications` | POST | Mute, unmute, or set per-event levels for a repo/branch |
 | `/defaults` | GET | Global config defaults (branches, ignored workflows, auto-discover, branch filter) |
 | `/defaults` | POST | Update global config defaults |
+| `/repo-config` | GET | Per-repo config for `?repo=owner/name` |
+| `/repo-config` | POST | Update per-repo config fields |
 | `/history` | GET | Build history for a repo (`?repo=&branch=&limit=`) |
 | `/history/all` | GET | Recent builds across all repos (`?limit=`) |
 | `/watch` | POST | Add a repo to watches |

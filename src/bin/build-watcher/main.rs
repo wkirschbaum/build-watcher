@@ -22,7 +22,9 @@ use tracing_subscriber::EnvFilter;
 use config::{ConfigManager, ConfigPersistence};
 
 fn parse_flag<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
-    args.windows(2).find(|w| w[0] == flag).map(|w| w[1].as_str())
+    args.windows(2)
+        .find(|w| w[0] == flag)
+        .map(|w| w[1].as_str())
 }
 
 #[tokio::main]
@@ -121,5 +123,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap_or(server::DEFAULT_PORT)
     };
 
-    server::serve(state, ct, lock, port).await.map_err(|e| e.into())
+    server::serve(state, ct, lock, port)
+        .await
+        .map_err(|e| e.into())
 }

@@ -1069,10 +1069,7 @@ pub(crate) fn render_header(frame: &mut ratatui::Frame, area: ratatui::layout::R
     let gap = w.saturating_sub(left_len + right.len() + indicators_len);
 
     let mut spans = vec![
-        Span::styled(
-            left_prefix,
-            Style::default().add_modifier(Modifier::BOLD),
-        ),
+        Span::styled(left_prefix, Style::default().add_modifier(Modifier::BOLD)),
         Span::raw(left_suffix),
         Span::raw(" ".repeat(gap)),
         Span::styled(right, dim),

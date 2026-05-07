@@ -1,4 +1,4 @@
-# Road to 1.0.0
+# Road to 1.0.0 ✓ shipped 2026-05-07
 
 ## Must do
 
@@ -13,7 +13,7 @@
 
 - [x] **Troubleshooting section in README** — covers auth, daemon not running, rate limit, Linux notification daemon, macOS terminal-notifier, and stale state.
 - [x] **Make `default_branches` settable via REST/MCP** — added `default_branches` to `Config`, `/defaults` GET/POST, TUI global config form (`C` key), and `branches_for` fallback.
-- [x] **Standardize MCP tool descriptions** — all 13 tools now follow: summary line + defaults + gotchas format.
+- [x] **Standardize MCP tool descriptions** — all 12 tools now follow: summary line + defaults + gotchas format.
 - [x] **Hide auto-managed config fields** — added note in README explaining `discovered_branches` is auto-managed and should not be edited by hand.
 - [x] **Poll aggression guidance** — README now explains when to use low/high, what happens at 0% remaining, and reset behavior.
 

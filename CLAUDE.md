@@ -19,10 +19,11 @@ cargo clippy                # Lint
 
 **Before every commit:** run `cargo fmt && cargo clippy && cargo test` and fix all issues first.
 
+**Flags:**
+- `--config-dir <path>` — use a custom config directory (state dir = `<path>/state/`). Enables running multiple daemon instances simultaneously. Port 0 (OS-assigned) is used automatically to avoid collisions.
+
 **Environment variables:**
-- `BUILD_WATCHER_PORT` (default: `8417`) — HTTP port for the MCP server
-- `STATE_DIRECTORY` (default: `~/.local/state/build-watcher/`) — runtime state
-- `CONFIGURATION_DIRECTORY` (default: `~/.config/build-watcher/`) — config dir
+- `BUILD_WATCHER_PORT` (default: `8417`) — HTTP port for the MCP server; ignored when `--config-dir` is used
 - `RUST_LOG` (default: `build_watcher=info`) — log level
 
 ## Architecture
@@ -32,7 +33,7 @@ cargo clippy                # Lint
 - `src/bin/build-watcher/main.rs` — Daemon entry point, wires up config, watches, event bus, and server
 - `src/bin/build-watcher/server/` — Server module directory:
   - `mod.rs` — `DaemonState`, axum router setup, `build_watch_snapshot()`, instance lock, `serve()`
-  - `mcp.rs` — MCP tool handlers (`BuildWatcher` struct, 13 tools)
+  - `mcp.rs` — MCP tool handlers (`BuildWatcher` struct, 12 tools)
   - `rest.rs` — REST/SSE endpoints (`/status`, `/stats`, `/events`, `/pause`, `/rerun`, etc.)
   - `actions.rs` — MCP tool action implementations, `persist_config()`
   - `schema.rs` — JSON schema definitions for tool parameters
@@ -67,11 +68,11 @@ cargo clippy                # Lint
 - `src/history.rs` — Build history management (per repo/branch, capped ring buffer)
 - `src/persistence.rs` — `Persistence` trait, crash-safe `save_json`/`load_json`, draft recovery (`recover_draft`)
 - `src/status.rs` — Shared HTTP response types (`StatusResponse`, `StatsResponse`) used by both daemon and TUI
-- `src/dirs.rs` — `config_dir()` and `state_dir()` helpers
+- `src/dirs.rs` — `config_dir()`, `state_dir()`, and `init()` helpers (pre-populate OnceLocks for `--config-dir` multi-instance support)
 
 ### How it works
 
-The `BuildWatcher` struct implements 13 MCP tools. When a repo is watched, it spawns an async tokio task per repo that polls GitHub via direct HTTP (`reqwest` with connection pooling and ETag-based conditional requests). Falls back to the `gh` CLI if the OAuth token cannot be obtained at startup. Events are emitted onto a broadcast `EventBus`; a notification handler subscribes, debounces (3s per repo/branch/kind), coalesces multiple workflows into summary notifications, throttles (10/60s), and dispatches desktop notifications based on config and pause/quiet-hours state.
+The `BuildWatcher` struct implements 12 MCP tools. When a repo is watched, it spawns an async tokio task per repo that polls GitHub via direct HTTP (`reqwest` with connection pooling and ETag-based conditional requests). Falls back to the `gh` CLI if the OAuth token cannot be obtained at startup. Events are emitted onto a broadcast `EventBus`; a notification handler subscribes, debounces (3s per repo/branch/kind), coalesces multiple workflows into summary notifications, throttles (10/60s), and dispatches desktop notifications based on config and pause/quiet-hours state.
 
 **Polling:** Single poll interval (minimum 5s) scales dynamically based on the GitHub API rate-limit budget and the configured aggression level. ETag caching means unchanged responses return `304 Not Modified` at zero rate-limit cost, so idle repos are essentially free to poll. The `gh` CLI must be authenticated (`gh auth login`) for token acquisition.
 

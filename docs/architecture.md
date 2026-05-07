@@ -167,7 +167,7 @@ watch_builds (MCP/REST)
        ▼
   start_watch()
        │
-       ├── fetch recent runs via gh
+       ├── fetch recent runs via reqwest
        ├── apply workflow filters
        ├── set last_seen_run_id to highest
        ├── record any in-progress runs
@@ -238,6 +238,7 @@ All JSON files use crash-safe writes:
 
 | Endpoint | Method | Purpose |
 |----------|--------|---------|
+| `/version` | GET | Daemon version and API version |
 | `/status` | GET | JSON snapshot of all watches, active runs, last builds, PRs |
 | `/stats` | GET | Daemon stats: uptime, poll interval, API rate limit |
 | `/events` | GET | SSE stream of `WatchEvent`s |
@@ -245,6 +246,8 @@ All JSON files use crash-safe writes:
 | `/notifications` | POST | Mute, unmute, or set per-event levels |
 | `/defaults` | GET | Global config defaults |
 | `/defaults` | POST | Update global config defaults |
+| `/repo-config` | GET | Per-repo config for `?repo=owner/name` |
+| `/repo-config` | POST | Update per-repo config fields |
 | `/history` | GET | Build history for a repo (`?repo=&branch=&limit=`) |
 | `/history/all` | GET | Recent builds across all repos |
 | `/watch` | POST | Add repos to watches |

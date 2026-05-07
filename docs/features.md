@@ -36,8 +36,8 @@ Notifications can be temporarily paused for a specified number of minutes or ind
 
 Two complementary filters control which workflows trigger notifications:
 
-- **Per-repo allow-list**: Only track workflows matching the specified names (case-insensitive). An empty list means all workflows. Set via `configure_workflows`.
-- **Global ignore-list**: Globally suppress workflows by name across all repos (case-insensitive). Useful for noisy workflows like Semgrep or Dependabot. Managed via `ignore_workflows` / `unignore_workflows`.
+- **Per-repo allow-list**: Only track workflows matching the specified names (case-insensitive). An empty list means all workflows. Set via `configure_repo`.
+- **Global ignore-list**: Globally suppress workflows by name across all repos (case-insensitive). Useful for noisy workflows like Semgrep or Dependabot. Managed via `configure_ignored_events` with `kind: "workflow"`.
 
 Both filters apply at poll time — the ignore-list is checked first, then the allow-list.
 
@@ -82,11 +82,11 @@ An internal broadcast channel decouples the polling loop from notification dispa
 
 ## MCP Server (Model Context Protocol)
 
-Runs as an HTTP server exposing tools via the MCP protocol, allowing Claude Code to manage watches interactively. The server uses `rmcp` with Streamable HTTP transport over `axum`. Tools exposed: `watch_builds`, `stop_watches`, `list_watches`, `configure_branches`, `configure_repo`, `configure_ignored_workflows`, `update_notifications`, `rerun_build`, `build_history`, `get_stats`, `set_poll_aggression` (11 tools). All tool parameters support double-encoded JSON arrays (a workaround for MCP clients that stringify array parameters).
+Runs as an HTTP server exposing tools via the MCP protocol, allowing Claude Code to manage watches interactively. The server uses `rmcp` with Streamable HTTP transport over `axum`. Tools exposed: `watch_builds`, `watch_from_git_remote`, `stop_watches`, `list_watches`, `configure_branches`, `configure_repo`, `configure_ignored_events`, `update_notifications`, `rerun_build`, `build_history`, `get_stats`, `set_poll_aggression` (12 tools). All tool parameters support double-encoded JSON arrays (a workaround for MCP clients that stringify array parameters).
 
-## Port Binding with Fallback
+## Port Binding
 
-The MCP server binds to a preferred port (default 8417, configurable via `BUILD_WATCHER_PORT`), falling back to up to 9 consecutive higher ports if the preferred port is occupied. The actual bound port is written to `~/.local/state/build-watcher/port` for discovery by other tools.
+The default instance binds to port 8417 (configurable via `BUILD_WATCHER_PORT`). Instances started with `--config-dir` use port 0 (OS-assigned), so multiple instances never collide. The actual bound port is written to the `port` file in the state directory for discovery by `bw` and other tools.
 
 ## Self-Update
 

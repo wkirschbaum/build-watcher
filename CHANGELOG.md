@@ -1,5 +1,33 @@
 # Changelog
 
+## [1.0.0] - 2026-05-07
+
+### Added
+
+- **`--config-dir <path>` flag** — run multiple daemon instances simultaneously. Config lives at `<path>/config.json`, state (socket, lock, port, watches) under `<path>/state/`. Custom instances use an OS-assigned port (no collisions). `bw --config-dir <path>` connects to the matching daemon and shows `[name]` in the header. Both `bw --reset-state` and auto-start correctly propagate the flag.
+
+### Changed
+
+- First stable release. All items on the pre-1.0 roadmap are complete.
+
+## [0.20.0] - 2026-05-07
+
+### Added
+
+- **Unix domain socket IPC** — daemon listens on `daemon.sock` alongside TCP; `bw` prefers the socket for lower-latency local connections with graceful TCP fallback.
+- **`GET /version` endpoint** — returns daemon version and API version for client compatibility checks.
+- **`GET/POST /repo-config` endpoints** — read and write per-repo config (branches, notifications, ignored events, alias, watch PRs, poll aggression, branch filter).
+
+### Changed
+
+- **`configure_ignored_events` replaces `configure_ignored_workflows`** — single tool now handles both GitHub event types (`schedule`, `workflow_dispatch`, etc.) via `kind: "event"` and workflow names via `kind: "workflow"`. Supports per-repo scoping for events.
+- **`--with-claude` required for MCP registration** — `build-watcher --register` no longer modifies `~/.claude.json` by default; pass `--with-claude` explicitly.
+- **`auto_discover_branches` and `watch_prs` default to `true`** for new repos.
+- **`discovered_branches` migrated to state file** — auto-discovered branches moved from `config.json` to `discovered.json` in the state directory; existing installs migrate automatically.
+- **Versioned watch state** — `watches.json` stored as `{ schema_version, watches }`; legacy flat-map format migrated automatically on first load.
+- **`configure_repo` MCP tool complete** — now exposes `auto_discover_branches`, `branch_filter`, and `ignored_events` for per-repo configuration.
+- **Typed `RunConclusion`, `RunStatus`, `PollAggression`** — proper Rust enums with serde-derived JSON; `StatsResponse::poll_aggression` is now typed.
+
 ## [0.19.2] - 2026-04-29
 
 ### Added
@@ -275,7 +303,12 @@
 
 - Avoid unnecessary config re-save on reads; improve persistence error logging
 
+[1.0.0]: https://github.com/wkirschbaum/build-watcher/releases/tag/v1.0.0
+[0.20.0]: https://github.com/wkirschbaum/build-watcher/releases/tag/v0.20.0
 [0.19.2]: https://github.com/wkirschbaum/build-watcher/releases/tag/v0.19.2
+[0.19.1]: https://github.com/wkirschbaum/build-watcher/releases/tag/v0.19.1
+[0.19.0]: https://github.com/wkirschbaum/build-watcher/releases/tag/v0.19.0
+[0.18.4]: https://github.com/wkirschbaum/build-watcher/releases/tag/v0.18.4
 [0.18.3]: https://github.com/wkirschbaum/build-watcher/releases/tag/v0.18.3
 [0.18.2]: https://github.com/wkirschbaum/build-watcher/releases/tag/v0.18.2
 [0.18.1]: https://github.com/wkirschbaum/build-watcher/releases/tag/v0.18.1
