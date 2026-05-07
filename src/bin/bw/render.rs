@@ -1056,7 +1056,6 @@ pub(crate) fn render_header(frame: &mut ratatui::Frame, area: ratatui::layout::R
             Style::default().fg(Color::Yellow),
         ));
     }
-
     let left_suffix = format!(" — up {uptime}");
     let right = format!("{poll}  {api}");
     let indicators_len: usize = indicators.iter().map(|s| s.content.len()).sum();

@@ -143,24 +143,18 @@ pub(crate) struct ConfigureRepoParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-pub(crate) struct ConfigureIgnoredWorkflowsParams {
-    /// Workflow names to add to the global ignore list (case-insensitive)
-    #[serde(default, deserialize_with = "deserialize_string_or_vec")]
-    pub add: Vec<String>,
-    /// Workflow names to remove from the global ignore list (case-insensitive)
-    #[serde(default, deserialize_with = "deserialize_string_or_vec")]
-    pub remove: Vec<String>,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
 pub(crate) struct ConfigureIgnoredEventsParams {
-    /// Event types to add to the ignore list (case-insensitive), e.g. "schedule", "workflow_dispatch"
+    /// What to ignore: "event" (default) for GitHub event types (e.g. schedule, workflow_dispatch),
+    /// or "workflow" for workflow names (e.g. Semgrep, Dependabot). Matching is case-insensitive.
+    pub kind: Option<String>,
+    /// Names to add to the ignore list
     #[serde(default, deserialize_with = "deserialize_string_or_vec")]
     pub add: Vec<String>,
-    /// Event types to remove from the ignore list (case-insensitive)
+    /// Names to remove from the ignore list
     #[serde(default, deserialize_with = "deserialize_string_or_vec")]
     pub remove: Vec<String>,
     /// Optional repo scope in "owner/repo" format. Omit to modify the global ignore list.
+    /// Only applies when kind="event".
     pub repo: Option<String>,
 }
 

@@ -19,9 +19,9 @@ use super::actions::{
 };
 use super::build_watch_snapshot;
 use super::schema::{
-    BuildHistoryParams, ConfigureBranchesParams, ConfigureIgnoredEventsParams,
-    ConfigureIgnoredWorkflowsParams, ConfigureRepoParams, ReposParams, RerunBuildParams,
-    SetPollAggressionParams, UpdateNotificationsParams, WatchFromGitRemoteParams,
+    BuildHistoryParams, ConfigureBranchesParams, ConfigureIgnoredEventsParams, ConfigureRepoParams,
+    ReposParams, RerunBuildParams, SetPollAggressionParams, UpdateNotificationsParams,
+    WatchFromGitRemoteParams,
 };
 
 #[derive(Clone)]
@@ -421,50 +421,11 @@ impl BuildWatcher {
         )]))
     }
 
-    #[tool(
-        description = "Add to or remove from the global workflow ignore list. \
-                       Ignored workflows are never tracked or notified across all repos; matching is case-insensitive. \
-                       Pass add and/or remove — at least one must be non-empty. \
-                       Common candidates: 'Semgrep', 'Dependabot', 'CodeQL'."
-    )]
-    async fn configure_ignored_workflows(
-        &self,
-        Parameters(params): Parameters<ConfigureIgnoredWorkflowsParams>,
-    ) -> Result<CallToolResult, McpError> {
-        if params.add.is_empty() && params.remove.is_empty() {
-            return Ok(CallToolResult::error(vec![Content::text(
-                "at least one of add or remove must be non-empty",
-            )]));
-        }
-
-        let add = params.add;
-        let remove = params.remove;
-        let result = self
-            .state
-            .config
-            .modify(|config| {
-                modify_ignore_list(&mut config.ignored_workflows, &add, &remove, "workflow")
-            })
-            .await;
-        let msgs = match result {
-            Ok(m) => m,
-            Err(e) => vec![format!(
-                "\u{26a0}\u{fe0f} Warning: config could not be saved to disk: {e}"
-            )],
-        };
-
-        Ok(CallToolResult::success(vec![Content::text(
-            msgs.join("\n"),
-        )]))
-    }
-
-    #[tool(
-        description = "Add to or remove from the ignored GitHub event type list. \
-                       Runs triggered by ignored events are never tracked or notified; matching is case-insensitive. \
-                       Common events: push, pull_request, schedule, workflow_dispatch. \
-                       Pass add and/or remove — at least one must be non-empty. \
-                       Default: global scope; pass repo to scope to a single repo."
-    )]
+    #[tool(description = "Add to or remove from an ignore list. \
+                       kind='event' (default): ignore by GitHub event type (push, pull_request, schedule, workflow_dispatch, …); \
+                         global scope by default, pass repo to scope to a single repo. \
+                       kind='workflow': ignore by workflow name (Semgrep, Dependabot, CodeQL, …); always global scope. \
+                       Pass add and/or remove — at least one must be non-empty. Matching is case-insensitive.")]
     async fn configure_ignored_events(
         &self,
         Parameters(params): Parameters<ConfigureIgnoredEventsParams>,
@@ -474,7 +435,16 @@ impl BuildWatcher {
                 "at least one of add or remove must be non-empty",
             )]));
         }
-        if let Some(repo) = &params.repo
+
+        let kind = params.kind.as_deref().unwrap_or("event");
+        if kind != "event" && kind != "workflow" {
+            return Ok(CallToolResult::error(vec![Content::text(
+                "kind must be 'event' or 'workflow'",
+            )]));
+        }
+
+        if kind == "event"
+            && let Some(repo) = &params.repo
             && let Err(e) = validate_repo(repo)
         {
             return Ok(CallToolResult::error(vec![Content::text(e)]));
@@ -487,15 +457,19 @@ impl BuildWatcher {
             .state
             .config
             .modify(|config| {
-                let list = if let Some(ref repo) = repo {
-                    &mut config.repos.entry(repo.clone()).or_default().ignored_events
+                if kind == "workflow" {
+                    modify_ignore_list(&mut config.ignored_workflows, &add, &remove, "workflow")
                 } else {
-                    &mut config.ignored_events
-                };
-                let scope = repo.as_deref().unwrap_or("global");
-                let mut msgs = modify_ignore_list(list, &add, &remove, "event");
-                msgs.push(format!("Scope: {scope}"));
-                msgs
+                    let list = if let Some(ref repo) = repo {
+                        &mut config.repos.entry(repo.clone()).or_default().ignored_events
+                    } else {
+                        &mut config.ignored_events
+                    };
+                    let scope = repo.as_deref().unwrap_or("global");
+                    let mut msgs = modify_ignore_list(list, &add, &remove, "event");
+                    msgs.push(format!("Scope: {scope}"));
+                    msgs
+                }
             })
             .await;
         let msgs = match result {
