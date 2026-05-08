@@ -248,9 +248,23 @@ impl RepoPoller {
                 self.read_config().await
             };
 
+            let wall_before = unix_now();
             match self.cancellable_sleep(Duration::from_secs(delay)).await {
                 WakeReason::Cancelled => return,
                 WakeReason::ConfigChanged | WakeReason::Elapsed => {}
+            }
+            // If wall time advanced much more than the expected sleep duration, the
+            // system was suspended. Reset watches so the next check_for_new_runs call
+            // silently seeds state rather than notifying for builds that completed
+            // during sleep. (active_runs are preserved and still processed normally.)
+            if unix_now().saturating_sub(wall_before) > delay + 30 {
+                tracing::info!(repo = %self.repo, "System wake detected; suppressing first post-wake poll");
+                let mut w = self.watches.lock().await;
+                for (key, entry) in w.iter_mut() {
+                    if key.matches_repo(&self.repo) {
+                        entry.waiting = true;
+                    }
+                }
             }
 
             if !self.has_any_watches().await {
