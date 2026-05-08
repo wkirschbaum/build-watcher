@@ -431,6 +431,13 @@ pub(crate) async fn set_repo_config_handler(
         return json_error(e);
     }
 
+    if let Some(filter) = &body.branch_filter
+        && !filter.is_empty()
+        && let Err(e) = regex::Regex::new(filter)
+    {
+        return json_error(format!("invalid branch filter regex: {e}"));
+    }
+
     let result = state
         .config
         .modify(|cfg| {
@@ -592,12 +599,14 @@ mod tests {
     use build_watcher::config::{
         ConfigManager, ConfigPersistence, NotificationLevel, SharedConfigManager,
     };
-    use build_watcher::events::{EventBus, RunSnapshot, WatchEvent};
+    use build_watcher::events::{EventBus, WatchEvent};
     use build_watcher::rate_limiter::MIN_POLL_SECS;
     use build_watcher::watcher::{PauseState, WatchEntry, WatchKey, Watches};
     use std::collections::HashMap;
     use std::sync::Arc;
     use tokio::sync::Mutex;
+
+    use crate::testutil::snap;
 
     fn null_config(config: build_watcher::config::Config) -> SharedConfigManager {
         Arc::new(ConfigManager::new(config, ConfigPersistence::Null))
@@ -776,22 +785,6 @@ mod tests {
         assert_eq!(resp.status(), 200);
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         serde_json::from_slice(&bytes).unwrap()
-    }
-
-    fn snap() -> RunSnapshot {
-        RunSnapshot {
-            repo: "alice/app".to_string(),
-            branch: "main".to_string(),
-            run_id: 42,
-            workflow: "CI".to_string(),
-            title: "Fix bug".to_string(),
-            event: "push".to_string(),
-            status: build_watcher::status::RunStatus::InProgress,
-            attempt: 1,
-            url: String::new(),
-            actor: None,
-            commit_author: None,
-        }
     }
 
     #[tokio::test]
@@ -1162,6 +1155,14 @@ mod tests {
         path: &str,
         body: &impl serde::Serialize,
     ) -> serde_json::Value {
+        json_post_with_status(router, path, body).await.1
+    }
+
+    async fn json_post_with_status(
+        router: &axum::Router,
+        path: &str,
+        body: &impl serde::Serialize,
+    ) -> (u16, serde_json::Value) {
         use http_body_util::BodyExt;
         use tower::ServiceExt;
         let req = http::Request::post(path)
@@ -1169,8 +1170,10 @@ mod tests {
             .body(axum::body::Body::from(serde_json::to_vec(body).unwrap()))
             .unwrap();
         let resp = router.clone().oneshot(req).await.unwrap();
+        let status = resp.status().as_u16();
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
-        serde_json::from_slice(&bytes).unwrap()
+        let json = serde_json::from_slice(&bytes).unwrap();
+        (status, json)
     }
 
     #[tokio::test]
@@ -1233,5 +1236,42 @@ mod tests {
             rc.poll_aggression,
             Some(build_watcher::config::PollAggression::High)
         );
+    }
+
+    #[tokio::test]
+    async fn set_repo_config_rejects_invalid_branch_filter_regex() {
+        let config = null_config(build_watcher::config::Config::default());
+        let router = repo_config_router(config.clone());
+
+        let body = build_watcher::status::RepoConfigView {
+            repo: "alice/app".to_string(),
+            alias: None,
+            workflows: None,
+            watch_prs: None,
+            poll_aggression: None,
+            clear_poll_aggression: None,
+            auto_discover_branches: None,
+            branch_filter: Some("[invalid regex".to_string()),
+            ignored_events: None,
+            branches: None,
+            notifications: None,
+        };
+        let resp = json_post(&router, "/repo-config", &body).await;
+        assert!(
+            resp.get("error").is_some(),
+            "expected error field, got: {resp}"
+        );
+        assert!(
+            resp["error"]
+                .as_str()
+                .unwrap()
+                .contains("invalid branch filter regex"),
+            "expected regex error message, got: {}",
+            resp["error"]
+        );
+
+        // Config should not have been modified.
+        let cfg = config.read().await;
+        assert!(!cfg.repos.contains_key("alice/app"));
     }
 }

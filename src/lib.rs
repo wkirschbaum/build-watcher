@@ -8,3 +8,6 @@ pub mod persistence;
 pub mod rate_limiter;
 pub mod status;
 pub mod watcher;
+
+#[cfg(test)]
+pub mod testutil;

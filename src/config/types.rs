@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -259,6 +260,10 @@ pub struct RepoConfig {
     /// Per-repo branch filter regex override. Falls back to the global setting when `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch_filter: Option<String>,
+    /// Compiled effective regex for `branch_filter` (per-repo or global fallback).
+    /// Populated by `Config::populate_compiled_filters()`. Not persisted.
+    #[serde(skip)]
+    pub compiled_branch_filter: Option<Arc<regex::Regex>>,
 }
 
 impl Default for RepoConfig {
@@ -274,6 +279,7 @@ impl Default for RepoConfig {
             poll_aggression: None,
             auto_discover_branches: None,
             branch_filter: None,
+            compiled_branch_filter: None,
         }
     }
 }
@@ -311,6 +317,10 @@ pub struct Config {
     pub default_branches: Vec<String>,
     #[serde(default)]
     pub repos: HashMap<String, RepoConfig>,
+    /// Compiled global `branch_filter` regex. Populated by `populate_compiled_filters()`.
+    /// Not persisted.
+    #[serde(skip)]
+    pub compiled_branch_filter: Option<Arc<regex::Regex>>,
 }
 
 impl Default for Config {
@@ -327,6 +337,7 @@ impl Default for Config {
             branch_filter: None,
             default_branches: Vec::new(),
             repos: HashMap::new(),
+            compiled_branch_filter: None,
         }
     }
 }

@@ -3,6 +3,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use build_watcher::config::NotificationLevel;
+use tokio_util::sync::CancellationToken;
 
 #[cfg(target_os = "linux")]
 mod linux;
@@ -36,8 +37,8 @@ pub trait Notifier: Send + Sync {
 }
 
 /// Detect and initialize the platform notification backend.
-pub async fn init() -> Arc<dyn Notifier> {
-    let n = imp::detect().await;
+pub async fn init(cancel: CancellationToken) -> Arc<dyn Notifier> {
+    let n = imp::detect(cancel).await;
     tracing::info!("Using notification backend: {}", n.name());
     Arc::from(n)
 }

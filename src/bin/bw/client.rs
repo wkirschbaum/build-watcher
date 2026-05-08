@@ -659,7 +659,12 @@ async fn feed_sse_chunk(
                 }
             }
         } else if let Some(data) = line.strip_prefix("data: ") {
-            *pending_data = Some(data.to_string());
+            if let Some(existing) = pending_data {
+                existing.push('\n');
+                existing.push_str(data);
+            } else {
+                *pending_data = Some(data.to_string());
+            }
         }
     }
 
@@ -700,4 +705,50 @@ pub(crate) fn open_browser(url: &str) {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::mpsc;
+
+    #[tokio::test]
+    async fn feed_sse_chunk_concatenates_multiline_data() {
+        // RFC 8895 says multiple "data:" lines in a single event are
+        // joined with newline before dispatch.
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut buf = String::new();
+        let mut pending: Option<String> = None;
+
+        // Simulate a valid two-line data event followed by a blank line.
+        // The two data lines should be joined as "line1\nline2".
+        let chunk = b"data: line1\ndata: line2\n\n";
+        feed_sse_chunk(chunk, &mut buf, &mut pending, &tx).await;
+
+        // We can't easily parse the WatchEvent here, but we can confirm
+        // the channel received exactly one message (the parse might fail
+        // since "line1\nline2" isn't valid JSON, but the concat happened).
+        // To test concat in isolation, inspect pending before blank line:
+        let mut buf2 = String::new();
+        let mut pending2: Option<String> = None;
+
+        // Feed just the two data lines without the blank line — pending should
+        // contain the concatenated string.
+        feed_sse_chunk(
+            b"data: first\ndata: second\n",
+            &mut buf2,
+            &mut pending2,
+            &tx,
+        )
+        .await;
+        assert_eq!(
+            pending2.as_deref(),
+            Some("first\nsecond"),
+            "multi-line data should be joined with newline"
+        );
+
+        drop(tx);
+        // Drain channel (the first chunk parse may fail but that's OK here).
+        while rx.try_recv().is_ok() {}
+    }
 }

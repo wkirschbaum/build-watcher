@@ -1,6 +1,6 @@
 [package]
 name = "build-watcher"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2024"
 license = "MIT"
 description = "Background daemon monitoring GitHub Actions builds with desktop notifications, MCP server, and live TUI dashboard"
@@ -42,6 +42,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 chrono = "0.4"
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+lru = "0.12"
 
 # Daemon-only
 rmcp = { version = "1", features = ["server", "transport-streamable-http-server", "macros"], optional = true }

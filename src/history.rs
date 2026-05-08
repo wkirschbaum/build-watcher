@@ -27,6 +27,9 @@ pub fn push_build(history: &mut BuildHistory, key: &WatchKey, build: LastBuild) 
 
 /// Returns `(branch, LastBuild)` pairs for `repo`, optionally filtered by `branch`,
 /// sorted newest-first by `completed_at`, limited to `limit` entries.
+///
+/// Entries with `completed_at = None` (abandoned/in-progress builds) sort last
+/// because `Reverse(None) < Reverse(Some(_))` under `Ord for Option`.
 pub fn history_for(
     history: &BuildHistory,
     repo: &str,
@@ -171,6 +174,25 @@ mod tests {
         let results = history_for(&hist, "alice/app", None, 10);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].1.run_id, 1);
+    }
+
+    #[test]
+    fn history_for_none_completed_at_sorts_last() {
+        let mut hist = BuildHistory::new();
+        let key = make_key("alice/app", "main");
+
+        // One build with a timestamp, one abandoned (None).
+        push_build(&mut hist, &key, make_build(1, Some(100)));
+        push_build(&mut hist, &key, make_build(2, None));
+
+        let results = history_for(&hist, "alice/app", None, 10);
+        assert_eq!(results.len(), 2);
+        // Timestamped build should come first.
+        assert_eq!(
+            results[0].1.run_id, 1,
+            "timestamped build should sort first"
+        );
+        assert_eq!(results[1].1.run_id, 2, "None completed_at should sort last");
     }
 
     #[test]

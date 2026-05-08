@@ -2,6 +2,8 @@ mod notification;
 mod platform;
 mod register;
 mod server;
+#[cfg(test)]
+mod testutil;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -68,17 +70,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pause: PauseState = Arc::new(Mutex::new(None));
     let rate_limit: RateLimitState = Arc::new(Mutex::new(None));
     let events = EventBus::new();
+    let ct = CancellationToken::new();
 
     // Subscribe before starting watches so no events are missed.
-    let notifier = platform::init().await;
+    let notifier = platform::init(ct.clone()).await;
     tokio::spawn(notification::run_notification_handler(
         events.subscribe(),
         config.clone(),
         pause.clone(),
         notifier,
     ));
-
-    let ct = CancellationToken::new();
     let gh: Arc<dyn GitHubClient> = match gh_auth_token().await {
         Ok(token) => {
             tracing::info!("Using direct HTTP client (reqwest)");

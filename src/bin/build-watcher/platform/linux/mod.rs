@@ -2,17 +2,20 @@
 // a wrapper with one extra (&self), triggering too_many_arguments on the expansion.
 #![allow(clippy::too_many_arguments)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 use futures_lite::StreamExt;
+use tokio_util::sync::CancellationToken;
 use zbus::Connection;
 use zbus::proxy;
 
 use crate::platform::{Notification, Notifier};
 use build_watcher::config::NotificationLevel;
+
+const MAX_ACTION_LISTENERS: usize = 20;
 
 // -- D-Bus interface proxy --
 
@@ -83,14 +86,18 @@ fn dbus_props(level: NotificationLevel) -> Option<DbusProps> {
 struct DbusNotifier {
     connection: Connection,
     ids: Arc<Mutex<HashMap<String, u32>>>,
+    listener_handles: Arc<Mutex<VecDeque<tokio::task::AbortHandle>>>,
+    cancel: CancellationToken,
 }
 
 impl DbusNotifier {
-    async fn new() -> zbus::Result<Self> {
+    async fn new(cancel: CancellationToken) -> zbus::Result<Self> {
         let connection = Connection::session().await?;
         Ok(Self {
             connection,
             ids: Arc::new(Mutex::new(HashMap::new())),
+            listener_handles: Arc::new(Mutex::new(VecDeque::new())),
+            cancel,
         })
     }
 }
@@ -119,6 +126,8 @@ impl Notifier for DbusNotifier {
         let group = n.group.clone();
         let app_name = n.app_name.clone();
         let ids = Arc::clone(&self.ids);
+        let listener_handles = Arc::clone(&self.listener_handles);
+        let cancel = self.cancel.child_token();
         let icon = props.icon;
         let category = props.category;
         let expire_ms = props.expire_ms;
@@ -172,7 +181,7 @@ impl Notifier for DbusNotifier {
                         .insert(group, id);
 
                     if url.is_some() {
-                        spawn_action_listener(proxy, id, url);
+                        spawn_action_listener(proxy, id, url, &listener_handles, cancel);
                     }
                 }
                 Ok(Err(e)) => {
@@ -188,12 +197,25 @@ impl Notifier for DbusNotifier {
 
 /// Spawn a background task that waits for the user to click the notification,
 /// then opens the URL via `xdg-open`. Times out after 10 minutes.
+///
+/// At most `MAX_ACTION_LISTENERS` tasks run concurrently; the oldest is aborted
+/// when the cap is reached. Tasks also exit on `cancel`.
 fn spawn_action_listener(
     proxy: NotificationsProxy<'static>,
     notification_id: u32,
     url: Option<String>,
+    handles: &Arc<Mutex<VecDeque<tokio::task::AbortHandle>>>,
+    cancel: CancellationToken,
 ) {
-    tokio::spawn(async move {
+    let mut h = handles
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    while h.len() >= MAX_ACTION_LISTENERS {
+        if let Some(old) = h.pop_front() {
+            old.abort();
+        }
+    }
+    let jh = tokio::spawn(async move {
         let mut stream = match proxy.receive_action_invoked().await {
             Ok(s) => s,
             Err(e) => {
@@ -227,15 +249,18 @@ fn spawn_action_listener(
                     break;
                 }
                 () = &mut timeout => break,
+                () = cancel.cancelled() => break,
             }
         }
     });
+    h.push_back(jh.abort_handle());
+    // Drop jh — task runs detached; abort_handle retains cancel capability.
 }
 
 // -- Platform API --
 
-pub async fn detect() -> Box<dyn Notifier> {
-    match DbusNotifier::new().await {
+pub async fn detect(cancel: CancellationToken) -> Box<dyn Notifier> {
+    match DbusNotifier::new(cancel).await {
         Ok(n) => Box::new(n),
         Err(e) => {
             tracing::warn!("D-Bus session bus unavailable: {e}; notifications disabled");

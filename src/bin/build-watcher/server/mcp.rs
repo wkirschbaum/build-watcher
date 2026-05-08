@@ -640,6 +640,11 @@ impl BuildWatcher {
         {
             return Ok(CallToolResult::error(vec![Content::text(e)]));
         }
+        if params.quiet_start.is_some() != params.quiet_end.is_some() {
+            return Ok(CallToolResult::error(vec![Content::text(
+                "quiet_start and quiet_end must both be provided",
+            )]));
+        }
 
         let has_levels = params.build_started.is_some()
             || params.build_success.is_some()
@@ -678,13 +683,16 @@ impl BuildWatcher {
                 .modify(|config| {
                     let mut inner_msgs = Vec::new();
 
-                    // Quiet hours
-                    inner_msgs.extend(apply_quiet_hours(
+                    // Quiet hours (pre-validated above, so Err shouldn't occur)
+                    match apply_quiet_hours(
                         config,
                         quiet_start.as_deref(),
                         quiet_end.as_deref(),
                         quiet_clear,
-                    ));
+                    ) {
+                        Ok(qh_msgs) => inner_msgs.extend(qh_msgs),
+                        Err(e) => inner_msgs.push(format!("Error: {e}")),
+                    }
 
                     // Notification levels
                     if has_levels {

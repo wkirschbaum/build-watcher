@@ -1,6 +1,7 @@
-use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::sync::Mutex;
 
+use lru::LruCache;
 use serde::{Deserialize, Serialize};
 
 use super::{
@@ -23,14 +24,18 @@ struct CachedResponse {
     body: Vec<u8>,
 }
 
+/// Maximum number of URLs tracked in the ETag cache.
+const ETAG_CACHE_CAP: usize = 500;
+
 /// GitHub client using direct HTTP via `reqwest`. Supports ETag-based
 /// conditional requests (304 responses don't count against the rate limit)
 /// and automatic token refresh on 401.
 pub struct ReqwestClient {
     client: reqwest::Client,
     token: Mutex<String>,
-    /// ETag cache: URL → (etag, response body).
-    cache: Mutex<HashMap<String, CachedResponse>>,
+    /// ETag cache: URL → (etag, response body). Bounded LRU behind an async
+    /// mutex so the async polling tasks are never blocked by a sync lock.
+    cache: tokio::sync::Mutex<LruCache<String, CachedResponse>>,
     base_url: String,
 }
 
@@ -48,7 +53,9 @@ impl ReqwestClient {
         Self {
             client,
             token: Mutex::new(token),
-            cache: Mutex::new(HashMap::new()),
+            cache: tokio::sync::Mutex::new(LruCache::new(
+                NonZeroUsize::new(ETAG_CACHE_CAP).unwrap(),
+            )),
             base_url,
         }
     }
@@ -110,7 +117,7 @@ impl ReqwestClient {
             CachedGetResult::Body(body) => Ok(body),
             CachedGetResult::Unauthorized => {
                 if self.refresh_token().await {
-                    self.cache.lock().unwrap().clear();
+                    self.cache.lock().await.clear();
                     match self.cached_get_inner(url, repo).await? {
                         CachedGetResult::Body(body) => Ok(body),
                         CachedGetResult::Unauthorized => Err(GhError::CliError {
@@ -132,9 +139,9 @@ impl ReqwestClient {
         let mut builder = self.get(url);
 
         let has_cache = {
-            let cache = self.cache.lock().unwrap();
+            let mut cache = self.cache.lock().await;
             if let Some(cached) = cache.get(url) {
-                builder = builder.header("If-None-Match", &cached.etag);
+                builder = builder.header("If-None-Match", cached.etag.clone());
                 true
             } else {
                 false
@@ -151,7 +158,7 @@ impl ReqwestClient {
         }
 
         if resp.status() == reqwest::StatusCode::NOT_MODIFIED {
-            let cache = self.cache.lock().unwrap();
+            let mut cache = self.cache.lock().await;
             if let Some(cached) = cache.get(url) {
                 tracing::trace!(url, "ETag cache hit (304)");
                 return Ok(CachedGetResult::Body(cached.body.clone()));
@@ -185,8 +192,8 @@ impl ReqwestClient {
             .to_vec();
 
         if let Some(etag) = etag {
-            let mut cache = self.cache.lock().unwrap();
-            cache.insert(
+            let mut cache = self.cache.lock().await;
+            cache.put(
                 url.to_string(),
                 CachedResponse {
                     etag,
@@ -644,11 +651,7 @@ impl GitHubClient for ReqwestClient {
     #[tracing::instrument(skip_all, fields(%repo))]
     async fn list_branches(&self, repo: &str) -> Result<Vec<String>, GhError> {
         let items: Vec<NameJson> = self
-            .api_get_query(
-                repo,
-                &format!("/repos/{repo}/branches"),
-                &[("per_page", "100")],
-            )
+            .api_get_all_pages(repo, &format!("/repos/{repo}/branches"))
             .await?;
         Ok(items.into_iter().map(|n| n.name).collect())
     }
@@ -892,6 +895,46 @@ mod tests {
             received[1].headers.get("if-none-match").is_some(),
             "second request should carry If-None-Match"
         );
+    }
+
+    #[tokio::test]
+    async fn list_branches_fetches_all_pages() {
+        let server = MockServer::start().await;
+
+        let page1: Vec<serde_json::Value> = (0..100u32)
+            .map(|i| serde_json::json!({ "name": format!("branch-{i:03}") }))
+            .collect();
+        let page2: Vec<serde_json::Value> = (100..102u32)
+            .map(|i| serde_json::json!({ "name": format!("branch-{i:03}") }))
+            .collect();
+
+        // Page 2: no Link header (last page).
+        Mock::given(method("GET"))
+            .and(path("/repos/alice/app/branches"))
+            .and(wiremock::matchers::query_param("page", "2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&page2))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+
+        // Page 1: 100 branches with Link: rel="next".
+        let page2_link = format!(
+            "<{}/repos/alice/app/branches?per_page=100&page=2>; rel=\"next\"",
+            server.uri()
+        );
+        Mock::given(method("GET"))
+            .and(path("/repos/alice/app/branches"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("link", page2_link.as_str())
+                    .set_body_json(&page1),
+            )
+            .mount(&server)
+            .await;
+
+        let client = make_client(server.uri());
+        let branches = client.list_branches("alice/app").await.unwrap();
+        assert_eq!(branches.len(), 102, "should have all 100 + 2 branches");
     }
 
     #[tokio::test]

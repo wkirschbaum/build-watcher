@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use chrono::Timelike;
 
 use super::types::{
@@ -92,18 +94,48 @@ impl Config {
             .unwrap_or(self.auto_discover_branches)
     }
 
-    /// Compile the effective `branch_filter` regex for a repo (per-repo → global fallback).
-    pub fn branch_filter_for(&self, repo: &str) -> Option<regex::Regex> {
-        let pattern = self
-            .repos
-            .get(repo)
-            .and_then(|r| r.branch_filter.as_ref())
-            .or(self.branch_filter.as_ref());
-        pattern.filter(|p| !p.is_empty()).and_then(|p| {
-            regex::Regex::new(p)
-                .inspect_err(|e| tracing::warn!(pattern = %p, error = %e, "Invalid branch_filter regex, ignoring"))
-                .ok()
-        })
+    /// Return the compiled effective `branch_filter` regex for a repo.
+    /// Resolves per-repo → global fallback. Call `populate_compiled_filters()` after
+    /// any mutation to keep this up-to-date.
+    pub fn branch_filter_for(&self, repo: &str) -> Option<Arc<regex::Regex>> {
+        if let Some(rc) = self.repos.get(repo) {
+            rc.compiled_branch_filter.clone()
+        } else {
+            self.compiled_branch_filter.clone()
+        }
+    }
+
+    /// Compile and cache all branch-filter regexes. Call after load and after each mutation.
+    pub fn populate_compiled_filters(&mut self) {
+        let global_re: Option<Arc<regex::Regex>> = self
+            .branch_filter
+            .as_deref()
+            .filter(|p| !p.is_empty())
+            .and_then(|p| {
+                regex::Regex::new(p)
+                    .inspect_err(|e| {
+                        tracing::warn!(pattern = %p, error = %e, "Invalid global branch_filter regex, ignoring");
+                    })
+                    .ok()
+                    .map(Arc::new)
+            });
+        self.compiled_branch_filter = global_re.clone();
+
+        for rc in self.repos.values_mut() {
+            rc.compiled_branch_filter = rc
+                .branch_filter
+                .as_deref()
+                .filter(|p| !p.is_empty())
+                .and_then(|p| {
+                    regex::Regex::new(p)
+                        .inspect_err(|e| {
+                            tracing::warn!(pattern = %p, error = %e, "Invalid branch_filter regex, ignoring");
+                        })
+                        .ok()
+                        .map(Arc::new)
+                })
+                .or_else(|| global_re.clone());
+        }
     }
 }
 

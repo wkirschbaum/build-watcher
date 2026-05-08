@@ -8,6 +8,10 @@ use serde::{Deserialize, Serialize};
 use crate::github::RunInfo;
 use crate::status::{RunConclusion, RunStatus};
 
+/// PR merge-readiness state, carried by events. Re-exported from the github module
+/// so consumers of `WatchEvent` don't need to import `build_watcher::github` directly.
+pub use crate::github::MergeState as PrMergeState;
+
 const CHANNEL_CAPACITY: usize = 256;
 
 /// Snapshot of a run's identity, carried by events.
@@ -97,8 +101,8 @@ pub enum WatchEvent {
         number: u64,
         title: String,
         url: String,
-        from: crate::github::MergeState,
-        to: crate::github::MergeState,
+        from: PrMergeState,
+        to: PrMergeState,
     },
 }
 
@@ -143,32 +147,7 @@ impl Default for EventBus {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn snap() -> RunSnapshot {
-        RunSnapshot {
-            repo: "alice/app".to_string(),
-            branch: "main".to_string(),
-            run_id: 12345,
-            workflow: "CI".to_string(),
-            title: "Fix login bug".to_string(),
-            event: "push".to_string(),
-            status: RunStatus::InProgress,
-            attempt: 1,
-            url: "https://github.com/alice/app/actions/runs/12345".to_string(),
-            actor: None,
-            commit_author: None,
-        }
-    }
-
-    fn completed(conclusion: RunConclusion) -> WatchEvent {
-        WatchEvent::RunCompleted {
-            run: snap(),
-            conclusion,
-            elapsed: None,
-            failing_steps: None,
-            failing_job_id: None,
-        }
-    }
+    use crate::testutil::{completed, snap};
 
     #[test]
     fn run_snapshot_methods() {

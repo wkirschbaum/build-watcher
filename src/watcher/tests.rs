@@ -10,27 +10,9 @@ use crate::config::{Config, ConfigManager, ConfigPersistence};
 use crate::events::WatchEvent;
 use crate::github::{GhError, RunInfo};
 use crate::status::{RunConclusion, RunStatus};
+use crate::testutil::make_run;
 
 use super::repo_poller::{IgnoreFilter, RepoPoller, RunChange, filter_runs};
-
-// -- Test helpers --
-
-fn make_run(id: u64, status: RunStatus, conclusion: &str) -> RunInfo {
-    RunInfo {
-        id,
-        status,
-        conclusion: conclusion.to_string(),
-        title: "Test PR".to_string(),
-        workflow: "CI".to_string(),
-        head_sha: "abc1234".to_string(),
-        event: "push".to_string(),
-        head_branch: "main".to_string(),
-        attempt: 1,
-        created_at: "2026-01-01T10:00:00Z".to_string(),
-        updated_at: "2026-01-01T10:05:00Z".to_string(),
-        url: "https://github.com/test/repo/actions/runs/1".to_string(),
-    }
-}
 
 fn make_active(status: RunStatus) -> ActiveRun {
     ActiveRun {
@@ -1464,5 +1446,100 @@ async fn abandoned_run_writes_last_build() {
     assert!(
         lb.conclusion == RunConclusion::Unknown,
         "conclusion should be unknown"
+    );
+}
+
+// -- startup_watches recovery paths --
+
+#[tokio::test]
+async fn startup_watches_inserts_waiting_when_no_persisted() {
+    let mut cfg = Config::default();
+    cfg.repos.insert(
+        "alice/app".to_string(),
+        crate::config::RepoConfig::default(),
+    );
+
+    let h = TestHarness::with_config(MockGitHub::with_runs(vec![]), cfg);
+    startup_watches(
+        &h.watches,
+        &h.config,
+        &h.handle,
+        &h.rate_limit,
+        HashMap::new(),
+    )
+    .await;
+    h.cancel();
+
+    let key = WatchKey::new("alice/app", "main");
+    let w = h.watches.lock().await;
+    assert!(w.contains_key(&key), "config key should be in watches");
+    assert!(
+        w[&key].waiting,
+        "entry without persisted data should start waiting"
+    );
+}
+
+#[tokio::test]
+async fn startup_watches_loads_persisted_state_for_config_keys() {
+    let mut cfg = Config::default();
+    cfg.repos.insert(
+        "alice/app".to_string(),
+        crate::config::RepoConfig::default(),
+    );
+
+    let h = TestHarness::with_config(MockGitHub::with_runs(vec![]), cfg);
+
+    let key = WatchKey::new("alice/app", "main");
+    let mut persisted = HashMap::new();
+    persisted.insert(
+        key.clone(),
+        PersistedWatch {
+            last_seen_run_id: 999,
+            last_builds: HashMap::new(),
+        },
+    );
+
+    startup_watches(&h.watches, &h.config, &h.handle, &h.rate_limit, persisted).await;
+    h.cancel();
+
+    let w = h.watches.lock().await;
+    assert!(w.contains_key(&key), "config key should be in watches");
+    let entry = &w[&key];
+    assert_eq!(
+        entry.last_seen_run_id, 999,
+        "last_seen_run_id should be restored from persisted state"
+    );
+}
+
+#[tokio::test]
+async fn startup_watches_ignores_orphan_persisted_keys() {
+    let mut cfg = Config::default();
+    cfg.repos.insert(
+        "alice/app".to_string(),
+        crate::config::RepoConfig::default(),
+    );
+
+    let h = TestHarness::with_config(MockGitHub::with_runs(vec![]), cfg);
+
+    let mut persisted = HashMap::new();
+    persisted.insert(
+        WatchKey::new("orphan/repo", "main"),
+        PersistedWatch {
+            last_seen_run_id: 42,
+            last_builds: HashMap::new(),
+        },
+    );
+
+    startup_watches(&h.watches, &h.config, &h.handle, &h.rate_limit, persisted).await;
+    h.cancel();
+
+    let w = h.watches.lock().await;
+    assert!(
+        !w.contains_key(&WatchKey::new("orphan/repo", "main")),
+        "orphan persisted key not in config should not be added to watches"
+    );
+    assert!(
+        w.contains_key(&WatchKey::new("alice/app", "main")),
+        "config key should still be present"
     );
 }

@@ -546,27 +546,28 @@ pub(crate) async fn apply_pause(
     }
 }
 
-/// Apply quiet hours changes to config. Returns messages describing what changed.
+/// Apply quiet hours changes to config. Returns messages describing what changed,
+/// or an error if only one of start/end is provided.
 pub(crate) fn apply_quiet_hours(
     config: &mut build_watcher::config::Config,
     quiet_start: Option<&str>,
     quiet_end: Option<&str>,
     quiet_clear: bool,
-) -> Vec<String> {
+) -> Result<Vec<String>, String> {
     let mut msgs = Vec::new();
     if quiet_clear {
         config.quiet_hours = None;
         msgs.push("Quiet hours cleared".to_string());
-    } else if quiet_start.is_some() || quiet_end.is_some() {
-        let start = quiet_start.unwrap_or("22:00").to_string();
-        let end = quiet_end.unwrap_or("06:00").to_string();
+    } else if quiet_start.is_some() != quiet_end.is_some() {
+        return Err("quiet_start and quiet_end must both be provided".to_string());
+    } else if let (Some(start), Some(end)) = (quiet_start, quiet_end) {
         config.quiet_hours = Some(build_watcher::config::QuietHours {
-            start: start.clone(),
-            end: end.clone(),
+            start: start.to_string(),
+            end: end.to_string(),
         });
         msgs.push(format!("Quiet hours set: {start}–{end} (local time)"));
     }
-    msgs
+    Ok(msgs)
 }
 
 pub(crate) fn validate_hhmm(s: &str) -> Result<(), String> {
@@ -631,6 +632,49 @@ mod tests {
         let msgs = modify_ignore_list(&mut list, &[], &["CI".to_string()], "event");
         assert!(list.is_empty());
         assert!(msgs.iter().any(|m| m.contains("No events are globally")));
+    }
+
+    #[test]
+    fn modify_ignore_list_remove_non_existent() {
+        let mut list = vec!["CI".to_string()];
+        let msgs = modify_ignore_list(&mut list, &[], &["Deploy".to_string()], "workflow");
+        assert_eq!(list, vec!["CI"]);
+        assert!(msgs.iter().any(|m| m.contains("None of the specified")));
+    }
+
+    #[test]
+    fn apply_quiet_hours_requires_both_start_and_end() {
+        let mut cfg = build_watcher::config::Config::default();
+        assert!(
+            apply_quiet_hours(&mut cfg, Some("22:00"), None, false).is_err(),
+            "start without end should error"
+        );
+        assert!(
+            apply_quiet_hours(&mut cfg, None, Some("06:00"), false).is_err(),
+            "end without start should error"
+        );
+    }
+
+    #[test]
+    fn apply_quiet_hours_accepts_both() {
+        let mut cfg = build_watcher::config::Config::default();
+        let msgs = apply_quiet_hours(&mut cfg, Some("22:00"), Some("06:00"), false).unwrap();
+        assert!(!msgs.is_empty());
+        let qh = cfg.quiet_hours.unwrap();
+        assert_eq!(qh.start, "22:00");
+        assert_eq!(qh.end, "06:00");
+    }
+
+    #[test]
+    fn apply_quiet_hours_clear() {
+        let mut cfg = build_watcher::config::Config::default();
+        cfg.quiet_hours = Some(build_watcher::config::QuietHours {
+            start: "22:00".to_string(),
+            end: "06:00".to_string(),
+        });
+        let msgs = apply_quiet_hours(&mut cfg, None, None, true).unwrap();
+        assert!(msgs.iter().any(|m| m.contains("cleared")));
+        assert!(cfg.quiet_hours.is_none());
     }
 
     #[test]

@@ -1,0 +1,73 @@
+use std::collections::{HashMap, HashSet};
+
+use crate::events::WatchEvent;
+use crate::github::PrInfo;
+
+use super::RepoPoller;
+
+impl RepoPoller {
+    /// Update PR display state and emit state-change events.
+    /// Uses `cached_prs` when provided; falls back to an API call when `None`.
+    /// No-ops when `watch_prs` is not enabled for this repo.
+    pub(in crate::watcher) async fn poll_prs_with(&mut self, cached_prs: Option<Vec<PrInfo>>) {
+        let watch_prs = {
+            let cfg = self.config.read().await;
+            cfg.repos.get(&self.repo).is_some_and(|rc| rc.watch_prs)
+        };
+        if !watch_prs {
+            return;
+        }
+
+        let prs = match cached_prs {
+            Some(p) => p,
+            None => match self.github.open_prs(&self.repo).await {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::debug!(repo = %self.repo, error = %e, "Failed to poll PRs");
+                    return;
+                }
+            },
+        };
+
+        // Detect transitions and emit events.
+        let current_ids: HashSet<u64> = prs.iter().map(|pr| pr.number).collect();
+        for pr in &prs {
+            let old = self.pr_states.get(&pr.number);
+            if old.is_none_or(|prev| *prev != pr.merge_state) {
+                if let Some(from) = old.cloned() {
+                    self.events.emit(WatchEvent::PrStateChanged {
+                        repo: self.repo.clone(),
+                        branch: pr.branch.clone(),
+                        target_branch: pr.target_branch.clone(),
+                        number: pr.number,
+                        title: pr.title.clone(),
+                        url: pr.url.clone(),
+                        from,
+                        to: pr.merge_state.clone(),
+                    });
+                }
+                self.pr_states.insert(pr.number, pr.merge_state.clone());
+            }
+        }
+        // Remove closed PRs from state.
+        self.pr_states.retain(|id, _| current_ids.contains(id));
+
+        // Update watch entries with PR data for display.
+        let mut w = self.watches.lock().await;
+        let mut prs_by_target: HashMap<&str, Vec<&PrInfo>> = HashMap::new();
+        for pr in &prs {
+            prs_by_target
+                .entry(pr.target_branch.as_str())
+                .or_default()
+                .push(pr);
+        }
+        for (key, entry) in w.iter_mut() {
+            if key.repo == self.repo {
+                entry.prs = prs_by_target
+                    .get(key.branch.as_str())
+                    .map(|prs| prs.iter().map(|pr| (*pr).clone()).collect())
+                    .unwrap_or_default();
+            }
+        }
+    }
+}

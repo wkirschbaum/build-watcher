@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
 
 use build_watcher::config::{self, NotificationLevel, SharedConfigManager};
-use build_watcher::events::WatchEvent;
+use build_watcher::events::{PrMergeState, WatchEvent};
 use build_watcher::format;
 use build_watcher::github;
 use build_watcher::status::RunConclusion;
@@ -129,7 +129,7 @@ pub(crate) fn effective_level(event: &WatchEvent, cfg: &config::Config) -> Notif
         } => {
             let notif = cfg.notifications_for(&run.repo, &run.branch);
             match conclusion {
-                RunConclusion::Success | RunConclusion::Cancelled => notif.build_success,
+                RunConclusion::Success => notif.build_success,
                 _ => notif.build_failure,
             }
         }
@@ -264,7 +264,9 @@ impl NotificationPipeline {
                 WatchEvent::RunStarted(run) | WatchEvent::RunCompleted { run, .. } => {
                     (run.repo.clone(), run.branch.clone())
                 }
-                _ => unreachable!(),
+                WatchEvent::StatusChanged { .. } | WatchEvent::PrStateChanged { .. } => {
+                    unreachable!("EventKind::from_event returns None for non-run events")
+                }
             };
             self.transitions.insert(tk, kind);
         }
@@ -486,11 +488,11 @@ async fn dispatch_pr_notification(
     drop(cfg);
 
     let (emoji, label) = match to {
-        github::MergeState::Clean => ("\u{2705}", "ready to merge"),
-        github::MergeState::Blocked => ("\u{1f6d1}", "blocked"),
-        github::MergeState::Unstable => ("\u{26a0}\u{fe0f}", "unstable"),
-        github::MergeState::Behind => ("\u{2b07}\u{fe0f}", "behind"),
-        github::MergeState::Dirty => ("\u{274c}", "has conflicts"),
+        PrMergeState::Clean => ("\u{2705}", "ready to merge"),
+        PrMergeState::Blocked => ("\u{1f6d1}", "blocked"),
+        PrMergeState::Unstable => ("\u{26a0}\u{fe0f}", "unstable"),
+        PrMergeState::Behind => ("\u{2b07}\u{fe0f}", "behind"),
+        PrMergeState::Dirty => ("\u{274c}", "has conflicts"),
         _ => return,
     };
 
@@ -498,7 +500,7 @@ async fn dispatch_pr_notification(
         .send(&Notification {
             title: format!("{emoji} PR #{number} {label}: {repo_label}"),
             body: title.to_string(),
-            level: if *to == github::MergeState::Clean {
+            level: if *to == PrMergeState::Clean {
                 NotificationLevel::Normal
             } else {
                 NotificationLevel::Low
@@ -564,42 +566,11 @@ pub async fn run_notification_handler(
 mod tests {
     use super::*;
     use build_watcher::config::NotificationLevel::*;
-    use build_watcher::events::RunSnapshot;
     use build_watcher::status::RunStatus;
     use std::pin::Pin;
     use tokio::sync::Mutex;
 
-    fn snap() -> RunSnapshot {
-        RunSnapshot {
-            repo: "alice/app".to_string(),
-            branch: "main".to_string(),
-            run_id: 12345,
-            workflow: "CI".to_string(),
-            title: "Fix login bug".to_string(),
-            event: "push".to_string(),
-            status: RunStatus::InProgress,
-            attempt: 1,
-            url: "https://github.com/alice/app/actions/runs/12345".to_string(),
-            actor: None,
-            commit_author: None,
-        }
-    }
-
-    fn snap_workflow(name: &str) -> RunSnapshot {
-        let mut s = snap();
-        s.workflow = name.to_string();
-        s
-    }
-
-    fn completed(conclusion: RunConclusion) -> WatchEvent {
-        WatchEvent::RunCompleted {
-            run: snap(),
-            conclusion,
-            elapsed: None,
-            failing_steps: None,
-            failing_job_id: None,
-        }
-    }
+    use crate::testutil::{completed, snap, snap_workflow};
 
     // -- Recording notifier --
 
@@ -809,6 +780,11 @@ mod tests {
             effective_level(&completed(RunConclusion::Failure), &cfg),
             Critical
         );
+        assert_eq!(
+            effective_level(&completed(RunConclusion::Cancelled), &cfg),
+            Critical,
+            "Cancelled should use build_failure level, not build_success"
+        );
 
         let status = WatchEvent::StatusChanged {
             run: snap(),
@@ -816,6 +792,37 @@ mod tests {
             to: RunStatus::InProgress,
         };
         assert_eq!(effective_level(&status, &cfg), Off);
+    }
+
+    #[tokio::test]
+    async fn cancelled_fires_when_build_success_is_off() {
+        use config::{Config, ConfigManager, ConfigPersistence, NotificationConfig};
+
+        let mut cfg = Config::default();
+        cfg.notifications = NotificationConfig {
+            build_started: Off,
+            build_success: Off,
+            build_failure: Normal,
+        };
+        let config = Arc::new(ConfigManager::new(cfg, ConfigPersistence::Null));
+        let pause = unpaused();
+        let recorder = RecordingNotifier::new();
+        let mut pipeline = NotificationPipeline::new();
+        let now = Instant::now();
+
+        pipeline
+            .ingest(completed(RunConclusion::Cancelled), &config, &pause, now)
+            .await;
+        pipeline
+            .dispatch_expired(now + DEBOUNCE_DELAY, &*recorder)
+            .await;
+
+        let titles = recorder.titles().await;
+        assert_eq!(
+            titles.len(),
+            1,
+            "Cancelled should fire when build_failure is Normal even though build_success is Off"
+        );
     }
 
     // -- Pipeline transition tests --

@@ -2,6 +2,8 @@ use std::future::Future;
 use std::pin::Pin;
 use std::process::{Command, Stdio};
 
+use tokio_util::sync::CancellationToken;
+
 use crate::platform::{Notification, Notifier};
 use build_watcher::config::NotificationLevel;
 
@@ -120,7 +122,7 @@ impl Notifier for AppleScriptNotifier {
 
 // -- Platform API --
 
-pub async fn detect() -> Box<dyn Notifier> {
+pub async fn detect(_cancel: CancellationToken) -> Box<dyn Notifier> {
     if TerminalNotifier::is_available() {
         Box::new(TerminalNotifier)
     } else {

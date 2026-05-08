@@ -54,6 +54,7 @@ impl ConfigManager {
         let (result, snapshot) = {
             let mut cfg = self.inner.lock().await;
             let r = f(&mut cfg);
+            cfg.populate_compiled_filters();
             let snap = cfg.clone();
             (r, snap)
         };
@@ -210,6 +211,7 @@ pub fn load_and_normalize() -> Config {
     if needs_save && let Err(e) = save_config(&cfg) {
         tracing::error!("Failed to save config on startup: {e}");
     }
+    cfg.populate_compiled_filters();
     cfg
 }
 
