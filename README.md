@@ -14,22 +14,14 @@ Stop switching browser tabs to check your CI. **build-watcher** runs quietly in 
 ## Quick start
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/wkirschbaum/build-watcher/main/install.sh | bash --with-claude
+curl -fsSL https://raw.githubusercontent.com/wkirschbaum/build-watcher/main/install.sh | bash
 ```
 
-That's it. The script installs binaries to `~/.local/bin/`, registers a system service, and wires up the MCP server in `~/.claude.json`. Then from Claude Code:
-
-```
-Watch my current repo and notify me when CI passes
-```
-
-Or open the TUI:
+Then open the TUI — it auto-starts the daemon on first run:
 
 ```sh
 bw
 ```
-
-`bw` auto-starts the daemon if it isn't already running.
 
 ## Requirements
 
@@ -43,24 +35,45 @@ bw
 
 ## Installation
 
-### One-liner (recommended)
+### One-liner
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/wkirschbaum/build-watcher/main/install.sh | bash
 ```
 
-Downloads pre-built binaries for your platform (Linux x86\_64/aarch64, macOS x86\_64/aarch64), installs to `~/.local/bin/`, and sets up the system service. Add `--with-claude` to also register the MCP server in `~/.claude.json`.
+Downloads pre-built binaries for your platform (Linux x86\_64/aarch64, macOS x86\_64/aarch64), installs to `~/.local/bin/`, and sets up the system service.
 
-### From source
+**Flags:**
+
+| Flag | Description |
+| --- | --- |
+| `--with-claude` | Register the MCP server in `~/.claude.json` for Claude Code integration |
+| `--local` | Build from source instead of downloading a release binary (requires `cargo`) |
+
+Both flags can be combined. Examples:
 
 ```sh
-# Build and install (full service + MCP setup)
-./install.sh --local
+# Install and register with Claude Code
+curl -fsSL https://raw.githubusercontent.com/wkirschbaum/build-watcher/main/install.sh | bash -s -- --with-claude
 
-# Or via cargo (binaries only — run --register afterwards)
-cargo install --git https://github.com/wkirschbaum/build-watcher.git
-build-watcher --register --port 8417
+# Build from source and register with Claude Code
+./install.sh --local --with-claude
 ```
+
+To register the MCP server after a plain install:
+
+```sh
+build-watcher --register
+```
+
+### From source via cargo
+
+```sh
+cargo install --git https://github.com/wkirschbaum/build-watcher.git
+build-watcher --register   # optional: register MCP server with Claude Code
+```
+
+Note: `cargo install` skips service setup — run `./install.sh --local` for the full install including systemd/launchd.
 
 ## Features
 
