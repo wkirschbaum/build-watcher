@@ -1,5 +1,37 @@
 # Changelog
 
+## [1.0.2] - 2026-05-08
+
+### Added
+
+- **`cargo-binstall` support** — `[package.metadata.binstall]` in `Cargo.toml` lets users install prebuilt binaries from GitHub Releases without compiling. Run `cargo binstall --git https://github.com/wkirschbaum/build-watcher build-watcher` to install `build-watcher` and `bw` directly from a release tarball.
+- **Topgrade integration documented** — README now shows a `~/.config/topgrade.toml` `[commands]` snippet that re-runs `cargo binstall --git ... -y` to keep the install up to date.
+
+### Changed
+
+- **Release archives repackaged** — each target now produces a single `build-watcher-v{version}-{target}.tar.gz` containing both `build-watcher` and `bw`, replacing the previous two-tarball-per-target layout. Required for `cargo-binstall`'s one-archive-per-crate model.
+- **`install.sh`** — adapts to the new combined-archive format; resolves the latest tag via `gh release view --json tagName` and downloads a single asset per platform.
+
+## [1.0.1] - 2026-05-08
+
+### Fixed
+
+- **`list_branches` now paginates** via `api_get_all_pages` — previously capped at 100 branches, silently dropping the rest on large repos.
+- **Cancelled builds use `build_failure` notification level** instead of `build_success`, so muting successes no longer swallows cancellations.
+- **`apply_quiet_hours` requires both `start` and `end`** — partial input is now rejected instead of silently filling defaults (`22:00`/`06:00`).
+- **`set_repo_config_handler` validates `branch_filter` regex** before storing — invalid regex returns `400` instead of corrupting the config.
+- **SSE multi-line `data:` lines are concatenated** with `\n` (RFC 8895 compliance) instead of overwriting earlier lines.
+- **`backfill_failing_steps` runs once per cycle** instead of twice, halving the per-poll API cost for resolved runs.
+
+### Changed
+
+- **ETag cache rewritten** with `tokio::sync::Mutex` + bounded `LruCache` (cap 500) — eliminates async-thread blocking on `std::sync::Mutex` and unbounded memory growth.
+- **D-Bus action listener tasks capped at 20** with a `CancellationToken` for clean shutdown — previously accumulated without bound on Linux.
+- **Branch-filter regex pre-compiled and cached** on `RepoConfig`, recompiled only on config change instead of every lookup.
+- **`repo_poller.rs` split** into `run_tracker.rs`, `branch_tracker.rs`, and `pr_tracker.rs`; main loop now delegates.
+- **Shared test helpers consolidated** into `src/testutil.rs` and `src/bin/build-watcher/testutil.rs`.
+- **Notification event match is now exhaustive** — adding a new `WatchEvent` variant produces a compile error instead of a silent fallthrough.
+
 ## [1.0.0] - 2026-05-07
 
 ### Added
@@ -303,6 +335,8 @@
 
 - Avoid unnecessary config re-save on reads; improve persistence error logging
 
+[1.0.2]: https://github.com/wkirschbaum/build-watcher/releases/tag/v1.0.2
+[1.0.1]: https://github.com/wkirschbaum/build-watcher/releases/tag/v1.0.1
 [1.0.0]: https://github.com/wkirschbaum/build-watcher/releases/tag/v1.0.0
 [0.20.0]: https://github.com/wkirschbaum/build-watcher/releases/tag/v0.20.0
 [0.19.2]: https://github.com/wkirschbaum/build-watcher/releases/tag/v0.19.2

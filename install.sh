@@ -78,14 +78,14 @@ else
   esac
 
   echo "==> Downloading latest release for $TARGET..."
-  gh release download \
+  LATEST_TAG="$(gh release view --repo wkirschbaum/build-watcher --json tagName -q .tagName)"
+  ARCHIVE="build-watcher-${LATEST_TAG}-${TARGET}.tar.gz"
+  gh release download "$LATEST_TAG" \
     --repo wkirschbaum/build-watcher \
-    --pattern "bw-${TARGET}.tar.gz" \
-    --pattern "build-watcher-${TARGET}.tar.gz" \
+    --pattern "$ARCHIVE" \
     --dir "$TMPDIR"
 
-  tar -xzf "$TMPDIR/bw-${TARGET}.tar.gz" -C "$TMPDIR"
-  tar -xzf "$TMPDIR/build-watcher-${TARGET}.tar.gz" -C "$TMPDIR"
+  tar -xzf "$TMPDIR/$ARCHIVE" -C "$TMPDIR"
 fi
 
 # -- Stop any running instance ------------------------------------------------

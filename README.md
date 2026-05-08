@@ -68,6 +68,27 @@ To register the MCP server after a plain install:
 build-watcher --register
 ```
 
+### Via cargo-binstall
+
+If you have [`cargo-binstall`](https://github.com/cargo-bins/cargo-binstall) installed, you can fetch prebuilt binaries straight from the GitHub Releases without compiling:
+
+```sh
+cargo binstall --git https://github.com/wkirschbaum/build-watcher build-watcher
+```
+
+This installs both `build-watcher` and `bw` into `~/.cargo/bin/`. Service setup (systemd/launchd) is skipped — run `./install.sh --local` afterwards if you want the daemon managed as a system service.
+
+#### Auto-update with topgrade
+
+[`topgrade`](https://github.com/topgrade-rs/topgrade) doesn't track git-sourced cargo crates by default, but you can wire build-watcher in as a custom command. Add to `~/.config/topgrade.toml`:
+
+```toml
+[commands]
+"build-watcher" = "cargo binstall --git https://github.com/wkirschbaum/build-watcher build-watcher -y"
+```
+
+Now `topgrade` will pull the latest release each run.
+
 ### From source via cargo
 
 ```sh

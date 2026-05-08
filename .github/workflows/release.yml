@@ -53,18 +53,14 @@ jobs:
         shell: bash
         run: |
           cd target/${{ matrix.target }}/release
-          tar czf bw-${{ matrix.target }}.tar.gz bw
-          tar czf build-watcher-${{ matrix.target }}.tar.gz build-watcher
-          mv bw-${{ matrix.target }}.tar.gz ../../../
-          mv build-watcher-${{ matrix.target }}.tar.gz ../../../
+          tar czf build-watcher-${{ github.ref_name }}-${{ matrix.target }}.tar.gz build-watcher bw
+          mv build-watcher-${{ github.ref_name }}-${{ matrix.target }}.tar.gz ../../../
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v7
         with:
           name: binaries-${{ matrix.target }}
-          path: |
-            bw-${{ matrix.target }}.tar.gz
-            build-watcher-${{ matrix.target }}.tar.gz
+          path: build-watcher-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
 
   release:
     needs: build
@@ -102,6 +98,4 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           body_path: release_notes.md
-          files: |
-            bw-*.tar.gz
-            build-watcher-*.tar.gz
+          files: build-watcher-v*.tar.gz
