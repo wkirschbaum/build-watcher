@@ -126,7 +126,7 @@ if [ ! -f "$CONFIG_FILE" ]; then
   # Recover from backup or draft left by a crash during save.
   DRAFT_FILE="$CONFIG_FILE.draft"
   BAK_FILE="$CONFIG_FILE.bak"
-  if [ -f "$DRAFT_FILE" ] && python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$DRAFT_FILE" 2>/dev/null; then
+  if [ -f "$DRAFT_FILE" ]; then
     echo "==> Recovering config from draft file..."
     mv "$DRAFT_FILE" "$CONFIG_FILE"
   elif [ -f "$BAK_FILE" ]; then
