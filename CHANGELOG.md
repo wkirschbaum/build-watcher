@@ -1,5 +1,20 @@
 # Changelog
 
+## [1.0.3] - 2026-05-08
+
+### Fixed
+
+- **`GET /history` `repo` field was always `""`** — `history_handler` passed an empty string instead of the query parameter value; every `HistoryEntryView` now carries the correct repo name.
+- **`show_author` deserialized as `false` for configs missing the field** — `#[serde(default)]` resolved to `bool::default()` (`false`) rather than the intended `true`; changed to `#[serde(default = "default_true")]` so existing configs without the field enable author display as expected.
+
+### Changed
+
+- **`display_title` visibility corrected** — was `pub(super)` (misleading) while called cross-module; now `pub(crate)`.
+- **`snap_workflow` added to lib `testutil`** — brings it on par with the binary test helper.
+- **Redundant early-exit condition removed** in run detection — `new_runs.is_empty()` was always implied by `unseen.is_empty()` and is now gone.
+- **Misplaced doc comment fixed** on `apply_pause` / `validate_hhmm` in `server/actions.rs`.
+- **Dead `_events: EventBus` parameters removed** from `test_router` and `test_router_full` in REST tests.
+
 ## [1.0.2] - 2026-05-08
 
 ### Added
@@ -335,6 +350,7 @@
 
 - Avoid unnecessary config re-save on reads; improve persistence error logging
 
+[1.0.3]: https://github.com/wkirschbaum/build-watcher/releases/tag/v1.0.3
 [1.0.2]: https://github.com/wkirschbaum/build-watcher/releases/tag/v1.0.2
 [1.0.1]: https://github.com/wkirschbaum/build-watcher/releases/tag/v1.0.1
 [1.0.0]: https://github.com/wkirschbaum/build-watcher/releases/tag/v1.0.0

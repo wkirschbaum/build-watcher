@@ -305,7 +305,7 @@ pub struct Config {
     pub quiet_hours: Option<QuietHours>,
     /// When true, fetch the triggering actor and commit author for each new run
     /// (costs 1 extra API call per newly detected run).
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub show_author: bool,
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub auto_discover_branches: bool,

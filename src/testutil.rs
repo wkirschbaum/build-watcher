@@ -18,6 +18,12 @@ pub fn snap() -> RunSnapshot {
     }
 }
 
+pub fn snap_workflow(name: &str) -> RunSnapshot {
+    let mut s = snap();
+    s.workflow = name.to_string();
+    s
+}
+
 pub fn completed(conclusion: RunConclusion) -> WatchEvent {
     WatchEvent::RunCompleted {
         run: snap(),

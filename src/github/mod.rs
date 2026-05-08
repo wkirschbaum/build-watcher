@@ -585,7 +585,7 @@ pub fn short_sha(sha: &str) -> &str {
 }
 
 /// Format a human-readable title with a compact event prefix.
-pub(super) fn display_title(event: &str, title: &str) -> String {
+pub(crate) fn display_title(event: &str, title: &str) -> String {
     let prefix = match event {
         e if e.starts_with("pull_request") => "PR: ",
         "schedule" => "cron: ",

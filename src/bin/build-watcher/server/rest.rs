@@ -545,7 +545,7 @@ pub(crate) async fn history_handler(
     drop(hist);
     let views: Vec<HistoryEntryView> = entries
         .into_iter()
-        .map(|(br, lb)| to_history_view(String::new(), br, lb, now))
+        .map(|(br, lb)| to_history_view(q.repo.clone(), br, lb, now))
         .collect();
     axum::Json(views).into_response()
 }
@@ -729,7 +729,7 @@ mod tests {
         )
     }
 
-    fn test_router(watches: Watches, pause: PauseState, _events: EventBus) -> axum::Router {
+    fn test_router(watches: Watches, pause: PauseState) -> axum::Router {
         test_router_with_handle(watches, pause, stub_handle())
     }
 
@@ -789,18 +789,18 @@ mod tests {
 
     #[tokio::test]
     async fn status_empty_watches() {
-        let (watches, pause, events) = empty_state();
-        let json = get_status_json(test_router(watches, pause, events)).await;
+        let (watches, pause, _) = empty_state();
+        let json = get_status_json(test_router(watches, pause)).await;
         assert_eq!(json["paused"], false);
         assert_eq!(json["watches"], serde_json::json!([]));
     }
 
     #[tokio::test]
     async fn status_paused_flag() {
-        let (watches, pause, events) = empty_state();
+        let (watches, pause, _) = empty_state();
         *pause.lock().await =
             Some(tokio::time::Instant::now() + std::time::Duration::from_secs(300));
-        let json = get_status_json(test_router(watches, pause, events)).await;
+        let json = get_status_json(test_router(watches, pause)).await;
         assert_eq!(json["paused"], true);
     }
 
@@ -808,7 +808,7 @@ mod tests {
     async fn status_with_last_build() {
         use build_watcher::github::LastBuild;
 
-        let (watches, pause, events) = empty_state();
+        let (watches, pause, _) = empty_state();
         let key = WatchKey::new("alice/app", "main");
         let mut entry = WatchEntry::default();
         entry.last_builds.insert(
@@ -832,7 +832,7 @@ mod tests {
         );
         watches.lock().await.insert(key, entry);
 
-        let json = get_status_json(test_router(watches, pause, events)).await;
+        let json = get_status_json(test_router(watches, pause)).await;
         let watches_arr = &json["watches"];
         assert_eq!(watches_arr.as_array().unwrap().len(), 1);
         let w = &watches_arr[0];
@@ -848,14 +848,14 @@ mod tests {
 
     #[tokio::test]
     async fn status_watches_sorted() {
-        let (watches, pause, events) = empty_state();
+        let (watches, pause, _) = empty_state();
         {
             let mut w = watches.lock().await;
             w.insert(WatchKey::new("zoo/bar", "main"), WatchEntry::default());
             w.insert(WatchKey::new("alice/app", "main"), WatchEntry::default());
             w.insert(WatchKey::new("alice/app", "develop"), WatchEntry::default());
         }
-        let json = get_status_json(test_router(watches, pause, events)).await;
+        let json = get_status_json(test_router(watches, pause)).await;
         let repos: Vec<&str> = json["watches"]
             .as_array()
             .unwrap()
@@ -869,7 +869,7 @@ mod tests {
         assert_eq!(json["watches"][1]["branch"], "main");
     }
 
-    fn test_router_full(watches: Watches, pause: PauseState, _events: EventBus) -> axum::Router {
+    fn test_router_full(watches: Watches, pause: PauseState) -> axum::Router {
         let handle = stub_handle();
         let app_state = super::super::DaemonState {
             watches,
@@ -893,8 +893,8 @@ mod tests {
         use http_body_util::BodyExt;
         use tower::ServiceExt;
 
-        let (watches, pause, events) = empty_state();
-        let router = test_router_full(watches, pause, events);
+        let (watches, pause, _) = empty_state();
+        let router = test_router_full(watches, pause);
         let req = http::Request::get("/stats")
             .body(axum::body::Body::empty())
             .unwrap();
@@ -914,9 +914,9 @@ mod tests {
         use http_body_util::BodyExt;
         use tower::ServiceExt;
 
-        let (watches, pause, events) = empty_state();
+        let (watches, pause, _) = empty_state();
 
-        let router = test_router_full(watches.clone(), pause.clone(), events.clone());
+        let router = test_router_full(watches.clone(), pause.clone());
         let req = http::Request::post("/pause")
             .header("content-type", "application/json")
             .body(axum::body::Body::from(r#"{"pause":true}"#))
@@ -931,7 +931,7 @@ mod tests {
             "should include message"
         );
 
-        let router = test_router_full(watches.clone(), pause.clone(), events.clone());
+        let router = test_router_full(watches.clone(), pause.clone());
         let req = http::Request::post("/pause")
             .header("content-type", "application/json")
             .body(axum::body::Body::from(r#"{"pause":false}"#))
@@ -951,7 +951,7 @@ mod tests {
     async fn status_with_active_runs() {
         use build_watcher::watcher::ActiveRun;
 
-        let (watches, pause, events) = empty_state();
+        let (watches, pause, _) = empty_state();
         let key = WatchKey::new("alice/app", "main");
         let mut entry = WatchEntry::default();
         entry.active_runs.insert(
@@ -971,7 +971,7 @@ mod tests {
         );
         watches.lock().await.insert(key, entry);
 
-        let json = get_status_json(test_router(watches, pause, events)).await;
+        let json = get_status_json(test_router(watches, pause)).await;
         let runs = &json["watches"][0]["active_runs"];
         assert_eq!(runs.as_array().unwrap().len(), 1);
         assert_eq!(runs[0]["run_id"], 42);
@@ -984,8 +984,8 @@ mod tests {
     async fn events_returns_text_event_stream() {
         use tower::ServiceExt;
 
-        let (watches, pause, events) = empty_state();
-        let router = test_router(watches, pause, events);
+        let (watches, pause, _) = empty_state();
+        let router = test_router(watches, pause);
         let req = http::Request::get("/events")
             .body(axum::body::Body::empty())
             .unwrap();

@@ -513,7 +513,6 @@ pub(crate) fn do_notification_action(
     }
 }
 
-/// Validate a time string in HH:MM (24-hour) format.
 /// Apply pause/resume to the pause state. Returns a human-readable message.
 pub(crate) async fn apply_pause(
     pause: &build_watcher::watcher::PauseState,
@@ -570,6 +569,7 @@ pub(crate) fn apply_quiet_hours(
     Ok(msgs)
 }
 
+/// Validate a time string in HH:MM (24-hour) format.
 pub(crate) fn validate_hhmm(s: &str) -> Result<(), String> {
     let Some((h, m)) = s.split_once(':') else {
         return Err(format!("{s:?} is not HH:MM format (e.g. \"22:00\")"));

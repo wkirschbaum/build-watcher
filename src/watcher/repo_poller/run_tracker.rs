@@ -383,7 +383,7 @@ impl RepoPoller {
                 })
                 .collect();
 
-            if new_runs.is_empty() && unseen.is_empty() && reruns.is_empty() {
+            if unseen.is_empty() && reruns.is_empty() {
                 continue;
             }
 
