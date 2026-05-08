@@ -2,6 +2,8 @@
 
 Stop switching browser tabs to check your CI. **build-watcher** runs quietly in the background, watches your GitHub Actions workflows, and pings you the moment something changes — via desktop notifications, a live terminal dashboard, or right inside Claude Code.
 
+> **Linux and macOS only.**
+
 ![TUI Dashboard](screenshots/tui.png)
 
 ## What it does
