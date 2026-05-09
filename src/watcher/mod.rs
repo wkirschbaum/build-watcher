@@ -19,8 +19,9 @@ pub type Watches = Arc<Mutex<HashMap<WatchKey, WatchEntry>>>;
 pub type PauseState = Arc<Mutex<Option<Instant>>>;
 pub type RateLimitState = Arc<Mutex<Option<RateLimit>>>;
 pub type DiscoveredBranches = Arc<Mutex<crate::persistence::DiscoveredMap>>;
+pub type DiscoveredRepos = Arc<Mutex<crate::persistence::DiscoveredRepoSet>>;
 
-pub use crate::persistence::load_discovered;
+pub use crate::persistence::{load_discovered, load_discovered_repos};
 pub use startup::{WatcherHandle, resolve_branches_for_repo, start_watch, startup_watches};
 pub use types::{
     ActiveRun, CURRENT_STATE_VERSION, PersistedState, PersistedWatch, WatchEntry, WatchKey,

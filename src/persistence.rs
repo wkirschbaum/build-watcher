@@ -10,9 +10,14 @@ use crate::history::BuildHistory;
 use crate::watcher::{CURRENT_STATE_VERSION, PersistedState, PersistedWatch, WatchKey};
 
 pub type DiscoveredMap = HashMap<String, Vec<String>>;
+pub type DiscoveredRepoSet = std::collections::HashSet<String>;
 
 pub fn load_discovered() -> DiscoveredMap {
     load_json(&state_dir().join("discovered.json")).unwrap_or_default()
+}
+
+pub fn load_discovered_repos() -> DiscoveredRepoSet {
+    load_json(&state_dir().join("discovered_repos.json")).unwrap_or_default()
 }
 
 // -- Safe JSON persistence --
@@ -217,6 +222,7 @@ pub trait Persistence: Send + Sync {
     ) -> Result<(), PersistError>;
     async fn save_history(&self, history: &BuildHistory) -> Result<(), PersistError>;
     async fn save_discovered(&self, discovered: &DiscoveredMap) -> Result<(), PersistError>;
+    async fn save_discovered_repos(&self, repos: &DiscoveredRepoSet) -> Result<(), PersistError>;
 
     /// Save both watches and history together. Logs errors without failing.
     async fn save_state(
@@ -259,6 +265,11 @@ impl Persistence for FilePersistence {
         let path = state_dir().join("discovered.json");
         save_json_async(path, discovered.clone()).await
     }
+
+    async fn save_discovered_repos(&self, repos: &DiscoveredRepoSet) -> Result<(), PersistError> {
+        let path = state_dir().join("discovered_repos.json");
+        save_json_async(path, repos.clone()).await
+    }
 }
 
 /// No-op persistence for tests.
@@ -276,6 +287,10 @@ impl Persistence for NullPersistence {
         Ok(())
     }
     async fn save_discovered(&self, _discovered: &DiscoveredMap) -> Result<(), PersistError> {
+        Ok(())
+    }
+
+    async fn save_discovered_repos(&self, _repos: &DiscoveredRepoSet) -> Result<(), PersistError> {
         Ok(())
     }
 }

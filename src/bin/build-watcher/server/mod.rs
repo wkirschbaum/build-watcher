@@ -26,8 +26,7 @@ use build_watcher::config::unix_now;
 use build_watcher::dirs::state_dir;
 use build_watcher::status::{ActiveRunView, LastBuildView, PrView, StatusResponse, WatchStatus};
 use build_watcher::watcher::{
-    DiscoveredBranches, PauseState, RateLimitState, WatchEntry, WatchKey, WatcherHandle, Watches,
-    collect_persisted,
+    PauseState, RateLimitState, WatchEntry, WatchKey, WatcherHandle, Watches, collect_persisted,
 };
 
 pub use mcp::BuildWatcher;
@@ -43,7 +42,6 @@ pub(crate) struct DaemonState {
     pub pause: PauseState,
     pub rate_limit: RateLimitState,
     pub started_at: std::time::Instant,
-    pub discovered: DiscoveredBranches,
 }
 
 /// Build a snapshot of all current watches from already-locked state.

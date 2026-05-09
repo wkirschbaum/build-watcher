@@ -83,6 +83,81 @@ impl NotificationLevel {
 
 // -- Poll aggression --
 
+/// How recently a repo must have been pushed to qualify for auto-discovery.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum RecentlyUpdated {
+    /// No recency filter — discover any matching repo regardless of age.
+    #[default]
+    Any,
+    /// Only repos pushed to within the last 7 days.
+    Week,
+    /// Only repos pushed to within the last 30 days.
+    Month,
+    /// Only repos pushed to within the last 365 days.
+    Year,
+}
+
+impl RecentlyUpdated {
+    /// Returns the maximum allowed age in seconds, or `None` for no limit.
+    pub fn max_age_secs(self) -> Option<u64> {
+        match self {
+            Self::Any => None,
+            Self::Week => Some(7 * 24 * 3600),
+            Self::Month => Some(30 * 24 * 3600),
+            Self::Year => Some(365 * 24 * 3600),
+        }
+    }
+}
+
+impl std::fmt::Display for RecentlyUpdated {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Any => write!(f, "any"),
+            Self::Week => write!(f, "week"),
+            Self::Month => write!(f, "month"),
+            Self::Year => write!(f, "year"),
+        }
+    }
+}
+
+impl std::str::FromStr for RecentlyUpdated {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "any" | "none" => Ok(Self::Any),
+            "week" => Ok(Self::Week),
+            "month" => Ok(Self::Month),
+            "year" => Ok(Self::Year),
+            other => Err(format!(
+                "unknown recently_updated {other:?}; valid: any, week, month, year"
+            )),
+        }
+    }
+}
+
+/// A rule for auto-discovering repos from GitHub.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutoDiscoverRule {
+    /// Unique identifier for this rule (e.g. `"my-org"`).
+    pub id: String,
+    /// Regex applied against the repo's owner/org name. `None` matches any owner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub org_pattern: Option<String>,
+    /// Regex applied against the repo name (not the full path). `None` matches any name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_pattern: Option<String>,
+    /// Only discover repos pushed within this window.
+    #[serde(default)]
+    pub recently_updated: RecentlyUpdated,
+    /// Compiled `org_pattern`. Populated by `populate_compiled_filters()`. Not persisted.
+    #[serde(skip)]
+    pub compiled_org_pattern: Option<Arc<regex::Regex>>,
+    /// Compiled `repo_pattern`. Populated by `populate_compiled_filters()`. Not persisted.
+    #[serde(skip)]
+    pub compiled_repo_pattern: Option<Arc<regex::Regex>>,
+}
+
 /// Controls how aggressively the poller consumes the GitHub API rate-limit budget.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
@@ -321,6 +396,10 @@ pub struct Config {
     /// Not persisted.
     #[serde(skip)]
     pub compiled_branch_filter: Option<Arc<regex::Regex>>,
+    /// Rules for auto-discovering repos from GitHub. The daemon periodically fetches
+    /// all accessible repos and starts watching those that match any rule.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub auto_discover_rules: Vec<AutoDiscoverRule>,
 }
 
 impl Default for Config {
@@ -338,6 +417,7 @@ impl Default for Config {
             default_branches: Vec::new(),
             repos: HashMap::new(),
             compiled_branch_filter: None,
+            auto_discover_rules: Vec::new(),
         }
     }
 }

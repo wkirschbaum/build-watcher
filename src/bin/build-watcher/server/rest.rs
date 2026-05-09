@@ -715,6 +715,12 @@ mod tests {
         ) -> Option<build_watcher::github::RunAuthorInfo> {
             None
         }
+
+        async fn list_accessible_repos(
+            &self,
+        ) -> Result<Vec<build_watcher::github::RepoInfo>, build_watcher::github::GhError> {
+            Ok(vec![])
+        }
     }
 
     fn stub_handle() -> build_watcher::watcher::WatcherHandle {
@@ -725,6 +731,7 @@ mod tests {
             Arc::new(build_watcher::persistence::NullPersistence),
             Arc::new(Mutex::new(HashMap::new())),
             Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(std::collections::HashSet::new())),
             Arc::new(tokio::sync::Notify::new()),
         )
     }
@@ -745,7 +752,6 @@ mod tests {
             pause,
             rate_limit: Arc::new(Mutex::new(None)),
             started_at: std::time::Instant::now(),
-            discovered: Arc::new(Mutex::new(HashMap::new())),
         };
         axum::Router::new()
             .route("/status", axum::routing::get(super::status_handler))
@@ -763,7 +769,6 @@ mod tests {
             pause,
             rate_limit: Arc::new(Mutex::new(None)),
             started_at: std::time::Instant::now(),
-            discovered: Arc::new(Mutex::new(HashMap::new())),
         };
         axum::Router::new()
             .route(
@@ -878,7 +883,6 @@ mod tests {
             pause,
             rate_limit: Arc::new(Mutex::new(None)),
             started_at: std::time::Instant::now(),
-            discovered: Arc::new(Mutex::new(HashMap::new())),
         };
         axum::Router::new()
             .route("/status", axum::routing::get(super::status_handler))
@@ -1128,7 +1132,6 @@ mod tests {
             pause,
             rate_limit: Arc::new(Mutex::new(None)),
             started_at: std::time::Instant::now(),
-            discovered: Arc::new(Mutex::new(HashMap::new())),
         };
         axum::Router::new()
             .route(

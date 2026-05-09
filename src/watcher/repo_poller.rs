@@ -320,6 +320,16 @@ impl RepoPoller {
             tracing::error!(error = %e, "Failed to save watches after removing dead repo");
         }
 
+        // Clean up branch discovery state so discovered.json doesn't accumulate orphans.
+        let updated_disc = {
+            let mut disc = self.discovered.lock().await;
+            disc.remove(&self.repo);
+            disc.clone()
+        };
+        if let Err(e) = self.persistence.save_discovered(&updated_disc).await {
+            tracing::error!(error = %e, "Failed to save branch discovery state after removing dead repo");
+        }
+
         let repo = self.repo.clone();
         if let Err(e) = self
             .config

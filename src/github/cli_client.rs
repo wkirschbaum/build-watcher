@@ -389,4 +389,9 @@ impl GitHubClient for GhCliClient {
             }
         }
     }
+
+    async fn list_accessible_repos(&self) -> Result<Vec<super::RepoInfo>, super::GhError> {
+        // GhCliClient does not support repo listing; auto-discovery requires the direct HTTP client.
+        Ok(Vec::new())
+    }
 }

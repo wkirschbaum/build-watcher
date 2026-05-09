@@ -191,6 +191,10 @@ impl crate::github::GitHubClient for MockGitHub {
     async fn run_author(&self, _: &str, _: u64) -> Option<crate::github::RunAuthorInfo> {
         None
     }
+
+    async fn list_accessible_repos(&self) -> Result<Vec<crate::github::RepoInfo>, GhError> {
+        Ok(Vec::new())
+    }
 }
 
 // -- Test harness for async integration tests --
@@ -215,6 +219,7 @@ impl TestHarness {
             Arc::new(crate::persistence::NullPersistence),
             Arc::new(Mutex::new(HashMap::new())),
             Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(std::collections::HashSet::new())),
             Arc::new(tokio::sync::Notify::new()),
         );
         Self {

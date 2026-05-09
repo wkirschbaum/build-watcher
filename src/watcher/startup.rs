@@ -6,17 +6,20 @@ use tokio::sync::{Mutex, Notify};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
+use crate::config::AutoDiscoverRule;
 use crate::events::EventBus;
-use crate::github::GitHubClient;
+use crate::github::{GitHubClient, RepoInfo};
 use crate::history::SharedHistory;
-use crate::persistence::Persistence;
+use crate::persistence::{DiscoveredRepoSet, Persistence};
 
 use super::repo_poller::RepoPoller;
 use super::types::{PersistedWatches, WatchEntry, WatchKey};
-use super::{RateLimitState, SharedConfig, Watches};
+use super::{DiscoveredRepos, RateLimitState, SharedConfig, Watches};
 
 /// How often the centralized rate-limit refresh task runs.
 const RATE_LIMIT_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+/// How often the repo auto-discovery task re-fetches the repo list from GitHub.
+const REPO_DISCOVER_INTERVAL: Duration = Duration::from_secs(60);
 
 // -- Watcher handle --
 
@@ -30,13 +33,18 @@ pub struct WatcherHandle {
     pub persistence: Arc<dyn Persistence>,
     pub history: SharedHistory,
     pub discovered: super::DiscoveredBranches,
+    /// Auto-discovered repos (managed by the repo-discovery task, separate from config).
+    pub discovered_repos: DiscoveredRepos,
     /// Notified when config changes so pollers wake early and recompute intervals.
     pub config_changed: Arc<Notify>,
+    /// Notified when auto-discover rules change to trigger an immediate discovery cycle.
+    pub discover_trigger: Arc<Notify>,
     /// Tracks which repos have an active `RepoPoller` to avoid spawning duplicates.
     active_repo_pollers: Arc<Mutex<HashSet<String>>>,
 }
 
 impl WatcherHandle {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         cancel: CancellationToken,
         events: EventBus,
@@ -44,6 +52,7 @@ impl WatcherHandle {
         persistence: Arc<dyn Persistence>,
         history: SharedHistory,
         discovered: super::DiscoveredBranches,
+        discovered_repos: DiscoveredRepos,
         config_changed: Arc<Notify>,
     ) -> Self {
         Self {
@@ -54,7 +63,9 @@ impl WatcherHandle {
             persistence,
             history,
             discovered,
+            discovered_repos,
             config_changed,
+            discover_trigger: Arc::new(Notify::new()),
             active_repo_pollers: Arc::new(Mutex::new(HashSet::new())),
         }
     }
@@ -189,6 +200,7 @@ pub async fn startup_watches(
         spawn_repo_poller(watches, config, handle, rate_limit, repo).await;
     }
     spawn_rate_limit_refresher(handle, rate_limit);
+    spawn_repo_discoverer(watches, config, handle, rate_limit);
 }
 
 /// Spawn a single background task that refreshes the shared rate-limit state
@@ -220,6 +232,181 @@ fn spawn_rate_limit_refresher(handle: &WatcherHandle, rate_limit: &RateLimitStat
     });
 }
 
+/// Spawn a background task that periodically fetches all accessible repos from
+/// GitHub and starts/stops watches based on `auto_discover_rules`.
+///
+/// Auto-discovered repos are tracked in `discovered_repos.json` — separate from
+/// `config.repos` (manually-watched repos). This mirrors how branch discovery
+/// works: rules exclusively manage their own set; manual watching is independent.
+fn spawn_repo_discoverer(
+    watches: &Watches,
+    config: &SharedConfig,
+    handle: &WatcherHandle,
+    rate_limit: &RateLimitState,
+) {
+    let watches = watches.clone();
+    let config = config.clone();
+    let handle = handle.clone();
+    let rate_limit = rate_limit.clone();
+    let token = handle.cancel.child_token();
+    let trigger = handle.discover_trigger.clone();
+
+    handle.tracker.clone().spawn(async move {
+        loop {
+            run_discovery_cycle(&watches, &config, &handle, &rate_limit).await;
+            tokio::select! {
+                () = tokio::time::sleep(REPO_DISCOVER_INTERVAL) => {}
+                () = trigger.notified() => {}
+                () = token.cancelled() => return,
+            }
+        }
+    });
+}
+
+async fn run_discovery_cycle(
+    watches: &Watches,
+    config: &SharedConfig,
+    handle: &WatcherHandle,
+    rate_limit: &RateLimitState,
+) {
+    // Read config once for everything needed this cycle.
+    let (rules, manually_watched): (Vec<AutoDiscoverRule>, HashSet<String>) = {
+        let cfg = config.read().await;
+        (
+            cfg.auto_discover_rules.clone(),
+            cfg.repos.keys().cloned().collect(),
+        )
+    };
+    if rules.is_empty() {
+        return;
+    }
+
+    let repos = match handle.github.list_accessible_repos().await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(error = %e, "Repo auto-discovery: failed to list repos");
+            return;
+        }
+    };
+
+    let now = crate::config::unix_now();
+    let matching: DiscoveredRepoSet = repos
+        .iter()
+        .filter(|r| rules.iter().any(|rule| repo_matches_rule(rule, r, now)))
+        .map(|r| r.full_name.clone())
+        .collect();
+
+    let old_set: DiscoveredRepoSet = handle.discovered_repos.lock().await.clone();
+
+    let to_add: Vec<String> = matching.difference(&old_set).cloned().collect();
+    // Only auto-remove repos not also manually pinned in config.
+    let to_remove: Vec<String> = old_set
+        .difference(&matching)
+        .filter(|r| !manually_watched.contains(*r))
+        .cloned()
+        .collect();
+
+    if to_add.is_empty() && to_remove.is_empty() {
+        return;
+    }
+
+    // new_set is built incrementally: repos are only added after watches start
+    // successfully, so a transient branch-resolution failure leaves the repo
+    // out of discovered_repos and the next cycle retries it.
+    let mut new_set = old_set.clone();
+
+    if !to_add.is_empty() {
+        tracing::info!(count = to_add.len(), "Repo auto-discovery: adding repos");
+        // Read configured branches for all new repos in one lock acquisition.
+        let configured_per_repo: Vec<(String, Vec<String>)> = {
+            let cfg = config.read().await;
+            to_add
+                .iter()
+                .map(|repo| (repo.clone(), cfg.branches_for(repo)))
+                .collect()
+        };
+        // Resolve default branches in parallel — one API call per repo.
+        let mut join_set = tokio::task::JoinSet::new();
+        for (repo, configured) in configured_per_repo {
+            let github = handle.github.clone();
+            join_set.spawn(async move {
+                let branches = resolve_branches_for_repo(&*github, &repo, &configured).await;
+                (repo, branches)
+            });
+        }
+        while let Some(Ok((repo, branches))) = join_set.join_next().await {
+            if branches.is_empty() {
+                tracing::warn!(repo = %repo, "Repo auto-discovery: no branches resolved, will retry next cycle");
+                continue;
+            }
+            for branch in &branches {
+                let _ = start_watch(watches, config, handle, rate_limit, &repo, branch).await;
+            }
+            new_set.insert(repo);
+        }
+    }
+
+    if !to_remove.is_empty() {
+        tracing::info!(
+            count = to_remove.len(),
+            "Repo auto-discovery: removing stale repos"
+        );
+        {
+            let mut w = watches.lock().await;
+            w.retain(|k, _| !to_remove.contains(&k.repo));
+        }
+        // Clean up branch discovery state so discovered.json doesn't accumulate orphans.
+        let updated_disc = {
+            let mut disc = handle.discovered.lock().await;
+            for repo in &to_remove {
+                disc.remove(repo);
+                new_set.remove(repo);
+            }
+            disc.clone()
+        };
+        if let Err(e) = handle.persistence.save_discovered(&updated_disc).await {
+            tracing::warn!(error = %e, "Failed to persist branch discovery cleanup");
+        }
+    }
+
+    // Persist only when the auto-discovered set actually changed.
+    if new_set != old_set {
+        *handle.discovered_repos.lock().await = new_set.clone();
+        if let Err(e) = handle.persistence.save_discovered_repos(&new_set).await {
+            tracing::warn!(error = %e, "Failed to persist discovered repos");
+        }
+    }
+}
+
+fn repo_matches_rule(rule: &AutoDiscoverRule, repo: &RepoInfo, now_unix: u64) -> bool {
+    if rule
+        .compiled_org_pattern
+        .as_ref()
+        .is_some_and(|re| !re.is_match(&repo.owner))
+    {
+        return false;
+    }
+    if rule
+        .compiled_repo_pattern
+        .as_ref()
+        .is_some_and(|re| !re.is_match(&repo.name))
+    {
+        return false;
+    }
+    if let Some(max_age) = rule.recently_updated.max_age_secs() {
+        let Some(pushed_at) = &repo.pushed_at else {
+            return false;
+        };
+        let Some(pushed_epoch) = crate::github::parse_iso_epoch(pushed_at) else {
+            return false;
+        };
+        if now_unix.saturating_sub(pushed_epoch) > max_age {
+            return false;
+        }
+    }
+    true
+}
+
 /// Resolve the branch list for a single repo: GitHub default branch first,
 /// then any configured/discovered branches not already in the list.
 pub async fn resolve_branches_for_repo(
@@ -246,32 +433,46 @@ pub async fn resolve_branches_for_repo(
 /// Resolve the complete set of WatchKeys from config + discovered state,
 /// querying GitHub for the repo default branch where needed.
 async fn resolve_config_keys(config: &SharedConfig, handle: &WatcherHandle) -> Vec<WatchKey> {
-    let discovered = handle.discovered.lock().await;
     let repos: Vec<(String, Vec<String>)> = {
+        let discovered_branches = handle.discovered.lock().await;
+        let discovered_repos = handle.discovered_repos.lock().await;
         let cfg = config.read().await;
-        cfg.watched_repos()
+        // Union of manually-configured repos and auto-discovered repos.
+        let mut all_repos: Vec<String> = cfg.watched_repos().into_iter().cloned().collect();
+        for repo in discovered_repos.iter() {
+            if !all_repos.contains(repo) {
+                all_repos.push(repo.clone());
+            }
+        }
+        all_repos
             .into_iter()
             .map(|repo| {
-                let mut branches = cfg.branches_for(repo);
-                if let Some(disc) = discovered.get(repo) {
+                let mut branches = cfg.branches_for(&repo);
+                if let Some(disc) = discovered_branches.get(&repo) {
                     for b in disc {
                         if !branches.contains(b) {
                             branches.push(b.clone());
                         }
                     }
                 }
-                (repo.to_string(), branches)
+                (repo, branches)
             })
             .collect()
     };
-    drop(discovered);
 
+    // Resolve default branches in parallel — one API call per repo.
+    let mut join_set = tokio::task::JoinSet::new();
+    for (repo, configured_branches) in repos {
+        let github = handle.github.clone();
+        join_set.spawn(async move {
+            let branches = resolve_branches_for_repo(&*github, &repo, &configured_branches).await;
+            (repo, branches)
+        });
+    }
     let mut keys = Vec::new();
-    for (repo, configured_branches) in &repos {
-        for branch in
-            resolve_branches_for_repo(&*handle.github, repo, &configured_branches[..]).await
-        {
-            let key = WatchKey::new(repo, &branch);
+    while let Some(Ok((repo, branches))) = join_set.join_next().await {
+        for branch in branches {
+            let key = WatchKey::new(&repo, &branch);
             if !keys.contains(&key) {
                 keys.push(key);
             }

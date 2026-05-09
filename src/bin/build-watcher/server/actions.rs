@@ -1,4 +1,6 @@
-use build_watcher::config::{NotificationLevel, NotificationOverrides};
+use build_watcher::config::{
+    AutoDiscoverRule, NotificationLevel, NotificationOverrides, RecentlyUpdated,
+};
 use build_watcher::github::run_url;
 use build_watcher::watcher::{
     collect_persisted, last_failed_build, resolve_branches_for_repo, start_watch,
@@ -218,7 +220,7 @@ pub(crate) async fn do_configure_branches(
     // Remove discovered branches the user is explicitly dropping so they
     // don't resurface on the next restart.
     {
-        let mut disc = state.discovered.lock().await;
+        let mut disc = state.handle.discovered.lock().await;
         if let Some(entry) = disc.get_mut(repo) {
             entry.retain(|b| new_branches.contains(b));
         }
@@ -325,6 +327,96 @@ pub(crate) async fn do_rerun(
         "all jobs"
     };
     Ok(format!("Rerunning {kind} for run {run_id}\n{url}"))
+}
+
+/// Add or replace an auto-discover rule. Validates regexes, persists config,
+/// and notifies the discovery task to run immediately.
+///
+/// Returns the rule summary on success or an error message.
+pub(crate) async fn do_add_auto_discover_rule(
+    state: &DaemonState,
+    id: String,
+    org_pattern: Option<String>,
+    repo_pattern: Option<String>,
+    recently_updated: RecentlyUpdated,
+) -> Result<String, String> {
+    if id.trim().is_empty() {
+        return Err("id must not be empty".to_string());
+    }
+    // Validate regexes before touching config.
+    if let Some(p) = &org_pattern {
+        regex::Regex::new(p).map_err(|e| format!("Invalid org_pattern regex {p:?}: {e}"))?;
+    }
+    if let Some(p) = &repo_pattern {
+        regex::Regex::new(p).map_err(|e| format!("Invalid repo_pattern regex {p:?}: {e}"))?;
+    }
+
+    let rule = AutoDiscoverRule {
+        id: id.clone(),
+        org_pattern: org_pattern.clone(),
+        repo_pattern: repo_pattern.clone(),
+        recently_updated,
+        compiled_org_pattern: None,
+        compiled_repo_pattern: None,
+    };
+
+    let replaced = state
+        .config
+        .modify(|cfg| {
+            if let Some(pos) = cfg.auto_discover_rules.iter().position(|r| r.id == id) {
+                cfg.auto_discover_rules[pos] = rule;
+                true
+            } else {
+                cfg.auto_discover_rules.push(rule);
+                false
+            }
+        })
+        .await
+        .map_err(|e| format!("Failed to save config: {e}"))?;
+
+    state.handle.discover_trigger.notify_one();
+
+    let verb = if replaced { "Updated" } else { "Added" };
+    let mut parts = Vec::new();
+    if let Some(p) = &org_pattern {
+        parts.push(format!("org_pattern: {p:?}"));
+    }
+    if let Some(p) = &repo_pattern {
+        parts.push(format!("repo_pattern: {p:?}"));
+    }
+    parts.push(format!("recently_updated: {recently_updated}"));
+    Ok(format!(
+        "{verb} rule {id:?}: {}\nDiscovery will run shortly.",
+        parts.join(", ")
+    ))
+}
+
+/// Remove an auto-discover rule by ID. The discovery task will clean up repos
+/// that were exclusively matched by this rule on its next cycle.
+///
+/// Returns a summary or an error if the rule was not found.
+pub(crate) async fn do_remove_auto_discover_rule(
+    state: &DaemonState,
+    id: &str,
+) -> Result<String, String> {
+    let found = state
+        .config
+        .modify(|cfg| {
+            let before = cfg.auto_discover_rules.len();
+            cfg.auto_discover_rules.retain(|r| r.id != id);
+            cfg.auto_discover_rules.len() < before
+        })
+        .await
+        .map_err(|e| format!("Failed to save config: {e}"))?;
+
+    if !found {
+        return Err(format!("Rule {id:?} not found"));
+    }
+
+    state.handle.discover_trigger.notify_one();
+    Ok(format!(
+        "Removed rule {id:?}. Repos matched only by this rule will stop being watched shortly."
+    ))
 }
 
 /// Merge a PR by number and trigger burst polling.

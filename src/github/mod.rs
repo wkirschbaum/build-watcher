@@ -441,6 +441,19 @@ pub struct PrInfo {
     pub review_decision: Option<String>,
 }
 
+/// Summary of a GitHub repository, used for auto-discovery.
+#[derive(Debug, Clone)]
+pub struct RepoInfo {
+    /// Full slug: `"owner/repo"`.
+    pub full_name: String,
+    /// Owner login (user or org).
+    pub owner: String,
+    /// Repository name without the owner prefix.
+    pub name: String,
+    /// ISO 8601 timestamp of the last push, if available.
+    pub pushed_at: Option<String>,
+}
+
 /// Abstraction over the GitHub API.
 #[async_trait::async_trait]
 pub trait GitHubClient: Send + Sync + 'static {
@@ -468,6 +481,9 @@ pub trait GitHubClient: Send + Sync + 'static {
     async fn open_prs(&self, repo: &str) -> Result<Vec<PrInfo>, GhError>;
     async fn pr_merge(&self, repo: &str, number: u64) -> Result<String, GhError>;
     async fn run_author(&self, repo: &str, run_id: u64) -> Option<RunAuthorInfo>;
+    /// Fetch all repos accessible to the authenticated user (owned, org member, collaborator).
+    /// Returns an empty vec when not supported (e.g. CLI fallback client).
+    async fn list_accessible_repos(&self) -> Result<Vec<RepoInfo>, GhError>;
 }
 
 /// Author information fetched from the GitHub Actions run detail API.
@@ -596,7 +612,7 @@ pub(crate) fn display_title(event: &str, title: &str) -> String {
 }
 
 /// Parse an ISO 8601 / RFC 3339 timestamp to Unix epoch seconds.
-pub(super) fn parse_iso_epoch(s: &str) -> Option<u64> {
+pub fn parse_iso_epoch(s: &str) -> Option<u64> {
     u64::try_from(chrono::DateTime::parse_from_rfc3339(s).ok()?.timestamp()).ok()
 }
 

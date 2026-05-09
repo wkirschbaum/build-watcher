@@ -192,6 +192,25 @@ pub(crate) struct BuildHistoryParams {
     pub limit: Option<u32>,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+pub(crate) struct AddAutoDiscoverRuleParams {
+    /// Unique ID for this rule, e.g. `"my-org"` or `"rust-projects"`.
+    pub id: String,
+    /// Regex applied to the repo's owner/org name. Omit to match any owner.
+    pub org_pattern: Option<String>,
+    /// Regex applied to the repo name (not the full path). Omit to match any name.
+    pub repo_pattern: Option<String>,
+    /// Recency filter: `"any"` (default), `"week"`, `"month"`, or `"year"`.
+    /// Only discovers repos pushed within the specified window.
+    pub recently_updated: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub(crate) struct RemoveAutoDiscoverRuleParams {
+    /// ID of the rule to remove.
+    pub id: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

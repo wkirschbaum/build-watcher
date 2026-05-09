@@ -83,30 +83,28 @@ impl ReqwestClient {
         }
     }
 
-    fn get(&self, url: &str) -> reqwest::RequestBuilder {
+    fn request(&self, method: reqwest::Method, url: &str) -> reqwest::RequestBuilder {
         self.client
-            .get(url)
+            .request(method, url)
             .bearer_auth(self.token())
             .header("Accept", "application/vnd.github+json")
             .header("X-GitHub-Api-Version", "2022-11-28")
+    }
+
+    fn get(&self, url: &str) -> reqwest::RequestBuilder {
+        self.request(reqwest::Method::GET, url)
+    }
+
+    fn post(&self, url: &str) -> reqwest::RequestBuilder {
+        self.request(reqwest::Method::POST, url)
     }
 
     fn post_json(&self, url: &str, body: &impl Serialize) -> reqwest::RequestBuilder {
-        self.client
-            .post(url)
-            .bearer_auth(self.token())
-            .header("Accept", "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", "2022-11-28")
-            .json(body)
+        self.post(url).json(body)
     }
 
     fn put_json(&self, url: &str, body: &impl Serialize) -> reqwest::RequestBuilder {
-        self.client
-            .put(url)
-            .bearer_auth(self.token())
-            .header("Accept", "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", "2022-11-28")
-            .json(body)
+        self.request(reqwest::Method::PUT, url).json(body)
     }
 
     /// Core GET with ETag-based conditional requests.
@@ -209,19 +207,6 @@ impl ReqwestClient {
         &self,
         repo: &str,
         path: &str,
-    ) -> Result<T, GhError> {
-        let url = format!("{}{path}", self.base_url);
-        let bytes = self.cached_get(&url, repo).await?;
-        serde_json::from_slice(&bytes).map_err(|e| GhError::Parse {
-            repo: repo.into(),
-            source: e,
-        })
-    }
-
-    async fn api_get_query<T: serde::de::DeserializeOwned>(
-        &self,
-        repo: &str,
-        path: &str,
         query: &[(&str, &str)],
     ) -> Result<T, GhError> {
         let base = format!("{}{path}", self.base_url);
@@ -236,21 +221,32 @@ impl ReqwestClient {
         })
     }
 
+    /// Fetch all pages of a paginated GitHub endpoint.
+    /// Adds `per_page=100` automatically; pass extra query params via `extra`.
     async fn api_get_all_pages<T: serde::de::DeserializeOwned>(
         &self,
         repo: &str,
         path: &str,
+        extra: &[(&str, &str)],
     ) -> Result<Vec<T>, GhError> {
-        let mut items = Vec::new();
-        let mut url = Some(format!("{}{path}?per_page=100", self.base_url));
+        let base = format!("{}{path}", self.base_url);
+        let mut params = vec![("per_page", "100")];
+        params.extend_from_slice(extra);
+        let first_url = reqwest::Url::parse_with_params(&base, &params)
+            .map_err(|e| GhError::CliError {
+                repo: repo.into(),
+                stderr: e.to_string(),
+            })?
+            .to_string();
 
+        let mut items = Vec::new();
+        let mut url = Some(first_url);
         while let Some(current_url) = url {
             let resp = self.send_with_retry(|s| s.get(&current_url), repo).await?;
             url = next_link_url(&resp);
             let page: Vec<T> = handle_response(resp, repo).await?;
             items.extend(page);
         }
-
         Ok(items)
     }
 
@@ -264,7 +260,7 @@ impl ReqwestClient {
         let mut query: Vec<(&str, &str)> = vec![("per_page", &limit_str)];
         query.extend_from_slice(extra);
         let resp: RestRunsResponse = self
-            .api_get_query(repo, &format!("/repos/{repo}/actions/runs"), &query)
+            .api_get(repo, &format!("/repos/{repo}/actions/runs"), &query)
             .await?;
         Ok(resp
             .workflow_runs
@@ -300,18 +296,7 @@ impl ReqwestClient {
 
     async fn api_post_empty(&self, repo: &str, path: &str) -> Result<String, GhError> {
         let url = format!("{}{path}", self.base_url);
-        let resp = self
-            .send_with_retry(
-                |s| {
-                    s.client
-                        .post(&url)
-                        .bearer_auth(s.token())
-                        .header("Accept", "application/vnd.github+json")
-                        .header("X-GitHub-Api-Version", "2022-11-28")
-                },
-                repo,
-            )
-            .await?;
+        let resp = self.send_with_retry(|s| s.post(&url), repo).await?;
         if !resp.status().is_success() {
             return Err(response_error(resp, repo).await);
         }
@@ -378,6 +363,14 @@ async fn handle_response<T: serde::de::DeserializeOwned>(
 }
 
 // -- REST API response types --
+
+#[derive(Debug, Deserialize)]
+struct GhRepoJson {
+    #[serde(default)]
+    full_name: String,
+    #[serde(default)]
+    pushed_at: Option<String>,
+}
 
 #[derive(Debug, Deserialize)]
 struct RestRunsResponse {
@@ -559,14 +552,18 @@ impl GitHubClient for ReqwestClient {
     #[tracing::instrument(skip_all, fields(%repo, %run_id))]
     async fn run_status(&self, repo: &str, run_id: u64) -> Result<RunInfo, GhError> {
         let raw: RestRunJson = self
-            .api_get(repo, &format!("/repos/{repo}/actions/runs/{run_id}"))
+            .api_get(repo, &format!("/repos/{repo}/actions/runs/{run_id}"), &[])
             .await?;
         raw.into_run_info(repo)
     }
 
     async fn failing_steps(&self, repo: &str, run_id: u64) -> Option<super::FailureInfo> {
         let resp: RestJobsResponse = self
-            .api_get(repo, &format!("/repos/{repo}/actions/runs/{run_id}/jobs"))
+            .api_get(
+                repo,
+                &format!("/repos/{repo}/actions/runs/{run_id}/jobs"),
+                &[],
+            )
             .await
             .inspect_err(|e| {
                 tracing::debug!(%repo, %run_id, error = %e, "Failed to fetch failing steps");
@@ -619,7 +616,7 @@ impl GitHubClient for ReqwestClient {
             query.push(("branch", b));
         }
         let resp: RestRunsResponse = self
-            .api_get_query(repo, &format!("/repos/{repo}/actions/runs"), &query)
+            .api_get(repo, &format!("/repos/{repo}/actions/runs"), &query)
             .await?;
         Ok(resp
             .workflow_runs
@@ -637,13 +634,13 @@ impl GitHubClient for ReqwestClient {
         struct RateLimitResources {
             core: RateLimit,
         }
-        let resp: RateLimitResponse = self.api_get("rate_limit", "/rate_limit").await?;
+        let resp: RateLimitResponse = self.api_get("rate_limit", "/rate_limit", &[]).await?;
         Ok(resp.resources.core)
     }
 
     async fn list_tags(&self, repo: &str) -> Result<Vec<String>, GhError> {
         let items: Vec<NameJson> = self
-            .api_get_all_pages(repo, &format!("/repos/{repo}/tags"))
+            .api_get_all_pages(repo, &format!("/repos/{repo}/tags"), &[])
             .await?;
         Ok(items.into_iter().map(|n| n.name).collect())
     }
@@ -651,14 +648,14 @@ impl GitHubClient for ReqwestClient {
     #[tracing::instrument(skip_all, fields(%repo))]
     async fn list_branches(&self, repo: &str) -> Result<Vec<String>, GhError> {
         let items: Vec<NameJson> = self
-            .api_get_all_pages(repo, &format!("/repos/{repo}/branches"))
+            .api_get_all_pages(repo, &format!("/repos/{repo}/branches"), &[])
             .await?;
         Ok(items.into_iter().map(|n| n.name).collect())
     }
 
     #[tracing::instrument(skip_all, fields(%repo))]
     async fn default_branch(&self, repo: &str) -> Result<String, GhError> {
-        let info: RestRepoJson = self.api_get(repo, &format!("/repos/{repo}")).await?;
+        let info: RestRepoJson = self.api_get(repo, &format!("/repos/{repo}"), &[]).await?;
         if info.default_branch.is_empty() {
             Err(GhError::MissingFields { repo: repo.into() })
         } else {
@@ -734,9 +731,27 @@ impl GitHubClient for ReqwestClient {
         })
     }
 
+    async fn list_accessible_repos(&self) -> Result<Vec<super::RepoInfo>, GhError> {
+        let raw: Vec<GhRepoJson> = self
+            .api_get_all_pages("user", "/user/repos", &[("type", "all")])
+            .await?;
+        Ok(raw
+            .into_iter()
+            .filter_map(|r| {
+                let (owner, name) = r.full_name.split_once('/')?;
+                Some(super::RepoInfo {
+                    full_name: r.full_name.clone(),
+                    owner: owner.to_string(),
+                    name: name.to_string(),
+                    pushed_at: r.pushed_at,
+                })
+            })
+            .collect())
+    }
+
     async fn run_author(&self, repo: &str, run_id: u64) -> Option<RunAuthorInfo> {
         let raw: RestRunJson = self
-            .api_get(repo, &format!("/repos/{repo}/actions/runs/{run_id}"))
+            .api_get(repo, &format!("/repos/{repo}/actions/runs/{run_id}"), &[])
             .await
             .inspect_err(|e| {
                 tracing::debug!(%repo, %run_id, error = %e, "Failed to fetch run author");

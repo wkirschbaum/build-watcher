@@ -14,14 +14,15 @@ use build_watcher::watcher::{count_api_calls, is_paused};
 
 use super::DaemonState;
 use super::actions::{
-    apply_levels, apply_pause, apply_quiet_hours, do_configure_branches, do_rerun, do_stop_watches,
-    do_watch_builds, format_outcomes, modify_ignore_list, validate_hhmm,
+    apply_levels, apply_pause, apply_quiet_hours, do_add_auto_discover_rule, do_configure_branches,
+    do_remove_auto_discover_rule, do_rerun, do_stop_watches, do_watch_builds, format_outcomes,
+    modify_ignore_list, validate_hhmm,
 };
 use super::build_watch_snapshot;
 use super::schema::{
-    BuildHistoryParams, ConfigureBranchesParams, ConfigureIgnoredEventsParams, ConfigureRepoParams,
-    ReposParams, RerunBuildParams, SetPollAggressionParams, UpdateNotificationsParams,
-    WatchFromGitRemoteParams,
+    AddAutoDiscoverRuleParams, BuildHistoryParams, ConfigureBranchesParams,
+    ConfigureIgnoredEventsParams, ConfigureRepoParams, RemoveAutoDiscoverRuleParams, ReposParams,
+    RerunBuildParams, SetPollAggressionParams, UpdateNotificationsParams, WatchFromGitRemoteParams,
 };
 
 #[derive(Clone)]
@@ -783,6 +784,104 @@ impl BuildWatcher {
         Ok(CallToolResult::success(vec![Content::text(format!(
             "Poll aggression set to {level}."
         ))]))
+    }
+
+    #[tool(description = "Add or replace an auto-discover rule. \
+                       The daemon will periodically (every ~60 s) fetch all GitHub repos \
+                       accessible to the authenticated user and automatically start watching \
+                       those matching the rule. \
+                       Auto-discovered repos are tracked separately from manually-added repos: \
+                       use remove_auto_discover_rule (not stop_watches) to stop them. \
+                       org_pattern matches the owner/org name; repo_pattern matches the repo \
+                       name (not the full path). Both are Go-style regexes. \
+                       recently_updated filters by last-push age: 'any' (no filter), \
+                       'week', 'month', or 'year'.")]
+    async fn add_auto_discover_rule(
+        &self,
+        Parameters(params): Parameters<AddAutoDiscoverRuleParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let recently_updated = match params
+            .recently_updated
+            .as_deref()
+            .unwrap_or("any")
+            .parse::<build_watcher::config::RecentlyUpdated>()
+        {
+            Ok(r) => r,
+            Err(e) => return Ok(CallToolResult::error(vec![Content::text(e)])),
+        };
+        match do_add_auto_discover_rule(
+            &self.state,
+            params.id,
+            params.org_pattern,
+            params.repo_pattern,
+            recently_updated,
+        )
+        .await
+        {
+            Ok(msg) => Ok(CallToolResult::success(vec![Content::text(msg)])),
+            Err(e) => Ok(CallToolResult::error(vec![Content::text(e)])),
+        }
+    }
+
+    #[tool(description = "Remove an auto-discover rule by ID. \
+                       Repos that were matched exclusively by this rule will stop being watched \
+                       on the next discovery cycle (~60 s). \
+                       Repos that are also manually watched (via watch_builds) are unaffected.")]
+    async fn remove_auto_discover_rule(
+        &self,
+        Parameters(params): Parameters<RemoveAutoDiscoverRuleParams>,
+    ) -> Result<CallToolResult, McpError> {
+        match do_remove_auto_discover_rule(&self.state, &params.id).await {
+            Ok(msg) => Ok(CallToolResult::success(vec![Content::text(msg)])),
+            Err(e) => Ok(CallToolResult::error(vec![Content::text(e)])),
+        }
+    }
+
+    #[tool(description = "List all auto-discover rules and the repos currently matched by them.")]
+    async fn list_auto_discover_rules(&self) -> Result<CallToolResult, McpError> {
+        let (rules, discovered) = {
+            let cfg = self.state.config.read().await;
+            let dr = self.state.handle.discovered_repos.lock().await;
+            (cfg.auto_discover_rules.clone(), dr.clone())
+        };
+
+        if rules.is_empty() {
+            return Ok(CallToolResult::success(vec![Content::text(
+                "No auto-discover rules configured.",
+            )]));
+        }
+
+        let mut lines = Vec::new();
+        for rule in &rules {
+            let mut parts = Vec::new();
+            if let Some(p) = &rule.org_pattern {
+                parts.push(format!("org: {p:?}"));
+            }
+            if let Some(p) = &rule.repo_pattern {
+                parts.push(format!("repo: {p:?}"));
+            }
+            parts.push(format!("updated: {}", rule.recently_updated));
+            lines.push(format!("• {} ({})", rule.id, parts.join(", ")));
+        }
+
+        if !discovered.is_empty() {
+            lines.push(String::new());
+            lines.push(format!(
+                "Currently discovered ({} repos):",
+                discovered.len()
+            ));
+            let mut sorted: Vec<&String> = discovered.iter().collect();
+            sorted.sort();
+            for repo in sorted {
+                lines.push(format!("  {repo}"));
+            }
+        } else {
+            lines.push("\nNo repos discovered yet (next cycle in ≤60 s).".to_string());
+        }
+
+        Ok(CallToolResult::success(vec![Content::text(
+            lines.join("\n"),
+        )]))
     }
 }
 

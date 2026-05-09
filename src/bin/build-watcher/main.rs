@@ -14,8 +14,8 @@ use build_watcher::github::{GhCliClient, GitHubClient, ReqwestClient, gh_auth_to
 use build_watcher::history::load_history;
 use build_watcher::persistence::FilePersistence;
 use build_watcher::watcher::{
-    DiscoveredBranches, PauseState, RateLimitState, WatcherHandle, load_discovered,
-    load_persisted_watches, startup_watches,
+    DiscoveredBranches, DiscoveredRepos, PauseState, RateLimitState, WatcherHandle,
+    load_discovered, load_discovered_repos, load_persisted_watches, startup_watches,
 };
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -66,6 +66,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ));
     let persisted = load_persisted_watches();
     let discovered: DiscoveredBranches = Arc::new(Mutex::new(load_discovered()));
+    let discovered_repos: DiscoveredRepos = Arc::new(Mutex::new(load_discovered_repos()));
     let watches = Arc::new(Mutex::new(HashMap::new()));
     let pause: PauseState = Arc::new(Mutex::new(None));
     let rate_limit: RateLimitState = Arc::new(Mutex::new(None));
@@ -99,11 +100,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         persistence,
         history,
         discovered,
+        discovered_repos,
         config.changed().clone(),
     );
     startup_watches(&watches, &config, &handle, &rate_limit, persisted).await;
 
-    let discovered_ref = handle.discovered.clone();
     let state = server::DaemonState {
         watches,
         config,
@@ -111,7 +112,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         pause,
         rate_limit,
         started_at: std::time::Instant::now(),
-        discovered: discovered_ref,
     };
     // Custom instances use port 0 (OS picks a free port); default instance uses
     // BUILD_WATCHER_PORT or 8417. The actual bound port is written to the port file.

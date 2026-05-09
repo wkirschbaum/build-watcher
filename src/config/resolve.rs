@@ -105,38 +105,38 @@ impl Config {
         }
     }
 
-    /// Compile and cache all branch-filter regexes. Call after load and after each mutation.
+    /// Compile and cache all branch-filter and auto-discover-rule regexes.
+    /// Call after load and after each mutation.
     pub fn populate_compiled_filters(&mut self) {
-        let global_re: Option<Arc<regex::Regex>> = self
-            .branch_filter
-            .as_deref()
-            .filter(|p| !p.is_empty())
-            .and_then(|p| {
-                regex::Regex::new(p)
-                    .inspect_err(|e| {
-                        tracing::warn!(pattern = %p, error = %e, "Invalid global branch_filter regex, ignoring");
-                    })
-                    .ok()
-                    .map(Arc::new)
-            });
+        let global_re: Option<Arc<regex::Regex>> =
+            compile_optional_regex(self.branch_filter.as_deref(), "global branch_filter");
         self.compiled_branch_filter = global_re.clone();
 
         for rc in self.repos.values_mut() {
             rc.compiled_branch_filter = rc
                 .branch_filter
                 .as_deref()
-                .filter(|p| !p.is_empty())
-                .and_then(|p| {
-                    regex::Regex::new(p)
-                        .inspect_err(|e| {
-                            tracing::warn!(pattern = %p, error = %e, "Invalid branch_filter regex, ignoring");
-                        })
-                        .ok()
-                        .map(Arc::new)
-                })
+                .and_then(|p| compile_optional_regex(Some(p), "branch_filter"))
                 .or_else(|| global_re.clone());
         }
+
+        for rule in self.auto_discover_rules.iter_mut() {
+            rule.compiled_org_pattern =
+                compile_optional_regex(rule.org_pattern.as_deref(), "org_pattern");
+            rule.compiled_repo_pattern =
+                compile_optional_regex(rule.repo_pattern.as_deref(), "repo_pattern");
+        }
     }
+}
+
+fn compile_optional_regex(pattern: Option<&str>, label: &str) -> Option<Arc<regex::Regex>> {
+    let p = pattern.filter(|s| !s.is_empty())?;
+    regex::Regex::new(p)
+        .inspect_err(
+            |e| tracing::warn!(pattern = %p, error = %e, "Invalid {label} regex, ignoring"),
+        )
+        .ok()
+        .map(Arc::new)
 }
 
 /// Returns the current local time as minutes since midnight.
