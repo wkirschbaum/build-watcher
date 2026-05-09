@@ -1,5 +1,40 @@
 # Changelog
 
+## [1.0.4] - 2026-05-09
+
+### Added
+
+- **Auto-discover repos by rule** — the daemon can automatically watch repos matching configurable rules. Each rule has an `id`, an optional `repo_pattern` (regex matched against the full `owner/name` path, e.g. `^myorg/foo-.*$`), an optional `org_pattern` (legacy: matched against the owner only), and a `recently_updated` filter (`any` | `week` | `month` | `year`). Auto-discovered repos are tracked separately from manually-added repos.
+- **REST API for auto-discover rules** — `GET /auto-discover-rules` lists all rules; `POST /auto-discover-rules` adds or replaces a rule by ID; `POST /auto-discover-rules/remove` removes a rule by ID.
+- **`auto_discovered_by_rule` field** in `GET /repo-config` response — `true` when the repo is being auto-watched by a discovery rule; branches for these repos cannot be edited manually.
+- **TUI: auto-discover rules popup** — press `D` to view, add (`a`/`+`), edit (`Enter`), and delete (`d`/`Delete`) discovery rules without leaving the dashboard.
+- **TUI: status-based sorting** now uses the worst conclusion across all workflows for a branch (not just the newest), matching the display logic.
+- **Paginated ETag caching** — `api_get_all_pages` now chains through the `Link: rel="next"` header so unchanged pages return 304s at zero rate-limit cost.
+- **Pagination guard** — `api_get_all_pages` truncates at 100 pages with a warning, preventing unbounded API loops for very large orgs.
+- **HH:MM zero-padding enforcement** — the quiet-hours validator now rejects single-digit hours or minutes (`9:05` must be `09:05`).
+
+### Fixed
+
+- **Actor and commit author missing from notifications and TUI** — `RunSnapshot::from_run_info()` and `ActiveRun::from_run_info()` were hard-coding `actor: None` / `commit_author: None`; now copies the fields from the run data.
+- **`set_defaults_handler` and `set_repo_config_handler` returned `ok: true` on disk-save errors** — now correctly returns `ok: false` so callers can detect the failure.
+- **`POST /unwatch` and the `stop_watches` MCP tool** did not validate repo names; now return an error for invalid inputs before touching any watches.
+- **`repo_pattern` matched against short name instead of full path** — was comparing against `repo.name` (e.g. `foo-bar`); now compares against `repo.full_name` (e.g. `myorg/foo-bar`). See **Changed** for migration notes.
+- **`last_failed_build`** filtered on `conclusion != Success`, which included `Cancelled` and `Skipped` as failures; now uses an explicit set (`Failure | TimedOut | StartupFailure`).
+- **Branch resolution task panics** in `run_discovery_cycle` and `resolve_config_keys` were silently swallowed by an `Ok`-only pattern on the `JoinHandle`; now logged as warnings and the cycle continues.
+- **`GroupBy::Status` splits-repo flag missing** — branches were landing in the wrong status group when grouping by status.
+
+### Changed
+
+- **Author info is now inline in `RunInfo`** — `actor` (GitHub login of the triggering actor) and `commit_author` (head-commit author name) are populated directly by the REST client at fetch time, eliminating a separate `GET /repos/{repo}/actions/runs/{id}` call per new run. The `gh` CLI fallback leaves these fields `None`.
+- **`run_author()` removed from the `GitHubClient` trait** — author info is embedded in `RunInfo` at fetch time. Code implementing `GitHubClient` must remove this method.
+- **`repo_pattern` now matches the full `owner/name` path** — previously matched only the repo short name. `org_pattern` retains its legacy owner-only semantics and is kept for backwards compatibility. **Migration:** if you have rules with `repo_pattern` anchored to the name only (e.g. `^foo-.*$`), update them to include the owner prefix (e.g. `^myorg/foo-.*$`). Rules that use only `org_pattern` are unaffected.
+- **Branch edits on auto-managed repos are now rejected** — `POST /branches` (REST) and `configure_branches` (MCP) return an error when the repo is rule-discovered or when branch auto-discovery is enabled. The TUI also blocks these operations before sending the request.
+- **`RwLock` replaces `Mutex` for the GitHub token** in `ReqwestClient` — concurrent poll tasks no longer block each other during token reads.
+
+### Backwards compatibility
+
+Config files, watch-state files, and the REST API are fully compatible with 1.0.0. All new response fields are optional and default-safe; old `bw` binaries connecting to a new daemon will simply ignore unknown fields. The only breaking change is `repo_pattern` semantics (see **Changed** above), which only affects auto-discover rules — a feature not present in any release before 1.0.4.
+
 ## [1.0.3] - 2026-05-08
 
 ### Fixed
