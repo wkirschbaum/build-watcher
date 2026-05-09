@@ -257,6 +257,10 @@ pub struct RunInfo {
     pub created_at: String,
     pub updated_at: String,
     pub url: String,
+    /// GitHub login of the actor who triggered the run (populated by the REST client only).
+    pub actor: Option<String>,
+    /// Name of the commit author from the head commit (populated by the REST client only).
+    pub commit_author: Option<String>,
 }
 
 impl RunInfo {
@@ -297,6 +301,8 @@ impl RunInfo {
             created_at: raw.created_at,
             updated_at: raw.updated_at,
             url: raw.url,
+            actor: None,
+            commit_author: None,
         })
     }
 
@@ -345,8 +351,8 @@ impl RunInfo {
             duration_secs: self.duration_secs(),
             attempt: self.attempt,
             url: self.url.clone(),
-            actor: None,
-            commit_author: None,
+            actor: self.actor.clone(),
+            commit_author: self.commit_author.clone(),
         }
     }
 }
@@ -480,7 +486,6 @@ pub trait GitHubClient: Send + Sync + 'static {
     async fn default_branch(&self, repo: &str) -> Result<String, GhError>;
     async fn open_prs(&self, repo: &str) -> Result<Vec<PrInfo>, GhError>;
     async fn pr_merge(&self, repo: &str, number: u64) -> Result<String, GhError>;
-    async fn run_author(&self, repo: &str, run_id: u64) -> Option<RunAuthorInfo>;
     /// Fetch all repos accessible to the authenticated user (owned, org member, collaborator).
     /// Returns an empty vec when not supported (e.g. CLI fallback client).
     async fn list_accessible_repos(&self) -> Result<Vec<RepoInfo>, GhError>;

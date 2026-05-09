@@ -158,15 +158,41 @@ pub(crate) async fn do_stop_watches(state: &DaemonState, repos: &[String]) -> Ve
     }
 }
 
+/// If the repo's branch list is auto-managed, return the reason as a
+/// human-readable string. Returns `None` when manual branch edits are allowed.
+///
+/// Rule discovery is checked first because that error is more actionable —
+/// the user has to remove or narrow the rule, not just toggle a flag.
+pub(crate) async fn auto_managed_reason(state: &DaemonState, repo: &str) -> Option<&'static str> {
+    if state.handle.discovered_repos.lock().await.contains(repo) {
+        return Some("repo is auto-discovered by a rule");
+    }
+    let cfg = state.config.read().await;
+    if cfg.auto_discover_for(repo) {
+        return Some("branch auto-discovery is enabled");
+    }
+    None
+}
+
 /// Shared logic for updating which branches are watched for a repo.
 ///
 /// Stops watches for branches no longer in the list, starts watches for new
 /// branches, updates config, and persists both.
+///
+/// Rejects the change with a single error outcome when the repo's branches are
+/// auto-managed — either because it was discovered by an `auto_discover_rule`
+/// or because branch auto-discovery is enabled (per-repo or global).
 pub(crate) async fn do_configure_branches(
     state: &DaemonState,
     repo: &str,
     new_branches: Vec<String>,
 ) -> Vec<ActionOutcome> {
+    if let Some(reason) = auto_managed_reason(state, repo).await {
+        return vec![ActionOutcome::err(format!(
+            "Cannot edit branches for {repo}: {reason}"
+        ))];
+    }
+
     let mut results = Vec::new();
 
     // Current branches from live watches.
@@ -666,6 +692,11 @@ pub(crate) fn validate_hhmm(s: &str) -> Result<(), String> {
     let Some((h, m)) = s.split_once(':') else {
         return Err(format!("{s:?} is not HH:MM format (e.g. \"22:00\")"));
     };
+    if h.len() != 2 || m.len() != 2 {
+        return Err(format!(
+            "{s:?} is not HH:MM format — use zero-padded two-digit hours and minutes (e.g. \"09:05\")"
+        ));
+    }
     let h: u32 = h
         .parse()
         .map_err(|_| format!("{s:?}: hours must be a number"))?;

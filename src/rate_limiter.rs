@@ -36,6 +36,8 @@ pub fn compute_interval(input: &PollInput) -> u64 {
 
     let time_left = rl.reset.saturating_sub(input.now).max(1);
     let target_budget = input.aggression.target_calls(rl.limit);
+    // Derived from `rl.used` (not `rl.remaining`) so external API consumers
+    // (gh CLI, curl, etc.) are factored in even when they eat into our target.
     let remaining_budget = target_budget.saturating_sub(rl.used);
 
     let interval = (calls * time_left)

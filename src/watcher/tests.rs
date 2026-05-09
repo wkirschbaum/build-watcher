@@ -188,10 +188,6 @@ impl crate::github::GitHubClient for MockGitHub {
     async fn pr_merge(&self, _: &str, _: u64) -> Result<String, GhError> {
         Ok("Merged".to_string())
     }
-    async fn run_author(&self, _: &str, _: u64) -> Option<crate::github::RunAuthorInfo> {
-        None
-    }
-
     async fn list_accessible_repos(&self) -> Result<Vec<crate::github::RepoInfo>, GhError> {
         Ok(Vec::new())
     }

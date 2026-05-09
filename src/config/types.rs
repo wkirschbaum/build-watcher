@@ -141,10 +141,12 @@ impl std::str::FromStr for RecentlyUpdated {
 pub struct AutoDiscoverRule {
     /// Unique identifier for this rule (e.g. `"my-org"`).
     pub id: String,
-    /// Regex applied against the repo's owner/org name. `None` matches any owner.
+    /// Legacy regex matched against the repo's owner only. New rules should use
+    /// `repo_pattern` against the full path instead. `None` skips the check.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub org_pattern: Option<String>,
-    /// Regex applied against the repo name (not the full path). `None` matches any name.
+    /// Regex matched against the full `"owner/name"` path (e.g. `^myorg/foo-.*$`).
+    /// `None` matches any repo.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo_pattern: Option<String>,
     /// Only discover repos pushed within this window.
@@ -485,5 +487,13 @@ mod tests {
         assert_eq!(NotificationLevel::Off.next(), NotificationLevel::Low);
         assert_eq!(NotificationLevel::Critical.next(), NotificationLevel::Off);
         assert_eq!(NotificationLevel::Off.prev(), NotificationLevel::Critical);
+    }
+
+    #[test]
+    fn repo_auto_discovery_is_off_by_default() {
+        // No rules means no repos get auto-watched on startup. New users must
+        // opt in explicitly.
+        let cfg = Config::default();
+        assert!(cfg.auto_discover_rules.is_empty());
     }
 }

@@ -412,26 +412,29 @@ impl RepoPoller {
                     }
                 }
 
-                // -- Pre-fetch author info (if enabled). --
+                // -- Collect author info from the run data (no extra API call needed). --
 
                 if show_author {
                     for run in &new_runs {
-                        if self.token.is_cancelled() {
-                            break;
-                        }
-                        if let Some(info) = self.github.run_author(&self.repo, run.id).await {
-                            author_by_id.insert(run.id, info);
+                        if let Some(actor) = run.actor.clone() {
+                            author_by_id.insert(
+                                run.id,
+                                crate::github::RunAuthorInfo {
+                                    actor,
+                                    commit_author: run.commit_author.clone(),
+                                },
+                            );
                         }
                     }
                     for (rerun, _) in &reruns {
-                        if self.token.is_cancelled() {
-                            break;
-                        }
                         if let std::collections::hash_map::Entry::Vacant(e) =
                             author_by_id.entry(rerun.id)
-                            && let Some(info) = self.github.run_author(&self.repo, rerun.id).await
+                            && let Some(actor) = rerun.actor.clone()
                         {
-                            e.insert(info);
+                            e.insert(crate::github::RunAuthorInfo {
+                                actor,
+                                commit_author: rerun.commit_author.clone(),
+                            });
                         }
                     }
                 }

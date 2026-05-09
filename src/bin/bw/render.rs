@@ -9,7 +9,8 @@ use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table};
 use build_watcher::config::NotificationLevel;
 use build_watcher::format;
 use build_watcher::status::{
-    ActiveRunView, HistoryEntryView, LastBuildView, PrView, RunConclusion, WatchStatus,
+    ActiveRunView, AutoDiscoverRuleView, HistoryEntryView, LastBuildView, PrView, RunConclusion,
+    WatchStatus,
 };
 
 use super::app::{
@@ -331,7 +332,7 @@ fn group_key_impl(
     repo: &str,
     first_branch: &str,
     workflow: Option<&str>,
-    worst_status: Option<(u8, &str)>,
+    worst_status: Option<(u8, u8, &str)>,
     group_by: GroupBy,
 ) -> Option<String> {
     match group_by {
@@ -339,9 +340,9 @@ fn group_key_impl(
         GroupBy::Branch => Some(first_branch.to_string()),
         GroupBy::Workflow => Some(workflow.unwrap_or("(none)").to_string()),
         GroupBy::Status => {
-            let worst = worst_status.unwrap_or((2, ""));
+            let worst = worst_status.unwrap_or((2, 0, ""));
             Some(if worst.0 <= 1 {
-                format::status(worst.1).to_string()
+                format::status(worst.2).to_string()
             } else {
                 "idle".to_string()
             })
@@ -808,9 +809,17 @@ pub(crate) fn sorted_watches(
 
     // Sort repo groups
     groups.sort_by(|a, b| {
-        // Group-by key as primary sort
+        // Group-by key as primary sort. For Status we compare the underlying
+        // (tier, severity, str) tuple instead of the display string so groups
+        // order semantically (active → failure → success → idle) rather than
+        // alphabetically.
         let group_ord = match group_by {
             GroupBy::None => std::cmp::Ordering::Equal,
+            GroupBy::Status => {
+                let ta = a.1.iter().map(watch_status).min();
+                let tb = b.1.iter().map(watch_status).min();
+                ta.cmp(&tb)
+            }
             _ => {
                 let ka = repo_group_key(&a.0, &a.1, group_by);
                 let kb = repo_group_key(&b.0, &b.1, group_by);
@@ -855,14 +864,17 @@ pub(crate) fn sorted_watches(
         .collect()
 }
 
-/// Status key: active runs (tier 0), completed (tier 1), idle (tier 2).
-pub(crate) fn watch_status(w: &WatchStatus) -> (u8, &'static str) {
+/// Status key: (tier, severity, status_str). Tier: active=0, completed=1, idle=2.
+/// For completed builds, picks the worst conclusion (matching the displayed
+/// branch status) and uses `severity()` so failures sort before cancellations
+/// before success — not alphabetically by conclusion string.
+pub(crate) fn watch_status(w: &WatchStatus) -> (u8, u8, &'static str) {
     if let Some(run) = w.active_runs.first() {
-        (0, run.status.as_str())
-    } else if let Some(b) = newest_last_build(w) {
-        (1, b.conclusion.as_str())
+        (0, 0, run.status.as_str())
+    } else if let Some(b) = worst_last_build(w) {
+        (1, b.conclusion.severity(), b.conclusion.as_str())
     } else {
-        (2, "")
+        (2, 0, "")
     }
 }
 
@@ -1064,9 +1076,9 @@ pub(crate) fn render_header(frame: &mut ratatui::Frame, area: ratatui::layout::R
     let left_prefix = format!("build-watcher{instance_label}");
     let left_suffix = format!(" — up {uptime}");
     let right = format!("{poll}  {api}");
-    let indicators_len: usize = indicators.iter().map(|s| s.content.len()).sum();
-    let left_len = left_prefix.len() + left_suffix.len();
-    let gap = w.saturating_sub(left_len + right.len() + indicators_len);
+    let indicators_len: usize = indicators.iter().map(|s| s.content.chars().count()).sum();
+    let left_len = left_prefix.chars().count() + left_suffix.chars().count();
+    let gap = w.saturating_sub(left_len + right.chars().count() + indicators_len);
 
     let mut spans = vec![
         Span::styled(left_prefix, Style::default().add_modifier(Modifier::BOLD)),
@@ -1111,20 +1123,18 @@ pub(crate) fn render_body<'a>(
     ]);
 
     // Bordered panel wrapping both column headings and the scrollable table.
-    // Show non-default group-by in the title so it's always visible.
+    // Always show the active group-by in the panel title so it's discoverable.
     let dim = Style::default().fg(Color::DarkGray);
-    let mut panel = Block::default()
+    let panel = Block::default()
         .borders(Borders::ALL)
-        .border_style(border_style);
-    if app.group_by != GroupBy::None && app.group_by != GroupBy::Org {
-        panel = panel.title_top(
+        .border_style(border_style)
+        .title_top(
             Line::from(Span::styled(
                 format!(" group: {} ", app.group_by.label()),
                 dim,
             ))
             .right_aligned(),
         );
-    }
     let inner = panel.inner(area);
     frame.render_widget(panel, area);
 
@@ -1246,7 +1256,7 @@ fn title_line(
     let mut spans = vec![Span::raw(format::truncate(title, max_width))];
     if let Some(s) = steps.filter(|s| !s.is_empty()) {
         let sep = " · ";
-        let available = max_width.saturating_sub(title.len() + sep.len());
+        let available = max_width.saturating_sub(title.chars().count() + sep.chars().count());
         spans.push(Span::styled(sep.to_string(), dim));
         spans.push(Span::styled(
             format::truncate(s, available),
@@ -1254,7 +1264,7 @@ fn title_line(
         ));
     }
     if let Some(a) = author.filter(|a| !a.is_empty()) {
-        let used: usize = spans.iter().map(|s| s.content.len()).sum();
+        let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
         let remaining = max_width.saturating_sub(used + 3); // " · " separator
         if remaining > 3 {
             spans.push(Span::styled(" · ".to_string(), dim));
@@ -1988,12 +1998,27 @@ fn render_detail_bar(
     let mut all_spans = vec![Span::raw(" ")];
     all_spans.extend(spans);
 
-    // Right-align "? help" hint with version.
+    // Right-align repos/branches counts and the "? help" hint with version.
     let hint_style = Style::default().fg(Color::DarkGray);
+    let branch_count = app.status.watches.len();
+    let repo_count = app
+        .status
+        .watches
+        .iter()
+        .map(|w| w.repo.as_str())
+        .collect::<std::collections::HashSet<_>>()
+        .len();
+    let counts = format!("{repo_count} repos · {branch_count} branches");
     let hint = format!("? help · v{}", env!("CARGO_PKG_VERSION"));
-    let content_len: usize = all_spans.iter().map(|s| s.content.len()).sum();
-    let pad = (area.width as usize).saturating_sub(content_len + hint.len());
+    let right = format!("{counts}  ·  {hint}");
+    // chars().count() approximates display width (matches `format::truncate` semantics
+    // used elsewhere). Avoids byte-count over-counting from multi-byte UTF-8 chars
+    // like `·` that appear in the detail spans.
+    let content_len: usize = all_spans.iter().map(|s| s.content.chars().count()).sum();
+    let pad = (area.width as usize).saturating_sub(content_len + right.chars().count());
     all_spans.push(Span::raw(" ".repeat(pad)));
+    all_spans.push(Span::styled(counts, hint_style));
+    all_spans.push(Span::styled("  ·  ", hint_style));
     all_spans.push(Span::styled(hint, hint_style));
 
     frame.render_widget(Paragraph::new(Line::from(all_spans)), area);
@@ -2022,7 +2047,8 @@ pub(crate) fn render_footer(frame: &mut ratatui::Frame, area: ratatui::layout::R
         | InputMode::NotificationPicker { .. }
         | InputMode::History { .. }
         | InputMode::PrPicker { .. }
-        | InputMode::BuildTimes { .. } => Paragraph::new(""),
+        | InputMode::BuildTimes { .. }
+        | InputMode::AutoDiscoverRules { .. } => Paragraph::new(""),
         InputMode::Normal => Paragraph::new(""),
     };
 
@@ -2383,6 +2409,11 @@ pub(crate) fn render(frame: &mut ratatui::Frame, app: &App) {
         render_build_times_popup(frame, title, rows, *selected);
     }
 
+    // Overlay the auto-discover rules popup if active.
+    if let InputMode::AutoDiscoverRules { rules, selected } = &app.input_mode {
+        render_auto_discover_rules_popup(frame, rules, *selected);
+    }
+
     // Overlay the help popup if active.
     if app.show_help && matches!(app.input_mode, InputMode::Normal) {
         render_help_popup(frame);
@@ -2425,8 +2456,43 @@ pub(crate) fn render_form_popup(
     fields: &[FormField],
     active: usize,
 ) {
-    // 1 row per field + 1 blank top + 1 blank bottom + 1 hint + 2 borders
-    let inner_height = fields.len() as u16 + 3;
+    let tab_labels: Vec<&str> = fields
+        .iter()
+        .filter(|f| f.is_tab)
+        .map(|f| f.label.as_str())
+        .collect();
+    let has_tabs = !tab_labels.is_empty();
+    let active_tab = super::forms::current_tab(fields, active);
+
+    // Collect indices of fields visible in the current view: when tabs are
+    // present, only fields belonging to the active tab; otherwise all non-tab
+    // fields. Fields appearing before the first tab marker are not shown when
+    // tabs are active.
+    let visible: Vec<usize> = if has_tabs {
+        let mut out = Vec::new();
+        let mut current: Option<usize> = None;
+        for (i, f) in fields.iter().enumerate() {
+            if f.is_tab {
+                current = Some(current.map_or(0, |c| c + 1));
+                continue;
+            }
+            if current == Some(active_tab) {
+                out.push(i);
+            }
+        }
+        out
+    } else {
+        fields
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| !f.is_tab)
+            .map(|(i, _)| i)
+            .collect()
+    };
+
+    // Layout: optional tabs row (1) + blank (1) + visible fields + blank (1) + hint (1).
+    let tabs_rows: u16 = if has_tabs { 2 } else { 0 };
+    let inner_height = visible.len() as u16 + 3 + tabs_rows;
     let popup_height = inner_height + 2;
     let popup = centered_rect(60, popup_height, frame.area());
 
@@ -2444,12 +2510,19 @@ pub(crate) fn render_form_popup(
         .fg(Color::Cyan)
         .add_modifier(Modifier::BOLD);
 
-    // Find the longest label for alignment
-    let label_width = fields.iter().map(|f| f.label.len()).max().unwrap_or(0);
+    let label_width = visible
+        .iter()
+        .map(|&i| fields[i].label.len())
+        .max()
+        .unwrap_or(0);
 
-    let mut constraints: Vec<Constraint> = Vec::with_capacity(fields.len() + 3);
+    let mut constraints: Vec<Constraint> = Vec::with_capacity(visible.len() + 5);
+    if has_tabs {
+        constraints.push(Constraint::Length(1)); // tab bar
+        constraints.push(Constraint::Length(1)); // separator/blank under tabs
+    }
     constraints.push(Constraint::Length(1)); // top padding
-    for _ in fields {
+    for _ in &visible {
         constraints.push(Constraint::Length(1)); // field row
     }
     constraints.push(Constraint::Length(1)); // bottom padding
@@ -2460,30 +2533,51 @@ pub(crate) fn render_form_popup(
         .constraints(constraints)
         .split(inner);
 
+    if has_tabs {
+        let tab_active = Style::default()
+            .fg(Color::Black)
+            .bg(Color::Cyan)
+            .add_modifier(Modifier::BOLD);
+        let tab_inactive = Style::default().fg(Color::DarkGray);
+        let mut spans: Vec<Span> = vec![Span::raw(" ")];
+        for (i, label) in tab_labels.iter().enumerate() {
+            let style = if i == active_tab {
+                tab_active
+            } else {
+                tab_inactive
+            };
+            spans.push(Span::styled(format!(" {label} "), style));
+            if i + 1 < tab_labels.len() {
+                spans.push(Span::raw(" "));
+            }
+        }
+        frame.render_widget(Paragraph::new(Line::from(spans)), rows[0]);
+    }
+
     // Fixed label column width: longest label + 2 chars padding
     let label_col = (label_width as u16) + 2;
+    let field_row_offset = if has_tabs { 3 } else { 1 };
 
-    for (i, field) in fields.iter().enumerate() {
-        let row = i + 1; // offset by top padding
-        let is_active = i == active;
+    for (vi, &fi) in visible.iter().enumerate() {
+        let field = &fields[fi];
+        let row = field_row_offset + vi;
+
+        let is_active = fi == active;
         let style = if is_active {
             active_label_style
         } else {
             label_style
         };
 
-        // Split row into label column (fixed) and value column (fill)
         let cols = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Length(label_col), Constraint::Min(1)])
             .split(rows[row]);
 
-        // Right-aligned label
         let label = Paragraph::new(Line::from(Span::styled(&field.label, style)))
             .alignment(ratatui::layout::Alignment::Right);
         frame.render_widget(label, cols[0]);
 
-        // Value with leading gap
         let mut spans: Vec<Span> = vec![Span::raw("  ")];
         if !field.options.is_empty() {
             let arrow_style = if is_active {
@@ -2510,16 +2604,22 @@ pub(crate) fn render_form_popup(
         frame.render_widget(Paragraph::new(Line::from(spans)), cols[1]);
     }
 
-    // Footer hint
-    let hint_row = fields.len() + 2;
-    frame.render_widget(
-        Paragraph::new(popup_hint(&[
+    let hint_row = rows.len() - 1;
+    let hint_pairs: &[(&str, &str)] = if has_tabs {
+        &[
+            ("[↑↓]", "field  "),
+            ("[Tab]", "next tab  "),
+            ("[Enter]", "save  "),
+            ("[Esc]", "cancel"),
+        ]
+    } else {
+        &[
             ("[Tab]", "next  "),
             ("[Enter]", "save  "),
             ("[Esc]", "cancel"),
-        ])),
-        rows[hint_row],
-    );
+        ]
+    };
+    frame.render_widget(Paragraph::new(popup_hint(hint_pairs)), rows[hint_row]);
 }
 
 pub(crate) fn render_notification_picker_popup(
@@ -2807,6 +2907,118 @@ pub(crate) fn render_history_popup(
 }
 
 /// Render the build times popup (opened with `b`/`B`).
+pub(crate) fn render_auto_discover_rules_popup(
+    frame: &mut ratatui::Frame,
+    rules: &[AutoDiscoverRuleView],
+    selected: usize,
+) {
+    let area = frame.area();
+    let data_rows = rules.len().max(1) as u16;
+    let popup_height = (data_rows + 5).min(area.height.saturating_sub(4));
+    let visible_rows = popup_height.saturating_sub(5) as usize;
+
+    let popup = centered_rect(80, popup_height, area);
+    frame.render_widget(Clear, popup);
+
+    let block = Block::default()
+        .title(" Auto-Discover Rules ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let inner_height = inner.height as usize;
+    let mut constraints = vec![Constraint::Length(1)]; // header
+    for _ in 0..inner_height.saturating_sub(3) {
+        constraints.push(Constraint::Length(1));
+    }
+    constraints.push(Constraint::Length(1)); // blank
+    constraints.push(Constraint::Length(1)); // hint
+    let rows_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
+        .split(inner);
+
+    let w = inner.width as usize;
+    // Fixed columns: org (20) + repo (20) + recency (8)
+    let fixed = 20 + 20 + 8;
+    let id_w = w.saturating_sub(fixed).max(8);
+
+    let header_style = Style::default()
+        .fg(Color::DarkGray)
+        .add_modifier(Modifier::BOLD);
+    let header = Line::from(vec![
+        Span::styled(format!("{:<id_w$}", "ID"), header_style),
+        Span::styled(format!("{:<20}", "ORG PATTERN"), header_style),
+        Span::styled(format!("{:<20}", "REPO PATTERN"), header_style),
+        Span::styled(format!("{:<8}", "RECENCY"), header_style),
+    ]);
+    frame.render_widget(Paragraph::new(header), rows_layout[0]);
+
+    if rules.is_empty() {
+        let dim = Style::default().fg(Color::DarkGray);
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "  No rules — press [a] to add one",
+                dim,
+            ))),
+            rows_layout[1],
+        );
+    } else {
+        let scroll_offset = if selected >= visible_rows {
+            selected - visible_rows + 1
+        } else {
+            0
+        };
+        let dim = Style::default().fg(Color::DarkGray);
+        let selected_style = Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD);
+
+        for (i, rule) in rules.iter().enumerate().skip(scroll_offset) {
+            let layout_idx = 1 + i - scroll_offset;
+            if layout_idx >= rows_layout.len() - 2 {
+                break;
+            }
+            let is_sel = i == selected;
+            let base_style = if is_sel { selected_style } else { dim };
+            let prefix = if is_sel { "▸ " } else { "  " };
+
+            let id = format::truncate(&rule.id, id_w.saturating_sub(2));
+            let org = rule
+                .org_pattern
+                .as_deref()
+                .map(|s| format::truncate(s, 18))
+                .unwrap_or_else(|| "—".to_string());
+            let repo = rule
+                .repo_pattern
+                .as_deref()
+                .map(|s| format::truncate(s, 18))
+                .unwrap_or_else(|| "—".to_string());
+
+            let spans = vec![
+                Span::styled(format!("{prefix}{id:<w$}", w = id_w - 2), base_style),
+                Span::styled(format!("{org:<20}"), base_style),
+                Span::styled(format!("{repo:<20}"), base_style),
+                Span::styled(format!("{:<8}", rule.recently_updated), base_style),
+            ];
+            frame.render_widget(Paragraph::new(Line::from(spans)), rows_layout[layout_idx]);
+        }
+    }
+
+    let hint_idx = rows_layout.len() - 1;
+    frame.render_widget(
+        Paragraph::new(popup_hint(&[
+            ("[↑↓]", "scroll  "),
+            ("[a]", "add  "),
+            ("[Enter]", "edit  "),
+            ("[d]", "delete  "),
+            ("[Esc]", "close"),
+        ])),
+        rows_layout[hint_idx],
+    );
+}
+
 pub(crate) fn render_build_times_popup(
     frame: &mut ratatui::Frame,
     title: &str,

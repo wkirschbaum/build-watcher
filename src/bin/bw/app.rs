@@ -10,7 +10,9 @@ use build_watcher::config::NotificationLevel;
 use build_watcher::dirs::state_dir;
 use build_watcher::events::WatchEvent;
 use build_watcher::persistence::{load_json, save_json};
-use build_watcher::status::{HistoryEntryView, RunConclusion, StatsResponse, StatusResponse};
+use build_watcher::status::{
+    AutoDiscoverRuleView, HistoryEntryView, RunConclusion, StatsResponse, StatusResponse,
+};
 
 use super::client::DaemonClient;
 
@@ -81,7 +83,7 @@ impl GroupBy {
     /// Whether this group mode splits a repo's branches across groups
     /// (each branch shown only under its matching group).
     pub(crate) fn splits_repo(self) -> bool {
-        matches!(self, GroupBy::Branch | GroupBy::Workflow)
+        matches!(self, GroupBy::Branch | GroupBy::Workflow | GroupBy::Status)
     }
 }
 
@@ -443,6 +445,8 @@ pub(crate) enum SseUpdate {
         title: String,
         rows: Vec<crate::forms::BuildTimeRow>,
     },
+    /// Open the auto-discover rules popup.
+    EnterAutoDiscoverRules { rules: Vec<AutoDiscoverRuleView> },
     /// Daemon became reachable after a background startup wait.
     DaemonReady(u16),
     /// A newer release was found; tag name to display in the header.
@@ -1051,6 +1055,69 @@ mod tests {
     }
 
     #[test]
+    fn sorted_watches_by_status_uses_worst_build_not_newest() {
+        // A branch displays its worst conclusion across workflows; sorting must
+        // agree. Without this, a branch with newest=success but older=failure
+        // sorts as a success while displaying as a failure.
+        let success_only = watch_with_build("alice/app", "main", RunConclusion::Success, 10.0);
+        let mixed_newest_success = WatchStatus {
+            repo: "bob/lib".to_string(),
+            branch: "main".to_string(),
+            last_builds: vec![
+                LastBuildView {
+                    run_id: 5,
+                    conclusion: RunConclusion::Failure,
+                    workflow: "Lint".to_string(),
+                    age_secs: Some(20.0),
+                    ..Default::default()
+                },
+                LastBuildView {
+                    run_id: 9,
+                    conclusion: RunConclusion::Success,
+                    workflow: "CI".to_string(),
+                    age_secs: Some(10.0),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        let watches = vec![success_only, mixed_newest_success];
+        let sorted = sorted_watches(&watches, SortColumn::Status, true, GroupBy::None);
+        // Failure-containing repo must sort before success-only repo.
+        assert_eq!(sorted[0].repo, "bob/lib");
+        assert_eq!(sorted[1].repo, "alice/app");
+    }
+
+    #[test]
+    fn sorted_watches_by_status_uses_severity_not_alphabetical() {
+        // severity(): Failure=0, Cancelled=1, Unknown=2, Success=3.
+        // Alphabetically "cancelled" < "failure", which would put cancellations
+        // before failures — wrong. Sort must use severity.
+        let watches = vec![
+            watch_with_build("a/cancelled", "main", RunConclusion::Cancelled, 10.0),
+            watch_with_build("b/failure", "main", RunConclusion::Failure, 10.0),
+        ];
+        let sorted = sorted_watches(&watches, SortColumn::Status, true, GroupBy::None);
+        assert_eq!(sorted[0].repo, "b/failure");
+        assert_eq!(sorted[1].repo, "a/cancelled");
+    }
+
+    #[test]
+    fn sorted_watches_by_status_groups_failures_within_repo() {
+        // Within a repo with multiple branches, branches sort by status:
+        // a failing branch must come before a successful branch.
+        let mut watches = vec![
+            watch_with_build("alice/app", "feature", RunConclusion::Success, 10.0),
+            watch_with_build("alice/app", "main", RunConclusion::Failure, 20.0),
+        ];
+        watches[1].last_builds[0].run_id = 2;
+        let sorted = sorted_watches(&watches, SortColumn::Status, true, GroupBy::Org);
+        assert_eq!(sorted[0].branch, "main"); // failure first
+        assert_eq!(sorted[1].branch, "feature"); // success second
+    }
+
+    #[test]
     fn sorted_watches_by_workflow() {
         let watches = vec![
             watch_with_build("alice/app", "main", RunConclusion::Success, 10.0), // CI
@@ -1163,8 +1230,52 @@ mod tests {
         let labels = group_header_labels(&flat);
         assert_eq!(labels.len(), 3);
         assert_eq!(labels[0], "in progress"); // active tier
-        assert_eq!(labels[1], "failure"); // completed, alphabetical
+        assert_eq!(labels[1], "failure"); // completed, by severity
         assert_eq!(labels[2], "success");
+    }
+
+    #[test]
+    fn flatten_rows_group_by_status_splits_multi_branch_repo() {
+        // A repo with branches in different statuses must show each branch
+        // under its own status group, not all under the worst one.
+        let watches = vec![
+            watch_with_build("alice/app", "main", RunConclusion::Failure, 10.0),
+            watch_with_build("alice/app", "feature", RunConclusion::Success, 20.0),
+        ];
+        let sorted = sorted_watches(&watches, SortColumn::Status, true, GroupBy::Status);
+        let flat = flatten_rows(
+            &sorted,
+            GroupBy::Status,
+            &no_collapsed(),
+            &no_wf_collapsed(),
+        );
+        let labels = group_header_labels(&flat);
+        assert_eq!(labels, vec!["failure", "success"]);
+    }
+
+    #[test]
+    fn sorted_watches_group_by_status_orders_semantically() {
+        // Group order must be: active → failure → cancelled → success → idle
+        // (not alphabetical: cancelled, failure, idle, in progress, success).
+        let watches = vec![
+            watch_with_build("e/success", "main", RunConclusion::Success, 10.0),
+            watch_with_build("a/cancelled", "main", RunConclusion::Cancelled, 10.0),
+            watch_with_build("c/failure", "main", RunConclusion::Failure, 10.0),
+            watch_with_active("b/active", "main", RunStatus::InProgress, 5.0),
+            watch("d/idle", "main"),
+        ];
+        let sorted = sorted_watches(&watches, SortColumn::Status, true, GroupBy::Status);
+        let order: Vec<&str> = sorted.iter().map(|w| w.repo.as_str()).collect();
+        assert_eq!(
+            order,
+            vec![
+                "b/active",
+                "c/failure",
+                "a/cancelled",
+                "e/success",
+                "d/idle"
+            ]
+        );
     }
 
     #[test]

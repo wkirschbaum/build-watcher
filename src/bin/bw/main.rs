@@ -338,11 +338,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             };
                         }
                         Some(SseUpdate::EnterForm { title, kind, fields }) => {
+                            // Sections are non-interactive — start on the first editable field.
+                            let active = fields.iter().position(|f| !f.is_tab).unwrap_or(0);
                             app.input_mode = InputMode::Form {
                                 title,
                                 kind,
                                 fields,
-                                active: 0,
+                                active,
                             };
                         }
                         Some(SseUpdate::EnterNotificationPicker {
@@ -373,6 +375,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             app.input_mode = InputMode::BuildTimes {
                                 title,
                                 rows,
+                                selected: 0,
+                            };
+                        }
+                        Some(SseUpdate::EnterAutoDiscoverRules { rules }) => {
+                            app.input_mode = InputMode::AutoDiscoverRules {
+                                rules,
                                 selected: 0,
                             };
                         }

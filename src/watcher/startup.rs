@@ -334,7 +334,14 @@ async fn run_discovery_cycle(
                 (repo, branches)
             });
         }
-        while let Some(Ok((repo, branches))) = join_set.join_next().await {
+        while let Some(result) = join_set.join_next().await {
+            let (repo, branches) = match result {
+                Ok(pair) => pair,
+                Err(e) => {
+                    tracing::warn!(error = %e, "Branch resolution task panicked during repo discovery");
+                    continue;
+                }
+            };
             if branches.is_empty() {
                 tracing::warn!(repo = %repo, "Repo auto-discovery: no branches resolved, will retry next cycle");
                 continue;
@@ -379,6 +386,8 @@ async fn run_discovery_cycle(
 }
 
 fn repo_matches_rule(rule: &AutoDiscoverRule, repo: &RepoInfo, now_unix: u64) -> bool {
+    // `org_pattern` (when set) matches against the owner only — kept for
+    // backwards compatibility with rules created before the unified filter.
     if rule
         .compiled_org_pattern
         .as_ref()
@@ -386,10 +395,12 @@ fn repo_matches_rule(rule: &AutoDiscoverRule, repo: &RepoInfo, now_unix: u64) ->
     {
         return false;
     }
+    // `repo_pattern` matches against the full "owner/name" path so a single
+    // regex like `^myorg/foo-.*$` can filter without a separate org field.
     if rule
         .compiled_repo_pattern
         .as_ref()
-        .is_some_and(|re| !re.is_match(&repo.name))
+        .is_some_and(|re| !re.is_match(&repo.full_name))
     {
         return false;
     }
@@ -470,7 +481,14 @@ async fn resolve_config_keys(config: &SharedConfig, handle: &WatcherHandle) -> V
         });
     }
     let mut keys = Vec::new();
-    while let Some(Ok((repo, branches))) = join_set.join_next().await {
+    while let Some(result) = join_set.join_next().await {
+        let (repo, branches) = match result {
+            Ok(pair) => pair,
+            Err(e) => {
+                tracing::warn!(error = %e, "Branch resolution task panicked during startup");
+                continue;
+            }
+        };
         for branch in branches {
             let key = WatchKey::new(&repo, &branch);
             if !keys.contains(&key) {
@@ -479,4 +497,115 @@ async fn resolve_config_keys(config: &SharedConfig, handle: &WatcherHandle) -> V
         }
     }
     keys
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::RecentlyUpdated;
+
+    fn make_rule(
+        org: Option<&str>,
+        repo: Option<&str>,
+        recency: RecentlyUpdated,
+    ) -> AutoDiscoverRule {
+        let mut r = AutoDiscoverRule {
+            id: "test".to_string(),
+            org_pattern: org.map(String::from),
+            repo_pattern: repo.map(String::from),
+            recently_updated: recency,
+            compiled_org_pattern: None,
+            compiled_repo_pattern: None,
+        };
+        if let Some(p) = &r.org_pattern {
+            r.compiled_org_pattern = Some(Arc::new(regex::Regex::new(p).unwrap()));
+        }
+        if let Some(p) = &r.repo_pattern {
+            r.compiled_repo_pattern = Some(Arc::new(regex::Regex::new(p).unwrap()));
+        }
+        r
+    }
+
+    fn make_repo(owner: &str, name: &str) -> RepoInfo {
+        RepoInfo {
+            full_name: format!("{owner}/{name}"),
+            owner: owner.to_string(),
+            name: name.to_string(),
+            pushed_at: None,
+        }
+    }
+
+    fn make_repo_with_push(owner: &str, name: &str, pushed_at: &str) -> RepoInfo {
+        RepoInfo {
+            full_name: format!("{owner}/{name}"),
+            owner: owner.to_string(),
+            name: name.to_string(),
+            pushed_at: Some(pushed_at.to_string()),
+        }
+    }
+
+    #[test]
+    fn repo_pattern_matches_full_owner_name_path() {
+        let rule = make_rule(None, Some(r"^myorg/foo-.*$"), RecentlyUpdated::Any);
+        assert!(repo_matches_rule(&rule, &make_repo("myorg", "foo-bar"), 0));
+        assert!(!repo_matches_rule(&rule, &make_repo("myorg", "bar"), 0));
+        assert!(!repo_matches_rule(
+            &rule,
+            &make_repo("otherorg", "foo-bar"),
+            0
+        ));
+    }
+
+    #[test]
+    fn repo_pattern_anchored_to_name_only_no_longer_matches() {
+        // Regression guard: a regex anchored only to the name (legacy semantics)
+        // should NOT match against the new full-path string.
+        let rule = make_rule(None, Some(r"^foo-.*$"), RecentlyUpdated::Any);
+        assert!(!repo_matches_rule(&rule, &make_repo("myorg", "foo-bar"), 0));
+    }
+
+    #[test]
+    fn legacy_org_pattern_still_filters_owner() {
+        let rule = make_rule(Some(r"^myorg$"), None, RecentlyUpdated::Any);
+        assert!(repo_matches_rule(&rule, &make_repo("myorg", "anything"), 0));
+        assert!(!repo_matches_rule(
+            &rule,
+            &make_repo("otherorg", "anything"),
+            0
+        ));
+    }
+
+    #[test]
+    fn org_and_repo_pattern_both_required() {
+        let rule = make_rule(Some(r"^myorg$"), Some(r"^myorg/foo$"), RecentlyUpdated::Any);
+        assert!(repo_matches_rule(&rule, &make_repo("myorg", "foo"), 0));
+        // Owner mismatch: fails on org_pattern.
+        assert!(!repo_matches_rule(&rule, &make_repo("other", "foo"), 0));
+        // Path mismatch: fails on repo_pattern (the full-path one).
+        assert!(!repo_matches_rule(&rule, &make_repo("myorg", "bar"), 0));
+    }
+
+    #[test]
+    fn unset_patterns_match_anything() {
+        let rule = make_rule(None, None, RecentlyUpdated::Any);
+        assert!(repo_matches_rule(&rule, &make_repo("any", "thing"), 0));
+    }
+
+    #[test]
+    fn recency_filter_rejects_stale_repos() {
+        let rule = make_rule(None, None, RecentlyUpdated::Week);
+        // Repo with no pushed_at fails when recency is set.
+        assert!(!repo_matches_rule(
+            &rule,
+            &make_repo("o", "r"),
+            1_700_000_000
+        ));
+        // Push from 2020 > one week before 2023 → rejected.
+        let stale = "2020-01-01T00:00:00Z";
+        assert!(!repo_matches_rule(
+            &rule,
+            &make_repo_with_push("o", "r", stale),
+            1_700_000_000
+        ));
+    }
 }

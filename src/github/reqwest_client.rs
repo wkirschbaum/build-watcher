@@ -1,38 +1,47 @@
 use std::num::NonZeroUsize;
-use std::sync::Mutex;
+use std::sync::RwLock;
 
 use lru::LruCache;
 use serde::{Deserialize, Serialize};
 
 use super::{
     DEFAULT_BRANCH_LIMIT, GH_TIMEOUT, GhAuthorJson, GhError, GhJob, GhPrJson, GhStep, GitHubClient,
-    HistoryEntry, IN_PROGRESS_LIMIT, MAX_OPEN_PRS, PrInfo, RateLimit, RunAuthorInfo, RunInfo,
-    RunStatus, default_attempt, extract_failing_steps, gh_auth_token,
+    HistoryEntry, IN_PROGRESS_LIMIT, MAX_OPEN_PRS, PrInfo, RateLimit, RunInfo, RunStatus,
+    default_attempt, extract_failing_steps, gh_auth_token,
 };
 
 const GITHUB_API_BASE: &str = "https://api.github.com";
 
-/// Result of `cached_get_inner` — either the response body or a 401 signal.
+/// Result of `cached_get_inner` — either the response body (with optional next-page
+/// URL parsed from the Link header) or a 401 signal.
 enum CachedGetResult {
-    Body(Vec<u8>),
+    Body {
+        body: Vec<u8>,
+        next_link: Option<String>,
+    },
     Unauthorized,
 }
 
-/// Cached HTTP response for ETag-based conditional requests.
+/// Cached HTTP response for ETag-based conditional requests. `next_link` is
+/// preserved so paginated endpoints (e.g. `list_accessible_repos`) can chain
+/// across cached pages without re-fetching from the network.
 struct CachedResponse {
     etag: String,
     body: Vec<u8>,
+    next_link: Option<String>,
 }
 
 /// Maximum number of URLs tracked in the ETag cache.
 const ETAG_CACHE_CAP: usize = 500;
+/// Maximum pages fetched per paginated request — guards against unbounded API loops for large orgs.
+const MAX_PAGES: usize = 100;
 
 /// GitHub client using direct HTTP via `reqwest`. Supports ETag-based
 /// conditional requests (304 responses don't count against the rate limit)
 /// and automatic token refresh on 401.
 pub struct ReqwestClient {
     client: reqwest::Client,
-    token: Mutex<String>,
+    token: RwLock<String>,
     /// ETag cache: URL → (etag, response body). Bounded LRU behind an async
     /// mutex so the async polling tasks are never blocked by a sync lock.
     cache: tokio::sync::Mutex<LruCache<String, CachedResponse>>,
@@ -52,7 +61,7 @@ impl ReqwestClient {
             .expect("failed to build reqwest client");
         Self {
             client,
-            token: Mutex::new(token),
+            token: RwLock::new(token),
             cache: tokio::sync::Mutex::new(LruCache::new(
                 NonZeroUsize::new(ETAG_CACHE_CAP).unwrap(),
             )),
@@ -61,13 +70,13 @@ impl ReqwestClient {
     }
 
     fn token(&self) -> String {
-        self.token.lock().unwrap().clone()
+        self.token.read().unwrap().clone()
     }
 
     async fn refresh_token(&self) -> bool {
         match gh_auth_token().await {
             Ok(new_token) => {
-                let mut current = self.token.lock().unwrap();
+                let mut current = self.token.write().unwrap();
                 if *current != new_token {
                     tracing::info!("GitHub token refreshed");
                     *current = new_token;
@@ -109,15 +118,21 @@ impl ReqwestClient {
 
     /// Core GET with ETag-based conditional requests.
     /// On 401, refreshes the token and retries once.
-    async fn cached_get(&self, url: &str, repo: &str) -> Result<Vec<u8>, GhError> {
+    /// Returns `(body, next_link)` where `next_link` is the next-page URL
+    /// parsed from the `Link: rel="next"` header, if present.
+    async fn cached_get(
+        &self,
+        url: &str,
+        repo: &str,
+    ) -> Result<(Vec<u8>, Option<String>), GhError> {
         let resp = self.cached_get_inner(url, repo).await?;
         match resp {
-            CachedGetResult::Body(body) => Ok(body),
+            CachedGetResult::Body { body, next_link } => Ok((body, next_link)),
             CachedGetResult::Unauthorized => {
                 if self.refresh_token().await {
                     self.cache.lock().await.clear();
                     match self.cached_get_inner(url, repo).await? {
-                        CachedGetResult::Body(body) => Ok(body),
+                        CachedGetResult::Body { body, next_link } => Ok((body, next_link)),
                         CachedGetResult::Unauthorized => Err(GhError::CliError {
                             repo: repo.into(),
                             stderr: "HTTP 401: Unauthorized (after token refresh)".into(),
@@ -159,7 +174,10 @@ impl ReqwestClient {
             let mut cache = self.cache.lock().await;
             if let Some(cached) = cache.get(url) {
                 tracing::trace!(url, "ETag cache hit (304)");
-                return Ok(CachedGetResult::Body(cached.body.clone()));
+                return Ok(CachedGetResult::Body {
+                    body: cached.body.clone(),
+                    next_link: cached.next_link.clone(),
+                });
             }
             if has_cache {
                 tracing::warn!(url, "304 but cached body missing");
@@ -179,6 +197,7 @@ impl ReqwestClient {
             .get("etag")
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
+        let next_link = next_link_url(&resp);
 
         let body = resp
             .bytes()
@@ -196,11 +215,12 @@ impl ReqwestClient {
                 CachedResponse {
                     etag,
                     body: body.clone(),
+                    next_link: next_link.clone(),
                 },
             );
         }
 
-        Ok(CachedGetResult::Body(body))
+        Ok(CachedGetResult::Body { body, next_link })
     }
 
     async fn api_get<T: serde::de::DeserializeOwned>(
@@ -214,15 +234,17 @@ impl ReqwestClient {
             repo: repo.into(),
             stderr: e.to_string(),
         })?;
-        let bytes = self.cached_get(url.as_str(), repo).await?;
+        let (bytes, _) = self.cached_get(url.as_str(), repo).await?;
         serde_json::from_slice(&bytes).map_err(|e| GhError::Parse {
             repo: repo.into(),
             source: e,
         })
     }
 
-    /// Fetch all pages of a paginated GitHub endpoint.
-    /// Adds `per_page=100` automatically; pass extra query params via `extra`.
+    /// Fetch all pages of a paginated GitHub endpoint, walking the `Link: rel="next"`
+    /// chain. Each page goes through the ETag cache so unchanged paginated responses
+    /// (common for slowly-changing endpoints like `list_accessible_repos`) are served
+    /// as 304s at zero rate-limit cost. Adds `per_page=100`; extra query params via `extra`.
     async fn api_get_all_pages<T: serde::de::DeserializeOwned>(
         &self,
         repo: &str,
@@ -241,11 +263,20 @@ impl ReqwestClient {
 
         let mut items = Vec::new();
         let mut url = Some(first_url);
+        let mut pages = 0usize;
         while let Some(current_url) = url {
-            let resp = self.send_with_retry(|s| s.get(&current_url), repo).await?;
-            url = next_link_url(&resp);
-            let page: Vec<T> = handle_response(resp, repo).await?;
+            if pages >= MAX_PAGES {
+                tracing::warn!(repo, pages, "Pagination limit reached, truncating results");
+                break;
+            }
+            pages += 1;
+            let (bytes, next_link) = self.cached_get(&current_url, repo).await?;
+            let page: Vec<T> = serde_json::from_slice(&bytes).map_err(|e| GhError::Parse {
+                repo: repo.into(),
+                source: e,
+            })?;
             items.extend(page);
+            url = next_link;
         }
         Ok(items)
     }
@@ -447,6 +478,15 @@ impl RestRunJson {
             created_at: self.created_at,
             updated_at: self.updated_at,
             url: self.html_url,
+            actor: self
+                .triggering_actor
+                .map(|a| a.login)
+                .filter(|s| !s.is_empty()),
+            commit_author: self
+                .head_commit
+                .and_then(|hc| hc.author)
+                .map(|a| a.name)
+                .filter(|s| !s.is_empty()),
         })
     }
 
@@ -747,28 +787,6 @@ impl GitHubClient for ReqwestClient {
                 })
             })
             .collect())
-    }
-
-    async fn run_author(&self, repo: &str, run_id: u64) -> Option<RunAuthorInfo> {
-        let raw: RestRunJson = self
-            .api_get(repo, &format!("/repos/{repo}/actions/runs/{run_id}"), &[])
-            .await
-            .inspect_err(|e| {
-                tracing::debug!(%repo, %run_id, error = %e, "Failed to fetch run author");
-            })
-            .ok()?;
-        let actor = raw.triggering_actor?.login;
-        if actor.is_empty() {
-            return None;
-        }
-        Some(RunAuthorInfo {
-            actor,
-            commit_author: raw
-                .head_commit
-                .and_then(|hc| hc.author)
-                .map(|a| a.name)
-                .filter(|s| !s.is_empty()),
-        })
     }
 }
 

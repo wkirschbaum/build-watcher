@@ -51,19 +51,67 @@ impl App {
                 active,
                 ..
             } => {
-                let f = &mut fields[*active];
-                let is_cycle = !f.options.is_empty();
+                let is_cycle = !fields[*active].options.is_empty();
+                let has_tabs = fields.iter().any(|f| f.is_tab);
+                let current_tab = super::forms::current_tab(fields, *active);
+                let tab_count = fields.iter().filter(|f| f.is_tab).count();
+                // Cycle through non-tab fields, wrapping within the current tab when
+                // the form has tabs (use PageUp/PageDown to move between tabs).
+                let advance = |start: usize, dir: i32, fields: &[super::forms::FormField]| {
+                    let n = fields.len();
+                    let mut i = start;
+                    for _ in 0..n {
+                        i = if dir > 0 {
+                            (i + 1) % n
+                        } else {
+                            (i + n - 1) % n
+                        };
+                        if fields[i].is_tab {
+                            continue;
+                        }
+                        if !has_tabs || super::forms::current_tab(fields, i) == current_tab {
+                            return i;
+                        }
+                    }
+                    start
+                };
+                let switch_tab = |dir: i32, fields: &[super::forms::FormField]| -> Option<usize> {
+                    if tab_count == 0 {
+                        return None;
+                    }
+                    let target = if dir > 0 {
+                        (current_tab + 1) % tab_count
+                    } else {
+                        (current_tab + tab_count - 1) % tab_count
+                    };
+                    super::forms::first_field_in_tab(fields, target)
+                };
                 match code {
                     KeyCode::Esc => {
                         self.input_mode = InputMode::Normal;
                     }
-                    KeyCode::Tab | KeyCode::Down => {
-                        *active = (*active + 1) % fields.len();
+                    KeyCode::Down => {
+                        *active = advance(*active, 1, fields);
                     }
-                    KeyCode::BackTab | KeyCode::Up => {
-                        *active = (*active + fields.len() - 1) % fields.len();
+                    KeyCode::Up => {
+                        *active = advance(*active, -1, fields);
+                    }
+                    KeyCode::Tab | KeyCode::PageDown => {
+                        if let Some(i) = switch_tab(1, fields) {
+                            *active = i;
+                        } else {
+                            *active = advance(*active, 1, fields);
+                        }
+                    }
+                    KeyCode::BackTab | KeyCode::PageUp => {
+                        if let Some(i) = switch_tab(-1, fields) {
+                            *active = i;
+                        } else {
+                            *active = advance(*active, -1, fields);
+                        }
                     }
                     KeyCode::Right | KeyCode::Char(' ') if is_cycle && !ctrl && !alt => {
+                        let f = &mut fields[*active];
                         let idx = f
                             .options
                             .iter()
@@ -72,6 +120,7 @@ impl App {
                         f.editor.buf = f.options[(idx + 1) % f.options.len()].to_string();
                     }
                     KeyCode::Left if is_cycle && !ctrl && !alt => {
+                        let f = &mut fields[*active];
                         let n = f.options.len();
                         let idx = f
                             .options
@@ -81,11 +130,14 @@ impl App {
                         f.editor.buf = f.options[(idx + n - 1) % n].to_string();
                     }
                     KeyCode::Enter => match kind {
-                        FormKind::GlobalDefaults => self.submit_config_form(daemon),
+                        FormKind::GlobalDefaults { .. } => self.submit_config_form(daemon),
                         FormKind::RepoConfig { .. } => self.submit_repo_config_form(daemon),
+                        FormKind::AutoDiscoverRule { .. } => {
+                            self.submit_auto_discover_rule_form(daemon)
+                        }
                     },
                     _ if !is_cycle => {
-                        handle_line_edit(&mut f.editor, code, ctrl, alt);
+                        handle_line_edit(&mut fields[*active].editor, code, ctrl, alt);
                     }
                     _ => {}
                 }
@@ -220,6 +272,95 @@ impl App {
                     }
                     KeyCode::Down | KeyCode::Char('j') if !rows.is_empty() => {
                         *selected = (*selected + 1).min(rows.len() - 1);
+                    }
+                    _ => {}
+                }
+                true
+            }
+            InputMode::AutoDiscoverRules { rules, selected } => {
+                match code {
+                    KeyCode::Esc | KeyCode::Char('q') => {
+                        self.input_mode = InputMode::Normal;
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        *selected = selected.saturating_sub(1);
+                    }
+                    KeyCode::Down | KeyCode::Char('j') if !rules.is_empty() => {
+                        *selected = (*selected + 1).min(rules.len() - 1);
+                    }
+                    KeyCode::Char('a') | KeyCode::Char('+') => {
+                        self.input_mode = InputMode::Form {
+                            title: "New Auto-Discover Rule".to_string(),
+                            kind: FormKind::AutoDiscoverRule { existing_id: None },
+                            fields: vec![
+                                super::forms::FormField::text("Repo filter", String::new()),
+                                super::forms::FormField::cycle(
+                                    "Updated filter",
+                                    "any".to_string(),
+                                    vec!["any", "week", "month", "year"],
+                                ),
+                            ],
+                            active: 0,
+                        };
+                    }
+                    KeyCode::Enter if !rules.is_empty() => {
+                        let rule = &rules[*selected];
+                        let id = rule.id.clone();
+                        let initial_filter = rule
+                            .repo_pattern
+                            .clone()
+                            .or_else(|| rule.org_pattern.clone())
+                            .unwrap_or_default();
+                        let recency = rule.recently_updated.clone();
+                        self.input_mode = InputMode::Form {
+                            title: format!("Edit Rule: {id}"),
+                            kind: FormKind::AutoDiscoverRule {
+                                existing_id: Some(id),
+                            },
+                            fields: vec![
+                                super::forms::FormField::text("Repo filter", initial_filter),
+                                super::forms::FormField::cycle(
+                                    "Updated filter",
+                                    recency,
+                                    vec!["any", "week", "month", "year"],
+                                ),
+                            ],
+                            active: 0,
+                        };
+                    }
+                    KeyCode::Char('d') | KeyCode::Delete if !rules.is_empty() => {
+                        let id = rules[*selected].id.clone();
+                        let d = daemon.clone();
+                        let tx = self.bg_tx.clone();
+                        self.input_mode = InputMode::Normal;
+                        self.set_flash(format!("Removing rule {id}…"));
+                        tokio::spawn(async move {
+                            match d.remove_auto_discover_rule(&id).await {
+                                Ok(()) => match d.get_auto_discover_rules().await {
+                                    Ok(rules) => {
+                                        let _ = tx
+                                            .send(SseUpdate::EnterAutoDiscoverRules { rules })
+                                            .await;
+                                    }
+                                    Err(e) => {
+                                        let _ = tx
+                                            .send(SseUpdate::BackgroundResult {
+                                                flash: format!("Rule removed. {e}"),
+                                                resync: false,
+                                            })
+                                            .await;
+                                    }
+                                },
+                                Err(e) => {
+                                    let _ = tx
+                                        .send(SseUpdate::BackgroundResult {
+                                            flash: e,
+                                            resync: false,
+                                        })
+                                        .await;
+                                }
+                            }
+                        });
                     }
                     _ => {}
                 }
@@ -718,6 +859,26 @@ fn repo_has_multi_workflow_branch(watches: &[WatchStatus], repo: &str) -> bool {
     })
 }
 
+/// Check whether the repo's branch list is auto-managed — either because it
+/// was discovered by a rule or because branch auto-discovery is on (per-repo
+/// override or global default). When this is true, the TUI blocks manual
+/// branch add/delete and the server rejects the same operations.
+async fn is_auto_discover(d: &DaemonClient, repo: &str) -> bool {
+    if let Ok(rc) = d.get_repo_config(repo).await {
+        if rc.auto_discovered_by_rule == Some(true) {
+            return true;
+        }
+        if let Some(val) = rc.auto_discover_branches {
+            return val;
+        }
+    }
+    d.get_defaults()
+        .await
+        .ok()
+        .and_then(|defaults| defaults.auto_discover_branches)
+        .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -774,19 +935,4 @@ mod tests {
             Some("anthropics/".to_string())
         );
     }
-}
-
-/// Check whether auto-discover branches is enabled for a repo,
-/// falling back to the global default.
-async fn is_auto_discover(d: &DaemonClient, repo: &str) -> bool {
-    if let Ok(rc) = d.get_repo_config(repo).await
-        && let Some(val) = rc.auto_discover_branches
-    {
-        return val;
-    }
-    d.get_defaults()
-        .await
-        .ok()
-        .and_then(|defaults| defaults.auto_discover_branches)
-        .unwrap_or(false)
 }

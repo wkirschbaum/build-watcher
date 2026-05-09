@@ -243,6 +243,15 @@ fn build_router(state: DaemonState, ct: &CancellationToken) -> axum::Router {
         )
         .route("/history", get(rest::history_handler))
         .route("/history/all", get(rest::history_all_handler))
+        .route(
+            "/auto-discover-rules",
+            axum::routing::get(rest::get_auto_discover_rules_handler)
+                .post(rest::add_auto_discover_rule_handler),
+        )
+        .route(
+            "/auto-discover-rules/remove",
+            axum::routing::post(rest::remove_auto_discover_rule_handler),
+        )
         .route("/shutdown", axum::routing::post(rest::shutdown_handler))
         .with_state(state)
         .nest_service("/mcp", service)

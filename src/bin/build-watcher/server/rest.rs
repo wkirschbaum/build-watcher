@@ -18,7 +18,8 @@ use build_watcher::watcher::{count_api_calls, is_paused};
 
 use super::DaemonState;
 use super::actions::{
-    apply_pause, do_configure_branches, do_merge, do_rerun, do_stop_watches, do_watch_builds,
+    apply_pause, do_add_auto_discover_rule, do_configure_branches, do_merge,
+    do_remove_auto_discover_rule, do_rerun, do_stop_watches, do_watch_builds,
 };
 use super::{build_watch_snapshot, json_error};
 
@@ -195,10 +196,15 @@ pub(crate) async fn watch_handler(
 pub(crate) async fn unwatch_handler(
     State(state): State<DaemonState>,
     axum::Json(body): axum::Json<WatchRequest>,
-) -> axum::Json<serde_json::Value> {
+) -> axum::response::Response {
+    for repo in &body.repos {
+        if let Err(e) = validate_repo(repo) {
+            return json_error(e);
+        }
+    }
     let results = do_stop_watches(&state, &body.repos).await;
     let messages: Vec<&str> = results.iter().map(|o| o.message()).collect();
-    axum::Json(serde_json::json!({ "ok": true, "messages": messages }))
+    axum::Json(serde_json::json!({ "ok": true, "messages": messages })).into_response()
 }
 
 #[derive(Deserialize)]
@@ -389,7 +395,7 @@ pub(crate) async fn set_defaults_handler(
         Err(e) => {
             let warning =
                 format!("\u{26a0}\u{fe0f} Warning: config could not be saved to disk: {e}");
-            axum::Json(serde_json::json!({ "ok": true, "messages": [], "warning": warning }))
+            axum::Json(serde_json::json!({ "ok": false, "messages": [], "warning": warning }))
                 .into_response()
         }
     }
@@ -405,6 +411,7 @@ pub(crate) async fn get_repo_config_handler(
     State(state): State<DaemonState>,
     Query(q): Query<RepoQuery>,
 ) -> axum::Json<build_watcher::status::RepoConfigView> {
+    let auto_discovered_by_rule = state.handle.discovered_repos.lock().await.contains(&q.repo);
     let cfg = state.config.read().await;
     let rc = cfg.repos.get(&q.repo).cloned().unwrap_or_default();
     axum::Json(build_watcher::status::RepoConfigView {
@@ -419,6 +426,7 @@ pub(crate) async fn get_repo_config_handler(
         ignored_events: Some(rc.ignored_events),
         branches: Some(rc.branches),
         notifications: Some(rc.notifications),
+        auto_discovered_by_rule: Some(auto_discovered_by_rule),
     })
 }
 
@@ -508,7 +516,7 @@ pub(crate) async fn set_repo_config_handler(
         Err(e) => {
             let warning =
                 format!("\u{26a0}\u{fe0f} Warning: config could not be saved to disk: {e}");
-            axum::Json(serde_json::json!({ "ok": true, "messages": [], "warning": warning }))
+            axum::Json(serde_json::json!({ "ok": false, "messages": [], "warning": warning }))
                 .into_response()
         }
     }
@@ -591,6 +599,81 @@ fn to_history_view(
         event: lb.event,
         duration_secs: lb.duration_secs,
         age_secs,
+    }
+}
+
+/// `GET /auto-discover-rules` — List all auto-discover rules.
+pub(crate) async fn get_auto_discover_rules_handler(
+    State(state): State<DaemonState>,
+) -> axum::Json<Vec<build_watcher::status::AutoDiscoverRuleView>> {
+    let cfg = state.config.read().await;
+    let rules = cfg
+        .auto_discover_rules
+        .iter()
+        .map(|r| build_watcher::status::AutoDiscoverRuleView {
+            id: r.id.clone(),
+            org_pattern: r.org_pattern.clone(),
+            repo_pattern: r.repo_pattern.clone(),
+            recently_updated: r.recently_updated.to_string(),
+        })
+        .collect();
+    axum::Json(rules)
+}
+
+#[derive(Deserialize)]
+pub(crate) struct AutoDiscoverRuleRequest {
+    id: String,
+    #[serde(default)]
+    org_pattern: Option<String>,
+    #[serde(default)]
+    repo_pattern: Option<String>,
+    #[serde(default)]
+    recently_updated: Option<String>,
+}
+
+/// `POST /auto-discover-rules` — Add or replace an auto-discover rule.
+pub(crate) async fn add_auto_discover_rule_handler(
+    State(state): State<DaemonState>,
+    axum::Json(body): axum::Json<AutoDiscoverRuleRequest>,
+) -> axum::response::Response {
+    use build_watcher::config::RecentlyUpdated;
+
+    let recently_updated = match body
+        .recently_updated
+        .as_deref()
+        .unwrap_or("any")
+        .parse::<RecentlyUpdated>()
+    {
+        Ok(v) => v,
+        Err(e) => return json_error(e),
+    };
+    match do_add_auto_discover_rule(
+        &state,
+        body.id,
+        body.org_pattern,
+        body.repo_pattern,
+        recently_updated,
+    )
+    .await
+    {
+        Ok(msg) => axum::Json(serde_json::json!({ "ok": true, "message": msg })).into_response(),
+        Err(e) => json_error(e),
+    }
+}
+
+#[derive(Deserialize)]
+pub(crate) struct RemoveRuleRequest {
+    id: String,
+}
+
+/// `POST /auto-discover-rules/remove` — Remove an auto-discover rule by ID.
+pub(crate) async fn remove_auto_discover_rule_handler(
+    State(state): State<DaemonState>,
+    axum::Json(body): axum::Json<RemoveRuleRequest>,
+) -> axum::response::Response {
+    match do_remove_auto_discover_rule(&state, &body.id).await {
+        Ok(msg) => axum::Json(serde_json::json!({ "ok": true, "message": msg })).into_response(),
+        Err(e) => json_error(e),
     }
 }
 
@@ -708,14 +791,6 @@ mod tests {
         ) -> Result<String, build_watcher::github::GhError> {
             Ok("Merged".to_string())
         }
-        async fn run_author(
-            &self,
-            _: &str,
-            _: u64,
-        ) -> Option<build_watcher::github::RunAuthorInfo> {
-            None
-        }
-
         async fn list_accessible_repos(
             &self,
         ) -> Result<Vec<build_watcher::github::RepoInfo>, build_watcher::github::GhError> {
@@ -1225,6 +1300,7 @@ mod tests {
             ignored_events: None,
             branches: None,
             notifications: None,
+            auto_discovered_by_rule: None,
         };
         let resp = json_post(&router, "/repo-config", &body).await;
         assert_eq!(resp["ok"], true);
@@ -1258,6 +1334,7 @@ mod tests {
             ignored_events: None,
             branches: None,
             notifications: None,
+            auto_discovered_by_rule: None,
         };
         let resp = json_post(&router, "/repo-config", &body).await;
         assert!(
@@ -1276,5 +1353,89 @@ mod tests {
         // Config should not have been modified.
         let cfg = config.read().await;
         assert!(!cfg.repos.contains_key("alice/app"));
+    }
+
+    // -- Branch-edit guards on auto-managed repos --
+
+    fn branches_router_with_state(
+        config: SharedConfigManager,
+        discovered_repos: build_watcher::persistence::DiscoveredRepoSet,
+    ) -> (axum::Router, build_watcher::watcher::DiscoveredRepos) {
+        let (watches, pause, _events) = empty_state();
+        let discovered_repos_handle: build_watcher::watcher::DiscoveredRepos =
+            Arc::new(Mutex::new(discovered_repos));
+        let handle = build_watcher::watcher::WatcherHandle::new(
+            tokio_util::sync::CancellationToken::new(),
+            EventBus::new(),
+            Arc::new(StubGitHub),
+            Arc::new(build_watcher::persistence::NullPersistence),
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(HashMap::new())),
+            discovered_repos_handle.clone(),
+            Arc::new(tokio::sync::Notify::new()),
+        );
+        let app_state = super::super::DaemonState {
+            watches,
+            config,
+            handle,
+            pause,
+            rate_limit: Arc::new(Mutex::new(None)),
+            started_at: std::time::Instant::now(),
+        };
+        let router = axum::Router::new()
+            .route("/branches", axum::routing::post(super::branches_handler))
+            .with_state(app_state);
+        (router, discovered_repos_handle)
+    }
+
+    #[tokio::test]
+    async fn branches_rejected_when_repo_is_rule_discovered() {
+        // Branches list is owned by the discovery rule; manual edits must be
+        // rejected even when the request bypasses the TUI's pre-check.
+        let cfg = build_watcher::config::Config {
+            auto_discover_branches: false, // isolate to the rule path
+            ..Default::default()
+        };
+        let mut discovered = std::collections::HashSet::new();
+        discovered.insert("alice/app".to_string());
+        let (router, _) = branches_router_with_state(null_config(cfg), discovered);
+
+        let body = serde_json::json!({
+            "repo": "alice/app",
+            "branches": ["main"],
+        });
+        let resp = json_post(&router, "/branches", &body).await;
+        let messages = resp["messages"].as_array().expect("messages array");
+        assert!(
+            messages.iter().any(|m| m
+                .as_str()
+                .unwrap_or("")
+                .contains("auto-discovered by a rule")),
+            "expected rule-discovery rejection, got: {resp}"
+        );
+    }
+
+    #[tokio::test]
+    async fn branches_rejected_when_branch_auto_discover_is_on() {
+        let cfg = build_watcher::config::Config {
+            auto_discover_branches: true,
+            ..Default::default()
+        };
+        let (router, _) =
+            branches_router_with_state(null_config(cfg), std::collections::HashSet::new());
+
+        let body = serde_json::json!({
+            "repo": "alice/app",
+            "branches": ["main"],
+        });
+        let resp = json_post(&router, "/branches", &body).await;
+        let messages = resp["messages"].as_array().expect("messages array");
+        assert!(
+            messages.iter().any(|m| m
+                .as_str()
+                .unwrap_or("")
+                .contains("branch auto-discovery is enabled")),
+            "expected branch-auto-discovery rejection, got: {resp}"
+        );
     }
 }

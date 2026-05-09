@@ -169,6 +169,23 @@ pub struct RepoConfigView {
     /// Per-repo notification overrides (read-only; use `POST /notifications` to update).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notifications: Option<NotificationOverrides>,
+    /// True when this repo is being auto-watched because it matches an active
+    /// `auto_discover_rule`. Branch lists for these repos are managed by the
+    /// daemon and cannot be edited manually. Read-only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_discovered_by_rule: Option<bool>,
+}
+
+/// One auto-discover rule as returned by `GET /auto-discover-rules`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutoDiscoverRuleView {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub org_pattern: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_pattern: Option<String>,
+    /// Recency filter: "any" | "week" | "month" | "year".
+    pub recently_updated: String,
 }
 
 /// Daemon stats returned by `GET /stats`.

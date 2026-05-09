@@ -51,8 +51,8 @@ impl RunSnapshot {
             status: run.status.clone(),
             attempt: run.attempt,
             url: run.url.clone(),
-            actor: None,
-            commit_author: None,
+            actor: run.actor.clone(),
+            commit_author: run.commit_author.clone(),
         }
     }
 
@@ -175,6 +175,8 @@ mod tests {
             created_at: "2026-01-01T10:00:00Z".to_string(),
             updated_at: "2026-01-01T10:05:00Z".to_string(),
             url: "https://github.com/alice/app/actions/runs/99".to_string(),
+            actor: None,
+            commit_author: None,
         };
         let s = RunSnapshot::from_run_info(&run, "alice/app", "release");
         assert_eq!(s.repo, "alice/app");

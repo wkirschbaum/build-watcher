@@ -36,8 +36,8 @@ impl ActiveRun {
             created_at: run.created_at.clone(),
             updated_at: run.updated_at.clone(),
             url: run.url.clone(),
-            actor: None,
-            commit_author: None,
+            actor: run.actor.clone(),
+            commit_author: run.commit_author.clone(),
         }
     }
 
@@ -354,7 +354,14 @@ pub fn last_failed_build<'a>(
             entry
                 .last_builds
                 .values()
-                .filter(|b| b.conclusion != RunConclusion::Success)
+                .filter(|b| {
+                    matches!(
+                        b.conclusion,
+                        RunConclusion::Failure
+                            | RunConclusion::TimedOut
+                            | RunConclusion::StartupFailure
+                    )
+                })
                 .map(move |b| (k, b))
         })
         .max_by_key(|(_, b)| b.run_id)

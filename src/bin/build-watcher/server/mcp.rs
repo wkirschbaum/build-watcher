@@ -91,6 +91,11 @@ impl BuildWatcher {
         &self,
         Parameters(params): Parameters<ReposParams>,
     ) -> Result<CallToolResult, McpError> {
+        for repo in &params.repos {
+            if let Err(e) = validate_repo(repo) {
+                return Ok(CallToolResult::error(vec![Content::text(e)]));
+            }
+        }
         let results = do_stop_watches(&self.state, &params.repos).await;
         Ok(CallToolResult::success(vec![Content::text(
             format_outcomes(&results, "\n"),
@@ -792,8 +797,9 @@ impl BuildWatcher {
                        those matching the rule. \
                        Auto-discovered repos are tracked separately from manually-added repos: \
                        use remove_auto_discover_rule (not stop_watches) to stop them. \
-                       org_pattern matches the owner/org name; repo_pattern matches the repo \
-                       name (not the full path). Both are Go-style regexes. \
+                       repo_pattern is a regex matched against the full \"owner/name\" path \
+                       (e.g. `^myorg/foo-.*$`). org_pattern is a legacy regex matched only \
+                       against the owner; new rules should set repo_pattern instead. \
                        recently_updated filters by last-push age: 'any' (no filter), \
                        'week', 'month', or 'year'.")]
     async fn add_auto_discover_rule(

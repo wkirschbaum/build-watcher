@@ -372,6 +372,49 @@ impl DaemonClient {
         self.get_json::<Vec<HistoryEntryView>>(&format!("/history/all?limit={limit}"))
             .await
     }
+
+    pub(crate) async fn get_auto_discover_rules(
+        &self,
+    ) -> Result<Vec<build_watcher::status::AutoDiscoverRuleView>, String> {
+        self.get_json("/auto-discover-rules").await
+    }
+
+    pub(crate) async fn add_auto_discover_rule(
+        &self,
+        id: &str,
+        org_pattern: Option<&str>,
+        repo_pattern: Option<&str>,
+        recently_updated: &str,
+    ) -> Result<(), String> {
+        #[derive(Serialize)]
+        struct Req<'a> {
+            id: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            org_pattern: Option<&'a str>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            repo_pattern: Option<&'a str>,
+            recently_updated: &'a str,
+        }
+        self.post_json(
+            "/auto-discover-rules",
+            &Req {
+                id,
+                org_pattern,
+                repo_pattern,
+                recently_updated,
+            },
+        )
+        .await
+    }
+
+    pub(crate) async fn remove_auto_discover_rule(&self, id: &str) -> Result<(), String> {
+        #[derive(Serialize)]
+        struct Req<'a> {
+            id: &'a str,
+        }
+        self.post_json("/auto-discover-rules/remove", &Req { id })
+            .await
+    }
 }
 
 impl Clone for DaemonClient {

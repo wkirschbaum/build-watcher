@@ -48,5 +48,7 @@ pub fn make_run(id: u64, status: RunStatus, conclusion: &str) -> RunInfo {
         created_at: "2026-01-01T10:00:00Z".to_string(),
         updated_at: "2026-01-01T10:05:00Z".to_string(),
         url: "https://github.com/test/repo/actions/runs/1".to_string(),
+        actor: None,
+        commit_author: None,
     }
 }

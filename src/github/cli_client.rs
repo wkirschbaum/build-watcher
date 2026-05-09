@@ -2,7 +2,7 @@ use serde::Deserialize;
 
 use super::{
     DEFAULT_BRANCH_LIMIT, GH_TIMEOUT, GhAuthorJson, GhError, GhJobsResponse, GhPrJson, GhRunJson,
-    GitHubClient, HistoryEntry, IN_PROGRESS_LIMIT, MAX_OPEN_PRS, PrInfo, RunAuthorInfo, RunInfo,
+    GitHubClient, HistoryEntry, IN_PROGRESS_LIMIT, MAX_OPEN_PRS, PrInfo, RunInfo,
     extract_failing_steps,
 };
 
@@ -356,38 +356,6 @@ impl GitHubClient for GhCliClient {
         )
         .await?;
         Ok(String::from_utf8_lossy(&stdout).trim().to_string())
-    }
-
-    async fn run_author(&self, repo: &str, run_id: u64) -> Option<RunAuthorInfo> {
-        let jq = ".triggering_actor.login as $actor | .head_commit.author.name as $author | {actor: $actor, commit_author: $author}";
-        let endpoint = format!("repos/{repo}/actions/runs/{run_id}");
-        let stdout = match gh_exec(repo, &["api", &endpoint, "--jq", jq]).await {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::debug!(%repo, %run_id, error = %e, "Failed to fetch run author");
-                return None;
-            }
-        };
-
-        #[derive(Deserialize)]
-        struct AuthorResponse {
-            actor: Option<String>,
-            commit_author: Option<String>,
-        }
-
-        match serde_json::from_slice::<AuthorResponse>(&stdout) {
-            Ok(resp) => {
-                let actor = resp.actor.filter(|s| !s.is_empty())?;
-                Some(RunAuthorInfo {
-                    actor,
-                    commit_author: resp.commit_author.filter(|s| !s.is_empty()),
-                })
-            }
-            Err(e) => {
-                tracing::debug!(%repo, %run_id, error = %e, "Failed to parse run author");
-                None
-            }
-        }
     }
 
     async fn list_accessible_repos(&self) -> Result<Vec<super::RepoInfo>, super::GhError> {

@@ -1,6 +1,8 @@
 use build_watcher::config::NotificationLevel;
 use build_watcher::github::{validate_branch, validate_repo};
-use build_watcher::status::{DefaultsConfig, HistoryEntryView, RunConclusion};
+use build_watcher::status::{
+    AutoDiscoverRuleView, DefaultsConfig, HistoryEntryView, RunConclusion,
+};
 
 use super::app::{App, SseUpdate};
 use super::client::DaemonClient;
@@ -25,6 +27,10 @@ pub(crate) struct FormField {
     pub(crate) editor: LineEditor,
     /// If non-empty, this is a cycle field (Left/Right to cycle, no free-text entry).
     pub(crate) options: Vec<&'static str>,
+    /// Tab marker — starts a new tab page with this field's `label` as the tab title.
+    /// Tab markers are rendered as a top tab bar, hidden from the field area, and
+    /// skipped during field navigation.
+    pub(crate) is_tab: bool,
 }
 
 impl FormField {
@@ -33,6 +39,7 @@ impl FormField {
             label: label.into(),
             editor: LineEditor::new(buffer),
             options: vec![],
+            is_tab: false,
         }
     }
 
@@ -45,12 +52,58 @@ impl FormField {
             label: label.into(),
             editor: LineEditor::new(buffer),
             options,
+            is_tab: false,
+        }
+    }
+
+    /// Tab marker. Subsequent non-marker fields belong to this tab until the next
+    /// marker. Forms with no markers render as a flat list (no tab bar).
+    pub(crate) fn tab(label: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            editor: LineEditor::empty(),
+            options: vec![],
+            is_tab: true,
         }
     }
 
     pub(crate) fn buffer(&self) -> &str {
         &self.editor.buf
     }
+}
+
+/// Compute the index of the tab containing `active`, given the field list.
+/// Returns 0 when no tab markers exist.
+pub(crate) fn current_tab(fields: &[FormField], active: usize) -> usize {
+    fields
+        .iter()
+        .take(active + 1)
+        .filter(|f| f.is_tab)
+        .count()
+        .saturating_sub(1)
+}
+
+/// Find the first non-tab field belonging to tab `tab_idx`. Returns `None` if
+/// the tab has no editable fields (or doesn't exist).
+pub(crate) fn first_field_in_tab(fields: &[FormField], tab_idx: usize) -> Option<usize> {
+    let mut current = 0usize;
+    let mut seen_tab = false;
+    for (i, f) in fields.iter().enumerate() {
+        if f.is_tab {
+            if seen_tab {
+                current += 1;
+            }
+            seen_tab = true;
+            if current > tab_idx {
+                return None;
+            }
+            continue;
+        }
+        if seen_tab && current == tab_idx {
+            return Some(i);
+        }
+    }
+    None
 }
 
 // ── Readline-style line editor ──────────────────────────────────────────
@@ -502,8 +555,18 @@ mod tests {
 
 /// Distinguishes which form is open so submission dispatches correctly.
 pub(crate) enum FormKind {
-    GlobalDefaults,
-    RepoConfig { repo: String },
+    GlobalDefaults {
+        /// ID of the existing auto-discover rule, if any. None means "create
+        /// a new rule with a default ID" when the user fills in patterns.
+        rule_id: Option<String>,
+    },
+    RepoConfig {
+        repo: String,
+    },
+    AutoDiscoverRule {
+        /// Set when editing an existing rule (the rule's current ID).
+        existing_id: Option<String>,
+    },
 }
 
 /// Text input mode for interactive prompts (e.g. "Add repo: ").
@@ -547,6 +610,11 @@ pub(crate) enum InputMode {
     BuildTimes {
         title: String,
         rows: Vec<BuildTimeRow>,
+        selected: usize,
+    },
+    /// Auto-discover rules management popup (opened with `A`).
+    AutoDiscoverRules {
+        rules: Vec<AutoDiscoverRuleView>,
         selected: usize,
     },
 }
@@ -625,8 +693,12 @@ pub(crate) struct PrPickerEntry {
 impl App {
     /// Submit the config form fields to the daemon.
     pub(crate) fn submit_config_form(&mut self, daemon: &DaemonClient) {
-        let InputMode::Form { fields, .. } = &self.input_mode else {
+        let InputMode::Form { fields, kind, .. } = &self.input_mode else {
             return;
+        };
+        let rule_id = match kind {
+            FormKind::GlobalDefaults { rule_id } => rule_id.clone(),
+            _ => None,
         };
 
         let workflows: Vec<String> = fields
@@ -663,12 +735,34 @@ impl App {
             .iter()
             .find(|f| f.label == "Show author")
             .map(|f| f.buffer() == "on");
+        let auto_discover_repos: bool = fields
+            .iter()
+            .find(|f| f.label == "Auto-discover repos")
+            .map(|f| f.buffer() == "on")
+            .unwrap_or(false);
+        let repo_filter: Option<String> = fields
+            .iter()
+            .find(|f| f.label == "Repo filter")
+            .map(|f| f.buffer().trim().to_string())
+            .filter(|s| !s.is_empty());
+        let recently_updated: String = fields
+            .iter()
+            .find(|f| f.label == "Updated filter")
+            .map(|f| f.buffer().to_string())
+            .unwrap_or_else(|| "any".to_string());
 
         if let Some(ref filter) = branch_filter
             && !filter.is_empty()
             && let Err(e) = regex::Regex::new(filter)
         {
             self.set_flash(format!("Invalid branch filter regex: {e}"));
+            return;
+        }
+        if auto_discover_repos
+            && let Some(ref filter) = repo_filter
+            && let Err(e) = regex::Regex::new(filter)
+        {
+            self.set_flash(format!("Invalid repo filter regex: {e}"));
             return;
         }
 
@@ -684,9 +778,26 @@ impl App {
             show_author,
         };
         self.spawn_action("Saving config…", true, async move {
-            d.set_defaults(&defaults)
-                .await
-                .map(|()| "Config saved".to_string())
+            d.set_defaults(&defaults).await?;
+            // Auto-discover repos toggle: ON upserts the singleton rule (creating
+            // one with id "default" when none exists); OFF removes the existing
+            // rule, if any. The form keeps the patterns visible regardless so
+            // the user can re-enable without losing their values mid-session.
+            match (auto_discover_repos, rule_id) {
+                (true, id) => {
+                    let id = id.unwrap_or_else(|| "default".to_string());
+                    // The unified filter goes into `repo_pattern`; the daemon
+                    // matches it against the full "owner/name" path. Legacy
+                    // `org_pattern` is cleared on save.
+                    d.add_auto_discover_rule(&id, None, repo_filter.as_deref(), &recently_updated)
+                        .await?;
+                }
+                (false, Some(id)) => {
+                    d.remove_auto_discover_rule(&id).await?;
+                }
+                (false, None) => {}
+            }
+            Ok("Config saved".to_string())
         });
     }
 
@@ -926,6 +1037,7 @@ impl App {
             ignored_events,
             branches: None,
             notifications: None,
+            auto_discovered_by_rule: None,
         };
 
         let d = daemon.clone();
@@ -937,57 +1049,46 @@ impl App {
         });
     }
 
-    /// Open the config defaults form (fetches current values from daemon).
-    pub(crate) fn open_config_form(&mut self, daemon: &DaemonClient) {
+    /// Open the auto-discover rule form (singleton: edits the first/only rule).
+    /// Multi-rule support is intentionally hidden from the UI — the underlying
+    /// list-based config is preserved as a baseline but only the first entry is
+    /// surfaced for editing.
+    ///
+    /// Currently unreachable — auto-discover lives inside the `C` config form.
+    /// Kept as a hook for revisiting multi-rule UI later.
+    #[allow(dead_code)]
+    pub(crate) fn open_auto_discover_rules(&mut self, daemon: &DaemonClient) {
         let d = daemon.clone();
         let tx = self.bg_tx.clone();
-        self.set_flash("Loading config…");
+        self.set_flash("Loading auto-discover rule…");
         tokio::spawn(async move {
-            match d.get_defaults().await {
-                Ok(defaults) => {
+            match d.get_auto_discover_rules().await {
+                Ok(rules) => {
+                    let existing = rules.into_iter().next();
+                    let (existing_id, repo_filter, recency, title) = match existing {
+                        Some(r) => (
+                            Some(r.id),
+                            r.repo_pattern.or(r.org_pattern).unwrap_or_default(),
+                            r.recently_updated,
+                            "Edit Auto-Discover Rule".to_string(),
+                        ),
+                        None => (
+                            None,
+                            String::new(),
+                            "any".to_string(),
+                            "New Auto-Discover Rule".to_string(),
+                        ),
+                    };
                     let _ = tx
                         .send(SseUpdate::EnterForm {
-                            title: "Config".to_string(),
-                            kind: FormKind::GlobalDefaults,
+                            title,
+                            kind: FormKind::AutoDiscoverRule { existing_id },
                             fields: vec![
-                                FormField::text(
-                                    "Ignored workflows",
-                                    defaults.ignored_workflows.unwrap_or_default().join(", "),
-                                ),
-                                FormField::text(
-                                    "Ignored events",
-                                    defaults.ignored_events.unwrap_or_default().join(", "),
-                                ),
+                                FormField::text("Repo filter", repo_filter),
                                 FormField::cycle(
-                                    "Poll aggression",
-                                    defaults.poll_aggression.unwrap_or_default().to_string(),
-                                    vec!["low", "medium", "high"],
-                                ),
-                                FormField::cycle(
-                                    "Auto-discover branches",
-                                    if defaults.auto_discover_branches.unwrap_or(false) {
-                                        "on".to_string()
-                                    } else {
-                                        "off".to_string()
-                                    },
-                                    vec!["off", "on"],
-                                ),
-                                FormField::text(
-                                    "Branch filter",
-                                    defaults.branch_filter.unwrap_or_default(),
-                                ),
-                                FormField::text(
-                                    "Default branches",
-                                    defaults.default_branches.unwrap_or_default().join(", "),
-                                ),
-                                FormField::cycle(
-                                    "Show author",
-                                    if defaults.show_author.unwrap_or(true) {
-                                        "on".to_string()
-                                    } else {
-                                        "off".to_string()
-                                    },
-                                    vec!["off", "on"],
+                                    "Updated filter",
+                                    recency,
+                                    vec!["any", "week", "month", "year"],
                                 ),
                             ],
                         })
@@ -1002,6 +1103,165 @@ impl App {
                         .await;
                 }
             }
+        });
+    }
+
+    /// Submit the auto-discover rule form. Reuses the existing rule's ID when
+    /// editing, or falls back to a fixed `"default"` ID for the singleton case.
+    pub(crate) fn submit_auto_discover_rule_form(&mut self, daemon: &DaemonClient) {
+        let InputMode::Form {
+            kind: FormKind::AutoDiscoverRule { existing_id },
+            fields,
+            ..
+        } = &self.input_mode
+        else {
+            return;
+        };
+
+        let id = existing_id.clone().unwrap_or_else(|| "default".to_string());
+        let repo_filter: Option<String> = fields
+            .iter()
+            .find(|f| f.label == "Repo filter")
+            .map(|f| f.buffer().trim().to_string())
+            .filter(|s| !s.is_empty());
+        let recently_updated = fields
+            .iter()
+            .find(|f| f.label == "Updated filter")
+            .map(|f| f.buffer().to_string())
+            .unwrap_or_else(|| "any".to_string());
+
+        let d = daemon.clone();
+        let tx = self.bg_tx.clone();
+        self.input_mode = InputMode::Normal;
+        self.set_flash("Saving rule…");
+        tokio::spawn(async move {
+            match d
+                .add_auto_discover_rule(&id, None, repo_filter.as_deref(), &recently_updated)
+                .await
+            {
+                Ok(()) => {
+                    let _ = tx
+                        .send(SseUpdate::BackgroundResult {
+                            flash: "Auto-discover rule saved".to_string(),
+                            resync: true,
+                        })
+                        .await;
+                }
+                Err(e) => {
+                    let _ = tx
+                        .send(SseUpdate::BackgroundResult {
+                            flash: e,
+                            resync: false,
+                        })
+                        .await;
+                }
+            }
+        });
+    }
+
+    /// Open the config form (fetches current defaults and the auto-discover rule).
+    /// The form is divided into sections: defaults, branch auto-discovery,
+    /// repo auto-discovery, and display options.
+    pub(crate) fn open_config_form(&mut self, daemon: &DaemonClient) {
+        let d = daemon.clone();
+        let tx = self.bg_tx.clone();
+        self.set_flash("Loading config…");
+        tokio::spawn(async move {
+            let defaults = match d.get_defaults().await {
+                Ok(v) => v,
+                Err(e) => {
+                    let _ = tx
+                        .send(SseUpdate::BackgroundResult {
+                            flash: e,
+                            resync: false,
+                        })
+                        .await;
+                    return;
+                }
+            };
+            // Best-effort: missing rules just yield an empty singleton form.
+            let rule = d
+                .get_auto_discover_rules()
+                .await
+                .ok()
+                .and_then(|rs| rs.into_iter().next());
+            // Prefer the unified `repo_pattern` (full "owner/repo" regex). When a
+            // legacy rule has only `org_pattern`, prefill the field with it so
+            // it's preserved across an edit instead of silently lost.
+            let (rule_id, repo_filter, recency) = match rule {
+                Some(r) => {
+                    let initial = r.repo_pattern.or(r.org_pattern).unwrap_or_default();
+                    (Some(r.id), initial, r.recently_updated)
+                }
+                None => (None, String::new(), "any".to_string()),
+            };
+            let _ = tx
+                .send(SseUpdate::EnterForm {
+                    title: "Config".to_string(),
+                    kind: FormKind::GlobalDefaults {
+                        rule_id: rule_id.clone(),
+                    },
+                    fields: vec![
+                        FormField::tab("Defaults"),
+                        FormField::text(
+                            "Ignored workflows",
+                            defaults.ignored_workflows.unwrap_or_default().join(", "),
+                        ),
+                        FormField::text(
+                            "Ignored events",
+                            defaults.ignored_events.unwrap_or_default().join(", "),
+                        ),
+                        FormField::cycle(
+                            "Poll aggression",
+                            defaults.poll_aggression.unwrap_or_default().to_string(),
+                            vec!["low", "medium", "high"],
+                        ),
+                        FormField::tab("Discovery"),
+                        FormField::cycle(
+                            "Auto-discover branches",
+                            if defaults.auto_discover_branches.unwrap_or(false) {
+                                "on".to_string()
+                            } else {
+                                "off".to_string()
+                            },
+                            vec!["off", "on"],
+                        ),
+                        FormField::text(
+                            "Branch filter",
+                            defaults.branch_filter.unwrap_or_default(),
+                        ),
+                        FormField::text(
+                            "Default branches",
+                            defaults.default_branches.unwrap_or_default().join(", "),
+                        ),
+                        FormField::cycle(
+                            "Auto-discover repos",
+                            if rule_id.is_some() {
+                                "on".to_string()
+                            } else {
+                                "off".to_string()
+                            },
+                            vec!["off", "on"],
+                        ),
+                        FormField::text("Repo filter", repo_filter),
+                        FormField::cycle(
+                            "Updated filter",
+                            recency,
+                            vec!["any", "week", "month", "year"],
+                        ),
+                        FormField::tab("Display"),
+                        FormField::cycle(
+                            "Show author",
+                            if defaults.show_author.unwrap_or(true) {
+                                "on".to_string()
+                            } else {
+                                "off".to_string()
+                            },
+                            vec!["off", "on"],
+                        ),
+                    ],
+                })
+                .await;
         });
     }
 }
