@@ -277,24 +277,24 @@ async fn run_discovery_cycle(
             cfg.repos.keys().cloned().collect(),
         )
     };
-    if rules.is_empty() {
-        return;
-    }
-
-    let repos = match handle.github.list_accessible_repos().await {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::warn!(error = %e, "Repo auto-discovery: failed to list repos");
-            return;
-        }
+    let matching: DiscoveredRepoSet = if rules.is_empty() {
+        // No rules — anything previously auto-discovered should be cleaned up.
+        HashSet::new()
+    } else {
+        let repos = match handle.github.list_accessible_repos().await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(error = %e, "Repo auto-discovery: failed to list repos");
+                return;
+            }
+        };
+        let now = crate::config::unix_now();
+        repos
+            .iter()
+            .filter(|r| rules.iter().any(|rule| repo_matches_rule(rule, r, now)))
+            .map(|r| r.full_name.clone())
+            .collect()
     };
-
-    let now = crate::config::unix_now();
-    let matching: DiscoveredRepoSet = repos
-        .iter()
-        .filter(|r| rules.iter().any(|rule| repo_matches_rule(rule, r, now)))
-        .map(|r| r.full_name.clone())
-        .collect();
 
     let old_set: DiscoveredRepoSet = handle.discovered_repos.lock().await.clone();
 

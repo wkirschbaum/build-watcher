@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.0.5] - 2026-05-11
+
+### Fixed
+
+- **Archived repos included in auto-discovery** — `list_accessible_repos` now filters out repos where `archived: true`, so they are never matched against auto-discover rules.
+- **Removing all auto-discover rules left previously-discovered repos still watched** — the discovery cycle returned early when the rule list was empty instead of treating the empty set as "nothing should be discovered", causing repos to linger. Now runs the cleanup pass regardless.
+
 ## [1.0.4] - 2026-05-09
 
 ### Added

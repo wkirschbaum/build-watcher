@@ -401,6 +401,8 @@ struct GhRepoJson {
     full_name: String,
     #[serde(default)]
     pushed_at: Option<String>,
+    #[serde(default)]
+    archived: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -777,6 +779,7 @@ impl GitHubClient for ReqwestClient {
             .await?;
         Ok(raw
             .into_iter()
+            .filter(|r| !r.archived)
             .filter_map(|r| {
                 let (owner, name) = r.full_name.split_once('/')?;
                 Some(super::RepoInfo {
