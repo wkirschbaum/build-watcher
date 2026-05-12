@@ -101,6 +101,8 @@ pub enum WatchEvent {
         number: u64,
         title: String,
         url: String,
+        author: String,
+        draft: bool,
         from: PrMergeState,
         to: PrMergeState,
     },

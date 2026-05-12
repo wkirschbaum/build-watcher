@@ -1264,6 +1264,68 @@ async fn poll_prs_emits_on_transition() {
     }
 }
 
+#[tokio::test]
+async fn poll_prs_unknown_state_does_not_cause_duplicate_notification() {
+    // Regression test: GitHub briefly returns Unknown while recomputing merge
+    // readiness after a push. This must not reset the tracked state and cause
+    // a duplicate notification when the PR returns to its prior state.
+    let h = TestHarness::with_config(MockGitHub::with_prs(vec![]), {
+        let mut cfg = Config::default();
+        cfg.repos
+            .entry("alice/app".to_string())
+            .or_default()
+            .watch_prs = true;
+        cfg
+    });
+    h.seed(WatchKey::new("alice/app", "main"), idle_entry(100))
+        .await;
+
+    let mut rx = h.subscribe();
+    let mut poller = h.poller("alice/app");
+
+    // First poll: Blocked — seeds state, no event.
+    poller
+        .poll_prs_with(Some(vec![make_pr(
+            42,
+            "feat/login",
+            crate::github::MergeState::Blocked,
+        )]))
+        .await;
+    assert!(rx.try_recv().is_err());
+    assert_eq!(
+        poller.pr_states.get(&42),
+        Some(&crate::github::MergeState::Blocked)
+    );
+
+    // GitHub briefly returns Unknown — state must not change and no event emitted.
+    poller
+        .poll_prs_with(Some(vec![make_pr(
+            42,
+            "feat/login",
+            crate::github::MergeState::Unknown,
+        )]))
+        .await;
+    assert!(rx.try_recv().is_err(), "Unknown should not emit an event");
+    assert_eq!(
+        poller.pr_states.get(&42),
+        Some(&crate::github::MergeState::Blocked),
+        "Unknown should not overwrite tracked state"
+    );
+
+    // PR returns to Blocked — no event, no duplicate notification.
+    poller
+        .poll_prs_with(Some(vec![make_pr(
+            42,
+            "feat/login",
+            crate::github::MergeState::Blocked,
+        )]))
+        .await;
+    assert!(
+        rx.try_recv().is_err(),
+        "returning to prior state after Unknown must not fire a duplicate notification"
+    );
+}
+
 // -- Restart recovery: in-progress runs at last_seen_run_id --
 
 #[tokio::test]

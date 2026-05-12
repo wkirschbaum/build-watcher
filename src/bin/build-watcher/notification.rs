@@ -366,6 +366,11 @@ impl NotificationPipeline {
         }
     }
 
+    /// Check the throttle for a PR notification (never Critical, always counts).
+    fn throttle_pr(&mut self, now: Instant) -> bool {
+        self.throttle_allows(now, false)
+    }
+
     fn throttle_allows(&mut self, now: Instant, is_critical: bool) -> bool {
         while self
             .throttle_timestamps
@@ -534,7 +539,11 @@ pub async fn run_notification_handler(
                 match result {
                     Ok(event) => {
                         if matches!(event, WatchEvent::PrStateChanged { .. }) {
-                            dispatch_pr_notification(&event, &config, &pause, &*notifier).await;
+                            if pipeline.throttle_pr(Instant::now()) {
+                                dispatch_pr_notification(&event, &config, &pause, &*notifier).await;
+                            } else {
+                                tracing::warn!("Throttled PR notification (budget exhausted)");
+                            }
                         } else {
                             pipeline.ingest(event, &config, &pause, Instant::now()).await;
                         }

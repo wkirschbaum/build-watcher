@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::events::WatchEvent;
-use crate::github::PrInfo;
+use crate::github::{MergeState, PrInfo};
 
 use super::RepoPoller;
 
@@ -15,6 +15,14 @@ impl RepoPoller {
             cfg.repos.get(&self.repo).is_some_and(|rc| rc.watch_prs)
         };
         if !watch_prs {
+            // Clear any previously populated PR display data so the TUI doesn't
+            // show stale PRs after watch_prs is disabled.
+            let mut w = self.watches.lock().await;
+            for (key, entry) in w.iter_mut() {
+                if key.repo == self.repo && !entry.prs.is_empty() {
+                    entry.prs.clear();
+                }
+            }
             return;
         }
 
@@ -32,6 +40,13 @@ impl RepoPoller {
         // Detect transitions and emit events.
         let current_ids: HashSet<u64> = prs.iter().map(|pr| pr.number).collect();
         for pr in &prs {
+            // Unknown and HasHooks are transient states GitHub emits while recomputing
+            // merge readiness (e.g. after a push). They don't produce notifications.
+            // Skipping them prevents the oscillation Unknown → Blocked from looking
+            // like a new Blocked transition and firing a duplicate notification.
+            if matches!(pr.merge_state, MergeState::Unknown | MergeState::HasHooks) {
+                continue;
+            }
             let old = self.pr_states.get(&pr.number);
             if old.is_none_or(|prev| *prev != pr.merge_state) {
                 if let Some(from) = old.cloned() {
@@ -42,6 +57,8 @@ impl RepoPoller {
                         number: pr.number,
                         title: pr.title.clone(),
                         url: pr.url.clone(),
+                        author: pr.author.clone(),
+                        draft: pr.draft,
                         from,
                         to: pr.merge_state.clone(),
                     });

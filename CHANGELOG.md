@@ -1,5 +1,14 @@
 # Changelog
 
+## [1.0.6] - 2026-05-12
+
+### Fixed
+
+- **Duplicate PR notifications when GitHub briefly returns `Unknown` merge state** — after a push, GitHub transiently sets `mergeStateStatus` to `UNKNOWN` while recomputing merge readiness. This was overwriting the tracked state, making the PR's return to its prior state (e.g. `Blocked`) look like a new transition and firing a duplicate desktop notification. `Unknown` and `HasHooks` states are now skipped entirely in the PR state tracker so they never reset the transition baseline.
+- **Stale PR data shown in TUI after `watch_prs` is disabled** — open PR entries were not cleared from watch state when `watch_prs` was turned off, causing the TUI to keep displaying them until the daemon restarted. They are now cleared on the next poll cycle after `watch_prs` is disabled.
+- **PR notifications not throttled** — `PrStateChanged` events bypassed the shared 10/60s notification budget used for build events. They now consume from the same budget, preventing notification bursts when many PRs change state simultaneously.
+- **Missing author and draft status on PR entries created via SSE** — `PrStateChanged` events did not carry `author` or `draft` fields, so PR rows inserted into the TUI's local cache via the SSE event stream showed an empty author and incorrect draft state. Both fields are now included in the event.
+
 ## [1.0.5] - 2026-05-11
 
 ### Fixed

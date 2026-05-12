@@ -288,6 +288,8 @@ impl StatusResponse {
                 number,
                 title,
                 url,
+                author,
+                draft,
                 to,
                 ..
             } => {
@@ -300,9 +302,9 @@ impl StatusResponse {
                             number,
                             title,
                             url,
-                            author: String::new(),
+                            author,
                             merge_state: to,
-                            draft: false,
+                            draft,
                         });
                     }
                 }
