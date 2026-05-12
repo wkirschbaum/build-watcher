@@ -401,6 +401,9 @@ Config files, watch-state files, and the REST API are fully compatible with 1.0.
 
 - Avoid unnecessary config re-save on reads; improve persistence error logging
 
+[1.0.6]: https://github.com/wkirschbaum/build-watcher/releases/tag/v1.0.6
+[1.0.5]: https://github.com/wkirschbaum/build-watcher/releases/tag/v1.0.5
+[1.0.4]: https://github.com/wkirschbaum/build-watcher/releases/tag/v1.0.4
 [1.0.3]: https://github.com/wkirschbaum/build-watcher/releases/tag/v1.0.3
 [1.0.2]: https://github.com/wkirschbaum/build-watcher/releases/tag/v1.0.2
 [1.0.1]: https://github.com/wkirschbaum/build-watcher/releases/tag/v1.0.1
