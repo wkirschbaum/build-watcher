@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt::Write as _;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use tokio::sync::broadcast;
 
@@ -19,6 +19,23 @@ use crate::platform::{Notification, Notifier};
 const DEBOUNCE_DELAY: Duration = Duration::from_secs(3);
 const THROTTLE_WINDOW: Duration = Duration::from_secs(60);
 const THROTTLE_MAX: usize = 10;
+
+/// Silence notifications for this long after the daemon starts. The pipeline
+/// still records transition state during the grace, so post-grace events
+/// correctly differentiate "new state" from "what was already true at startup".
+///
+/// Stops the "all my watches just notified at once" spam every time you
+/// restart the daemon.
+const STARTUP_GRACE: Duration = Duration::from_secs(60);
+
+/// Wall-clock gap between successive ingests beyond which we assume the
+/// daemon was suspended (laptop sleep, system pause). Long enough that
+/// genuinely-quiet periods don't trigger it on busy repos.
+const WAKE_GAP_THRESHOLD: Duration = Duration::from_secs(600); // 10 min
+
+/// Silence notifications for this long after a detected wake-up. Matches the
+/// startup grace so the first batch of catch-up events settles quietly.
+const WAKE_GRACE: Duration = Duration::from_secs(60);
 
 // -- Types --
 
@@ -90,6 +107,17 @@ struct BufferedEvent {
     event: WatchEvent,
     repo_label: String,
     level: NotificationLevel,
+}
+
+/// Outcome of `NotificationPipeline::pr_action`.
+#[derive(Debug, PartialEq, Eq)]
+enum PrAction {
+    /// Caller should dispatch the PR notification.
+    Send,
+    /// Currently in startup or wake warmup — caller should drop the event.
+    Silenced,
+    /// Throttle budget exhausted — caller should drop the event.
+    Throttled,
 }
 
 // -- Helpers --
@@ -197,17 +225,91 @@ struct NotificationPipeline {
     next_id: u64,
     /// Sliding-window throttle.
     throttle_timestamps: VecDeque<Instant>,
+    /// Pipeline construction time. Used for `STARTUP_GRACE`.
+    startup_at: Instant,
+    /// Wall-clock time of the most recent ingest. `Instant` doesn't advance
+    /// during suspend, so we compare wall clocks to detect "the daemon was
+    /// paused" and enter wake-up grace.
+    last_ingest_wall: Option<SystemTime>,
+    /// When the current wake-up grace expires (None if not in one).
+    warmup_until: Option<Instant>,
 }
 
 impl NotificationPipeline {
     fn new() -> Self {
+        Self::new_at(Instant::now())
+    }
+
+    /// Construct a pipeline with an explicit `startup_at`. Production code
+    /// calls `new()`; tests use this to bypass the startup grace window.
+    fn new_at(startup_at: Instant) -> Self {
         Self {
             transitions: HashMap::new(),
             pending: HashMap::new(),
             deadlines: BTreeMap::new(),
             next_id: 0,
             throttle_timestamps: VecDeque::new(),
+            startup_at,
+            last_ingest_wall: None,
+            warmup_until: None,
         }
+    }
+
+    /// Advance the wall-clock tracker and arm wake warmup if the gap from the
+    /// previous ingest exceeds `WAKE_GAP_THRESHOLD`.
+    ///
+    /// Called unconditionally at the start of every ingest — before the
+    /// `is_transition` filter — so the gap reflects actual daemon activity,
+    /// not just notification-worthy transitions. Without this, a build that
+    /// runs in_progress for 30+ minutes (emitting many same-state repeat
+    /// events that fail `is_transition`) would let the wall clock stagnate
+    /// and falsely trigger wake warmup when the build finally completes.
+    fn observe_event_wall(&mut self, now: Instant, now_wall: SystemTime) {
+        let prev = self.last_ingest_wall.replace(now_wall);
+        if let Some(last_wall) = prev
+            && let Ok(gap) = now_wall.duration_since(last_wall)
+            && gap > WAKE_GAP_THRESHOLD
+        {
+            tracing::info!(
+                gap_secs = gap.as_secs(),
+                "Detected wall-clock gap > {}s — entering {}s notification warmup",
+                WAKE_GAP_THRESHOLD.as_secs(),
+                WAKE_GRACE.as_secs(),
+            );
+            self.warmup_until = Some(now + WAKE_GRACE);
+        }
+    }
+
+    /// Pure read: are we currently in startup or wake warmup at `now`?
+    /// Also garbage-collects an expired `warmup_until` so the field reflects
+    /// reality and external observers (logging, tests) see a clean value.
+    fn is_in_warmup(&mut self, now: Instant) -> bool {
+        if now.duration_since(self.startup_at) < STARTUP_GRACE {
+            return true;
+        }
+        if let Some(until) = self.warmup_until {
+            if now < until {
+                return true;
+            }
+            self.warmup_until = None;
+        }
+        false
+    }
+
+    /// Record `event` in the transitions map without buffering or notifying.
+    /// Used during warmup so the post-warmup pipeline correctly identifies
+    /// real transitions versus "what was already true when we woke up".
+    fn record_transition(&mut self, event: &WatchEvent) {
+        let Some(kind) = EventKind::from_event(event) else {
+            return;
+        };
+        let (tk, sha) = match event {
+            WatchEvent::RunStarted(run) | WatchEvent::RunCompleted { run, .. } => {
+                ((run.repo.clone(), run.branch.clone()), run.head_sha.clone())
+            }
+            WatchEvent::StatusChanged { .. } | WatchEvent::PrStateChanged { .. } => return,
+        };
+        self.transitions.insert(tk, (kind, sha));
     }
 
     /// Check whether this event represents a branch-level transition worth notifying about.
@@ -258,12 +360,27 @@ impl NotificationPipeline {
         config: &SharedConfigManager,
         pause: &PauseState,
         now: Instant,
+        now_wall: SystemTime,
     ) {
+        // Advance the wall-clock tracker on EVERY event, not only transitions —
+        // see `observe_event_wall` for rationale.
+        self.observe_event_wall(now, now_wall);
+
         // Single config read for everything we need from it. Held across the
         // pause-check await; this is safe because the pause lock and config
         // lock are never acquired in the reverse order, so no deadlock.
         let cfg = config.read().await;
         if !self.is_transition(&event, cfg.notify_mode) {
+            return;
+        }
+
+        // Warmup gate sits BEFORE pause/suppression so transition state always
+        // gets recorded during startup or post-suspend windows — that way the
+        // first post-warmup events correctly compare against current reality
+        // rather than firing as fresh transitions.
+        if self.is_in_warmup(now) {
+            drop(cfg);
+            self.record_transition(&event);
             return;
         }
 
@@ -285,17 +402,7 @@ impl NotificationPipeline {
         };
 
         // Record transition.
-        if let Some(kind) = EventKind::from_event(&event) {
-            let (tk, sha) = match &event {
-                WatchEvent::RunStarted(run) | WatchEvent::RunCompleted { run, .. } => {
-                    ((run.repo.clone(), run.branch.clone()), run.head_sha.clone())
-                }
-                WatchEvent::StatusChanged { .. } | WatchEvent::PrStateChanged { .. } => {
-                    unreachable!("EventKind::from_event returns None for non-run events")
-                }
-            };
-            self.transitions.insert(tk, (kind, sha));
-        }
+        self.record_transition(&event);
 
         // Buffer for debounce.
         let is_new = !self.pending.contains_key(&key);
@@ -335,16 +442,18 @@ impl NotificationPipeline {
                 .pop_first()
                 .expect("already verified non-empty");
             if let Some(events) = self.pending.remove(&key) {
-                self.dispatch_group(key, events, notifier).await;
+                self.dispatch_group(key, events, now, notifier).await;
             }
         }
     }
 
-    /// Dispatch a single debounce group.
+    /// Dispatch a single debounce group. Takes `now` rather than calling
+    /// `Instant::now()` so the throttle check is deterministic in tests.
     async fn dispatch_group(
         &mut self,
         key: DebounceKey,
         events: Vec<BufferedEvent>,
+        now: Instant,
         notifier: &dyn Notifier,
     ) {
         if events.is_empty() {
@@ -358,7 +467,7 @@ impl NotificationPipeline {
         };
         let is_critical = level == NotificationLevel::Critical;
 
-        if !self.throttle_allows(Instant::now(), is_critical) {
+        if !self.throttle_allows(now, is_critical) {
             tracing::warn!("Throttled notification for {} (budget exhausted)", key.repo);
             return;
         }
@@ -392,9 +501,19 @@ impl NotificationPipeline {
         }
     }
 
-    /// Check the throttle for a PR notification (never Critical, always counts).
-    fn throttle_pr(&mut self, now: Instant) -> bool {
-        self.throttle_allows(now, false)
+    /// Decide what to do with a PR notification. Updates the wall-clock
+    /// tracker (so build-event wake detection accounts for PR-only activity)
+    /// and gates on warmup before the throttle check.
+    fn pr_action(&mut self, now: Instant, now_wall: SystemTime) -> PrAction {
+        self.observe_event_wall(now, now_wall);
+        if self.is_in_warmup(now) {
+            return PrAction::Silenced;
+        }
+        if self.throttle_allows(now, false) {
+            PrAction::Send
+        } else {
+            PrAction::Throttled
+        }
     }
 
     fn throttle_allows(&mut self, now: Instant, is_critical: bool) -> bool {
@@ -569,13 +688,26 @@ pub async fn run_notification_handler(
                 match result {
                     Ok(event) => {
                         if matches!(event, WatchEvent::PrStateChanged { .. }) {
-                            if pipeline.throttle_pr(Instant::now()) {
-                                dispatch_pr_notification(&event, &config, &pause, &*notifier).await;
-                            } else {
-                                tracing::warn!("Throttled PR notification (budget exhausted)");
+                            match pipeline.pr_action(Instant::now(), SystemTime::now()) {
+                                PrAction::Send => {
+                                    dispatch_pr_notification(&event, &config, &pause, &*notifier)
+                                        .await;
+                                }
+                                PrAction::Silenced => {
+                                    tracing::debug!(
+                                        "PR notification silenced (startup or wake warmup)"
+                                    );
+                                }
+                                PrAction::Throttled => {
+                                    tracing::warn!(
+                                        "Throttled PR notification (budget exhausted)"
+                                    );
+                                }
                             }
                         } else {
-                            pipeline.ingest(event, &config, &pause, Instant::now()).await;
+                            pipeline
+                                .ingest(event, &config, &pause, Instant::now(), SystemTime::now())
+                                .await;
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -658,17 +790,30 @@ mod tests {
         Arc::new(Mutex::new(None))
     }
 
+    /// A `now` instant that's safely past `STARTUP_GRACE`. Use this in tests
+    /// that aren't specifically about the warmup behaviour.
+    fn after_grace_now() -> Instant {
+        Instant::now() + STARTUP_GRACE + Duration::from_secs(1)
+    }
+
+    /// A `startup_at` value that's already past warmup relative to `now`.
+    fn startup_before_grace(now: Instant) -> Instant {
+        now - STARTUP_GRACE - Duration::from_secs(1)
+    }
+
     /// Ingest events and flush, returning dispatched notification titles.
     /// All events share the same instant — debounce will coalesce them.
     async fn dispatched_titles(events: Vec<WatchEvent>) -> Vec<String> {
         let config = default_config_manager();
         let pause = unpaused();
         let recorder = RecordingNotifier::new();
-        let mut pipeline = NotificationPipeline::new();
-        let now = Instant::now();
+        let now = after_grace_now();
+        let mut pipeline = NotificationPipeline::new_at(startup_before_grace(now));
 
         for event in events {
-            pipeline.ingest(event, &config, &pause, now).await;
+            pipeline
+                .ingest(event, &config, &pause, now, SystemTime::now())
+                .await;
         }
 
         pipeline
@@ -692,13 +837,15 @@ mod tests {
         let config = Arc::new(ConfigManager::new(cfg, ConfigPersistence::Null));
         let pause = unpaused();
         let recorder = RecordingNotifier::new();
-        let mut pipeline = NotificationPipeline::new();
-        let start = Instant::now();
+        let start = after_grace_now();
+        let mut pipeline = NotificationPipeline::new_at(startup_before_grace(start));
 
         let step = DEBOUNCE_DELAY + Duration::from_millis(100);
         let mut now = start;
         for event in events {
-            pipeline.ingest(event, &config, &pause, now).await;
+            pipeline
+                .ingest(event, &config, &pause, now, SystemTime::now())
+                .await;
             pipeline
                 .dispatch_expired(now + DEBOUNCE_DELAY, &*recorder)
                 .await;
@@ -881,11 +1028,17 @@ mod tests {
         let config = Arc::new(ConfigManager::new(cfg, ConfigPersistence::Null));
         let pause = unpaused();
         let recorder = RecordingNotifier::new();
-        let mut pipeline = NotificationPipeline::new();
-        let now = Instant::now();
+        let now = after_grace_now();
+        let mut pipeline = NotificationPipeline::new_at(startup_before_grace(now));
 
         pipeline
-            .ingest(completed(RunConclusion::Cancelled), &config, &pause, now)
+            .ingest(
+                completed(RunConclusion::Cancelled),
+                &config,
+                &pause,
+                now,
+                SystemTime::now(),
+            )
             .await;
         pipeline
             .dispatch_expired(now + DEBOUNCE_DELAY, &*recorder)
@@ -1205,11 +1358,17 @@ mod tests {
         let config = default_config_manager();
         let pause = unpaused();
         let recorder = RecordingNotifier::new();
-        let mut pipeline = NotificationPipeline::new();
-        let now = Instant::now();
+        let now = after_grace_now();
+        let mut pipeline = NotificationPipeline::new_at(startup_before_grace(now));
 
         pipeline
-            .ingest(WatchEvent::RunStarted(snap()), &config, &pause, now)
+            .ingest(
+                WatchEvent::RunStarted(snap()),
+                &config,
+                &pause,
+                now,
+                SystemTime::now(),
+            )
             .await;
 
         // Before deadline: nothing dispatched.
@@ -1230,8 +1389,8 @@ mod tests {
         let config = default_config_manager();
         let pause = unpaused();
         let recorder = RecordingNotifier::new();
-        let mut pipeline = NotificationPipeline::new();
-        let now = Instant::now();
+        let now = after_grace_now();
+        let mut pipeline = NotificationPipeline::new_at(startup_before_grace(now));
 
         // Alternate started/success on distinct branches to create transitions.
         // Both are Normal level, so throttle applies equally.
@@ -1251,12 +1410,351 @@ mod tests {
                     flaky: false,
                 }
             };
-            pipeline.ingest(event, &config, &pause, now).await;
+            pipeline
+                .ingest(event, &config, &pause, now, SystemTime::now())
+                .await;
         }
 
         pipeline
             .dispatch_expired(now + DEBOUNCE_DELAY, &*recorder)
             .await;
         assert_eq!(recorder.titles().await.len(), THROTTLE_MAX);
+    }
+
+    // -- Warmup tests --
+
+    /// Drive the pipeline through a sequence of events at controlled instants
+    /// and return the dispatched titles.
+    async fn drive_pipeline(
+        pipeline: &mut NotificationPipeline,
+        events: Vec<(WatchEvent, Instant, SystemTime)>,
+        final_now: Instant,
+    ) -> Vec<String> {
+        let config = default_config_manager();
+        let pause = unpaused();
+        let recorder = RecordingNotifier::new();
+        for (event, now, now_wall) in events {
+            pipeline.ingest(event, &config, &pause, now, now_wall).await;
+            pipeline
+                .dispatch_expired(now + DEBOUNCE_DELAY, &*recorder)
+                .await;
+        }
+        pipeline
+            .dispatch_expired(final_now + DEBOUNCE_DELAY, &*recorder)
+            .await;
+        recorder.titles().await
+    }
+
+    #[tokio::test]
+    async fn startup_grace_silences_initial_events() {
+        // Daemon just started — startup_at == now. Event inside the grace
+        // window should NOT dispatch.
+        let startup_at = Instant::now();
+        let mut pipeline = NotificationPipeline::new_at(startup_at);
+        let now = startup_at + Duration::from_secs(5); // inside STARTUP_GRACE
+        let titles = drive_pipeline(
+            &mut pipeline,
+            vec![(completed(RunConclusion::Success), now, SystemTime::now())],
+            now,
+        )
+        .await;
+        assert!(titles.is_empty(), "in-grace events should not dispatch");
+    }
+
+    #[tokio::test]
+    async fn startup_grace_records_transition_so_post_grace_repeats_stay_silent() {
+        // The whole point of recording-during-warmup: if the same kind+sha
+        // arrives after the grace, it should still be suppressed as a repeat,
+        // not fire as a "fresh" transition.
+        let startup_at = Instant::now();
+        let mut pipeline = NotificationPipeline::new_at(startup_at);
+        let in_grace = startup_at + Duration::from_secs(5);
+        let after_grace = startup_at + STARTUP_GRACE + Duration::from_secs(5);
+
+        let titles = drive_pipeline(
+            &mut pipeline,
+            vec![
+                (
+                    completed(RunConclusion::Success),
+                    in_grace,
+                    SystemTime::now(),
+                ),
+                (
+                    completed(RunConclusion::Success),
+                    after_grace,
+                    SystemTime::now(),
+                ),
+            ],
+            after_grace,
+        )
+        .await;
+        assert!(
+            titles.is_empty(),
+            "repeat of same kind+sha after grace should still be suppressed"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_grace_events_dispatch_normally() {
+        let startup_at = Instant::now();
+        let mut pipeline = NotificationPipeline::new_at(startup_at);
+        let now = startup_at + STARTUP_GRACE + Duration::from_secs(1);
+        let titles = drive_pipeline(
+            &mut pipeline,
+            vec![(completed(RunConclusion::Failure), now, SystemTime::now())],
+            now,
+        )
+        .await;
+        assert_eq!(titles.len(), 1, "post-grace events should dispatch");
+    }
+
+    #[tokio::test]
+    async fn large_wall_clock_gap_enters_wake_warmup() {
+        // First event well past startup grace dispatches normally. Second
+        // event arrives with a wall-clock gap > WAKE_GAP_THRESHOLD — the
+        // daemon presumably slept — and should be silenced.
+        let startup_at = Instant::now();
+        let mut pipeline = NotificationPipeline::new_at(startup_at);
+        let first_now = startup_at + STARTUP_GRACE + Duration::from_secs(1);
+        let first_wall = SystemTime::now();
+        let second_now = first_now + Duration::from_secs(5);
+        // Wall-clock jumped way ahead — simulates 1 hour suspend.
+        let second_wall = first_wall + Duration::from_secs(3600);
+
+        let mut first = completed(RunConclusion::Failure);
+        if let WatchEvent::RunCompleted { run, .. } = &mut first {
+            run.head_sha = "sha-a".to_string();
+        }
+        let mut second = completed(RunConclusion::Failure);
+        if let WatchEvent::RunCompleted { run, .. } = &mut second {
+            run.head_sha = "sha-b".to_string();
+            run.branch = "other".to_string();
+        }
+
+        let titles = drive_pipeline(
+            &mut pipeline,
+            vec![
+                (first, first_now, first_wall),
+                (second, second_now, second_wall),
+            ],
+            second_now,
+        )
+        .await;
+        assert_eq!(
+            titles.len(),
+            1,
+            "first dispatches, second silenced by wake warmup"
+        );
+    }
+
+    #[tokio::test]
+    async fn wake_warmup_expires_after_wake_grace() {
+        // After WAKE_GRACE elapses, subsequent events dispatch normally again.
+        let startup_at = Instant::now();
+        let mut pipeline = NotificationPipeline::new_at(startup_at);
+        let first_now = startup_at + STARTUP_GRACE + Duration::from_secs(1);
+        let first_wall = SystemTime::now();
+        let after_wake_now = first_now + Duration::from_secs(5);
+        let after_wake_wall = first_wall + Duration::from_secs(3600);
+        let post_grace_now = after_wake_now + WAKE_GRACE + Duration::from_secs(1);
+
+        let mut first = completed(RunConclusion::Failure);
+        if let WatchEvent::RunCompleted { run, .. } = &mut first {
+            run.head_sha = "sha-a".to_string();
+        }
+        let mut wake = completed(RunConclusion::Failure);
+        if let WatchEvent::RunCompleted { run, .. } = &mut wake {
+            run.head_sha = "sha-b".to_string();
+            run.branch = "other".to_string();
+        }
+        let mut post = completed(RunConclusion::Failure);
+        if let WatchEvent::RunCompleted { run, .. } = &mut post {
+            run.head_sha = "sha-c".to_string();
+            run.branch = "third".to_string();
+        }
+
+        let titles = drive_pipeline(
+            &mut pipeline,
+            vec![
+                (first, first_now, first_wall),
+                (wake, after_wake_now, after_wake_wall),
+                // Third event lands well past wake grace — should dispatch.
+                (post, post_grace_now, after_wake_wall),
+            ],
+            post_grace_now,
+        )
+        .await;
+        assert_eq!(
+            titles.len(),
+            2,
+            "first + post-wake-grace dispatch, middle wake event silent"
+        );
+    }
+
+    #[tokio::test]
+    async fn long_running_build_does_not_falsely_trigger_wake_warmup() {
+        // Regression: a build that runs in_progress for > WAKE_GAP_THRESHOLD
+        // emits repeat same-state events that fail is_transition. Wall clock
+        // must still advance on each ingest so the eventual completion
+        // doesn't trigger a false-positive wake warmup.
+        let startup_at = Instant::now();
+        let mut pipeline = NotificationPipeline::new_at(startup_at);
+        let started_now = startup_at + STARTUP_GRACE + Duration::from_secs(1);
+        let started_wall = SystemTime::now();
+        let mut started = WatchEvent::RunStarted(snap());
+        if let WatchEvent::RunStarted(s) = &mut started {
+            s.head_sha = "sha-a".to_string();
+        }
+
+        // First event: a real transition that dispatches.
+        let config = default_config_manager();
+        let pause = unpaused();
+        let recorder = RecordingNotifier::new();
+        pipeline
+            .ingest(started.clone(), &config, &pause, started_now, started_wall)
+            .await;
+
+        // Many repeat same-state events over 15 minutes (longer than
+        // WAKE_GAP_THRESHOLD). Each is a non-transition (same kind+sha)
+        // so is_transition returns false — but observe_event_wall must
+        // still update the wall clock tracker.
+        for i in 1..=15 {
+            let mut repeat = started.clone();
+            if let WatchEvent::RunStarted(s) = &mut repeat {
+                s.head_sha = "sha-a".to_string();
+            }
+            let later_now = started_now + Duration::from_secs(60 * i);
+            let later_wall = started_wall + Duration::from_secs(60 * i);
+            pipeline
+                .ingest(repeat, &config, &pause, later_now, later_wall)
+                .await;
+        }
+
+        // Completion arrives 15 minutes after the started event — a real
+        // transition. Without the fix, wake warmup would trigger and silence
+        // this. With the fix, wall clock has been advancing throughout, so
+        // no gap is detected and the completion fires.
+        let mut completed = WatchEvent::RunCompleted {
+            run: snap(),
+            conclusion: RunConclusion::Failure,
+            elapsed: None,
+            failing_steps: None,
+            failing_job_id: None,
+            flaky: false,
+        };
+        if let WatchEvent::RunCompleted { run, .. } = &mut completed {
+            run.head_sha = "sha-a".to_string();
+        }
+        let completed_now = started_now + Duration::from_secs(60 * 15 + 30);
+        let completed_wall = started_wall + Duration::from_secs(60 * 15 + 30);
+        pipeline
+            .ingest(completed, &config, &pause, completed_now, completed_wall)
+            .await;
+        pipeline
+            .dispatch_expired(completed_now + DEBOUNCE_DELAY, &*recorder)
+            .await;
+
+        let titles = recorder.titles().await;
+        assert_eq!(
+            titles.len(),
+            2,
+            "started + completed should both fire; long-running build must \
+             not falsely trigger wake warmup (got: {titles:?})"
+        );
+    }
+
+    #[test]
+    fn pr_action_silenced_during_startup_grace() {
+        let startup_at = Instant::now();
+        let mut pipeline = NotificationPipeline::new_at(startup_at);
+        let now = startup_at + Duration::from_secs(5); // inside grace
+        assert_eq!(
+            pipeline.pr_action(now, SystemTime::now()),
+            PrAction::Silenced
+        );
+    }
+
+    #[test]
+    fn pr_action_send_after_startup_grace() {
+        let startup_at = Instant::now();
+        let mut pipeline = NotificationPipeline::new_at(startup_at);
+        let now = startup_at + STARTUP_GRACE + Duration::from_secs(1);
+        assert_eq!(pipeline.pr_action(now, SystemTime::now()), PrAction::Send);
+    }
+
+    #[test]
+    fn pr_action_updates_wall_clock_for_build_wake_detection() {
+        // PR-only activity must update last_ingest_wall — otherwise a build
+        // event arriving later sees a stale wall and falsely enters wake warmup.
+        let startup_at = Instant::now();
+        let mut pipeline = NotificationPipeline::new_at(startup_at);
+        let first_now = startup_at + STARTUP_GRACE + Duration::from_secs(1);
+        let first_wall = SystemTime::now();
+        let _ = pipeline.pr_action(first_now, first_wall);
+
+        // Build event 5 seconds later, wall clock advanced 5 seconds.
+        // Without the PR path updating last_ingest_wall, observe_event_wall
+        // would have None for prev and not trigger a gap. With the fix, prev
+        // is the PR's wall time → small gap → no wake warmup.
+        let later_now = first_now + Duration::from_secs(5);
+        let later_wall = first_wall + Duration::from_secs(5);
+        pipeline.observe_event_wall(later_now, later_wall);
+        assert!(
+            !pipeline.is_in_warmup(later_now),
+            "no warmup expected — small gap from PR to build"
+        );
+    }
+
+    #[test]
+    fn pr_action_throttled_after_budget_exhausted() {
+        let startup_at = Instant::now();
+        let mut pipeline = NotificationPipeline::new_at(startup_at);
+        let now = startup_at + STARTUP_GRACE + Duration::from_secs(1);
+        // Fill throttle budget with non-critical entries.
+        for _ in 0..THROTTLE_MAX {
+            pipeline.throttle_allows(now, false);
+        }
+        assert_eq!(
+            pipeline.pr_action(now, SystemTime::now()),
+            PrAction::Throttled
+        );
+    }
+
+    #[tokio::test]
+    async fn wall_clock_going_backwards_does_not_trigger_wake_warmup() {
+        // NTP correction can jump SystemTime backwards. We should NOT enter
+        // wake warmup in that case (duration_since returns Err which we treat
+        // as no gap).
+        let startup_at = Instant::now();
+        let mut pipeline = NotificationPipeline::new_at(startup_at);
+        let first_now = startup_at + STARTUP_GRACE + Duration::from_secs(1);
+        let first_wall = SystemTime::now() + Duration::from_secs(3600); // pretend wall was ahead
+        let second_now = first_now + Duration::from_secs(5);
+        let second_wall = SystemTime::now(); // wall jumped back
+
+        let mut first = completed(RunConclusion::Failure);
+        if let WatchEvent::RunCompleted { run, .. } = &mut first {
+            run.head_sha = "sha-a".to_string();
+        }
+        let mut second = completed(RunConclusion::Failure);
+        if let WatchEvent::RunCompleted { run, .. } = &mut second {
+            run.head_sha = "sha-b".to_string();
+            run.branch = "other".to_string();
+        }
+
+        let titles = drive_pipeline(
+            &mut pipeline,
+            vec![
+                (first, first_now, first_wall),
+                (second, second_now, second_wall),
+            ],
+            second_now,
+        )
+        .await;
+        assert_eq!(
+            titles.len(),
+            2,
+            "backwards wall clock should not silence the second event"
+        );
     }
 }
