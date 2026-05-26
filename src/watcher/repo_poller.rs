@@ -119,6 +119,7 @@ pub(super) enum RunChange {
         elapsed: Option<f64>,
         failing_steps: Option<String>,
         failing_job_id: Option<u64>,
+        flaky: bool,
     },
     StatusChanged {
         run: RunSnapshot,
@@ -145,12 +146,14 @@ impl RunChange {
                 elapsed,
                 failing_steps,
                 failing_job_id,
+                flaky,
             } => WatchEvent::RunCompleted {
                 run,
                 conclusion,
                 elapsed,
                 failing_steps,
                 failing_job_id,
+                flaky,
             },
             Self::StatusChanged { run, from, to } => WatchEvent::StatusChanged { run, from, to },
         }

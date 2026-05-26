@@ -735,6 +735,24 @@ impl App {
             .iter()
             .find(|f| f.label == "Show author")
             .map(|f| f.buffer() == "on");
+        let detect_flakes: Option<bool> = fields
+            .iter()
+            .find(|f| f.label == "Detect flakes")
+            .map(|f| f.buffer() == "on");
+        let show_duration_trend: Option<bool> = fields
+            .iter()
+            .find(|f| f.label == "Duration trend")
+            .map(|f| f.buffer() == "on");
+        let notify_mode = fields
+            .iter()
+            .find(|f| f.label == "Notify mode")
+            .and_then(|f| match f.buffer() {
+                "every build" => Some(build_watcher::config::NotifyMode::EveryBuild),
+                "failures + recoveries" => {
+                    Some(build_watcher::config::NotifyMode::FailuresAndRecoveries)
+                }
+                _ => None,
+            });
         let auto_discover_repos: bool = fields
             .iter()
             .find(|f| f.label == "Auto-discover repos")
@@ -776,6 +794,9 @@ impl App {
             branch_filter,
             default_branches,
             show_author,
+            detect_flakes,
+            show_duration_trend,
+            notify_mode,
         };
         self.spawn_action("Saving config…", true, async move {
             d.set_defaults(&defaults).await?;
@@ -1258,6 +1279,39 @@ impl App {
                                 "off".to_string()
                             },
                             vec!["off", "on"],
+                        ),
+                        FormField::cycle(
+                            "Detect flakes",
+                            if defaults.detect_flakes.unwrap_or(true) {
+                                "on".to_string()
+                            } else {
+                                "off".to_string()
+                            },
+                            vec!["off", "on"],
+                        ),
+                        FormField::cycle(
+                            "Duration trend",
+                            if defaults.show_duration_trend.unwrap_or(true) {
+                                "on".to_string()
+                            } else {
+                                "off".to_string()
+                            },
+                            vec!["off", "on"],
+                        ),
+                        FormField::cycle(
+                            "Notify mode",
+                            match defaults
+                                .notify_mode
+                                .unwrap_or(build_watcher::config::NotifyMode::EveryBuild)
+                            {
+                                build_watcher::config::NotifyMode::EveryBuild => {
+                                    "every build".to_string()
+                                }
+                                build_watcher::config::NotifyMode::FailuresAndRecoveries => {
+                                    "failures + recoveries".to_string()
+                                }
+                            },
+                            vec!["every build", "failures + recoveries"],
                         ),
                     ],
                 })

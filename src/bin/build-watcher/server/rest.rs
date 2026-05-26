@@ -30,7 +30,13 @@ pub(crate) async fn status_handler(
     let paused = is_paused(&state.pause).await;
     let watches = state.watches.lock().await;
     let cfg = state.config.read().await;
-    axum::Json(build_watch_snapshot(&watches, Some(&cfg), paused))
+    let history = state.handle.history.lock().await;
+    axum::Json(build_watch_snapshot(
+        &watches,
+        Some(&cfg),
+        Some(&history),
+        paused,
+    ))
 }
 
 /// `GET /events` — SSE stream of `WatchEvent`s as they occur.
@@ -313,15 +319,39 @@ pub(crate) async fn get_defaults_handler(
         branch_filter: cfg.branch_filter.clone(),
         default_branches: Some(cfg.default_branches.clone()),
         show_author: Some(cfg.show_author),
+        detect_flakes: Some(cfg.detect_flakes),
+        show_duration_trend: Some(cfg.show_duration_trend),
+        notify_mode: Some(cfg.notify_mode),
     })
 }
 
 /// `POST /defaults` — Update global default config fields.
 /// Accepts the same `DefaultsConfig` shape — `None` fields are left unchanged.
+///
+/// Validates request body before forwarding to the config writer:
+/// - `branch_filter` must compile as a regex
+/// - `notify_mode` must be a recognised mode string (no silent fallback)
+///
+/// `NotifyMode`'s `Deserialize` impl is intentionally lenient (so a hand-edited
+/// config file with a typo doesn't refuse to load), but the REST API is strict —
+/// callers deserve a 400 with the allowed values rather than a silent default.
 pub(crate) async fn set_defaults_handler(
     State(state): State<DaemonState>,
-    axum::Json(body): axum::Json<DefaultsConfig>,
+    axum::Json(raw): axum::Json<serde_json::Value>,
 ) -> axum::response::Response {
+    if let Some(mode) = raw.get("notify_mode").and_then(|v| v.as_str())
+        && build_watcher::config::parse_notify_mode(mode).is_none()
+    {
+        return json_error(format!(
+            "invalid notify_mode '{mode}', expected 'every_build' or 'failures_and_recoveries'"
+        ));
+    }
+
+    let body: DefaultsConfig = match serde_json::from_value(raw) {
+        Ok(b) => b,
+        Err(e) => return json_error(format!("invalid request body: {e}")),
+    };
+
     // Validate inputs before taking the config lock.
     if let Some(filter) = &body.branch_filter
         && !filter.is_empty()
@@ -384,6 +414,24 @@ pub(crate) async fn set_defaults_handler(
                     "show author: {}",
                     if enabled { "on" } else { "off" }
                 ));
+            }
+            if let Some(enabled) = body.detect_flakes {
+                cfg.detect_flakes = enabled;
+                messages.push(format!(
+                    "flake detection: {}",
+                    if enabled { "on" } else { "off" }
+                ));
+            }
+            if let Some(enabled) = body.show_duration_trend {
+                cfg.show_duration_trend = enabled;
+                messages.push(format!(
+                    "duration trend: {}",
+                    if enabled { "on" } else { "off" }
+                ));
+            }
+            if let Some(mode) = body.notify_mode {
+                cfg.notify_mode = mode;
+                messages.push(format!("notify mode: {mode}"));
             }
             messages
         })
@@ -908,6 +956,7 @@ mod tests {
                 url: String::new(),
                 actor: None,
                 commit_author: None,
+                flaky: false,
             },
         );
         watches.lock().await.insert(key, entry);
@@ -1436,6 +1485,167 @@ mod tests {
                 .unwrap_or("")
                 .contains("branch auto-discovery is enabled")),
             "expected branch-auto-discovery rejection, got: {resp}"
+        );
+    }
+
+    // -- Defaults round-trip --
+
+    fn defaults_router(config: SharedConfigManager) -> axum::Router {
+        let (watches, pause, _events) = empty_state();
+        let handle = stub_handle();
+        let app_state = super::super::DaemonState {
+            watches,
+            config,
+            handle,
+            pause,
+            rate_limit: Arc::new(Mutex::new(None)),
+            started_at: std::time::Instant::now(),
+        };
+        axum::Router::new()
+            .route(
+                "/defaults",
+                axum::routing::get(super::get_defaults_handler).post(super::set_defaults_handler),
+            )
+            .with_state(app_state)
+    }
+
+    #[tokio::test]
+    async fn get_defaults_includes_new_toggles() {
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        let config = null_config(build_watcher::config::Config::default());
+        let router = defaults_router(config);
+        let req = http::Request::get("/defaults")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["detect_flakes"], true);
+        assert_eq!(json["show_duration_trend"], true);
+        assert_eq!(json["notify_mode"], "every_build");
+    }
+
+    #[tokio::test]
+    async fn set_defaults_updates_new_toggles() {
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        let config = null_config(build_watcher::config::Config::default());
+        let router = defaults_router(config.clone());
+        let body = r#"{
+            "detect_flakes": false,
+            "show_duration_trend": false,
+            "notify_mode": "failure_only"
+        }"#;
+        let req = http::Request::post("/defaults")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["ok"], true);
+
+        // Confirm the config was actually mutated.
+        let cfg = config.read().await;
+        assert!(!cfg.detect_flakes);
+        assert!(!cfg.show_duration_trend);
+        assert_eq!(
+            cfg.notify_mode,
+            build_watcher::config::NotifyMode::FailuresAndRecoveries
+        );
+    }
+
+    #[tokio::test]
+    async fn set_defaults_rejects_unknown_notify_mode() {
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        let config = null_config(build_watcher::config::Config::default());
+        let router = defaults_router(config.clone());
+        let body = r#"{"notify_mode": "nonsense"}"#;
+        let req = http::Request::post("/defaults")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        // `json_error` returns the error in the body (project convention), not
+        // via HTTP status. Match that convention here.
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let err = json["error"].as_str().unwrap_or_default();
+        assert!(
+            err.contains("notify_mode"),
+            "error should mention field: {err}"
+        );
+        assert!(
+            err.contains("nonsense"),
+            "error should echo offending value: {err}"
+        );
+        assert!(
+            json.get("ok").is_none(),
+            "rejected requests should not say ok: {json}"
+        );
+
+        // Confirm config was NOT mutated.
+        let cfg = config.read().await;
+        assert_eq!(
+            cfg.notify_mode,
+            build_watcher::config::NotifyMode::EveryBuild,
+            "default should remain unchanged"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_defaults_accepts_failure_only_alias() {
+        // The legacy "failure_only" name remains accepted as an alias for
+        // failures_and_recoveries — documented at NotifyMode::Deserialize.
+        use tower::ServiceExt;
+        let config = null_config(build_watcher::config::Config::default());
+        let router = defaults_router(config.clone());
+        let body = r#"{"notify_mode": "failure_only"}"#;
+        let req = http::Request::post("/defaults")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let cfg = config.read().await;
+        assert_eq!(
+            cfg.notify_mode,
+            build_watcher::config::NotifyMode::FailuresAndRecoveries
+        );
+    }
+
+    #[tokio::test]
+    async fn set_defaults_omitted_fields_leave_existing_values() {
+        let config = null_config(build_watcher::config::Config {
+            detect_flakes: false,
+            show_duration_trend: false,
+            notify_mode: build_watcher::config::NotifyMode::FailuresAndRecoveries,
+            ..build_watcher::config::Config::default()
+        });
+        let router = defaults_router(config.clone());
+
+        // Empty body: nothing changes.
+        let req = http::Request::post("/defaults")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from("{}"))
+            .unwrap();
+        use tower::ServiceExt;
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), 200);
+
+        let cfg = config.read().await;
+        assert!(!cfg.detect_flakes);
+        assert!(!cfg.show_duration_trend);
+        assert_eq!(
+            cfg.notify_mode,
+            build_watcher::config::NotifyMode::FailuresAndRecoveries
         );
     }
 }

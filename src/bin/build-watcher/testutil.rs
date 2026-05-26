@@ -14,6 +14,7 @@ pub fn snap() -> RunSnapshot {
         url: "https://github.com/alice/app/actions/runs/12345".to_string(),
         actor: None,
         commit_author: None,
+        head_sha: "abc1234".to_string(),
     }
 }
 
@@ -30,5 +31,6 @@ pub fn completed(conclusion: RunConclusion) -> WatchEvent {
         elapsed: None,
         failing_steps: None,
         failing_job_id: None,
+        flaky: false,
     }
 }

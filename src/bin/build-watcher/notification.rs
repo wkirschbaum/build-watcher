@@ -188,7 +188,9 @@ fn coalesced_body(kind: EventKind, events: &[BufferedEvent]) -> String {
 /// Owns all notification state: transition tracking, debounce buffer, and throttle window.
 /// Testable without channels, timers, or spawned tasks.
 struct NotificationPipeline {
-    transitions: HashMap<(String, String), EventKind>,
+    /// Last-notified (kind, head_sha) per (repo, branch). Used to suppress
+    /// repeat polls of the same state on the same commit.
+    transitions: HashMap<(String, String), (EventKind, String)>,
     /// Debounce buffer: events grouped by key, with deadlines.
     pending: HashMap<DebounceKey, Vec<BufferedEvent>>,
     deadlines: BTreeMap<(Instant, u64), DebounceKey>,
@@ -209,7 +211,15 @@ impl NotificationPipeline {
     }
 
     /// Check whether this event represents a branch-level transition worth notifying about.
-    fn is_transition(&self, event: &WatchEvent) -> bool {
+    ///
+    /// In `EveryBuild` mode: notify when the kind transitions OR the head SHA changes
+    /// (so a new commit always notifies even if the prior commit was in the same state).
+    ///
+    /// In `FailuresAndRecoveries` mode: notify on `Failed` events (subject to the
+    /// kind/SHA transition rule) AND on `Succeeded` events when the previous
+    /// recorded kind was `Failed` (recovery signal). Started and Cancelled are
+    /// always suppressed.
+    fn is_transition(&self, event: &WatchEvent, mode: config::NotifyMode) -> bool {
         let (run, kind) = match event {
             WatchEvent::RunStarted(run) => (run, EventKind::Started),
             WatchEvent::RunCompleted {
@@ -224,8 +234,21 @@ impl NotificationPipeline {
             ),
             WatchEvent::StatusChanged { .. } | WatchEvent::PrStateChanged { .. } => return false,
         };
+
         let key = (run.repo.clone(), run.branch.clone());
-        self.transitions.get(&key).is_none_or(|prev| *prev != kind)
+        let prev = self.transitions.get(&key);
+
+        if mode == config::NotifyMode::FailuresAndRecoveries {
+            // Only Failed events and Failed → Succeeded recoveries qualify.
+            let allowed = matches!(kind, EventKind::Failed)
+                || (matches!(kind, EventKind::Succeeded)
+                    && matches!(prev, Some((EventKind::Failed, _))));
+            if !allowed {
+                return false;
+            }
+        }
+
+        prev.is_none_or(|(prev_kind, prev_sha)| *prev_kind != kind || *prev_sha != run.head_sha)
     }
 
     /// Ingest an event: check transition + suppression, buffer if appropriate.
@@ -236,12 +259,15 @@ impl NotificationPipeline {
         pause: &PauseState,
         now: Instant,
     ) {
-        if !self.is_transition(&event) {
+        // Single config read for everything we need from it. Held across the
+        // pause-check await; this is safe because the pause lock and config
+        // lock are never acquired in the reverse order, so no deadlock.
+        let cfg = config.read().await;
+        if !self.is_transition(&event, cfg.notify_mode) {
             return;
         }
 
         let paused = is_paused(pause).await;
-        let cfg = config.read().await;
         let level = effective_level(&event, &cfg);
         let suppressed = level == NotificationLevel::Off
             || (level != NotificationLevel::Critical && (paused || cfg.is_in_quiet_hours()));
@@ -260,15 +286,15 @@ impl NotificationPipeline {
 
         // Record transition.
         if let Some(kind) = EventKind::from_event(&event) {
-            let tk = match &event {
+            let (tk, sha) = match &event {
                 WatchEvent::RunStarted(run) | WatchEvent::RunCompleted { run, .. } => {
-                    (run.repo.clone(), run.branch.clone())
+                    ((run.repo.clone(), run.branch.clone()), run.head_sha.clone())
                 }
                 WatchEvent::StatusChanged { .. } | WatchEvent::PrStateChanged { .. } => {
                     unreachable!("EventKind::from_event returns None for non-run events")
                 }
             };
-            self.transitions.insert(tk, kind);
+            self.transitions.insert(tk, (kind, sha));
         }
 
         // Buffer for debounce.
@@ -421,11 +447,14 @@ async fn dispatch_single(
             conclusion,
             elapsed,
             failing_steps,
+            flaky,
             ..
         } => {
             let succeeded = conclusion == RunConclusion::Success;
 
-            let (emoji, status) = if succeeded {
+            let (emoji, status) = if succeeded && flaky {
+                ("\u{26a1}", "flake recovered")
+            } else if succeeded {
                 ("\u{2705}", "succeeded")
             } else {
                 ("\u{274c}", "failed")
@@ -630,6 +659,7 @@ mod tests {
     }
 
     /// Ingest events and flush, returning dispatched notification titles.
+    /// All events share the same instant — debounce will coalesce them.
     async fn dispatched_titles(events: Vec<WatchEvent>) -> Vec<String> {
         let config = default_config_manager();
         let pause = unpaused();
@@ -644,6 +674,36 @@ mod tests {
         pipeline
             .dispatch_expired(now + DEBOUNCE_DELAY, &*recorder)
             .await;
+        recorder.titles().await
+    }
+
+    /// Like `dispatched_titles` but spaces events past the debounce window so
+    /// each transition dispatches independently. Use for suppression tests
+    /// where coalescing would obscure the count.
+    async fn dispatched_titles_with_mode(
+        events: Vec<WatchEvent>,
+        mode: config::NotifyMode,
+    ) -> Vec<String> {
+        use config::{Config, ConfigManager, ConfigPersistence};
+        let cfg = Config {
+            notify_mode: mode,
+            ..Config::default()
+        };
+        let config = Arc::new(ConfigManager::new(cfg, ConfigPersistence::Null));
+        let pause = unpaused();
+        let recorder = RecordingNotifier::new();
+        let mut pipeline = NotificationPipeline::new();
+        let start = Instant::now();
+
+        let step = DEBOUNCE_DELAY + Duration::from_millis(100);
+        let mut now = start;
+        for event in events {
+            pipeline.ingest(event, &config, &pause, now).await;
+            pipeline
+                .dispatch_expired(now + DEBOUNCE_DELAY, &*recorder)
+                .await;
+            now += step;
+        }
         recorder.titles().await
     }
 
@@ -752,6 +812,7 @@ mod tests {
                     elapsed: None,
                     failing_steps: Some("Build / Run tests".into()),
                     failing_job_id: None,
+                    flaky: false,
                 },
                 repo_label: "app".into(),
                 level: Critical,
@@ -763,6 +824,7 @@ mod tests {
                     elapsed: None,
                     failing_steps: None,
                     failing_job_id: None,
+                    flaky: false,
                 },
                 repo_label: "app".into(),
                 level: Critical,
@@ -842,13 +904,19 @@ mod tests {
     #[test]
     fn transition_allows_first_started() {
         let pipeline = NotificationPipeline::new();
-        assert!(pipeline.is_transition(&WatchEvent::RunStarted(snap())));
+        assert!(pipeline.is_transition(
+            &WatchEvent::RunStarted(snap()),
+            config::NotifyMode::EveryBuild
+        ));
     }
 
     #[test]
     fn transition_allows_first_completion() {
         let pipeline = NotificationPipeline::new();
-        assert!(pipeline.is_transition(&completed(RunConclusion::Success)));
+        assert!(pipeline.is_transition(
+            &completed(RunConclusion::Success),
+            config::NotifyMode::EveryBuild
+        ));
     }
 
     #[tokio::test]
@@ -860,6 +928,208 @@ mod tests {
         .await;
         assert_eq!(titles.len(), 1);
         assert!(titles[0].contains("succeeded"));
+    }
+
+    fn completed_with_sha(conclusion: RunConclusion, sha: &str) -> WatchEvent {
+        let mut s = snap();
+        s.head_sha = sha.to_string();
+        WatchEvent::RunCompleted {
+            run: s,
+            conclusion,
+            elapsed: None,
+            failing_steps: None,
+            failing_job_id: None,
+            flaky: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn every_build_mode_fires_on_new_commit_same_kind() {
+        let titles = dispatched_titles_with_mode(
+            vec![
+                completed_with_sha(RunConclusion::Success, "sha-a"),
+                completed_with_sha(RunConclusion::Success, "sha-b"),
+            ],
+            config::NotifyMode::EveryBuild,
+        )
+        .await;
+        assert_eq!(
+            titles.len(),
+            2,
+            "new commit should fire even when kind is unchanged"
+        );
+    }
+
+    #[tokio::test]
+    async fn every_build_mode_suppresses_same_commit_repeat() {
+        let titles = dispatched_titles_with_mode(
+            vec![
+                completed_with_sha(RunConclusion::Failure, "sha-a"),
+                completed_with_sha(RunConclusion::Failure, "sha-a"),
+            ],
+            config::NotifyMode::EveryBuild,
+        )
+        .await;
+        assert_eq!(
+            titles.len(),
+            1,
+            "repeat poll of same commit should suppress"
+        );
+    }
+
+    #[tokio::test]
+    async fn failures_and_recoveries_suppresses_first_success() {
+        // First-ever success on a branch isn't a recovery — there's no prior
+        // failure to recover from — so it should not fire.
+        let titles = dispatched_titles_with_mode(
+            vec![
+                completed_with_sha(RunConclusion::Success, "sha-a"),
+                WatchEvent::RunStarted({
+                    let mut s = snap();
+                    s.head_sha = "sha-b".to_string();
+                    s
+                }),
+            ],
+            config::NotifyMode::FailuresAndRecoveries,
+        )
+        .await;
+        assert!(
+            titles.is_empty(),
+            "Started + first-success should both be suppressed"
+        );
+    }
+
+    #[tokio::test]
+    async fn failures_and_recoveries_fires_on_failure() {
+        let titles = dispatched_titles_with_mode(
+            vec![completed_with_sha(RunConclusion::Failure, "sha-a")],
+            config::NotifyMode::FailuresAndRecoveries,
+        )
+        .await;
+        assert_eq!(titles.len(), 1);
+        assert!(titles[0].contains("failed"));
+    }
+
+    #[tokio::test]
+    async fn failures_and_recoveries_suppresses_repeat_failure_same_commit() {
+        let titles = dispatched_titles_with_mode(
+            vec![
+                completed_with_sha(RunConclusion::Failure, "sha-a"),
+                completed_with_sha(RunConclusion::Failure, "sha-a"),
+            ],
+            config::NotifyMode::FailuresAndRecoveries,
+        )
+        .await;
+        assert_eq!(titles.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn failures_and_recoveries_fires_on_new_commit_failure() {
+        let titles = dispatched_titles_with_mode(
+            vec![
+                completed_with_sha(RunConclusion::Failure, "sha-a"),
+                completed_with_sha(RunConclusion::Failure, "sha-b"),
+            ],
+            config::NotifyMode::FailuresAndRecoveries,
+        )
+        .await;
+        assert_eq!(titles.len(), 2, "new-commit failure should re-fire");
+    }
+
+    #[tokio::test]
+    async fn failures_and_recoveries_fires_on_recovery() {
+        // The whole point: Failed → Success should notify so the user knows
+        // the branch went green.
+        let titles = dispatched_titles_with_mode(
+            vec![
+                completed_with_sha(RunConclusion::Failure, "sha-a"),
+                completed_with_sha(RunConclusion::Success, "sha-a"),
+            ],
+            config::NotifyMode::FailuresAndRecoveries,
+        )
+        .await;
+        assert_eq!(
+            titles.len(),
+            2,
+            "recovery (Failed → Success) should fire alongside the original failure"
+        );
+        assert!(titles[0].contains("failed"));
+        assert!(titles[1].contains("succeeded") || titles[1].contains("flake"));
+    }
+
+    #[tokio::test]
+    async fn failures_and_recoveries_recovery_works_across_new_commit() {
+        // Fix-it commit: failure on sha-a, then push sha-b which passes.
+        let titles = dispatched_titles_with_mode(
+            vec![
+                completed_with_sha(RunConclusion::Failure, "sha-a"),
+                completed_with_sha(RunConclusion::Success, "sha-b"),
+            ],
+            config::NotifyMode::FailuresAndRecoveries,
+        )
+        .await;
+        assert_eq!(
+            titles.len(),
+            2,
+            "recovery on a new commit should still fire"
+        );
+    }
+
+    #[tokio::test]
+    async fn failures_and_recoveries_suppresses_cancelled() {
+        let titles = dispatched_titles_with_mode(
+            vec![completed_with_sha(RunConclusion::Cancelled, "sha-a")],
+            config::NotifyMode::FailuresAndRecoveries,
+        )
+        .await;
+        assert!(
+            titles.is_empty(),
+            "Cancelled is never a failure or recovery"
+        );
+    }
+
+    #[tokio::test]
+    async fn failures_and_recoveries_suppresses_success_after_success() {
+        let titles = dispatched_titles_with_mode(
+            vec![
+                completed_with_sha(RunConclusion::Success, "sha-a"),
+                completed_with_sha(RunConclusion::Success, "sha-b"),
+            ],
+            config::NotifyMode::FailuresAndRecoveries,
+        )
+        .await;
+        assert!(
+            titles.is_empty(),
+            "consecutive successes are not recoveries"
+        );
+    }
+
+    #[tokio::test]
+    async fn flaky_success_title_says_flake_recovered() {
+        let flaky_event = WatchEvent::RunCompleted {
+            run: snap(),
+            conclusion: RunConclusion::Success,
+            elapsed: None,
+            failing_steps: None,
+            failing_job_id: None,
+            flaky: true,
+        };
+        let titles = dispatched_titles(vec![flaky_event]).await;
+        assert_eq!(titles.len(), 1);
+        assert!(
+            titles[0].contains("flake recovered"),
+            "expected flake-recovered title, got {:?}",
+            titles[0]
+        );
+        assert!(!titles[0].contains("succeeded"));
+    }
+
+    #[tokio::test]
+    async fn non_flaky_success_keeps_succeeded_title() {
+        let titles = dispatched_titles(vec![completed(RunConclusion::Success)]).await;
+        assert_eq!(titles.len(), 1);
+        assert!(titles[0].contains("succeeded"));
+        assert!(!titles[0].contains("flake"));
     }
 
     #[tokio::test]
@@ -906,6 +1176,7 @@ mod tests {
                 elapsed: None,
                 failing_steps: None,
                 failing_job_id: None,
+                flaky: false,
             }
         }])
         .await;
@@ -977,6 +1248,7 @@ mod tests {
                     elapsed: None,
                     failing_steps: None,
                     failing_job_id: None,
+                    flaky: false,
                 }
             };
             pipeline.ingest(event, &config, &pause, now).await;

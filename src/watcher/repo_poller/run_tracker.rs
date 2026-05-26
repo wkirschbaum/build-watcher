@@ -160,6 +160,21 @@ impl RepoPoller {
             }
         }
 
+        let detect_flakes = self.config.read().await.detect_flakes;
+
+        // Resolve flake status for each completion (Success with prior failure on same SHA).
+        let mut flaky_by_idx: HashMap<usize, bool> = HashMap::new();
+        if detect_flakes {
+            let hist = self.history.lock().await;
+            for c in &completions {
+                let (run, key) = &found_runs[c.run_idx];
+                let is_recovered = run.succeeded()
+                    && crate::history::is_flake(&hist, key, &run.workflow, &run.head_sha);
+                flaky_by_idx.insert(c.run_idx, is_recovered);
+            }
+        }
+        let flake_for = |idx: usize| *flaky_by_idx.get(&idx).unwrap_or(&false);
+
         // Emit events for completions, copying author from the ActiveRun
         // (which holds it from initial detection) before it gets removed.
         for c in &completions {
@@ -172,16 +187,18 @@ impl RepoPoller {
                     snapshot.commit_author.clone_from(&active.commit_author);
                 }
             }
+            let flaky = flake_for(c.run_idx);
             changes.push(RunChange::Completed {
                 run: snapshot,
                 conclusion: run.run_conclusion(),
                 elapsed: run.duration_secs().map(|s| s as f64),
                 failing_steps: c.failing_steps.clone(),
                 failing_job_id: c.failing_job_id,
+                flaky,
             });
             tracing::info!(
                 key = %key, run_id = run.id,
-                sha = run.short_sha(), conclusion = %run.conclusion,
+                sha = run.short_sha(), conclusion = %run.conclusion, flaky,
                 "Build completed"
             );
         }
@@ -193,7 +210,12 @@ impl RepoPoller {
             for c in &completions {
                 let (run, key) = &found_runs[c.run_idx];
                 if let Some(entry) = w.get_mut(key) {
-                    entry.record_completion(run, c.failing_steps.clone(), c.failing_job_id);
+                    entry.record_completion(
+                        run,
+                        c.failing_steps.clone(),
+                        c.failing_job_id,
+                        flake_for(c.run_idx),
+                    );
                     if let Some(lb) = entry.last_builds.get(&run.workflow) {
                         new_builds.push((key.clone(), lb.clone()));
                     }
@@ -330,7 +352,10 @@ impl RepoPoller {
         let branches = self.sync_branches(&all_runs, branches, cached_prs).await;
 
         let run_filters = self.run_filters().await;
-        let show_author = self.config.read().await.show_author;
+        let (show_author, detect_flakes) = {
+            let cfg = self.config.read().await;
+            (cfg.show_author, cfg.detect_flakes)
+        };
         let mut any_changed = false;
 
         for key in &branches {
@@ -391,6 +416,9 @@ impl RepoPoller {
             // calls — just update state below.
             let mut failure_by_id: HashMap<u64, (Option<String>, Option<u64>)> = HashMap::new();
             let mut author_by_id: HashMap<u64, crate::github::RunAuthorInfo> = HashMap::new();
+            // Flake status by run_id. Populated only when detect_flakes is on AND
+            // this is not the initial seed (history is empty during seeding).
+            let mut flaky_runs: HashMap<u64, bool> = HashMap::new();
 
             if !is_initial {
                 // -- Pre-fetch failure info outside the lock (async API calls). --
@@ -439,6 +467,34 @@ impl RepoPoller {
                     }
                 }
 
+                // Resolve flake status for completed Success runs in this batch
+                // (one history lock per branch, not per run).
+                if detect_flakes {
+                    let hist = self.history.lock().await;
+                    for run in &new_runs {
+                        if run.is_completed()
+                            && run.succeeded()
+                            && crate::history::is_flake(&hist, key, &run.workflow, &run.head_sha)
+                        {
+                            flaky_runs.insert(run.id, true);
+                        }
+                    }
+                    for (rerun, _lb) in &reruns {
+                        if rerun.is_completed()
+                            && rerun.succeeded()
+                            && crate::history::is_flake(
+                                &hist,
+                                key,
+                                &rerun.workflow,
+                                &rerun.head_sha,
+                            )
+                        {
+                            flaky_runs.insert(rerun.id, true);
+                        }
+                    }
+                }
+                let is_flaky = |run_id: u64| flaky_runs.get(&run_id).copied().unwrap_or(false);
+
                 // -- Emit events for new runs. --
 
                 for run in &new_runs {
@@ -460,6 +516,7 @@ impl RepoPoller {
                             elapsed: None,
                             failing_steps,
                             failing_job_id,
+                            flaky: is_flaky(run.id),
                         });
                     } else {
                         tracing::info!(
@@ -490,9 +547,10 @@ impl RepoPoller {
                             .get(&rerun.id)
                             .cloned()
                             .unwrap_or((None, None));
+                        let flaky = is_flaky(rerun.id);
                         tracing::info!(
                             key = %key, run_id = rerun.id,
-                            old_conclusion = %lb.conclusion, new_conclusion = %rerun.conclusion,
+                            old_conclusion = %lb.conclusion, new_conclusion = %rerun.conclusion, flaky,
                             "Re-run completed with different conclusion"
                         );
                         changes.push(RunChange::Completed {
@@ -501,6 +559,7 @@ impl RepoPoller {
                             elapsed: None,
                             failing_steps,
                             failing_job_id,
+                            flaky,
                         });
                     }
                 }
@@ -524,17 +583,21 @@ impl RepoPoller {
                                 new_lb.failing_steps = steps.clone();
                                 new_lb.failing_job_id = *job_id;
                             }
+                            new_lb.flaky = flaky_runs.get(&rerun.id).copied().unwrap_or(false);
                             entry.last_builds.insert(new_lb.workflow.clone(), new_lb);
                         }
                     }
 
                     entry.apply_author_info(&author_by_id);
 
-                    // Apply failure info to last builds.
+                    // Apply failure info and flake status to last builds.
                     for lb in entry.last_builds.values_mut() {
                         if let Some((steps, job_id)) = failure_by_id.get(&lb.run_id) {
                             lb.failing_steps = steps.clone();
                             lb.failing_job_id = *job_id;
+                        }
+                        if let Some(&f) = flaky_runs.get(&lb.run_id) {
+                            lb.flaky = f;
                         }
                     }
                     // Bump the high-water mark for ALL unseen runs (including filtered-out
@@ -558,6 +621,7 @@ impl RepoPoller {
                         lb.failing_steps = steps.clone();
                         lb.failing_job_id = *job_id;
                     }
+                    lb.flaky = flaky_runs.get(&r.id).copied().unwrap_or(false);
                     lb
                 })
                 .collect();
@@ -568,6 +632,7 @@ impl RepoPoller {
                         new_lb.failing_steps = steps.clone();
                         new_lb.failing_job_id = *job_id;
                     }
+                    new_lb.flaky = flaky_runs.get(&rerun.id).copied().unwrap_or(false);
                     completed.push(new_lb);
                 }
             }

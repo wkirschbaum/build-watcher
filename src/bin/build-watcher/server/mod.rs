@@ -52,9 +52,11 @@ pub(crate) struct DaemonState {
 pub(crate) fn build_watch_snapshot(
     watches: &HashMap<WatchKey, WatchEntry>,
     config: Option<&build_watcher::config::Config>,
+    history: Option<&build_watcher::history::BuildHistory>,
     paused: bool,
 ) -> StatusResponse {
     let now_unix = unix_now();
+    let show_duration_trend = config.is_some_and(|c| c.show_duration_trend);
     let mut watch_list: Vec<WatchStatus> = watches
         .iter()
         .map(|(key, entry)| {
@@ -75,6 +77,13 @@ pub(crate) fn build_watch_snapshot(
                 .map(|(run_id, run)| {
                     let elapsed_secs =
                         build_watcher::github::elapsed_since(&run.created_at, now_unix);
+                    let avg_duration_secs = if show_duration_trend {
+                        history.and_then(|h| {
+                            build_watcher::history::avg_duration(h, key, &run.workflow)
+                        })
+                    } else {
+                        None
+                    };
                     ActiveRunView {
                         run_id: *run_id,
                         status: run.status.clone(),
@@ -86,6 +95,7 @@ pub(crate) fn build_watch_snapshot(
                         url: run.url.clone(),
                         actor: run.actor.clone(),
                         commit_author: run.commit_author.clone(),
+                        avg_duration_secs,
                     }
                 })
                 .collect();
@@ -120,6 +130,7 @@ pub(crate) fn build_watch_snapshot(
                         duration_secs: lb.duration_secs,
                         actor: lb.actor.clone(),
                         commit_author: lb.commit_author.clone(),
+                        flaky: lb.flaky,
                     }
                 })
                 .collect();

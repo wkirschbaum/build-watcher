@@ -3,7 +3,7 @@
 /// Shared between the daemon (`server.rs`) and the TUI (`bin/bw.rs`).
 use serde::{Deserialize, Serialize};
 
-pub use crate::config::{NotificationOverrides, PollAggression};
+pub use crate::config::{NotificationOverrides, NotifyMode, PollAggression};
 // Re-exported here for backward compatibility — defined in github module.
 pub use crate::github::{RunConclusion, RunStatus};
 
@@ -28,6 +28,10 @@ pub struct ActiveRunView {
     pub actor: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub commit_author: Option<String>,
+    /// Rolling average duration (seconds) for this workflow, when known.
+    /// Only populated when `show_duration_trend` is enabled in the daemon config.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avg_duration_secs: Option<u64>,
 }
 
 /// Summary of the last completed build as returned by `GET /status`.
@@ -59,6 +63,9 @@ pub struct LastBuildView {
     pub actor: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub commit_author: Option<String>,
+    /// True when this success followed a failed attempt on the same commit.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub flaky: bool,
 }
 
 /// One watched repo/branch as returned by `GET /status`.
@@ -135,6 +142,12 @@ pub struct DefaultsConfig {
     pub default_branches: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub show_author: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detect_flakes: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub show_duration_trend: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notify_mode: Option<NotifyMode>,
 }
 
 /// Per-repo config view used by `GET /repo-config` and `POST /repo-config`.
@@ -230,6 +243,7 @@ impl StatusResponse {
                         url: snap.url,
                         actor: snap.actor,
                         commit_author: snap.commit_author,
+                        avg_duration_secs: None,
                     });
                 }
             }
@@ -238,6 +252,7 @@ impl StatusResponse {
                 conclusion,
                 failing_steps,
                 failing_job_id,
+                flaky,
                 ..
             } => {
                 let Some(watch) = find_watch_mut(&mut self.watches, &run.repo, &run.branch) else {
@@ -258,6 +273,7 @@ impl StatusResponse {
                     duration_secs: None,
                     actor: run.actor,
                     commit_author: run.commit_author,
+                    flaky,
                 };
                 // Replace existing entry for this workflow, or append.
                 if let Some(existing) = watch
@@ -341,6 +357,7 @@ mod tests {
             url: format!("https://github.com/{repo}/actions/runs/{run_id}"),
             actor: None,
             commit_author: None,
+            head_sha: "abc1234".to_string(),
         }
     }
 
@@ -439,6 +456,7 @@ mod tests {
                 url: String::new(),
                 actor: None,
                 commit_author: None,
+                avg_duration_secs: None,
             }],
             ..Default::default()
         }]);
@@ -449,6 +467,7 @@ mod tests {
             elapsed: Some(35.0),
             failing_steps: None,
             failing_job_id: None,
+            flaky: false,
         });
 
         assert!(status.watches[0].active_runs.is_empty());

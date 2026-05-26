@@ -497,6 +497,7 @@ mod tests {
             url: format!("https://github.com/{repo}/actions/runs/{run_id}"),
             actor: None,
             commit_author: None,
+            head_sha: "abc1234".to_string(),
         }
     }
 
@@ -574,6 +575,7 @@ mod tests {
             elapsed: Some(35.0),
             failing_steps: None,
             failing_job_id: None,
+            flaky: false,
         });
 
         assert!(status.watches[0].active_runs.is_empty());
@@ -595,6 +597,7 @@ mod tests {
             elapsed: None,
             failing_steps: Some("Build / tests".to_string()),
             failing_job_id: None,
+            flaky: false,
         });
 
         assert_eq!(status.watches[0].last_builds.len(), 1);
@@ -611,6 +614,7 @@ mod tests {
             elapsed: None,
             failing_steps: None,
             failing_job_id: None,
+            flaky: false,
         });
 
         assert!(status.watches[0].last_builds.is_empty());
@@ -945,6 +949,7 @@ mod tests {
             elapsed: None,
             failing_steps: None,
             failing_job_id: None,
+            flaky: false,
         });
 
         assert_eq!(status.watches[0].last_builds.len(), 1);

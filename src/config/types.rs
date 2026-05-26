@@ -244,6 +244,54 @@ impl PollAggression {
     }
 }
 
+/// Controls which build events fire desktop notifications.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum NotifyMode {
+    /// Notify on each new commit and each kind transition (default).
+    /// Repeat failures on the same commit are still suppressed.
+    #[default]
+    EveryBuild,
+    /// Notify on failures and the recovery that ends them. Specifically:
+    /// any Failed event (first failure or new-commit failure) fires, and a
+    /// Success that follows a Failed state for the same branch also fires
+    /// (so you know when red turns green). Other Success / Started /
+    /// Cancelled events are suppressed.
+    FailuresAndRecoveries,
+}
+
+/// String form accepted by config files and the REST API.
+/// `every_build` and `failures_and_recoveries` are the canonical names;
+/// the others are accepted as aliases. Returns `None` for unknown input.
+pub fn parse_notify_mode(s: &str) -> Option<NotifyMode> {
+    match s.to_lowercase().as_str() {
+        "every_build" | "everybuild" | "all" => Some(NotifyMode::EveryBuild),
+        "failures_and_recoveries" | "failures" | "failure_only" => {
+            Some(NotifyMode::FailuresAndRecoveries)
+        }
+        _ => None,
+    }
+}
+
+impl<'de> Deserialize<'de> for NotifyMode {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        Ok(parse_notify_mode(&s).unwrap_or_else(|| {
+            tracing::warn!("config: unknown notify_mode {s:?}, using 'every_build'");
+            NotifyMode::EveryBuild
+        }))
+    }
+}
+
+impl std::fmt::Display for NotifyMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EveryBuild => write!(f, "every_build"),
+            Self::FailuresAndRecoveries => write!(f, "failures_and_recoveries"),
+        }
+    }
+}
+
 /// Per-event notification levels.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -384,6 +432,21 @@ pub struct Config {
     /// (costs 1 extra API call per newly detected run).
     #[serde(default = "default_true")]
     pub show_author: bool,
+    /// When true, a successful build that follows a failed attempt on the same
+    /// commit is flagged as a flake — notification swaps to "flake recovered"
+    /// instead of "build succeeded".
+    #[serde(default = "default_true")]
+    pub detect_flakes: bool,
+    /// When true, in-progress runs in the TUI display the rolling average
+    /// duration for that workflow alongside the elapsed time.
+    #[serde(default = "default_true")]
+    pub show_duration_trend: bool,
+    /// Controls which build events fire desktop notifications. Defaults to
+    /// `EveryBuild` — notify on every kind transition and every new-commit
+    /// build. Switch to `FailuresAndRecoveries` for the quietest mode that
+    /// still tells you when red turns green.
+    #[serde(default)]
+    pub notify_mode: NotifyMode,
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub auto_discover_branches: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -411,6 +474,9 @@ impl Default for Config {
             ignored_workflows: Vec::new(),
             ignored_events: Vec::new(),
             show_author: true,
+            detect_flakes: true,
+            show_duration_trend: true,
+            notify_mode: NotifyMode::default(),
             notifications: NotificationConfig::default(),
             quiet_hours: None,
             poll_aggression: PollAggression::default(),
@@ -495,5 +561,20 @@ mod tests {
         // opt in explicitly.
         let cfg = Config::default();
         assert!(cfg.auto_discover_rules.is_empty());
+    }
+
+    #[test]
+    fn flake_detection_and_duration_trend_default_on() {
+        let cfg = Config::default();
+        assert!(cfg.detect_flakes);
+        assert!(cfg.show_duration_trend);
+    }
+
+    #[test]
+    fn config_without_new_toggles_deserializes_with_defaults() {
+        // Old config files predate the toggles — should load with both enabled.
+        let cfg: Config = serde_json::from_str("{}").unwrap();
+        assert!(cfg.detect_flakes);
+        assert!(cfg.show_duration_trend);
     }
 }

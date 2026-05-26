@@ -200,6 +200,10 @@ pub struct LastBuild {
     pub actor: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub commit_author: Option<String>,
+    /// True when this build succeeded on a re-run after a prior failed attempt
+    /// on the same commit. Computed by the tracker when flake detection is enabled.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub flaky: bool,
 }
 
 impl LastBuild {
@@ -353,6 +357,7 @@ impl RunInfo {
             url: self.url.clone(),
             actor: self.actor.clone(),
             commit_author: self.commit_author.clone(),
+            flaky: false,
         }
     }
 }

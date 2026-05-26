@@ -114,7 +114,7 @@ impl BuildWatcher {
                 "No active watches",
             )]));
         }
-        let snapshot = build_watch_snapshot(&watches, None, paused);
+        let snapshot = build_watch_snapshot(&watches, None, None, paused);
 
         let mut lines: Vec<String> = Vec::new();
         if snapshot.paused {

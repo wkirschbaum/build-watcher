@@ -37,6 +37,10 @@ pub struct RunSnapshot {
     /// Name of the commit author.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub commit_author: Option<String>,
+    /// Head commit SHA. Used by notification suppression to distinguish
+    /// repeat polls of the same commit from new-commit builds.
+    #[serde(default)]
+    pub head_sha: String,
 }
 
 impl RunSnapshot {
@@ -53,6 +57,7 @@ impl RunSnapshot {
             url: run.url.clone(),
             actor: run.actor.clone(),
             commit_author: run.commit_author.clone(),
+            head_sha: run.head_sha.clone(),
         }
     }
 
@@ -84,6 +89,10 @@ pub enum WatchEvent {
         /// Database ID of the first failed job (for constructing job URLs).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         failing_job_id: Option<u64>,
+        /// True when this build succeeded on a re-run after a prior failed
+        /// attempt on the same commit (flake recovered).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        flaky: bool,
     },
 
     /// A build's status changed (e.g. queued -> `in_progress`).
@@ -201,6 +210,7 @@ mod tests {
             elapsed: Some(134.5),
             failing_steps: None,
             failing_job_id: None,
+            flaky: false,
         };
         let json = serde_json::to_value(&event).unwrap();
         assert_eq!(json["RunCompleted"]["elapsed"], 134.5);
@@ -214,6 +224,7 @@ mod tests {
             elapsed: Some(42.0),
             failing_steps: Some("Build / Run tests".to_string()),
             failing_job_id: None,
+            flaky: false,
         };
         let json = serde_json::to_string(&event).unwrap();
         let decoded: WatchEvent = serde_json::from_str(&json).unwrap();

@@ -66,6 +66,7 @@ fn make_last_build(
         url: "https://github.com/test/repo/actions/runs/1".to_string(),
         actor: None,
         commit_author: None,
+        flaky: false,
     }
 }
 
@@ -253,6 +254,11 @@ impl TestHarness {
         self.watches.lock().await[key].clone()
     }
 
+    async fn seed_history(&self, key: &WatchKey, build: crate::github::LastBuild) {
+        let mut hist = self.handle.history.lock().await;
+        crate::history::push_build(&mut hist, key, build);
+    }
+
     fn subscribe(&self) -> tokio::sync::broadcast::Receiver<WatchEvent> {
         self.handle.events.subscribe()
     }
@@ -306,7 +312,7 @@ fn record_completion_removes_active_run() {
     let mut entry = make_entry();
     assert!(entry.active_runs.contains_key(&101));
     let run = make_run(101, RunStatus::Completed, "success");
-    entry.record_completion(&run, None, None);
+    entry.record_completion(&run, None, None, false);
     assert!(!entry.active_runs.contains_key(&101));
 }
 
@@ -314,7 +320,7 @@ fn record_completion_removes_active_run() {
 fn record_completion_noop_for_unknown_run() {
     let mut entry = make_entry();
     let run = make_run(999, RunStatus::Completed, "success");
-    entry.record_completion(&run, None, None);
+    entry.record_completion(&run, None, None, false);
     // Still has the original active runs
     assert!(entry.active_runs.contains_key(&101));
 }
@@ -323,7 +329,7 @@ fn record_completion_noop_for_unknown_run() {
 fn record_completion_removes_run_and_sets_last_build() {
     let mut entry = make_entry();
     let run = make_run(101, RunStatus::Completed, "success");
-    entry.record_completion(&run, None, None);
+    entry.record_completion(&run, None, None, false);
 
     assert!(!entry.active_runs.contains_key(&101));
     assert!(entry.active_runs.contains_key(&102));
@@ -336,7 +342,7 @@ fn record_completion_removes_run_and_sets_last_build() {
 fn record_completion_stores_failing_steps() {
     let mut entry = make_entry();
     let run = make_run(101, RunStatus::Completed, "failure");
-    entry.record_completion(&run, Some("Build / Run tests".to_string()), None);
+    entry.record_completion(&run, Some("Build / Run tests".to_string()), None, false);
     assert_eq!(
         entry
             .last_builds
@@ -353,7 +359,7 @@ fn record_completion_clears_failure_count() {
     let mut entry = make_entry();
     entry.failure_counts.insert(101, 3);
     let run = make_run(101, RunStatus::Completed, "failure");
-    entry.record_completion(&run, None, None);
+    entry.record_completion(&run, None, None, false);
     assert!(!entry.failure_counts.contains_key(&101));
 }
 
@@ -475,7 +481,7 @@ fn has_active_runs_reflects_state() {
 fn persisted_roundtrip_preserves_fields() {
     let mut entry = make_entry();
     let run = make_run(101, RunStatus::Completed, "success");
-    entry.record_completion(&run, None, None);
+    entry.record_completion(&run, None, None, false);
 
     let restored = WatchEntry::from_persisted(entry.to_persisted());
     assert_eq!(restored.last_seen_run_id, 101);
@@ -598,7 +604,12 @@ fn filter_runs_multiple_ignore_dimensions() {
 fn last_failed_build_finds_failure() {
     let mut watches = HashMap::new();
     let mut entry = make_entry();
-    entry.record_completion(&make_run(200, RunStatus::Completed, "failure"), None, None);
+    entry.record_completion(
+        &make_run(200, RunStatus::Completed, "failure"),
+        None,
+        None,
+        false,
+    );
     watches.insert(WatchKey::new("alice/app", "main"), entry);
 
     let (key, build) = last_failed_build(&watches, "alice/app").unwrap();
@@ -610,7 +621,12 @@ fn last_failed_build_finds_failure() {
 fn last_failed_build_ignores_success() {
     let mut watches = HashMap::new();
     let mut entry = make_entry();
-    entry.record_completion(&make_run(200, RunStatus::Completed, "success"), None, None);
+    entry.record_completion(
+        &make_run(200, RunStatus::Completed, "success"),
+        None,
+        None,
+        false,
+    );
     watches.insert(WatchKey::new("alice/app", "main"), entry);
     assert!(last_failed_build(&watches, "alice/app").is_none());
 }
@@ -620,11 +636,21 @@ fn last_failed_build_picks_most_recent() {
     let mut watches = HashMap::new();
 
     let mut entry1 = make_entry();
-    entry1.record_completion(&make_run(100, RunStatus::Completed, "failure"), None, None);
+    entry1.record_completion(
+        &make_run(100, RunStatus::Completed, "failure"),
+        None,
+        None,
+        false,
+    );
     watches.insert(WatchKey::new("alice/app", "main"), entry1);
 
     let mut entry2 = make_entry();
-    entry2.record_completion(&make_run(200, RunStatus::Completed, "failure"), None, None);
+    entry2.record_completion(
+        &make_run(200, RunStatus::Completed, "failure"),
+        None,
+        None,
+        false,
+    );
     watches.insert(WatchKey::new("alice/app", "develop"), entry2);
 
     assert_eq!(
@@ -637,7 +663,12 @@ fn last_failed_build_picks_most_recent() {
 fn last_failed_build_ignores_other_repos() {
     let mut watches = HashMap::new();
     let mut entry = make_entry();
-    entry.record_completion(&make_run(200, RunStatus::Completed, "failure"), None, None);
+    entry.record_completion(
+        &make_run(200, RunStatus::Completed, "failure"),
+        None,
+        None,
+        false,
+    );
     watches.insert(WatchKey::new("bob/other", "main"), entry);
     assert!(last_failed_build(&watches, "alice/app").is_none());
 }
@@ -1016,7 +1047,7 @@ async fn record_completion_bumps_last_seen() {
         ..idle_entry(50)
     };
     let run = make_run(100, RunStatus::Completed, "success");
-    entry.record_completion(&run, None, None);
+    entry.record_completion(&run, None, None, false);
 
     assert_eq!(entry.last_seen_run_id, 100);
     assert!(entry.active_runs.is_empty());
@@ -1040,6 +1071,7 @@ fn run_change_dedup_keeps_first() {
         url: format!("https://github.com/alice/app/actions/runs/{id}"),
         actor: None,
         commit_author: None,
+        head_sha: "abc1234".to_string(),
     };
 
     let changes = vec![
@@ -1049,6 +1081,7 @@ fn run_change_dedup_keeps_first() {
             elapsed: Some(42.0),
             failing_steps: None,
             failing_job_id: None,
+            flaky: false,
         },
         RunChange::Started { run: snap(102) },
         // Duplicate of 101 — should be suppressed
@@ -1058,6 +1091,7 @@ fn run_change_dedup_keeps_first() {
             elapsed: None,
             failing_steps: None,
             failing_job_id: None,
+            flaky: false,
         },
     ];
 
@@ -1158,6 +1192,86 @@ async fn check_for_new_runs_detects_rerun_in_progress() {
         .check_for_new_runs_repo_wide(None)
         .await;
     assert!(changes2.is_empty());
+
+    h.cancel();
+}
+
+#[tokio::test]
+async fn rerun_success_after_history_failure_flags_flaky() {
+    let key = WatchKey::new("alice/app", "main");
+    // History has a prior failure on head_sha=abc1234 (same as the rerun).
+    let prior_fail = make_last_build(199, RunConclusion::Failure);
+    let runs = vec![make_run(200, RunStatus::Completed, "success")];
+    let h = TestHarness::new(MockGitHub::with_runs(runs));
+    h.seed_history(&key, prior_fail).await;
+    h.seed(
+        key.clone(),
+        WatchEntry {
+            last_builds: HashMap::from([(
+                "CI".to_string(),
+                make_last_build(199, RunConclusion::Failure),
+            )]),
+            ..idle_entry(199)
+        },
+    )
+    .await;
+
+    let changes = h
+        .poller("alice/app")
+        .check_for_new_runs_repo_wide(None)
+        .await;
+
+    assert_eq!(changes.len(), 1);
+    match &changes[0] {
+        RunChange::Completed {
+            conclusion, flaky, ..
+        } => {
+            assert_eq!(*conclusion, RunConclusion::Success);
+            assert!(flaky, "rerun success after history failure should be flaky");
+        }
+        other => panic!("expected Completed, got {other:?}"),
+    }
+    let lb = h.entry(&key).await.last_builds.get("CI").unwrap().clone();
+    assert!(lb.flaky, "stored LastBuild should retain flaky flag");
+
+    h.cancel();
+}
+
+#[tokio::test]
+async fn rerun_success_skips_flaky_when_detect_flakes_off() {
+    let key = WatchKey::new("alice/app", "main");
+    let cfg = Config {
+        detect_flakes: false,
+        ..Config::default()
+    };
+    let prior_fail = make_last_build(199, RunConclusion::Failure);
+    let runs = vec![make_run(200, RunStatus::Completed, "success")];
+    let h = TestHarness::with_config(MockGitHub::with_runs(runs), cfg);
+    h.seed_history(&key, prior_fail).await;
+    h.seed(
+        key.clone(),
+        WatchEntry {
+            last_builds: HashMap::from([(
+                "CI".to_string(),
+                make_last_build(199, RunConclusion::Failure),
+            )]),
+            ..idle_entry(199)
+        },
+    )
+    .await;
+
+    let changes = h
+        .poller("alice/app")
+        .check_for_new_runs_repo_wide(None)
+        .await;
+
+    assert_eq!(changes.len(), 1);
+    match &changes[0] {
+        RunChange::Completed { flaky, .. } => {
+            assert!(!flaky, "detect_flakes=false should leave flaky=false");
+        }
+        other => panic!("expected Completed, got {other:?}"),
+    }
 
     h.cancel();
 }

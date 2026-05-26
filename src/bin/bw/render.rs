@@ -616,7 +616,16 @@ fn branch_aggregate_status(w: &WatchStatus) -> (String, String, Style) {
         let emoji = status_emoji(status_str);
         let elapsed = run
             .elapsed_secs
-            .map(|s| format::duration(Duration::from_secs_f64(s)))
+            .map(|s| {
+                let base = format::duration(Duration::from_secs_f64(s));
+                match run.avg_duration_secs {
+                    Some(avg) if avg > 0 => format!(
+                        "{base} / avg {}",
+                        format::duration(Duration::from_secs(avg))
+                    ),
+                    _ => base,
+                }
+            })
             .unwrap_or_default();
         let extra = if w.active_runs.len() > 1 {
             format!(" +{}", w.active_runs.len() - 1)
@@ -1446,7 +1455,18 @@ fn render_active_run<'a>(
     let emoji = status_emoji(status_str);
     let elapsed = run
         .elapsed_secs
-        .map(|s| format::duration(Duration::from_secs_f64(s)))
+        .map(|s| {
+            let base = format::duration(Duration::from_secs_f64(s));
+            match run.avg_duration_secs {
+                Some(avg) if avg > 0 => {
+                    format!(
+                        "{base} / avg {}",
+                        format::duration(Duration::from_secs(avg))
+                    )
+                }
+                _ => base,
+            }
+        })
         .unwrap_or_default();
     let sfx = attempt_suffix(run.attempt);
     let status_text = if extra_badge.is_empty() {

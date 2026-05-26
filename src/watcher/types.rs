@@ -64,6 +64,7 @@ impl ActiveRun {
             url: self.url.clone(),
             actor: self.actor.clone(),
             commit_author: self.commit_author.clone(),
+            flaky: false,
         }
     }
 }
@@ -241,6 +242,7 @@ impl WatchEntry {
         run: &RunInfo,
         failing_steps: Option<String>,
         failing_job_id: Option<u64>,
+        flaky: bool,
     ) {
         // Propagate author info from ActiveRun before removing it.
         let (actor, commit_author) = self
@@ -258,6 +260,7 @@ impl WatchEntry {
         last_build.failing_job_id = failing_job_id;
         last_build.actor = actor;
         last_build.commit_author = commit_author;
+        last_build.flaky = flaky;
         self.last_builds
             .insert(last_build.workflow.clone(), last_build);
     }
