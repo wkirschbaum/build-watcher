@@ -281,8 +281,10 @@ mod tests {
 
     #[test]
     fn ignored_events_merges_global_and_per_repo() {
-        let mut config = Config::default();
-        config.ignored_events = vec!["schedule".to_string()];
+        let mut config = Config {
+            ignored_events: vec!["schedule".to_string()],
+            ..Config::default()
+        };
         config.repos.insert(
             "alice/app".to_string(),
             RepoConfig {
@@ -299,8 +301,10 @@ mod tests {
 
     #[test]
     fn ignored_events_global_only() {
-        let mut config = Config::default();
-        config.ignored_events = vec!["schedule".to_string()];
+        let config = Config {
+            ignored_events: vec!["schedule".to_string()],
+            ..Config::default()
+        };
         let events = config.ignored_events_for("unknown/repo");
         assert_eq!(events, vec!["schedule"]);
     }

@@ -844,8 +844,10 @@ async fn check_for_new_runs_applies_workflow_filter() {
     let mut semgrep = make_run(102, RunStatus::InProgress, "");
     semgrep.workflow = "Semgrep".to_string();
 
-    let mut cfg = Config::default();
-    cfg.ignored_workflows = vec!["Semgrep".to_string()];
+    let cfg = Config {
+        ignored_workflows: vec!["Semgrep".to_string()],
+        ..Config::default()
+    };
     let h = TestHarness::with_config(MockGitHub::with_runs(vec![ci, semgrep]), cfg);
     h.seed(key.clone(), idle_entry(100)).await;
 
@@ -1424,8 +1426,10 @@ async fn auto_discovered_branch_suppresses_historical_notifications() {
     r3.head_branch = "main".to_string();
 
     let mut cfg = Config::default();
-    let mut rc = crate::config::RepoConfig::default();
-    rc.auto_discover_branches = Some(true);
+    let rc = crate::config::RepoConfig {
+        auto_discover_branches: Some(true),
+        ..crate::config::RepoConfig::default()
+    };
     cfg.repos.insert("alice/app".to_string(), rc);
 
     let h = TestHarness::with_config(MockGitHub::with_runs(vec![r1, r2, r3]), cfg);

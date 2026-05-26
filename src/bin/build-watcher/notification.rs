@@ -498,7 +498,8 @@ async fn dispatch_pr_notification(
         PrMergeState::Unstable => ("\u{26a0}\u{fe0f}", "unstable"),
         PrMergeState::Behind => ("\u{2b07}\u{fe0f}", "behind"),
         PrMergeState::Dirty => ("\u{274c}", "has conflicts"),
-        _ => return,
+        // No notification for transient/uninformative states.
+        PrMergeState::HasHooks | PrMergeState::Unknown => return,
     };
 
     notifier
@@ -807,11 +808,13 @@ mod tests {
     async fn cancelled_fires_when_build_success_is_off() {
         use config::{Config, ConfigManager, ConfigPersistence, NotificationConfig};
 
-        let mut cfg = Config::default();
-        cfg.notifications = NotificationConfig {
-            build_started: Off,
-            build_success: Off,
-            build_failure: Normal,
+        let cfg = Config {
+            notifications: NotificationConfig {
+                build_started: Off,
+                build_success: Off,
+                build_failure: Normal,
+            },
+            ..Config::default()
         };
         let config = Arc::new(ConfigManager::new(cfg, ConfigPersistence::Null));
         let pause = unpaused();

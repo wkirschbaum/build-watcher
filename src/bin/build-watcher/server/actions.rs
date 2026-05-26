@@ -790,11 +790,13 @@ mod tests {
 
     #[test]
     fn apply_quiet_hours_clear() {
-        let mut cfg = build_watcher::config::Config::default();
-        cfg.quiet_hours = Some(build_watcher::config::QuietHours {
-            start: "22:00".to_string(),
-            end: "06:00".to_string(),
-        });
+        let mut cfg = build_watcher::config::Config {
+            quiet_hours: Some(build_watcher::config::QuietHours {
+                start: "22:00".to_string(),
+                end: "06:00".to_string(),
+            }),
+            ..build_watcher::config::Config::default()
+        };
         let msgs = apply_quiet_hours(&mut cfg, None, None, true).unwrap();
         assert!(msgs.iter().any(|m| m.contains("cleared")));
         assert!(cfg.quiet_hours.is_none());
