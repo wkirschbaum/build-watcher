@@ -9,14 +9,78 @@ use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table};
 use build_watcher::config::NotificationLevel;
 use build_watcher::format;
 use build_watcher::status::{
-    ActiveRunView, AutoDiscoverRuleView, HistoryEntryView, LastBuildView, PrView, RunConclusion,
-    WatchStatus,
+    ActiveRunView, AutoDiscoverRuleView, BuildSample, HistoryEntryView, LastBuildView, PrView,
+    RunConclusion, WatchStatus,
 };
 
 use super::app::{
     App, ExpandLevel, FormField, GroupBy, InputMode, PrPickerEntry, SortColumn, SseState,
 };
 use super::forms::BuildTimeRow;
+
+/// Block characters used by the sparkline, low → high.
+const SPARK_BLOCKS: &[char] = &[
+    '\u{2581}', '\u{2582}', '\u{2583}', '\u{2584}', '\u{2585}', '\u{2586}', '\u{2587}', '\u{2588}',
+];
+
+/// Colour for a sparkline bar based on the build's conclusion.
+fn spark_color(conclusion: &RunConclusion) -> Color {
+    match conclusion {
+        RunConclusion::Success => COLOR_SUCCESS,
+        RunConclusion::Failure | RunConclusion::TimedOut | RunConclusion::StartupFailure => {
+            COLOR_FAILURE
+        }
+        RunConclusion::Cancelled => Color::Yellow,
+        RunConclusion::Unknown => Color::DarkGray,
+    }
+}
+
+/// Colour-coded sparkline of recent builds.
+///
+/// Input is newest-first; output is rendered oldest-on-the-left so the
+/// rightmost bar represents the most recent build (standard time-axis
+/// convention). Each bar is coloured by conclusion — green for Success,
+/// red for Failure family, yellow for Cancelled, gray for Unknown — so a
+/// glance at the row tells you both runtime variance *and* the pass/fail
+/// pattern over the window.
+///
+/// Returns an empty Vec for fewer than 2 samples (no trend possible).
+/// When all durations are identical, every bar renders at the mid-level block.
+pub(crate) fn sparkline(samples_newest_first: &[BuildSample]) -> Vec<Span<'static>> {
+    if samples_newest_first.len() < 2 {
+        return Vec::new();
+    }
+    let min = samples_newest_first
+        .iter()
+        .map(|s| s.duration_secs)
+        .min()
+        .unwrap();
+    let max = samples_newest_first
+        .iter()
+        .map(|s| s.duration_secs)
+        .max()
+        .unwrap();
+    let span = max.saturating_sub(min);
+    let mid = SPARK_BLOCKS.len() / 2;
+    let max_idx = SPARK_BLOCKS.len() as u64 - 1;
+    samples_newest_first
+        .iter()
+        .rev() // oldest first for display
+        .map(|sample| {
+            let block = match (sample.duration_secs - min)
+                .checked_mul(max_idx)
+                .and_then(|n| n.checked_div(span))
+            {
+                Some(idx) => SPARK_BLOCKS[idx as usize],
+                None => SPARK_BLOCKS[mid], // identical samples → mid-level
+            };
+            Span::styled(
+                block.to_string(),
+                Style::default().fg(spark_color(&sample.conclusion)),
+            )
+        })
+        .collect()
+}
 
 /// Inline info shown on the repo header when there's exactly one watched branch.
 pub(crate) struct SingleBranchInfo<'a> {
@@ -616,16 +680,7 @@ fn branch_aggregate_status(w: &WatchStatus) -> (String, String, Style) {
         let emoji = status_emoji(status_str);
         let elapsed = run
             .elapsed_secs
-            .map(|s| {
-                let base = format::duration(Duration::from_secs_f64(s));
-                match run.avg_duration_secs {
-                    Some(avg) if avg > 0 => format!(
-                        "{base} / avg {}",
-                        format::duration(Duration::from_secs(avg))
-                    ),
-                    _ => base,
-                }
-            })
+            .map(|s| format::duration(Duration::from_secs_f64(s)))
             .unwrap_or_default();
         let extra = if w.active_runs.len() > 1 {
             format!(" +{}", w.active_runs.len() - 1)
@@ -1455,18 +1510,7 @@ fn render_active_run<'a>(
     let emoji = status_emoji(status_str);
     let elapsed = run
         .elapsed_secs
-        .map(|s| {
-            let base = format::duration(Duration::from_secs_f64(s));
-            match run.avg_duration_secs {
-                Some(avg) if avg > 0 => {
-                    format!(
-                        "{base} / avg {}",
-                        format::duration(Duration::from_secs(avg))
-                    )
-                }
-                _ => base,
-            }
-        })
+        .map(|s| format::duration(Duration::from_secs_f64(s)))
         .unwrap_or_default();
     let sfx = attempt_suffix(run.attempt);
     let status_text = if extra_badge.is_empty() {
@@ -1804,6 +1848,59 @@ fn push_author<'a>(
     }
 }
 
+/// Append the 7-day duration trend to a detail bar span list.
+///
+/// Layout: `· avg 4:10 (3:42–5:18) ▂▃▅▄▂▃▆▄`
+///
+/// The trend is one logical chunk — average with the (min–max) range that
+/// jitters around it, then the sparkline visualising the spread. Min/max are
+/// included only when there's actual variance; otherwise the parenthesised
+/// range is omitted (avoiding noisy `(4:10–4:10)`).
+///
+/// Skips entirely when there are no successful samples in the window
+/// (avg is `None`).
+fn push_trend_spans<'a>(
+    s: &mut Vec<Span<'a>>,
+    avg: Option<u64>,
+    samples: &[BuildSample],
+    label_style: Style,
+    dim: Style,
+) {
+    let fmt = |secs: u64| format::duration(Duration::from_secs(secs));
+
+    let Some(avg_s) = avg.filter(|&a| a > 0) else {
+        return;
+    };
+
+    s.push(detail_sep());
+    s.push(Span::styled("avg ", label_style));
+    s.push(Span::styled(fmt(avg_s), dim));
+
+    // Min/max are derived from Success samples only — the avg they bracket is
+    // the typical-runtime stat, so the range should track the same population.
+    let success_durations: Vec<u64> = samples
+        .iter()
+        .filter(|b| b.conclusion == RunConclusion::Success)
+        .map(|b| b.duration_secs)
+        .collect();
+    if let (Some(&min), Some(&max)) = (
+        success_durations.iter().min(),
+        success_durations.iter().max(),
+    ) && min != max
+    {
+        s.push(Span::styled(
+            format!(" ({}\u{2013}{})", fmt(min), fmt(max)),
+            dim,
+        ));
+    }
+
+    let spark = sparkline(samples);
+    if !spark.is_empty() {
+        s.push(Span::raw(" "));
+        s.extend(spark);
+    }
+}
+
 /// Render a detail bar with a border showing contextual info for the currently selected row.
 fn render_detail_bar(
     frame: &mut ratatui::Frame,
@@ -1931,6 +2028,13 @@ fn render_detail_bar(
                 s.push(detail_sep());
                 s.push(Span::styled(format::age(elapsed as u64), dim));
             }
+            push_trend_spans(
+                &mut s,
+                run.avg_duration_secs,
+                &run.recent_builds,
+                label_style,
+                dim,
+            );
             push_author(&mut s, &run.actor, &run.commit_author, label_style, dim);
             s
         }
@@ -1967,10 +2071,25 @@ fn render_detail_bar(
                     Style::default().fg(COLOR_FAILURE),
                 ));
             }
+            // Order: when it finished (age), then how long it took, then the
+            // 7-day trend. This groups all duration-related spans
+            // (took / avg / sparkline) contiguously at the end of the row.
             if let Some(age) = build.age_secs {
                 s.push(detail_sep());
                 s.push(Span::styled(format::age(age as u64), dim));
             }
+            if let Some(d) = build.duration_secs {
+                s.push(detail_sep());
+                s.push(Span::styled("took ", label_style));
+                s.push(Span::styled(format::duration(Duration::from_secs(d)), dim));
+            }
+            push_trend_spans(
+                &mut s,
+                build.avg_duration_secs,
+                &build.recent_builds,
+                label_style,
+                dim,
+            );
             push_author(&mut s, &build.actor, &build.commit_author, label_style, dim);
             s
         }
@@ -3149,4 +3268,93 @@ pub(crate) fn render_build_times_popup(
         Paragraph::new(popup_hint(&[("[↑↓]", "scroll  "), ("[Esc]", "close")])),
         rows_layout[hint_idx],
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn s(duration_secs: u64, conclusion: RunConclusion) -> BuildSample {
+        BuildSample {
+            duration_secs,
+            conclusion,
+        }
+    }
+
+    fn sample_chars(spans: &[Span<'_>]) -> Vec<char> {
+        spans
+            .iter()
+            .map(|sp| sp.content.chars().next().unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn sparkline_empty_for_too_few_samples() {
+        assert!(sparkline(&[]).is_empty());
+        assert!(sparkline(&[s(100, RunConclusion::Success)]).is_empty());
+    }
+
+    #[test]
+    fn sparkline_renders_one_span_per_sample() {
+        let spans = sparkline(&[
+            s(100, RunConclusion::Success),
+            s(200, RunConclusion::Success),
+            s(150, RunConclusion::Success),
+            s(175, RunConclusion::Success),
+        ]);
+        assert_eq!(spans.len(), 4);
+    }
+
+    #[test]
+    fn sparkline_handles_identical_samples_without_panic() {
+        // All same → no span, every bar at mid level. The key thing is no
+        // divide-by-zero. Result is non-empty (≥2 samples).
+        let spans = sparkline(&[
+            s(100, RunConclusion::Success),
+            s(100, RunConclusion::Success),
+            s(100, RunConclusion::Success),
+        ]);
+        assert_eq!(spans.len(), 3);
+    }
+
+    #[test]
+    fn sparkline_renders_oldest_on_left() {
+        // Input is newest-first; render should reverse so the rightmost bar
+        // is the most recent. With samples [200, 100] (newest=200, oldest=100),
+        // the rightmost bar should be at the high block, leftmost at the low.
+        let spans = sparkline(&[
+            s(200, RunConclusion::Success),
+            s(100, RunConclusion::Success),
+        ]);
+        assert_eq!(spans.len(), 2);
+        let chars = sample_chars(&spans);
+        assert_eq!(chars[0], SPARK_BLOCKS[0], "leftmost = oldest = min");
+        assert_eq!(chars[1], SPARK_BLOCKS[7], "rightmost = newest = max");
+    }
+
+    #[test]
+    fn sparkline_colors_each_bar_by_conclusion() {
+        let spans = sparkline(&[
+            s(100, RunConclusion::Success),
+            s(200, RunConclusion::Failure),
+            s(150, RunConclusion::Cancelled),
+        ]);
+        // Rendered oldest-on-left, so order in output is reversed from input:
+        //   spans[0] = Cancelled, spans[1] = Failure, spans[2] = Success
+        assert_eq!(spans[0].style.fg, Some(Color::Yellow), "cancelled = yellow");
+        assert_eq!(spans[1].style.fg, Some(COLOR_FAILURE), "failure = red");
+        assert_eq!(spans[2].style.fg, Some(COLOR_SUCCESS), "success = green");
+    }
+
+    #[test]
+    fn sparkline_groups_failure_family_as_red() {
+        let spans = sparkline(&[
+            s(100, RunConclusion::Failure),
+            s(200, RunConclusion::TimedOut),
+            s(150, RunConclusion::StartupFailure),
+        ]);
+        for sp in &spans {
+            assert_eq!(sp.style.fg, Some(COLOR_FAILURE));
+        }
+    }
 }

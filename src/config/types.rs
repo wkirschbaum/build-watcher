@@ -437,10 +437,6 @@ pub struct Config {
     /// instead of "build succeeded".
     #[serde(default = "default_true")]
     pub detect_flakes: bool,
-    /// When true, in-progress runs in the TUI display the rolling average
-    /// duration for that workflow alongside the elapsed time.
-    #[serde(default = "default_true")]
-    pub show_duration_trend: bool,
     /// Controls which build events fire desktop notifications. Defaults to
     /// `EveryBuild` — notify on every kind transition and every new-commit
     /// build. Switch to `FailuresAndRecoveries` for the quietest mode that
@@ -475,7 +471,6 @@ impl Default for Config {
             ignored_events: Vec::new(),
             show_author: true,
             detect_flakes: true,
-            show_duration_trend: true,
             notify_mode: NotifyMode::default(),
             notifications: NotificationConfig::default(),
             quiet_hours: None,
@@ -564,17 +559,15 @@ mod tests {
     }
 
     #[test]
-    fn flake_detection_and_duration_trend_default_on() {
+    fn flake_detection_default_on() {
         let cfg = Config::default();
         assert!(cfg.detect_flakes);
-        assert!(cfg.show_duration_trend);
     }
 
     #[test]
     fn config_without_new_toggles_deserializes_with_defaults() {
-        // Old config files predate the toggles — should load with both enabled.
+        // Old config files predate the toggle — should load with it enabled.
         let cfg: Config = serde_json::from_str("{}").unwrap();
         assert!(cfg.detect_flakes);
-        assert!(cfg.show_duration_trend);
     }
 }

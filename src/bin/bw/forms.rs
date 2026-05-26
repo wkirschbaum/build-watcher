@@ -739,10 +739,6 @@ impl App {
             .iter()
             .find(|f| f.label == "Detect flakes")
             .map(|f| f.buffer() == "on");
-        let show_duration_trend: Option<bool> = fields
-            .iter()
-            .find(|f| f.label == "Duration trend")
-            .map(|f| f.buffer() == "on");
         let notify_mode = fields
             .iter()
             .find(|f| f.label == "Notify mode")
@@ -795,7 +791,6 @@ impl App {
             default_branches,
             show_author,
             detect_flakes,
-            show_duration_trend,
             notify_mode,
         };
         self.spawn_action("Saving config…", true, async move {
@@ -1289,15 +1284,7 @@ impl App {
                             },
                             vec!["off", "on"],
                         ),
-                        FormField::cycle(
-                            "Duration trend",
-                            if defaults.show_duration_trend.unwrap_or(true) {
-                                "on".to_string()
-                            } else {
-                                "off".to_string()
-                            },
-                            vec!["off", "on"],
-                        ),
+                        FormField::tab("Notifications"),
                         FormField::cycle(
                             "Notify mode",
                             match defaults

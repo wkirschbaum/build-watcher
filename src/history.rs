@@ -91,28 +91,111 @@ pub fn is_flake(history: &BuildHistory, key: &WatchKey, workflow: &str, head_sha
 /// trends; require at least 2 successful builds.
 const AVG_DURATION_MIN_SAMPLES: usize = 2;
 
+/// Rolling window for duration-trend statistics (avg + sparkline).
+/// 7 days matches typical CI cadence (most workflows run multiple times/day)
+/// and is recent enough that perf regressions show up quickly.
+pub const TREND_WINDOW_SECS: u64 = 7 * 24 * 60 * 60;
+
+/// Maximum samples returned by `recent_successful_durations`. Caps the
+/// sparkline width so it fits on a TUI row even for very busy repos.
+pub const TREND_MAX_SAMPLES: usize = 15;
+
+/// Successful builds for `(key, workflow)` whose `completed_at` is within
+/// the trend window of `now_unix`. Returned newest-first. Only Success
+/// builds with a recorded `duration_secs` and `completed_at` are included.
+fn successful_durations_in_window(
+    history: &BuildHistory,
+    key: &WatchKey,
+    workflow: &str,
+    now_unix: u64,
+) -> Vec<u64> {
+    use crate::github::RunConclusion;
+    let Some(builds) = history.get(key) else {
+        return Vec::new();
+    };
+    let cutoff = now_unix.saturating_sub(TREND_WINDOW_SECS);
+    builds
+        .iter()
+        .filter(|b| {
+            b.workflow == workflow
+                && b.conclusion == RunConclusion::Success
+                && b.completed_at.is_some_and(|t| t >= cutoff)
+        })
+        .filter_map(|b| b.duration_secs)
+        .collect()
+}
+
 /// Rolling average duration (seconds) across **successful** completed builds
-/// with a recorded `duration_secs` for the given `(key, workflow)`.
+/// for `(key, workflow)` within the last `TREND_WINDOW_SECS`.
 ///
 /// Only Success builds are counted — Cancelled builds typically run for
 /// seconds and Failures often abort partway, so mixing them in produces an
 /// average that doesn't reflect actual workflow duration.
 ///
 /// Returns `None` when there are fewer than `AVG_DURATION_MIN_SAMPLES`
-/// qualifying builds.
-pub fn avg_duration(history: &BuildHistory, key: &WatchKey, workflow: &str) -> Option<u64> {
-    use crate::github::RunConclusion;
-    let builds = history.get(key)?;
-    let durations: Vec<u64> = builds
-        .iter()
-        .filter(|b| b.workflow == workflow && b.conclusion == RunConclusion::Success)
-        .filter_map(|b| b.duration_secs)
-        .collect();
+/// qualifying builds in the window.
+pub fn avg_duration(
+    history: &BuildHistory,
+    key: &WatchKey,
+    workflow: &str,
+    now_unix: u64,
+) -> Option<u64> {
+    let durations = successful_durations_in_window(history, key, workflow, now_unix);
     if durations.len() < AVG_DURATION_MIN_SAMPLES {
         return None;
     }
     let sum: u64 = durations.iter().sum();
     Some(sum / durations.len() as u64)
+}
+
+/// Most recent successful durations for `(key, workflow)` within the trend
+/// window, capped at `TREND_MAX_SAMPLES`. Newest-first.
+///
+/// Designed for sparkline display: returns the raw values so the renderer
+/// can normalize them however it likes.
+pub fn recent_successful_durations(
+    history: &BuildHistory,
+    key: &WatchKey,
+    workflow: &str,
+    now_unix: u64,
+) -> Vec<u64> {
+    let mut durations = successful_durations_in_window(history, key, workflow, now_unix);
+    durations.truncate(TREND_MAX_SAMPLES);
+    durations
+}
+
+/// All completed builds for `(key, workflow)` within the trend window,
+/// regardless of conclusion. Newest-first, capped at `TREND_MAX_SAMPLES`.
+/// Only entries with a recorded `duration_secs` and `completed_at` are
+/// included.
+///
+/// Designed for the colour-coded sparkline: the renderer can show each bar
+/// in a colour matched to the conclusion (Success / Failure / Cancelled).
+/// Avg/min/max stats should still filter to Success — those represent
+/// typical-runtime, and failures often abort partway and would skew them.
+pub fn recent_completed_builds(
+    history: &BuildHistory,
+    key: &WatchKey,
+    workflow: &str,
+    now_unix: u64,
+) -> Vec<crate::status::BuildSample> {
+    let Some(builds) = history.get(key) else {
+        return Vec::new();
+    };
+    let cutoff = now_unix.saturating_sub(TREND_WINDOW_SECS);
+    builds
+        .iter()
+        .filter(|b| {
+            b.workflow == workflow
+                && b.completed_at.is_some_and(|t| t >= cutoff)
+                && b.duration_secs.is_some()
+        })
+        .take(TREND_MAX_SAMPLES)
+        .map(|b| crate::status::BuildSample {
+            duration_secs: b.duration_secs.unwrap(),
+            conclusion: b.conclusion.clone(),
+        })
+        .collect()
 }
 
 /// Return a copy of `history` with each key pruned to at most MAX_HISTORY entries.
@@ -339,6 +422,9 @@ mod tests {
         assert!(!is_flake(&hist, &key, "CI", ""));
     }
 
+    /// "Now" used by the trend tests — any reference timestamp inside the window works.
+    const TEST_NOW: u64 = 10_000_000;
+
     #[test]
     fn avg_duration_averages_successful_builds_only() {
         use crate::github::RunConclusion;
@@ -366,7 +452,12 @@ mod tests {
             &key,
             build_with(4, "CI", "d", RunConclusion::Failure, Some(30)),
         );
-        assert_eq!(avg_duration(&hist, &key, "CI"), Some(150));
+        // Override completed_at on every entry so they fall inside the window
+        // (build_with uses run_id as the timestamp, which would be ancient).
+        for b in hist.get_mut(&key).unwrap() {
+            b.completed_at = Some(TEST_NOW - 60);
+        }
+        assert_eq!(avg_duration(&hist, &key, "CI", TEST_NOW), Some(150));
     }
 
     #[test]
@@ -380,8 +471,9 @@ mod tests {
             &key,
             build_with(1, "CI", "a", RunConclusion::Success, Some(100)),
         );
+        hist.get_mut(&key).unwrap()[0].completed_at = Some(TEST_NOW - 60);
         assert_eq!(
-            avg_duration(&hist, &key, "CI"),
+            avg_duration(&hist, &key, "CI", TEST_NOW),
             None,
             "single sample is not an average"
         );
@@ -390,7 +482,10 @@ mod tests {
             &key,
             build_with(2, "CI", "b", RunConclusion::Success, Some(200)),
         );
-        assert_eq!(avg_duration(&hist, &key, "CI"), Some(150));
+        for b in hist.get_mut(&key).unwrap() {
+            b.completed_at = Some(TEST_NOW - 60);
+        }
+        assert_eq!(avg_duration(&hist, &key, "CI", TEST_NOW), Some(150));
     }
 
     #[test]
@@ -413,14 +508,17 @@ mod tests {
             &key,
             build_with(3, "CI", "c", RunConclusion::Success, None),
         );
-        assert_eq!(avg_duration(&hist, &key, "CI"), Some(150));
+        for b in hist.get_mut(&key).unwrap() {
+            b.completed_at = Some(TEST_NOW - 60);
+        }
+        assert_eq!(avg_duration(&hist, &key, "CI", TEST_NOW), Some(150));
     }
 
     #[test]
     fn avg_duration_none_for_unknown_workflow() {
         let hist = BuildHistory::new();
         let key = make_key("alice/app", "main");
-        assert_eq!(avg_duration(&hist, &key, "CI"), None);
+        assert_eq!(avg_duration(&hist, &key, "CI", TEST_NOW), None);
     }
 
     #[test]
@@ -438,11 +536,72 @@ mod tests {
             &key,
             build_with(2, "CI", "b", RunConclusion::Failure, Some(200)),
         );
+        for b in hist.get_mut(&key).unwrap() {
+            b.completed_at = Some(TEST_NOW - 60);
+        }
         assert_eq!(
-            avg_duration(&hist, &key, "CI"),
+            avg_duration(&hist, &key, "CI", TEST_NOW),
             None,
             "no successful samples means no average"
         );
+    }
+
+    #[test]
+    fn avg_duration_excludes_builds_outside_7_day_window() {
+        use crate::github::RunConclusion;
+        let mut hist = BuildHistory::new();
+        let key = make_key("alice/app", "main");
+        // Two recent successes (durations 100, 200) and two old ones (1000, 2000)
+        // from 10 days back. Average should only count the recent two → (100+200)/2 = 150.
+        for (run_id, dur, age_secs) in [
+            (1, 100, 60_u64),
+            (2, 200, 120),
+            (3, 1_000, 10 * 24 * 60 * 60),
+            (4, 2_000, 10 * 24 * 60 * 60),
+        ] {
+            let mut b = build_with(run_id, "CI", "x", RunConclusion::Success, Some(dur));
+            b.completed_at = Some(TEST_NOW - age_secs);
+            push_build(&mut hist, &key, b);
+        }
+        assert_eq!(avg_duration(&hist, &key, "CI", TEST_NOW), Some(150));
+    }
+
+    #[test]
+    fn recent_successful_durations_caps_at_trend_max_samples() {
+        use crate::github::RunConclusion;
+        let mut hist = BuildHistory::new();
+        let key = make_key("alice/app", "main");
+        // Push way more than the cap.
+        for i in 0..50 {
+            push_build(
+                &mut hist,
+                &key,
+                build_with(
+                    i,
+                    "CI",
+                    &format!("sha-{i}"),
+                    RunConclusion::Success,
+                    Some(100 + i),
+                ),
+            );
+        }
+        for b in hist.get_mut(&key).unwrap() {
+            b.completed_at = Some(TEST_NOW - 60);
+        }
+        let samples = recent_successful_durations(&hist, &key, "CI", TEST_NOW);
+        assert!(
+            samples.len() <= TREND_MAX_SAMPLES,
+            "should cap at {}, got {}",
+            TREND_MAX_SAMPLES,
+            samples.len()
+        );
+    }
+
+    #[test]
+    fn recent_successful_durations_empty_for_no_matching_builds() {
+        let hist = BuildHistory::new();
+        let key = make_key("alice/app", "main");
+        assert!(recent_successful_durations(&hist, &key, "CI", TEST_NOW).is_empty());
     }
 
     #[test]

@@ -320,7 +320,6 @@ pub(crate) async fn get_defaults_handler(
         default_branches: Some(cfg.default_branches.clone()),
         show_author: Some(cfg.show_author),
         detect_flakes: Some(cfg.detect_flakes),
-        show_duration_trend: Some(cfg.show_duration_trend),
         notify_mode: Some(cfg.notify_mode),
     })
 }
@@ -419,13 +418,6 @@ pub(crate) async fn set_defaults_handler(
                 cfg.detect_flakes = enabled;
                 messages.push(format!(
                     "flake detection: {}",
-                    if enabled { "on" } else { "off" }
-                ));
-            }
-            if let Some(enabled) = body.show_duration_trend {
-                cfg.show_duration_trend = enabled;
-                messages.push(format!(
-                    "duration trend: {}",
                     if enabled { "on" } else { "off" }
                 ));
             }
@@ -1524,7 +1516,6 @@ mod tests {
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["detect_flakes"], true);
-        assert_eq!(json["show_duration_trend"], true);
         assert_eq!(json["notify_mode"], "every_build");
     }
 
@@ -1537,7 +1528,6 @@ mod tests {
         let router = defaults_router(config.clone());
         let body = r#"{
             "detect_flakes": false,
-            "show_duration_trend": false,
             "notify_mode": "failure_only"
         }"#;
         let req = http::Request::post("/defaults")
@@ -1553,7 +1543,6 @@ mod tests {
         // Confirm the config was actually mutated.
         let cfg = config.read().await;
         assert!(!cfg.detect_flakes);
-        assert!(!cfg.show_duration_trend);
         assert_eq!(
             cfg.notify_mode,
             build_watcher::config::NotifyMode::FailuresAndRecoveries
@@ -1625,7 +1614,6 @@ mod tests {
     async fn set_defaults_omitted_fields_leave_existing_values() {
         let config = null_config(build_watcher::config::Config {
             detect_flakes: false,
-            show_duration_trend: false,
             notify_mode: build_watcher::config::NotifyMode::FailuresAndRecoveries,
             ..build_watcher::config::Config::default()
         });
@@ -1642,7 +1630,6 @@ mod tests {
 
         let cfg = config.read().await;
         assert!(!cfg.detect_flakes);
-        assert!(!cfg.show_duration_trend);
         assert_eq!(
             cfg.notify_mode,
             build_watcher::config::NotifyMode::FailuresAndRecoveries

@@ -44,6 +44,28 @@ pub(crate) struct DaemonState {
     pub started_at: std::time::Instant,
 }
 
+/// Compute (avg, recent_builds) for a workflow over the 7-day window.
+/// Returns `(None, vec![])` when no history is available.
+///
+/// `avg` is success-only (typical-runtime stat — failures often abort partway
+/// and would skew it). `recent_builds` includes all conclusions so the TUI
+/// sparkline can colour each bar by outcome. The trend is always computed —
+/// the TUI consumes it from the detail bar only, so there's no row-clutter
+/// cost that would justify gating it behind a toggle.
+fn trend_for(
+    history: Option<&build_watcher::history::BuildHistory>,
+    key: &WatchKey,
+    workflow: &str,
+    now_unix: u64,
+) -> (Option<u64>, Vec<build_watcher::status::BuildSample>) {
+    let Some(h) = history else {
+        return (None, Vec::new());
+    };
+    let avg = build_watcher::history::avg_duration(h, key, workflow, now_unix);
+    let recent = build_watcher::history::recent_completed_builds(h, key, workflow, now_unix);
+    (avg, recent)
+}
+
 /// Build a snapshot of all current watches from already-locked state.
 ///
 /// Pure function (no async, no locks) — callers acquire the locks and pass
@@ -56,7 +78,6 @@ pub(crate) fn build_watch_snapshot(
     paused: bool,
 ) -> StatusResponse {
     let now_unix = unix_now();
-    let show_duration_trend = config.is_some_and(|c| c.show_duration_trend);
     let mut watch_list: Vec<WatchStatus> = watches
         .iter()
         .map(|(key, entry)| {
@@ -77,13 +98,8 @@ pub(crate) fn build_watch_snapshot(
                 .map(|(run_id, run)| {
                     let elapsed_secs =
                         build_watcher::github::elapsed_since(&run.created_at, now_unix);
-                    let avg_duration_secs = if show_duration_trend {
-                        history.and_then(|h| {
-                            build_watcher::history::avg_duration(h, key, &run.workflow)
-                        })
-                    } else {
-                        None
-                    };
+                    let (avg_duration_secs, recent_builds) =
+                        trend_for(history, key, &run.workflow, now_unix);
                     ActiveRunView {
                         run_id: *run_id,
                         status: run.status.clone(),
@@ -96,6 +112,7 @@ pub(crate) fn build_watch_snapshot(
                         actor: run.actor.clone(),
                         commit_author: run.commit_author.clone(),
                         avg_duration_secs,
+                        recent_builds,
                     }
                 })
                 .collect();
@@ -117,6 +134,8 @@ pub(crate) fn build_watch_snapshot(
                 })
                 .map(|lb| {
                     let age_secs = lb.completed_at.map(|t| now_unix.saturating_sub(t) as f64);
+                    let (avg_duration_secs, recent_builds) =
+                        trend_for(history, key, &lb.workflow, now_unix);
                     LastBuildView {
                         run_id: lb.run_id,
                         conclusion: lb.conclusion.clone(),
@@ -131,6 +150,8 @@ pub(crate) fn build_watch_snapshot(
                         actor: lb.actor.clone(),
                         commit_author: lb.commit_author.clone(),
                         flaky: lb.flaky,
+                        avg_duration_secs,
+                        recent_builds,
                     }
                 })
                 .collect();

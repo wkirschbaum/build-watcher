@@ -7,6 +7,15 @@ pub use crate::config::{NotificationOverrides, NotifyMode, PollAggression};
 // Re-exported here for backward compatibility — defined in github module.
 pub use crate::github::{RunConclusion, RunStatus};
 
+/// One completed build for the trend sparkline. Carries the duration and the
+/// conclusion so the TUI can colour each bar by outcome (Success / Failure /
+/// Cancelled / etc.) rather than only showing the successful subset.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BuildSample {
+    pub duration_secs: u64,
+    pub conclusion: RunConclusion,
+}
+
 /// A single active run as returned by `GET /status`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ActiveRunView {
@@ -28,10 +37,16 @@ pub struct ActiveRunView {
     pub actor: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub commit_author: Option<String>,
-    /// Rolling average duration (seconds) for this workflow, when known.
-    /// Only populated when `show_duration_trend` is enabled in the daemon config.
+    /// Rolling average duration (seconds) for this workflow over the last
+    /// 7 days of successful builds. `None` when there are fewer than 2
+    /// successful samples in the window.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub avg_duration_secs: Option<u64>,
+    /// Recent completed builds for this workflow, newest-first, from the last
+    /// 7 days. Includes failures + cancellations so the sparkline can colour
+    /// each bar by conclusion. Empty when there's no qualifying history.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recent_builds: Vec<BuildSample>,
 }
 
 /// Summary of the last completed build as returned by `GET /status`.
@@ -66,6 +81,15 @@ pub struct LastBuildView {
     /// True when this success followed a failed attempt on the same commit.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub flaky: bool,
+    /// Rolling 7-day average duration (Success only) for this workflow.
+    /// `None` when there are fewer than 2 successful samples in the window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avg_duration_secs: Option<u64>,
+    /// Recent completed builds for this workflow, newest-first, from the last
+    /// 7 days. Includes failures + cancellations so the TUI can colour each
+    /// sparkline bar by conclusion.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recent_builds: Vec<BuildSample>,
 }
 
 /// One watched repo/branch as returned by `GET /status`.
@@ -144,8 +168,6 @@ pub struct DefaultsConfig {
     pub show_author: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detect_flakes: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub show_duration_trend: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notify_mode: Option<NotifyMode>,
 }
@@ -243,7 +265,10 @@ impl StatusResponse {
                         url: snap.url,
                         actor: snap.actor,
                         commit_author: snap.commit_author,
+                        // SSE deltas don't have history context — the next /status
+                        // resync repopulates these from the daemon's trend computation.
                         avg_duration_secs: None,
+                        recent_builds: Vec::new(),
                     });
                 }
             }
@@ -274,6 +299,9 @@ impl StatusResponse {
                     actor: run.actor,
                     commit_author: run.commit_author,
                     flaky,
+                    // SSE delta — trend populated on next /status resync.
+                    avg_duration_secs: None,
+                    recent_builds: Vec::new(),
                 };
                 // Replace existing entry for this workflow, or append.
                 if let Some(existing) = watch
@@ -457,6 +485,7 @@ mod tests {
                 actor: None,
                 commit_author: None,
                 avg_duration_secs: None,
+                recent_builds: Vec::new(),
             }],
             ..Default::default()
         }]);
