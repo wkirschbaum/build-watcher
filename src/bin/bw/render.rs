@@ -1921,7 +1921,6 @@ fn render_detail_bar(
 
     let spans: Vec<Span<'_>> = match sel_idx {
         Some(DisplayRow::RepoHeader {
-            repo,
             branch_count,
             failing,
             active,
@@ -1930,17 +1929,11 @@ fn render_detail_bar(
             single_branch,
             ..
         }) => {
-            let mut s = vec![Span::styled(*repo, dim)];
+            // The selected row already shows the repo name in its first
+            // column. The bar adds branch-level context only.
+            let mut s: Vec<Span<'_>> = Vec::new();
             if let Some(sb) = single_branch {
-                s.push(detail_sep());
                 s.push(Span::styled(sb.branch, dim));
-                if !sb.status_key.is_empty() {
-                    s.push(detail_sep());
-                    s.push(Span::styled(
-                        format::status(&sb.status_key),
-                        status_style(&sb.status_key),
-                    ));
-                }
                 if let Some(run_id) = sb.run_id {
                     s.push(detail_sep());
                     s.push(Span::styled("run ", label_style));
@@ -1964,7 +1957,6 @@ fn render_detail_bar(
                 }
                 push_author(&mut s, &sb.actor, &sb.commit_author, label_style, dim);
             } else {
-                s.push(detail_sep());
                 s.push(Span::styled(format!("{} branches", branch_count), dim));
                 s.push(detail_sep());
                 s.push(Span::styled(
@@ -1998,17 +1990,12 @@ fn render_detail_bar(
             }
             s
         }
-        Some(DisplayRow::ActiveRun {
-            repo, branch, run, ..
-        }) => {
+        Some(DisplayRow::ActiveRun { run, .. }) => {
+            // The selected row already shows status (with color), repo, branch,
+            // workflow, and elapsed in its columns — no need to repeat them.
+            // The bar shows the deep-dive details: run id, event, retry,
+            // duration trend, author.
             let mut s = vec![
-                Span::styled(
-                    format::status(run.status.as_str()),
-                    status_style(run.status.as_str()),
-                ),
-                detail_sep(),
-                Span::styled(format!("{} · {} · {}", repo, branch, run.workflow), dim),
-                detail_sep(),
                 Span::styled("run ", label_style),
                 Span::styled(run.run_id.to_string(), dim),
             ];
@@ -2024,10 +2011,6 @@ fn render_detail_bar(
                     Style::default().fg(Color::Yellow),
                 ));
             }
-            if let Some(elapsed) = run.elapsed_secs {
-                s.push(detail_sep());
-                s.push(Span::styled(format::age(elapsed as u64), dim));
-            }
             push_trend_spans(
                 &mut s,
                 run.avg_duration_secs,
@@ -2038,20 +2021,12 @@ fn render_detail_bar(
             push_author(&mut s, &run.actor, &run.commit_author, label_style, dim);
             s
         }
-        Some(DisplayRow::LastBuild {
-            repo,
-            branch,
-            build,
-            ..
-        }) => {
+        Some(DisplayRow::LastBuild { build, .. }) => {
+            // The selected row already shows conclusion (with color), repo,
+            // branch, workflow, and age — no need to repeat them. The bar
+            // shows the deep-dive details: run id, retry, failing steps,
+            // exact duration, 7-day trend, author.
             let mut s = vec![
-                Span::styled(
-                    format::status(build.conclusion.as_str()),
-                    status_style(build.conclusion.as_str()),
-                ),
-                detail_sep(),
-                Span::styled(format!("{} · {} · {}", repo, branch, build.workflow), dim),
-                detail_sep(),
                 Span::styled("run ", label_style),
                 Span::styled(build.run_id.to_string(), dim),
             ];
@@ -2071,13 +2046,6 @@ fn render_detail_bar(
                     Style::default().fg(COLOR_FAILURE),
                 ));
             }
-            // Order: when it finished (age), then how long it took, then the
-            // 7-day trend. This groups all duration-related spans
-            // (took / avg / sparkline) contiguously at the end of the row.
-            if let Some(age) = build.age_secs {
-                s.push(detail_sep());
-                s.push(Span::styled(format::age(age as u64), dim));
-            }
             if let Some(d) = build.duration_secs {
                 s.push(detail_sep());
                 s.push(Span::styled("took ", label_style));
@@ -2093,22 +2061,14 @@ fn render_detail_bar(
             push_author(&mut s, &build.actor, &build.commit_author, label_style, dim);
             s
         }
-        Some(DisplayRow::NeverRan {
-            repo,
-            branch,
-            waiting,
-            ..
-        }) => {
+        Some(DisplayRow::NeverRan { waiting, .. }) => {
+            // Repo/branch already in the selected row's columns.
             let msg = if *waiting {
                 "waiting for first poll"
             } else {
                 "no builds yet"
             };
-            vec![
-                Span::styled(format!("{} · {}", repo, branch), dim),
-                detail_sep(),
-                Span::styled(msg, dim),
-            ]
+            vec![Span::styled(msg, dim)]
         }
         Some(DisplayRow::GroupHeader { label }) => {
             vec![
@@ -2117,18 +2077,16 @@ fn render_detail_bar(
             ]
         }
         Some(DisplayRow::BranchHeader {
-            repo,
-            branch,
             workflow_count,
             expanded,
             ..
         }) => {
+            // Repo/branch already in the selected row's columns.
             let state = if *expanded { "expanded" } else { "collapsed" };
-            vec![
-                Span::styled(format!("{repo} · {branch}"), dim),
-                detail_sep(),
-                Span::styled(format!("{workflow_count} workflows ({state})"), dim),
-            ]
+            vec![Span::styled(
+                format!("{workflow_count} workflows ({state})"),
+                dim,
+            )]
         }
         None => vec![],
     };

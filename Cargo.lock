@@ -193,7 +193,7 @@ dependencies = [
 
 [[package]]
 name = "build-watcher"
-version = "1.0.7"
+version = "1.1.0"
 dependencies = [
  "async-trait",
  "axum",

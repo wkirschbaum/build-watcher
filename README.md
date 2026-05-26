@@ -108,6 +108,8 @@ Note: `cargo install` skips service setup — run `./install.sh --local` for the
 - Notification titles: `✅ succeeded: my-app | CI` — org prefix omitted when the repo name is unambiguous
 - Failure notifications include the name of the failing job and step
 - Build duration shown on completion
+- **Notify mode** (`every_build` / `failures_and_recoveries`) — pick the quieter mode to only get notified on failures plus the recovery that fixes them
+- **Flake detection** — a Success that follows a failed attempt on the same commit fires as `⚡ flake recovered` instead of `✅ succeeded`
 - **Quiet hours** — suppress non-critical notifications on a schedule (e.g. `22:00–07:00`)
 - Pause notifications temporarily (timed or indefinite) with `p` in the TUI
 
@@ -118,6 +120,8 @@ The `bw` dashboard updates in real time over SSE. Repos expand to show per-branc
 **Sorting:** repo, branch, status, workflow, age (`s`/`S` to cycle)
 
 **Grouping:** by org, branch, workflow, status, or none (`g`/`G` to cycle)
+
+**Duration trend.** Select any active or completed build to see a 7-day trend in the detail bar at the bottom: `avg 4:10 (3:42–5:18) ▂▃▅▄▆▃▄▅`. The min–max range is success-only (typical-runtime stat); the sparkline bars include every conclusion colour-coded — green for Success, red for Failure, yellow for Cancelled — so you can spot flaky workflows at a glance.
 
 #### Keybindings
 
@@ -200,6 +204,8 @@ Config lives at `~/.config/build-watcher/config.json` and is edited live — no 
 {
   "poll_aggression": "medium",
   "show_author": true,
+  "detect_flakes": true,
+  "notify_mode": "every_build",
   "auto_discover_branches": true,
   "notifications": {
     "build_started": "normal",
@@ -232,6 +238,8 @@ Config lives at `~/.config/build-watcher/config.json` and is edited live — no 
 | --- | --- | --- |
 | `poll_aggression` | `medium` | Rate-limit budget: `low` (≤15%), `medium` (≤40%), `high` (≤80%) |
 | `show_author` | `true` | Show commit author in TUI and notifications (1 extra API call per new run) |
+| `detect_flakes` | `true` | Flag a success following a failed attempt on the same commit as a recovered flake |
+| `notify_mode` | `every_build` | `every_build` (notify on every kind change + every new commit) or `failures_and_recoveries` (only failures + the success that ends them) |
 | `auto_discover_branches` | `true` | Auto-watch branches with active runs or open PRs |
 | `branch_filter` | — | Regex to filter auto-discovered branches |
 | `default_branches` | — | Extra branches watched for repos with no per-repo branch config |

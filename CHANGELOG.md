@@ -1,5 +1,24 @@
 # Changelog
 
+## [1.1.0] - 2026-05-26
+
+### Added
+
+- **Flake detection** (`detect_flakes`, default on) — a Success that follows a failed attempt on the same commit is flagged as a recovered flake. The desktop notification swaps from "✅ succeeded" to "⚡ flake recovered", and the `flaky` bit is persisted on each `LastBuild` so the signal survives daemon restarts. New helper `history::is_flake`.
+- **Build duration trend** — the detail bar at the bottom of the TUI now shows a 7-day duration trend for the selected active or completed build: `avg 4:10 (3:42–5:18) ▂▃▅▄▆▃▄▅`. The avg + (min–max) range come from successful samples only (the typical-runtime stat); the sparkline bars include every conclusion colour-coded — green for Success, red for Failure/TimedOut/StartupFailure, yellow for Cancelled, gray for Unknown. New helpers `history::avg_duration` and `history::recent_completed_builds`. New `BuildSample` type and `avg_duration_secs` / `recent_builds` fields on `ActiveRunView` and `LastBuildView`.
+- **Notify mode** (`notify_mode`, default `every_build`) — controls which build events fire desktop notifications. `every_build` notifies on every kind change and every new-commit build (repeat polls of the same commit + same state are still suppressed). `failures_and_recoveries` only fires on Failed events and the Success that ends a failure streak — pick this for the quietest mode that still tells you when red turns green. Backed by `head_sha` now carried on `RunSnapshot` so the pipeline can distinguish same-commit repeats from new-commit builds.
+- TUI config form exposes the new toggles: `Detect flakes` on the Display tab and `Notify mode` on a new Notifications tab.
+
+### Changed
+
+- `POST /defaults` REST endpoint now validates `notify_mode` strings up-front and returns an error for unknown values, matching the existing `branch_filter` regex validation pattern. The legacy `"failure_only"` string remains accepted as an alias for `failures_and_recoveries`.
+- `NotificationPipeline.ingest` now reads the config lock once per ingest call instead of twice.
+- **TUI detail bar tidied up** — dropped repo / branch / workflow / status / age from the bar across all row types, since the selected row already shows those in its columns. The bar is now purely the deep-dive details: run id, retry, failing steps, exact duration, 7-day trend, author.
+
+### Fixed
+
+- `is_transition` was tracking per-(repo, branch, kind) only — a new commit in the same state as the previous one was suppressed indefinitely. The transition key now also includes `head_sha`, so a new-commit build always notifies even when the kind hasn't changed.
+
 ## [1.0.7] - 2026-05-26
 
 ### Changed
@@ -412,6 +431,7 @@ Config files, watch-state files, and the REST API are fully compatible with 1.0.
 
 - Avoid unnecessary config re-save on reads; improve persistence error logging
 
+[1.1.0]: https://github.com/wkirschbaum/build-watcher/compare/v1.0.7...v1.1.0
 [1.0.7]: https://github.com/wkirschbaum/build-watcher/compare/v1.0.6...v1.0.7
 [1.0.6]: https://github.com/wkirschbaum/build-watcher/releases/tag/v1.0.6
 [1.0.5]: https://github.com/wkirschbaum/build-watcher/releases/tag/v1.0.5

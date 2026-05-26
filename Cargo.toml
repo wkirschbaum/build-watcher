@@ -1,6 +1,6 @@
 [package]
 name = "build-watcher"
-version = "1.0.7"
+version = "1.1.0"
 edition = "2024"
 license = "MIT"
 description = "Background daemon monitoring GitHub Actions builds with desktop notifications, MCP server, and live TUI dashboard"
