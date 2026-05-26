@@ -1,5 +1,16 @@
 # Changelog
 
+## [1.0.7] - 2026-05-26
+
+### Changed
+
+- **Dependency bumps** — `lru` 0.12 → 0.18, `ratatui` 0.29 → 0.30 (via the `crossterm_0_29` feature), `crossterm` 0.28 → 0.29, plus 22 semver-compatible updates including `tokio`, `rmcp`, `axum`/`tower-http`, and `serde_json`. No user-visible behavior change; no breaking ratatui 0.30 APIs are in use.
+
+### Fixed
+
+- **Non-exhaustive `PrMergeState` match in the PR notification handler** — the `_ => return` fallback meant a new `MergeState` variant would compile silently with no notification path. Now matches `HasHooks | Unknown` explicitly so future variants surface at compile time.
+- **Clippy `field_reassign_with_default` warnings** in five test/setup sites converted to struct-literal initialization.
+
 ## [1.0.6] - 2026-05-12
 
 ### Fixed
@@ -401,6 +412,7 @@ Config files, watch-state files, and the REST API are fully compatible with 1.0.
 
 - Avoid unnecessary config re-save on reads; improve persistence error logging
 
+[1.0.7]: https://github.com/wkirschbaum/build-watcher/compare/v1.0.6...v1.0.7
 [1.0.6]: https://github.com/wkirschbaum/build-watcher/releases/tag/v1.0.6
 [1.0.5]: https://github.com/wkirschbaum/build-watcher/releases/tag/v1.0.5
 [1.0.4]: https://github.com/wkirschbaum/build-watcher/releases/tag/v1.0.4
