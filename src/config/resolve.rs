@@ -260,6 +260,7 @@ mod tests {
                     build_success: Some(NotificationLevel::Critical),
                     build_failure: None,
                 },
+                ..Default::default()
             },
         );
         config.repos.insert(

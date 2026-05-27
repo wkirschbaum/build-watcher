@@ -19,8 +19,14 @@
   <string>Background</string>
   <key>RunAtLoad</key>
   <true/>
+  <!-- Restart only on unsuccessful exit. The daemon exits 0 when another
+       instance already holds the lock, so a redundant launch is a clean no-op
+       rather than a 10s restart loop; genuine crashes still respawn. -->
   <key>KeepAlive</key>
-  <true/>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
   <key>ThrottleInterval</key>
   <integer>10</integer>
   <key>StandardOutPath</key>

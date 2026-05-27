@@ -48,8 +48,82 @@ fn try_existing_daemon() -> Option<DaemonClient> {
         .map(|_| DaemonClient::new(port))
 }
 
-/// Start the daemon process (fire and forget). Forwards `--config-dir` when given.
+/// Ensure a daemon is being started. Prefers the installed platform service
+/// (systemd user unit on Linux, launchd agent on macOS) so the daemon is owned
+/// by the service manager — one owner, surviving `bw` exit, and no orphan
+/// competing with the service for the instance lock. Falls back to spawning a
+/// raw child only when no service is installed or when `--config-dir` is used
+/// (explicitly ephemeral, service-free multi-instance mode).
 fn start_daemon(config_dir: Option<&std::path::Path>) -> Result<(), Box<dyn std::error::Error>> {
+    if config_dir.is_none() && start_platform_service() {
+        return Ok(());
+    }
+    spawn_daemon_process(config_dir)
+}
+
+/// Try to start the installed platform service. Returns `true` if a service was
+/// found and a start was issued; `false` if none is installed or the service
+/// tooling is unavailable, so the caller falls back to a raw spawn.
+#[cfg(target_os = "linux")]
+fn start_platform_service() -> bool {
+    use std::process::{Command, Stdio};
+    // Clear any prior failed/rate-limited state from a previous crash loop so
+    // `start` works; harmless (and ignored) if the unit isn't installed. We only
+    // reach here when no daemon was reachable, so a (re)start can't disrupt a
+    // healthy one. stdio is silenced so a benign "unit not loaded" message
+    // doesn't leak to the terminal.
+    let _ = Command::new("systemctl")
+        .args(["--user", "reset-failed", "build-watcher.service"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    Command::new("systemctl")
+        .args(["--user", "start", "build-watcher.service"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// macOS: kick the launchd agent if its plist is installed. `kickstart` starts
+/// a loaded-but-stopped agent; it needs the GUI domain target `gui/<uid>/<label>`.
+#[cfg(target_os = "macos")]
+fn start_platform_service() -> bool {
+    use std::process::{Command, Stdio};
+    let Some(home) = std::env::var_os("HOME") else {
+        return false;
+    };
+    let plist = std::path::Path::new(&home).join("Library/LaunchAgents/com.build-watcher.plist");
+    if !plist.exists() {
+        return false;
+    }
+    // `libc` isn't linked into this binary (it's gated behind the daemon
+    // feature), so read the uid from `id -u`.
+    let Some(uid) = Command::new("id")
+        .arg("-u")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|s| s.trim().parse::<u32>().ok())
+    else {
+        return false;
+    };
+    Command::new("launchctl")
+        .args(["kickstart", &format!("gui/{uid}/com.build-watcher")])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Spawn the daemon binary directly (fire and forget). Forwards `--config-dir`
+/// when given. Used for ephemeral multi-instance runs and as the fallback when
+/// no platform service is installed.
+fn spawn_daemon_process(
+    config_dir: Option<&std::path::Path>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let exe = std::env::current_exe()?;
     let daemon_bin = exe
         .parent()

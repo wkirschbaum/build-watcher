@@ -610,6 +610,67 @@ impl App {
                     }
                 }
             }
+            KeyCode::Char('f') => {
+                if let Some((repo, branch, _, _)) = selected {
+                    // A repo-level pin cascades to every branch. `repo_pinned` is
+                    // the same for all rows of the repo, so any watch carries it.
+                    let repo_pinned = self
+                        .status
+                        .watches
+                        .iter()
+                        .any(|w| w.repo == repo && w.repo_pinned);
+                    let branch_count = self
+                        .status
+                        .watches
+                        .iter()
+                        .filter(|w| w.repo == repo)
+                        .count();
+                    // A repo-header row means "whole repo" only when it carries
+                    // no branch (a genuine multi-branch header). A single-branch
+                    // header carries its branch name and must target that branch
+                    // — including a lone pinned branch that has moved into the
+                    // Pinned section, where its repo renders single-branch.
+                    // Without this, unpinning such a branch would flip the repo
+                    // flag (`RepoConfig.pinned`, already false) instead of the
+                    // branch flag (`bc.pinned`), so the branch stayed pinned.
+                    // The single-branch exception also lets the lone row of a
+                    // repo-pinned repo lift that repo pin.
+                    let is_whole_repo =
+                        is_repo_row && (branch.is_empty() || (branch_count <= 1 && repo_pinned));
+
+                    if repo_pinned && !is_whole_repo {
+                        // The branch is pinned only because its repo is. It can't
+                        // be unpinned on its own — the repo pin has to be lifted.
+                        self.set_flash("Repo is pinned — unpin the repo to release its branches");
+                    } else {
+                        // Decide direction by reading the row's current effective
+                        // pinned state from app.status. For a whole-repo row, "any
+                        // branch pinned" counts as pinned; otherwise we look at the
+                        // specific branch.
+                        let currently_pinned = self.status.watches.iter().any(|w| {
+                            w.repo == repo && (is_whole_repo || w.branch == branch) && w.pinned
+                        });
+                        let target = !currently_pinned;
+                        let d = daemon.clone();
+                        let repo_owned = repo.to_string();
+                        let branch_owned = if is_whole_repo {
+                            None
+                        } else {
+                            Some(branch.to_string())
+                        };
+                        let label = match &branch_owned {
+                            Some(b) => format!("{repo_owned}/{b}"),
+                            None => repo_owned.clone(),
+                        };
+                        let verb = if target { "Pinned" } else { "Unpinned" };
+                        self.spawn_action(format!("{verb} {label}…"), true, async move {
+                            d.pin(&repo_owned, branch_owned.as_deref(), target)
+                                .await
+                                .map(|()| format!("{verb} {label}"))
+                        });
+                    }
+                }
+            }
             KeyCode::Char('N') => {
                 if let Some((repo, branch, _, _)) = selected {
                     let d = daemon.clone();

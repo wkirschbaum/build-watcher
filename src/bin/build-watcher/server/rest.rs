@@ -133,6 +133,94 @@ pub(crate) async fn pause_handler(
 }
 
 #[derive(Deserialize)]
+pub(crate) struct PinRequest {
+    repo: String,
+    /// When omitted, pins/unpins the whole repo. When present, pins/unpins
+    /// just that branch (creating a `BranchConfig` entry if needed).
+    #[serde(default)]
+    branch: Option<String>,
+    pinned: bool,
+}
+
+/// `POST /pin` — Toggle the pinned flag on a repo or a specific branch.
+/// Pinned watches appear in the TUI's dedicated "Pinned" section above
+/// everything else.
+pub(crate) async fn pin_handler(
+    State(state): State<DaemonState>,
+    axum::Json(body): axum::Json<PinRequest>,
+) -> axum::response::Response {
+    if let Err(e) = validate_repo(&body.repo) {
+        return json_error(e);
+    }
+    if let Some(branch) = &body.branch
+        && let Err(e) = build_watcher::github::validate_branch(branch)
+    {
+        return json_error(e);
+    }
+
+    let result = state
+        .config
+        .modify(|cfg| {
+            let mut messages = Vec::new();
+            let rc = cfg.repos.entry(body.repo.clone()).or_default();
+            match &body.branch {
+                None => {
+                    rc.pinned = body.pinned;
+                    // A repo pin replaces any individual branch pins: the repo
+                    // pin already cascades to every branch, so leaving stale
+                    // per-branch flags around would resurrect them when the
+                    // repo is later unpinned. Clear them, dropping entries that
+                    // become empty so the config doesn't accumulate stubs.
+                    if body.pinned {
+                        rc.branch_notifications.retain(|_, bc| {
+                            bc.pinned = false;
+                            !bc.is_empty()
+                        });
+                    }
+                    messages.push(format!(
+                        "{}: {}",
+                        body.repo,
+                        if body.pinned { "pinned" } else { "unpinned" }
+                    ));
+                }
+                Some(branch) => {
+                    if body.pinned {
+                        rc.branch_notifications
+                            .entry(branch.clone())
+                            .or_default()
+                            .pinned = true;
+                    } else if let Some(bc) = rc.branch_notifications.get_mut(branch) {
+                        // Unpin, then drop the entry if nothing else is left on it.
+                        bc.pinned = false;
+                        if bc.is_empty() {
+                            rc.branch_notifications.remove(branch);
+                        }
+                    }
+                    messages.push(format!(
+                        "{}@{}: {}",
+                        body.repo,
+                        branch,
+                        if body.pinned { "pinned" } else { "unpinned" }
+                    ));
+                }
+            }
+            messages
+        })
+        .await;
+    match result {
+        Ok(messages) => {
+            axum::Json(serde_json::json!({ "ok": true, "messages": messages })).into_response()
+        }
+        Err(e) => {
+            let warning =
+                format!("\u{26a0}\u{fe0f} Warning: config could not be saved to disk: {e}");
+            axum::Json(serde_json::json!({ "ok": false, "messages": [], "warning": warning }))
+                .into_response()
+        }
+    }
+}
+
+#[derive(Deserialize)]
 pub(crate) struct RerunRequest {
     repo: String,
     run_id: Option<u64>,
@@ -1607,6 +1695,204 @@ mod tests {
         assert_eq!(
             cfg.notify_mode,
             build_watcher::config::NotifyMode::FailuresAndRecoveries
+        );
+    }
+
+    // -- /pin endpoint --
+
+    fn pin_router(config: SharedConfigManager) -> axum::Router {
+        let (watches, pause, _events) = empty_state();
+        let handle = stub_handle();
+        let app_state = super::super::DaemonState {
+            watches,
+            config,
+            handle,
+            pause,
+            rate_limit: Arc::new(Mutex::new(None)),
+            started_at: std::time::Instant::now(),
+        };
+        axum::Router::new()
+            .route("/pin", axum::routing::post(super::pin_handler))
+            .with_state(app_state)
+    }
+
+    #[tokio::test]
+    async fn pin_repo_sets_repo_pinned_flag() {
+        use tower::ServiceExt;
+        let config = null_config(build_watcher::config::Config::default());
+        let router = pin_router(config.clone());
+        let req = http::Request::post("/pin")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                r#"{"repo":"alice/app","pinned":true}"#,
+            ))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), 200);
+
+        let cfg = config.read().await;
+        let rc = cfg.repos.get("alice/app").expect("repo entry created");
+        assert!(rc.pinned, "repo should be pinned");
+    }
+
+    #[tokio::test]
+    async fn pin_branch_sets_branch_pinned_flag() {
+        use tower::ServiceExt;
+        let config = null_config(build_watcher::config::Config::default());
+        let router = pin_router(config.clone());
+        let req = http::Request::post("/pin")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                r#"{"repo":"alice/app","branch":"main","pinned":true}"#,
+            ))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), 200);
+
+        let cfg = config.read().await;
+        let rc = cfg.repos.get("alice/app").expect("repo entry created");
+        assert!(!rc.pinned, "repo itself should not be pinned");
+        let bc = rc
+            .branch_notifications
+            .get("main")
+            .expect("branch entry created");
+        assert!(bc.pinned, "branch should be pinned");
+    }
+
+    #[tokio::test]
+    async fn pin_rejects_invalid_repo() {
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+        let config = null_config(build_watcher::config::Config::default());
+        let router = pin_router(config);
+        let req = http::Request::post("/pin")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                r#"{"repo":"not-a-valid-repo","pinned":true}"#,
+            ))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(json["error"].is_string(), "should error on invalid repo");
+    }
+
+    #[tokio::test]
+    async fn pin_unpin_clears_flag() {
+        use tower::ServiceExt;
+        let mut cfg = build_watcher::config::Config::default();
+        let rc = build_watcher::config::RepoConfig {
+            pinned: true,
+            ..Default::default()
+        };
+        cfg.repos.insert("alice/app".to_string(), rc);
+        let config = null_config(cfg);
+
+        let router = pin_router(config.clone());
+        let req = http::Request::post("/pin")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                r#"{"repo":"alice/app","pinned":false}"#,
+            ))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), 200);
+
+        let cfg = config.read().await;
+        assert!(!cfg.repos.get("alice/app").unwrap().pinned);
+    }
+
+    #[tokio::test]
+    async fn pin_repo_clears_individual_branch_pins() {
+        use build_watcher::config::{BranchConfig, NotificationLevel, NotificationOverrides};
+        use tower::ServiceExt;
+        // One branch pinned with nothing else; another pinned but also carrying
+        // a notification override.
+        let mut cfg = build_watcher::config::Config::default();
+        let mut rc = build_watcher::config::RepoConfig::default();
+        rc.branch_notifications.insert(
+            "main".to_string(),
+            BranchConfig {
+                pinned: true,
+                ..Default::default()
+            },
+        );
+        rc.branch_notifications.insert(
+            "dev".to_string(),
+            BranchConfig {
+                pinned: true,
+                notifications: NotificationOverrides {
+                    build_failure: Some(NotificationLevel::Off),
+                    ..Default::default()
+                },
+            },
+        );
+        cfg.repos.insert("alice/app".to_string(), rc);
+        let config = null_config(cfg);
+
+        // Pinning the whole repo should drop the redundant branch pins so they
+        // can't resurface when the repo is later unpinned.
+        let router = pin_router(config.clone());
+        let req = http::Request::post("/pin")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                r#"{"repo":"alice/app","pinned":true}"#,
+            ))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), 200);
+
+        let cfg = config.read().await;
+        let rc = cfg.repos.get("alice/app").unwrap();
+        assert!(rc.pinned, "repo should be pinned");
+        // The pin-only entry is dropped entirely; the one with a notification
+        // override is kept but unpinned.
+        assert!(
+            !rc.branch_notifications.contains_key("main"),
+            "empty branch entry should be removed"
+        );
+        let dev = rc
+            .branch_notifications
+            .get("dev")
+            .expect("branch with notification override is preserved");
+        assert!(!dev.pinned, "branch pin should be cleared");
+        assert_eq!(
+            dev.notifications.build_failure,
+            Some(NotificationLevel::Off)
+        );
+    }
+
+    #[tokio::test]
+    async fn unpin_branch_drops_empty_entry() {
+        use build_watcher::config::BranchConfig;
+        use tower::ServiceExt;
+        let mut cfg = build_watcher::config::Config::default();
+        let mut rc = build_watcher::config::RepoConfig::default();
+        rc.branch_notifications.insert(
+            "main".to_string(),
+            BranchConfig {
+                pinned: true,
+                ..Default::default()
+            },
+        );
+        cfg.repos.insert("alice/app".to_string(), rc);
+        let config = null_config(cfg);
+
+        let router = pin_router(config.clone());
+        let req = http::Request::post("/pin")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                r#"{"repo":"alice/app","branch":"main","pinned":false}"#,
+            ))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), 200);
+
+        let cfg = config.read().await;
+        let rc = cfg.repos.get("alice/app").unwrap();
+        assert!(
+            !rc.branch_notifications.contains_key("main"),
+            "unpinning a branch with no other overrides should drop its entry"
         );
     }
 

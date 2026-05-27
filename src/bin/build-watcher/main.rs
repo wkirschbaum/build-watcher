@@ -58,7 +58,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Acquire the instance lock before any expensive startup work (config saves,
     // GitHub API calls) so we fail fast if another daemon is already running.
-    let lock = server::acquire_instance_lock()?;
+    // A held lock is benign (another daemon owns it), so we exit 0 rather than
+    // erroring — this keeps the service manager (systemd `on-failure` / launchd
+    // `SuccessfulExit:false`) from restart-looping when a second instance is
+    // launched alongside the running one.
+    let lock = match server::acquire_instance_lock() {
+        Ok(lock) => lock,
+        Err(e @ server::ServerError::InstanceAlreadyRunning(_)) => {
+            tracing::info!("{e}");
+            return Ok(());
+        }
+        Err(e) => return Err(e.into()),
+    };
 
     let config = Arc::new(ConfigManager::new(
         config::load_and_normalize(),

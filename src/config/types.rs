@@ -355,6 +355,19 @@ pub struct QuietHours {
 pub struct BranchConfig {
     #[serde(default, skip_serializing_if = "NotificationOverrides::is_empty")]
     pub notifications: NotificationOverrides,
+    /// When true, the TUI pins this branch to its dedicated "Pinned" section
+    /// above all other watches.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pinned: bool,
+}
+
+impl BranchConfig {
+    /// True when this entry carries no overrides at all (no notification
+    /// overrides, not pinned). Such entries can be dropped from
+    /// `branch_notifications` so the config doesn't accumulate empty stubs.
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 /// Per-repo settings. Presence in the map means the repo is watched.
@@ -389,6 +402,11 @@ pub struct RepoConfig {
     /// Populated by `Config::populate_compiled_filters()`. Not persisted.
     #[serde(skip)]
     pub compiled_branch_filter: Option<Arc<regex::Regex>>,
+    /// When true, all branches of this repo appear in the TUI's "Pinned"
+    /// section. Repo-level pin cascades — individual branch pin flags
+    /// inside a pinned repo are redundant (the repo pin wins).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pinned: bool,
 }
 
 impl Default for RepoConfig {
@@ -405,6 +423,7 @@ impl Default for RepoConfig {
             auto_discover_branches: None,
             branch_filter: None,
             compiled_branch_filter: None,
+            pinned: false,
         }
     }
 }

@@ -2,11 +2,19 @@
 Description=Build Watcher MCP Server
 After=network.target sleep.target
 Conflicts=sleep.target
+# Give up after 5 failed starts in 5 minutes so a persistent failure (e.g. a
+# genuine crash loop) stops hammering instead of restarting forever. A healthy
+# daemon never approaches this.
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
 ExecStart=@@BINARY_PATH@@
-Restart=always
+# on-failure (not always): the daemon exits 0 when another instance already
+# holds the lock, so a redundant start is a clean no-op rather than a restart
+# loop. Genuine crashes (non-zero / signal) still auto-recover.
+Restart=on-failure
 RestartSec=10
 TimeoutStopSec=10
 Environment=RUST_LOG=build_watcher=info

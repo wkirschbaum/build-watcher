@@ -889,9 +889,67 @@ async fn check_for_new_runs_applies_workflow_filter() {
     let entry = h.entry(&key).await;
     assert!(entry.active_runs.contains_key(&101));
     assert!(!entry.active_runs.contains_key(&102));
-    assert_eq!(entry.last_seen_run_id, 102);
+    // The high-water mark must NOT advance past the ignored Semgrep run (102):
+    // doing so would hide a real run with a lower id that surfaces on a later
+    // poll. It only advances to the newest tracked run (101).
+    assert_eq!(entry.last_seen_run_id, 101);
 
     h.cancel();
+}
+
+#[tokio::test]
+async fn ignored_run_does_not_hide_later_lower_id_real_run() {
+    // Regression: an ignored workflow (Semgrep, id 102) is created alongside a
+    // real push build (id 101) but reaches the runs listing first. The first
+    // poll sees only the ignored run; the real run surfaces on the next poll
+    // with a LOWER id. It must still be detected — the ignored run must not have
+    // advanced the high-water mark past it. (Each real poll re-fetches runs, so
+    // the two polls are modelled as two harnesses carrying the entry forward.)
+    let key = WatchKey::new("alice/app", "main");
+
+    let mut semgrep = make_run(102, RunStatus::Completed, "success");
+    semgrep.workflow = "Semgrep".to_string();
+
+    let cfg = Config {
+        ignored_workflows: vec!["Semgrep".to_string()],
+        ..Config::default()
+    };
+
+    // Poll 1: only the ignored Semgrep run (102) is visible.
+    let h1 = TestHarness::with_config(MockGitHub::with_runs(vec![semgrep.clone()]), cfg.clone());
+    h1.seed(key.clone(), idle_entry(100)).await;
+    h1.poller("alice/app")
+        .check_for_new_runs_repo_wide(None)
+        .await;
+    let after_poll1 = h1.entry(&key).await;
+    assert!(
+        after_poll1.last_seen_run_id < 101,
+        "ignored run 102 must not advance the mark past the unseen real run 101"
+    );
+    h1.cancel();
+
+    // Poll 2: the real push build (101) now appears alongside the ignored run.
+    // Carry the entry from poll 1 forward, exactly as the persisted state would be.
+    let mut ci = make_run(101, RunStatus::InProgress, "");
+    ci.workflow = "CI".to_string();
+    let h2 = TestHarness::with_config(MockGitHub::with_runs(vec![ci, semgrep]), cfg);
+    h2.seed(key.clone(), after_poll1).await;
+    let changes = h2
+        .poller("alice/app")
+        .check_for_new_runs_repo_wide(None)
+        .await;
+
+    let entry = h2.entry(&key).await;
+    assert!(
+        entry.active_runs.contains_key(&101),
+        "the real run 101 must be detected even though ignored run 102 has a higher id"
+    );
+    assert!(
+        changes.iter().any(|c| c.run_id() == 101),
+        "a change should be emitted for the real run 101"
+    );
+
+    h2.cancel();
 }
 
 // -- RepoPoller: poll_active_runs_batch --

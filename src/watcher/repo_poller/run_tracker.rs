@@ -408,7 +408,12 @@ impl RepoPoller {
                 })
                 .collect();
 
-            if unseen.is_empty() && reruns.is_empty() {
+            // Nothing to track on this branch. We key off `new_runs` rather than
+            // `unseen` because ignored/filtered runs no longer advance the
+            // high-water mark — leaving them in `unseen` forever — so an
+            // `unseen`-based check would do the full per-branch work every poll
+            // for repos whose newest activity is an ignored workflow.
+            if new_runs.is_empty() && reruns.is_empty() {
                 continue;
             }
 
@@ -600,12 +605,18 @@ impl RepoPoller {
                             lb.flaky = f;
                         }
                     }
-                    // Bump the high-water mark for ALL unseen runs (including filtered-out
-                    // ones) so ignored workflows don't re-trigger on the next poll.
-                    if let Some(max_id) = unseen.iter().map(|r| r.id).max() {
-                        entry.last_seen_run_id = entry.last_seen_run_id.max(max_id);
-                    }
-                    if !new_runs.is_empty() || !unseen.is_empty() || !reruns.is_empty() {
+                    // `incorporate_new_runs` has already advanced the high-water
+                    // mark to the newest *tracked* run. We deliberately do NOT
+                    // bump it past filtered-out `unseen` runs: ignored workflows
+                    // often share a branch with real builds (e.g. a
+                    // `pull_request` Semgrep run created alongside a `push`
+                    // build) and can carry a HIGHER run id. Advancing past them
+                    // would leapfrog the real run, so when it surfaces just below
+                    // the mark on a later poll — the GitHub runs listing is only
+                    // eventually consistent at the head — it would be skipped
+                    // forever. Ignored runs above the mark simply get re-filtered
+                    // each poll, which is cheap and emits nothing.
+                    if !new_runs.is_empty() || !reruns.is_empty() {
                         any_changed = true;
                     }
                 }

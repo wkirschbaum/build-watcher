@@ -173,6 +173,31 @@ impl DaemonClient {
         self.post_json("/pause", &Req { pause }).await
     }
 
+    /// Pin or unpin a repo (when `branch` is `None`) or a specific branch.
+    pub(crate) async fn pin(
+        &self,
+        repo: &str,
+        branch: Option<&str>,
+        pinned: bool,
+    ) -> Result<(), String> {
+        #[derive(Serialize)]
+        struct Req<'a> {
+            repo: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            branch: Option<&'a str>,
+            pinned: bool,
+        }
+        self.post_json(
+            "/pin",
+            &Req {
+                repo,
+                branch,
+                pinned,
+            },
+        )
+        .await
+    }
+
     pub(crate) async fn watch(&self, repo: &str) -> Result<(), String> {
         #[derive(Serialize)]
         struct Req<'a> {

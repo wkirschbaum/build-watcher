@@ -110,6 +110,16 @@ pub struct WatchStatus {
     /// True until the first successful poll provides data.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub waiting: bool,
+    /// True when the user has pinned this branch (or its parent repo).
+    /// The TUI groups pinned watches into a dedicated section above the rest.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pinned: bool,
+    /// True when the *repo* itself is pinned (a repo-level pin that cascades to
+    /// every branch). Distinct from `pinned`, which is also set by a branch-level
+    /// pin. The TUI uses this to forbid unpinning an individual branch out of a
+    /// pinned repo — the repo pin must be lifted instead.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub repo_pinned: bool,
 }
 
 /// Compact PR view for the TUI status display.

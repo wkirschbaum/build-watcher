@@ -107,6 +107,18 @@ pub(crate) struct SingleBranchInfo<'a> {
     pub actor: Option<String>,
     /// Name of the commit author.
     pub commit_author: Option<String>,
+    /// The run/build this collapsed row stands for. The detail bar renders it
+    /// with the *same* code as a standalone `ActiveRun`/`LastBuild` row — a
+    /// single-branch repo header is just the same item shown in a different
+    /// place.
+    pub source: SingleBranchSource<'a>,
+}
+
+/// The underlying run/build a single-branch repo header collapses into.
+pub(crate) enum SingleBranchSource<'a> {
+    Active(&'a ActiveRunView),
+    Last(&'a LastBuildView),
+    None,
 }
 
 /// Format a compact colored PR badge from a list of `PrView`s.
@@ -140,6 +152,13 @@ fn pr_badge(prs: &[PrView]) -> Line<'static> {
 
 pub(crate) enum DisplayRow<'a> {
     GroupHeader {
+        label: String,
+    },
+    /// Top-of-table section divider (currently used for "★ pinned" / "other"
+    /// when at least one watch is pinned). Distinct from `GroupHeader` so it
+    /// can render with its own style and so detail-bar logic can tell them
+    /// apart.
+    SectionHeader {
         label: String,
     },
     RepoHeader {
@@ -315,6 +334,7 @@ fn compute_single_branch_info<'a>(branches: &[&'a WatchStatus]) -> Option<Single
         failing_steps,
         actor,
         commit_author,
+        source,
     ) = if let Some(run) = w.active_runs.first() {
         (
             run.title.clone(),
@@ -326,6 +346,7 @@ fn compute_single_branch_info<'a>(branches: &[&'a WatchStatus]) -> Option<Single
             None,
             run.actor.clone(),
             run.commit_author.clone(),
+            SingleBranchSource::Active(run),
         )
     } else if let Some(b) = newest_last_build(w) {
         (
@@ -338,6 +359,7 @@ fn compute_single_branch_info<'a>(branches: &[&'a WatchStatus]) -> Option<Single
             b.failing_steps.clone(),
             b.actor.clone(),
             b.commit_author.clone(),
+            SingleBranchSource::Last(b),
         )
     } else {
         (
@@ -350,6 +372,7 @@ fn compute_single_branch_info<'a>(branches: &[&'a WatchStatus]) -> Option<Single
             None,
             None,
             None,
+            SingleBranchSource::None,
         )
     };
     let mut wf_set: Vec<&str> = Vec::new();
@@ -377,6 +400,7 @@ fn compute_single_branch_info<'a>(branches: &[&'a WatchStatus]) -> Option<Single
         failing_steps,
         actor,
         commit_author,
+        source,
     })
 }
 
@@ -423,16 +447,18 @@ fn repo_group_key(repo: &str, branches: &[WatchStatus], group_by: GroupBy) -> St
     group_key_impl(repo, first_branch, workflow, worst, group_by).unwrap_or_default()
 }
 
-/// Group watches by repo, preserving first-seen order.
-fn group_watches_by_repo(watches: &[WatchStatus]) -> Vec<(&str, Vec<&WatchStatus>)> {
+/// Group watches by repo, preserving first-seen order. Takes a slice of
+/// references so it can be reused for both the pinned and unpinned subsets
+/// in `flatten_rows`.
+fn group_watches_by_repo<'a>(watches: &[&'a WatchStatus]) -> Vec<(&'a str, Vec<&'a WatchStatus>)> {
     let mut groups: Vec<(&str, Vec<&WatchStatus>)> = Vec::new();
     let mut index: HashMap<&str, usize> = HashMap::new();
     for w in watches {
         if let Some(&idx) = index.get(w.repo.as_str()) {
-            groups[idx].1.push(w);
+            groups[idx].1.push(*w);
         } else {
             index.insert(&w.repo, groups.len());
-            groups.push((&w.repo, vec![w]));
+            groups.push((&w.repo, vec![*w]));
         }
     }
     groups
@@ -446,13 +472,61 @@ pub(crate) fn flatten_rows<'a>(
 ) -> FlatRows<'a> {
     let mut rows = Vec::new();
     let mut selectable = Vec::new();
+
+    // Split into pinned and unpinned. Pinned watches always appear in their
+    // own section at the top of the table, regardless of the active grouping.
+    let pinned: Vec<&WatchStatus> = watches.iter().filter(|w| w.pinned).collect();
+    let unpinned: Vec<&WatchStatus> = watches.iter().filter(|w| !w.pinned).collect();
+
+    if !pinned.is_empty() {
+        rows.push(DisplayRow::SectionHeader {
+            label: "\u{2605} pinned".to_string(),
+        });
+        emit_repo_block(
+            &pinned,
+            group_by,
+            expand,
+            workflow_collapsed,
+            &mut rows,
+            &mut selectable,
+        );
+        if !unpinned.is_empty() {
+            rows.push(DisplayRow::SectionHeader {
+                label: "other".to_string(),
+            });
+        }
+    }
+    if !unpinned.is_empty() {
+        emit_repo_block(
+            &unpinned,
+            group_by,
+            expand,
+            workflow_collapsed,
+            &mut rows,
+            &mut selectable,
+        );
+    }
+
+    FlatRows { rows, selectable }
+}
+
+/// Emit DisplayRows for a contiguous set of watches (pinned subset or
+/// unpinned subset). Applies the active grouping inside the block.
+fn emit_repo_block<'a>(
+    watches: &[&'a WatchStatus],
+    group_by: GroupBy,
+    expand: &HashMap<String, ExpandLevel>,
+    workflow_collapsed: &HashSet<String>,
+    rows: &mut Vec<DisplayRow<'a>>,
+    selectable: &mut Vec<usize>,
+) {
     let mut current_group: Option<String> = None;
 
     let repo_groups = if group_by.splits_repo() {
         // Each watch gets its own group entry so repos appear under each matching group.
         watches
             .iter()
-            .map(|w| (w.repo.as_str(), vec![w]))
+            .map(|w| (w.repo.as_str(), vec![*w]))
             .collect::<Vec<_>>()
     } else {
         group_watches_by_repo(watches)
@@ -521,20 +595,18 @@ pub(crate) fn flatten_rows<'a>(
                         tree_prefix,
                         tree_indent,
                         show_wf,
-                        &mut rows,
-                        &mut selectable,
+                        rows,
+                        selectable,
                     );
                 }
             } else if expand_single_branch_workflows {
                 let w = branches[0];
                 let branch_key = format!("{}#{}", repo, w.branch);
                 let show_wf = repo_allows_workflows && !workflow_collapsed.contains(&branch_key);
-                emit_branch_workflow_rows(w, "", "", show_wf, &mut rows, &mut selectable);
+                emit_branch_workflow_rows(w, "", "", show_wf, rows, selectable);
             }
         }
     }
-
-    FlatRows { rows, selectable }
 }
 
 /// Emit rows for a single branch's workflows. Each active run gets its own row,
@@ -768,7 +840,7 @@ impl DisplayRow<'_> {
                 muted,
                 ..
             } => Some((repo, branch, None, *muted)),
-            DisplayRow::GroupHeader { .. } => None,
+            DisplayRow::GroupHeader { .. } | DisplayRow::SectionHeader { .. } => None,
         }
     }
 
@@ -1380,6 +1452,26 @@ fn render_group_header<'a>(label: &str) -> Row<'a> {
     .style(Style::default().bg(Color::Rgb(25, 30, 40)))
 }
 
+/// Top-level section divider (pinned / other). Rendered as a faint dashed rule
+/// with the label inset — subtle enough to separate the sections without
+/// competing with the data rows or the group headers nested inside them.
+fn render_section_header<'a>(label: &str, cw: &ColWidths) -> Row<'a> {
+    let style = Style::default().fg(Color::DarkGray);
+    let dashes = |w: usize| "─".repeat(w);
+    // First column: "── label ──────" padded with dashes to the column width.
+    let prefix = format!("── {label} ");
+    let pad = cw.repo.saturating_sub(prefix.chars().count());
+    let first = format!("{prefix}{}", "─".repeat(pad));
+    Row::new(vec![
+        Cell::from(first).style(style),
+        Cell::from(dashes(cw.branch)).style(style),
+        Cell::from(dashes(cw.status)).style(style),
+        Cell::from(dashes(cw.workflow)).style(style),
+        Cell::from(dashes(cw.title)).style(style),
+        Cell::from(dashes(AGE_W)).style(style),
+    ])
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_repo_header<'a>(
     repo: &str,
@@ -1670,6 +1762,7 @@ fn render_display_row<'a>(
 ) -> Row<'a> {
     match dr {
         DisplayRow::GroupHeader { label } => render_group_header(label),
+        DisplayRow::SectionHeader { label } => render_section_header(label, cw),
         DisplayRow::RepoHeader {
             repo,
             branch_count,
@@ -1901,6 +1994,86 @@ fn push_trend_spans<'a>(
     }
 }
 
+/// Detail-bar spans for an active run: run id, event, retry, duration trend,
+/// author. Shared by the `ActiveRun` row and a single-branch repo header that
+/// collapses one — the bar content is identical regardless of where the item
+/// is shown. Status/repo/branch/workflow already appear in the row's columns.
+fn active_run_detail_spans<'a>(
+    run: &'a ActiveRunView,
+    label_style: Style,
+    dim: Style,
+) -> Vec<Span<'a>> {
+    let mut s = vec![
+        Span::styled("run ", label_style),
+        Span::styled(run.run_id.to_string(), dim),
+    ];
+    if !run.event.is_empty() {
+        s.push(detail_sep());
+        s.push(Span::styled(&run.event, dim));
+    }
+    if run.attempt > 1 {
+        s.push(detail_sep());
+        s.push(Span::styled("retry ", label_style));
+        s.push(Span::styled(
+            format!("#{}", run.attempt),
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+    push_trend_spans(
+        &mut s,
+        run.avg_duration_secs,
+        &run.recent_builds,
+        label_style,
+        dim,
+    );
+    push_author(&mut s, &run.actor, &run.commit_author, label_style, dim);
+    s
+}
+
+/// Detail-bar spans for a completed build: run id, retry, failing steps, exact
+/// duration, 7-day trend, author. Shared by the `LastBuild` row and a
+/// single-branch repo header that collapses one.
+fn last_build_detail_spans<'a>(
+    build: &'a LastBuildView,
+    label_style: Style,
+    dim: Style,
+) -> Vec<Span<'a>> {
+    let mut s = vec![
+        Span::styled("run ", label_style),
+        Span::styled(build.run_id.to_string(), dim),
+    ];
+    if build.attempt > 1 {
+        s.push(detail_sep());
+        s.push(Span::styled("retry ", label_style));
+        s.push(Span::styled(
+            format!("#{}", build.attempt),
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+    if let Some(steps) = &build.failing_steps {
+        s.push(detail_sep());
+        s.push(Span::styled("failed: ", label_style));
+        s.push(Span::styled(
+            steps.as_str(),
+            Style::default().fg(COLOR_FAILURE),
+        ));
+    }
+    if let Some(d) = build.duration_secs {
+        s.push(detail_sep());
+        s.push(Span::styled("took ", label_style));
+        s.push(Span::styled(format::duration(Duration::from_secs(d)), dim));
+    }
+    push_trend_spans(
+        &mut s,
+        build.avg_duration_secs,
+        &build.recent_builds,
+        label_style,
+        dim,
+    );
+    push_author(&mut s, &build.actor, &build.commit_author, label_style, dim);
+    s
+}
+
 /// Render a detail bar with a border showing contextual info for the currently selected row.
 fn render_detail_bar(
     frame: &mut ratatui::Frame,
@@ -1929,33 +2102,28 @@ fn render_detail_bar(
             single_branch,
             ..
         }) => {
-            // The selected row already shows the repo name in its first
-            // column. The bar adds branch-level context only.
+            // A single-branch repo header collapses one run/build: render its
+            // detail bar with the very same builder a standalone row would use,
+            // so the trend/sparkline and everything else appear identically. For
+            // a true multi-branch header, summarise the branch counts instead.
             let mut s: Vec<Span<'_>> = Vec::new();
             if let Some(sb) = single_branch {
-                s.push(Span::styled(sb.branch, dim));
-                if let Some(run_id) = sb.run_id {
-                    s.push(detail_sep());
-                    s.push(Span::styled("run ", label_style));
-                    s.push(Span::styled(run_id.to_string(), dim));
+                match &sb.source {
+                    SingleBranchSource::Active(run) => {
+                        s = active_run_detail_spans(run, label_style, dim);
+                    }
+                    SingleBranchSource::Last(build) => {
+                        s = last_build_detail_spans(build, label_style, dim);
+                    }
+                    SingleBranchSource::None => {
+                        let msg = if sb.waiting {
+                            "waiting for first poll"
+                        } else {
+                            "no builds yet"
+                        };
+                        s.push(Span::styled(msg, dim));
+                    }
                 }
-                if sb.attempt > 1 {
-                    s.push(detail_sep());
-                    s.push(Span::styled("retry ", label_style));
-                    s.push(Span::styled(
-                        format!("#{}", sb.attempt),
-                        Style::default().fg(Color::Yellow),
-                    ));
-                }
-                if let Some(steps) = &sb.failing_steps {
-                    s.push(detail_sep());
-                    s.push(Span::styled("failed: ", label_style));
-                    s.push(Span::styled(
-                        steps.clone(),
-                        Style::default().fg(COLOR_FAILURE),
-                    ));
-                }
-                push_author(&mut s, &sb.actor, &sb.commit_author, label_style, dim);
             } else {
                 s.push(Span::styled(format!("{} branches", branch_count), dim));
                 s.push(detail_sep());
@@ -1990,76 +2158,9 @@ fn render_detail_bar(
             }
             s
         }
-        Some(DisplayRow::ActiveRun { run, .. }) => {
-            // The selected row already shows status (with color), repo, branch,
-            // workflow, and elapsed in its columns — no need to repeat them.
-            // The bar shows the deep-dive details: run id, event, retry,
-            // duration trend, author.
-            let mut s = vec![
-                Span::styled("run ", label_style),
-                Span::styled(run.run_id.to_string(), dim),
-            ];
-            if !run.event.is_empty() {
-                s.push(detail_sep());
-                s.push(Span::styled(&run.event, dim));
-            }
-            if run.attempt > 1 {
-                s.push(detail_sep());
-                s.push(Span::styled("retry ", label_style));
-                s.push(Span::styled(
-                    format!("#{}", run.attempt),
-                    Style::default().fg(Color::Yellow),
-                ));
-            }
-            push_trend_spans(
-                &mut s,
-                run.avg_duration_secs,
-                &run.recent_builds,
-                label_style,
-                dim,
-            );
-            push_author(&mut s, &run.actor, &run.commit_author, label_style, dim);
-            s
-        }
+        Some(DisplayRow::ActiveRun { run, .. }) => active_run_detail_spans(run, label_style, dim),
         Some(DisplayRow::LastBuild { build, .. }) => {
-            // The selected row already shows conclusion (with color), repo,
-            // branch, workflow, and age — no need to repeat them. The bar
-            // shows the deep-dive details: run id, retry, failing steps,
-            // exact duration, 7-day trend, author.
-            let mut s = vec![
-                Span::styled("run ", label_style),
-                Span::styled(build.run_id.to_string(), dim),
-            ];
-            if build.attempt > 1 {
-                s.push(detail_sep());
-                s.push(Span::styled("retry ", label_style));
-                s.push(Span::styled(
-                    format!("#{}", build.attempt),
-                    Style::default().fg(Color::Yellow),
-                ));
-            }
-            if let Some(steps) = &build.failing_steps {
-                s.push(detail_sep());
-                s.push(Span::styled("failed: ", label_style));
-                s.push(Span::styled(
-                    steps.as_str(),
-                    Style::default().fg(COLOR_FAILURE),
-                ));
-            }
-            if let Some(d) = build.duration_secs {
-                s.push(detail_sep());
-                s.push(Span::styled("took ", label_style));
-                s.push(Span::styled(format::duration(Duration::from_secs(d)), dim));
-            }
-            push_trend_spans(
-                &mut s,
-                build.avg_duration_secs,
-                &build.recent_builds,
-                label_style,
-                dim,
-            );
-            push_author(&mut s, &build.actor, &build.commit_author, label_style, dim);
-            s
+            last_build_detail_spans(build, label_style, dim)
         }
         Some(DisplayRow::NeverRan { waiting, .. }) => {
             // Repo/branch already in the selected row's columns.
@@ -2088,7 +2189,7 @@ fn render_detail_bar(
                 dim,
             )]
         }
-        None => vec![],
+        Some(DisplayRow::SectionHeader { .. }) | None => vec![],
     };
 
     // Pad with a leading space to align with the body panel's inner content.
@@ -2290,6 +2391,14 @@ pub(crate) fn render_help_popup(frame: &mut ratatui::Frame) {
         Line::from(vec![
             Span::styled("    M         ", key_style),
             Span::styled("Merge PR", desc_style),
+        ]),
+        Line::from(vec![
+            Span::styled("    f         ", key_style),
+            Span::styled("Pin/unpin repo or branch (★ section at top)", desc_style),
+        ]),
+        Line::from(vec![
+            Span::styled("              ", key_style),
+            Span::styled("a repo pin covers all its branches", desc_style),
         ]),
         Line::from(""),
         Line::from(Span::styled("  Notifications", section_style)),

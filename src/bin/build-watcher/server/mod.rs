@@ -12,6 +12,15 @@ use axum::response::IntoResponse as _;
 pub(crate) enum ServerError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+    /// Another daemon already holds the instance lock. This is benign — it's
+    /// not a crash — so `main` treats it as a clean (exit 0) no-op rather than
+    /// a failure, which keeps systemd/launchd from restart-looping when a
+    /// second instance is launched alongside the running one.
+    #[error(
+        "Another build-watcher instance is already running ({0}). \
+         Stop it first, or use --config-dir to run a separate instance."
+    )]
+    InstanceAlreadyRunning(std::io::Error),
     #[error("{0}")]
     Other(String),
 }
@@ -160,6 +169,19 @@ pub(crate) fn build_watch_snapshot(
             let muted = config
                 .is_some_and(|cfg| cfg.notifications_for(&key.repo, &key.branch).is_all_off());
 
+            // Pinned if the repo is pinned OR this specific branch is pinned
+            // in the per-repo branch_notifications map. Repo pin cascades.
+            let repo_pinned =
+                config.is_some_and(|cfg| cfg.repos.get(&key.repo).is_some_and(|rc| rc.pinned));
+            let pinned = repo_pinned
+                || config.is_some_and(|cfg| {
+                    cfg.repos.get(&key.repo).is_some_and(|rc| {
+                        rc.branch_notifications
+                            .get(&key.branch)
+                            .is_some_and(|bc| bc.pinned)
+                    })
+                });
+
             let prs = entry
                 .prs
                 .iter()
@@ -181,6 +203,8 @@ pub(crate) fn build_watch_snapshot(
                 prs,
                 muted,
                 waiting: entry.waiting,
+                pinned,
+                repo_pinned,
             }
         })
         .collect();
@@ -221,11 +245,9 @@ pub fn acquire_instance_lock() -> Result<std::fs::File, ServerError> {
 
     let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     if rc != 0 {
-        let os_err = std::io::Error::last_os_error();
-        return Err(ServerError::Other(format!(
-            "Another build-watcher instance is already running ({os_err}). \
-             Stop it first, or use --config-dir to run a separate instance."
-        )));
+        return Err(ServerError::InstanceAlreadyRunning(
+            std::io::Error::last_os_error(),
+        ));
     }
 
     // Write our PID for observability (not used for locking).
@@ -256,6 +278,7 @@ fn build_router(state: DaemonState, ct: &CancellationToken) -> axum::Router {
         .route("/stats", get(rest::stats_handler))
         .route("/events", get(rest::events_handler))
         .route("/pause", axum::routing::post(rest::pause_handler))
+        .route("/pin", axum::routing::post(rest::pin_handler))
         .route("/rerun", axum::routing::post(rest::rerun_handler))
         .route("/merge", axum::routing::post(rest::merge_handler))
         .route("/watch", axum::routing::post(rest::watch_handler))
@@ -374,6 +397,18 @@ pub async fn serve(
                     }
                 }
             }
+            // axum now waits for in-flight connections to drain, but a `bw`
+            // dashboard holds a `/events` SSE stream that never closes, so the
+            // drain would hang forever — the daemon would only die when the
+            // service manager escalates to SIGKILL. Force a clean exit if the
+            // drain doesn't finish promptly. (SIGKILL skips the post-serve
+            // cleanup too, so nothing extra is lost; this just exits faster and
+            // with a benign status.)
+            tokio::spawn(async {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                tracing::warn!("Shutdown drain timed out (long-lived SSE client); forcing exit.");
+                std::process::exit(0);
+            });
             ct.cancel();
         })
         .await

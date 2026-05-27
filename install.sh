@@ -41,6 +41,20 @@ for arg in "$@"; do
   esac
 done
 
+# Emit a repo file (service unit, plist, desktop entry) to stdout. For --local
+# builds, read it from the working tree so locally-modified files are used —
+# otherwise a local binary would be paired with a stale service definition
+# fetched from the release branch. Falls back to the remote for non-local runs
+# (e.g. the curl-piped installer) or if the local file is missing.
+fetch_repo_file() {
+  local rel=$1
+  if [ "$LOCAL" = true ] && [ -f "$rel" ]; then
+    cat "$rel"
+  else
+    curl -fsSL "$RAW_URL/$rel"
+  fi
+}
+
 # -- Acquire binaries ---------------------------------------------------------
 
 TMPDIR="$(mktemp -d)"
@@ -106,13 +120,32 @@ fi
 pkill -x "$BINARY_NAME" 2>/dev/null || true
 pkill -f "$BINARY_PATH" 2>/dev/null || true
 sleep 1
+# Escalate to SIGKILL for any that survived: the daemon can ignore SIGTERM while
+# a long-lived SSE client (a running `bw` dashboard) keeps its graceful shutdown
+# waiting. A survivor would keep holding the instance lock, so the freshly
+# (re)started service can't take over.
+pkill -KILL -x "$BINARY_NAME" 2>/dev/null || true
+pkill -KILL -f "$BINARY_PATH" 2>/dev/null || true
 
 # -- Install binaries ---------------------------------------------------------
+# Install via atomic rename rather than overwriting in place. Copying onto a
+# running executable raises "Text file busy" (ETXTBSY); rename(2) instead swaps
+# the directory entry, so a still-running (or respawning) daemon keeps executing
+# its old inode while the new binary lands on a fresh one. This makes the install
+# robust even if the stop step above lost the race with systemd's Restart=.
+
+install_atomic() {
+  local src=$1 dst=$2 tmp
+  tmp="$(mktemp "$dst.XXXXXX")"
+  cp "$src" "$tmp"
+  chmod 755 "$tmp"
+  mv -f "$tmp" "$dst"
+}
 
 echo "==> Installing binaries to $INSTALL_DIR..."
 mkdir -p "$INSTALL_DIR"
-cp "$TMPDIR/$BINARY_NAME" "$INSTALL_DIR/$BINARY_NAME"
-cp "$TMPDIR/bw" "$INSTALL_DIR/bw"
+install_atomic "$TMPDIR/$BINARY_NAME" "$INSTALL_DIR/$BINARY_NAME"
+install_atomic "$TMPDIR/bw" "$INSTALL_DIR/bw"
 
 # -- Seed config file if missing ----------------------------------------------
 # Only written on a fresh install; existing config is never overwritten so
@@ -159,7 +192,7 @@ if [ "$OS" != "Darwin" ]; then
   echo "==> Installing desktop entry..."
   DESKTOP_DIR="$HOME/.local/share/applications"
   mkdir -p "$DESKTOP_DIR"
-  curl -fsSL "$RAW_URL/build-watcher.desktop" -o "$DESKTOP_DIR/build-watcher.desktop"
+  fetch_repo_file "build-watcher.desktop" > "$DESKTOP_DIR/build-watcher.desktop"
   command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database "$DESKTOP_DIR" 2>/dev/null || true
   echo "  Desktop:  $DESKTOP_DIR/build-watcher.desktop"
 fi
@@ -175,7 +208,7 @@ if [ "$OS" = "Darwin" ]; then
   PLIST_PATH="$PLIST_DIR/com.build-watcher.plist"
   mkdir -p "$PLIST_DIR"
 
-  curl -fsSL "$RAW_URL/src/platform/macos/com.build-watcher.plist" \
+  fetch_repo_file "src/platform/macos/com.build-watcher.plist" \
     | sed -e "s|@@BINARY_PATH@@|$BINARY_PATH|g" \
           -e "s|@@HOME@@|$HOME|g" \
     > "$PLIST_PATH"
@@ -189,7 +222,7 @@ else
   SYSTEMD_DIR="$HOME/.config/systemd/user"
   mkdir -p "$SYSTEMD_DIR"
 
-  curl -fsSL "$RAW_URL/src/platform/linux/build-watcher.service" \
+  fetch_repo_file "src/platform/linux/build-watcher.service" \
     | sed -e "s|@@BINARY_PATH@@|$BINARY_PATH|g" \
     > "$SYSTEMD_DIR/$BINARY_NAME.service"
 
