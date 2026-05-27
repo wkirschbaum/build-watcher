@@ -369,6 +369,10 @@ pub async fn serve(
 
     let sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate());
 
+    // Clone for the shutdown watchdog below, which may need to persist state
+    // from a spawned task while the main path is still blocked draining.
+    let watchdog_state = state.clone();
+
     axum::serve(listener, router)
         .with_graceful_shutdown(async move {
             match sigterm {
@@ -397,16 +401,25 @@ pub async fn serve(
                     }
                 }
             }
-            // axum now waits for in-flight connections to drain, but a `bw`
-            // dashboard holds a `/events` SSE stream that never closes, so the
-            // drain would hang forever — the daemon would only die when the
-            // service manager escalates to SIGKILL. Force a clean exit if the
-            // drain doesn't finish promptly. (SIGKILL skips the post-serve
-            // cleanup too, so nothing extra is lost; this just exits faster and
-            // with a benign status.)
-            tokio::spawn(async {
+            // axum (and the Unix-socket server) now wait for in-flight
+            // connections to drain, but a `bw` dashboard holds a `/events` SSE
+            // stream that never closes, so the drain would hang forever — the
+            // daemon would only die when the service manager escalates to
+            // SIGKILL. Persist state and force a clean exit if the drain doesn't
+            // finish promptly. If the normal path completes first it returns and
+            // the runtime drops this task, so the save runs exactly once.
+            tokio::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                tracing::warn!("Shutdown drain timed out (long-lived SSE client); forcing exit.");
+                tracing::warn!(
+                    "Shutdown drain timed out (long-lived SSE client); saving state and forcing exit."
+                );
+                let persisted = collect_persisted(&watchdog_state.watches).await;
+                let hist = watchdog_state.handle.history.lock().await.clone();
+                watchdog_state
+                    .handle
+                    .persistence
+                    .save_state(&persisted, &hist)
+                    .await;
                 std::process::exit(0);
             });
             ct.cancel();

@@ -1,5 +1,22 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- **Ignored-workflow runs could permanently hide real builds.** The poll high-water mark (`last_seen_run_id`) was advanced past *all* unseen runs, including ones filtered out by the ignored-workflows list. Because an ignored workflow that shares a branch (e.g. a `pull_request` Semgrep run created alongside a `push` build) often carries a higher run id, the mark leapfrogged the real run, which then never registered as "unseen" on a later poll — the repo stayed stuck on a stale build. The mark now advances only past runs we actually track.
+- **Unpinning a branch in the TUI didn't work.** A pinned branch in a multi-branch repo renders as a single-branch repo header in the Pinned section; the toggle was flipping the repo-level flag instead of the branch flag, so the branch stayed pinned. It now targets the branch.
+- **Build graph missing for pinned / single-branch rows.** The 7-day duration sparkline now shows in the detail bar for single-branch repo headers (which is how pinned branches render), via a shared detail-span builder so all row types render identically.
+- **`install.sh` could fail with "Text file busy".** Binaries are now installed via atomic rename, so an in-progress install no longer races a still-running (or respawning) daemon.
+- **Daemon could hang on SIGTERM.** A `bw` dashboard's long-lived `/events` SSE stream kept axum's graceful shutdown waiting forever, so the daemon only died on SIGKILL. Shutdown is now bounded: it persists state and exits cleanly within a few seconds even with a connected client.
+
+### Changed
+
+- **Pinning is now repo-or-branch with clear precedence.** Pinning a repo cascades to all its branches and clears any individual branch pins; you can't unpin a single branch out of a repo-level pin (the TUI explains how to lift it instead). Empty `BranchConfig` entries are pruned so the config doesn't accumulate stubs.
+- **The daemon is owned by the platform service.** `bw` now starts the installed systemd user unit / launchd agent and connects to it instead of spawning its own orphan daemon that competed for the instance lock (which could put systemd into a restart loop). It still spawns a daemon directly when no service is installed or under `--config-dir`. The daemon exits 0 (benign) when another instance already holds the lock; the systemd unit uses `Restart=on-failure` + a start-limit, and the launchd agent uses `KeepAlive={SuccessfulExit:false}`.
+- **Pinned / other section dividers** in the TUI are now a subtle dashed rule instead of a bold filled bar.
+- **`install.sh --local`** uses the working-tree service/plist/desktop files instead of fetching them from the release branch, and escalates stale-process cleanup to SIGKILL.
+
 ## [1.1.0] - 2026-05-26
 
 ### Added

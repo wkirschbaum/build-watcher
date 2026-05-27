@@ -952,6 +952,50 @@ async fn ignored_run_does_not_hide_later_lower_id_real_run() {
     h2.cancel();
 }
 
+#[tokio::test]
+async fn initial_seed_ignored_run_does_not_advance_mark_past_real_run() {
+    // On the first poll after (re)start the entry is `waiting` (is_initial),
+    // which seeds state silently. An ignored workflow with a higher run id must
+    // still not drag the high-water mark past the real run — otherwise that real
+    // run would be invisible forever once polling resumes.
+    let key = WatchKey::new("alice/app", "main");
+    let mut ci = make_run(101, RunStatus::Completed, "success");
+    ci.workflow = "CI".to_string();
+    let mut semgrep = make_run(102, RunStatus::Completed, "success");
+    semgrep.workflow = "Semgrep".to_string();
+
+    let cfg = Config {
+        ignored_workflows: vec!["Semgrep".to_string()],
+        ..Config::default()
+    };
+    let h = TestHarness::with_config(MockGitHub::with_runs(vec![ci, semgrep]), cfg);
+    let mut seed = idle_entry(100);
+    seed.waiting = true;
+    h.seed(key.clone(), seed).await;
+
+    let changes = h
+        .poller("alice/app")
+        .check_for_new_runs_repo_wide(None)
+        .await;
+
+    let entry = h.entry(&key).await;
+    assert_eq!(
+        entry.last_seen_run_id, 101,
+        "ignored run 102 must not advance the seed mark past the real run 101"
+    );
+    assert_eq!(entry.last_builds.get("CI").unwrap().run_id, 101);
+    assert!(
+        changes.is_empty(),
+        "initial seed must not emit notifications: {changes:?}"
+    );
+    assert!(
+        !entry.waiting,
+        "waiting flag should be cleared after the seed poll"
+    );
+
+    h.cancel();
+}
+
 // -- RepoPoller: poll_active_runs_batch --
 
 #[tokio::test]
