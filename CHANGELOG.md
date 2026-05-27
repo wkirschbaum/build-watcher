@@ -1,9 +1,14 @@
 # Changelog
 
-## [Unreleased]
+## [1.2.0] - 2026-05-27
+
+### Added
+
+- **Notification warmup gates** — two grace windows stop notification floods. A 60s startup grace silences the burst that would otherwise fire for the current state of every watched branch when the daemon (re)starts with an empty in-memory transition map; transition state is still recorded during the window, so only genuinely-new events fire once it expires. A post-suspend wake grace triggers on a detected wall-clock gap > 10 minutes (NTP backward jumps are ignored), catching the machine-woke-from-sleep case the poller-level wake detection misses.
 
 ### Fixed
 
+- **Notification pipeline edge cases** found while building the warmup gates: the wall-clock marker is now updated on every event (not just transitions), so a long-running build no longer looks like a suspend gap and silences its own completion; PR notifications now pass through the startup-warmup gate and update the wall-clock marker like build events; and a double config read in `ingest` was collapsed back to one.
 - **Ignored-workflow runs could permanently hide real builds.** The poll high-water mark (`last_seen_run_id`) was advanced past *all* unseen runs, including ones filtered out by the ignored-workflows list. Because an ignored workflow that shares a branch (e.g. a `pull_request` Semgrep run created alongside a `push` build) often carries a higher run id, the mark leapfrogged the real run, which then never registered as "unseen" on a later poll — the repo stayed stuck on a stale build. The mark now advances only past runs we actually track.
 - **Unpinning a branch in the TUI didn't work.** A pinned branch in a multi-branch repo renders as a single-branch repo header in the Pinned section; the toggle was flipping the repo-level flag instead of the branch flag, so the branch stayed pinned. It now targets the branch.
 - **Build graph missing for pinned / single-branch rows.** The 7-day duration sparkline now shows in the detail bar for single-branch repo headers (which is how pinned branches render), via a shared detail-span builder so all row types render identically.
@@ -448,6 +453,7 @@ Config files, watch-state files, and the REST API are fully compatible with 1.0.
 
 - Avoid unnecessary config re-save on reads; improve persistence error logging
 
+[1.2.0]: https://github.com/wkirschbaum/build-watcher/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/wkirschbaum/build-watcher/compare/v1.0.7...v1.1.0
 [1.0.7]: https://github.com/wkirschbaum/build-watcher/compare/v1.0.6...v1.0.7
 [1.0.6]: https://github.com/wkirschbaum/build-watcher/releases/tag/v1.0.6
