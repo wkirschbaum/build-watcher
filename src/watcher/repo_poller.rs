@@ -88,9 +88,14 @@ pub(super) fn filter_runs<'a, R: std::borrow::Borrow<crate::github::RunInfo> + '
         .collect()
 }
 
-/// Consecutive "repo not found" responses required before the repo is removed.
-/// Guards against transient 404s triggering permanent repo deletion.
+/// Consecutive "repo not found" responses required before a repo enters
+/// quarantine. Guards against single-poll flakes flipping a healthy repo.
 pub(super) const NOT_FOUND_THRESHOLD: u32 = 3;
+/// Time a repo must remain in quarantine — continuously 404ing on every poll
+/// — before it is removed from config. The daemon keeps polling throughout,
+/// so any recovery during this window clears the quarantine flag instead.
+/// Sized so a multi-hour GitHub outage or auth blip can't destroy user data.
+pub(super) const QUARANTINE_DELETE_SECS: u64 = 6 * 60 * 60;
 /// Maximum individual `run_status` fallback calls when the batch endpoint misses runs.
 const MAX_FALLBACK_CALLS: usize = 10;
 /// Maximum `failing_steps` backfill calls per poll cycle to avoid rate-limit blowout.

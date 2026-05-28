@@ -1,5 +1,15 @@
 # Changelog
 
+## [1.2.2] - 2026-05-28
+
+### Fixed
+
+- **Repos could be silently auto-deleted by a brief 404 burst.** A multi-minute GitHub auth/API flake (the kind that returns 404 on private repos when token state is stale) was enough to permanently wipe user-curated watches: hitting three consecutive 404s — about 15 seconds of polling — instantly removed the repo from `config.json`, `watches.json`, and discovery state, and the per-save `.bak` rotation overwrote the last-good backup as each subsequent repo fell over. Six repos were lost in a single 5-minute window during the incident on 2026-05-28. The threshold now triggers **quarantine** instead of deletion (see below); the prior behavior is gone.
+
+### Added
+
+- **Quarantine for unreachable repos.** When a repo returns 404 on `NOT_FOUND_THRESHOLD` consecutive polls the daemon now sets `RepoConfig.quarantined_at` (persisted across restarts) instead of removing the entry. Polling continues at normal cadence, so a transient outage, expired token, or rate-limit incident self-heals the moment GitHub responds again — the flag clears automatically on the first successful poll. Only after **6 hours of continuous failure** (`QUARANTINE_DELETE_SECS`) is the repo finally deleted, giving any reasonable outage room to recover and the user time to notice. `WatchStatus.quarantined_secs` exposes the elapsed time per branch row over `/status`; the TUI dims the affected rows, replaces the status column with `⊘ unreachable <age>`, and the detail bar shows the remaining grace window so it's obvious what's happening and when the daemon will give up.
+
 ## [1.2.1] - 2026-05-28
 
 ### Changed
@@ -463,6 +473,7 @@ Config files, watch-state files, and the REST API are fully compatible with 1.0.
 
 - Avoid unnecessary config re-save on reads; improve persistence error logging
 
+[1.2.2]: https://github.com/wkirschbaum/build-watcher/compare/v1.2.1...v1.2.2
 [1.2.1]: https://github.com/wkirschbaum/build-watcher/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/wkirschbaum/build-watcher/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/wkirschbaum/build-watcher/compare/v1.0.7...v1.1.0

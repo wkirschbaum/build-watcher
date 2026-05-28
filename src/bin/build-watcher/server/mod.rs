@@ -182,6 +182,13 @@ pub(crate) fn build_watch_snapshot(
                     })
                 });
 
+            let quarantined_secs = config.and_then(|cfg| {
+                cfg.repos
+                    .get(&key.repo)
+                    .and_then(|rc| rc.quarantined_at)
+                    .map(|since| now_unix.saturating_sub(since))
+            });
+
             let prs = entry
                 .prs
                 .iter()
@@ -205,6 +212,7 @@ pub(crate) fn build_watch_snapshot(
                 waiting: entry.waiting,
                 pinned,
                 repo_pinned,
+                quarantined_secs,
             }
         })
         .collect();

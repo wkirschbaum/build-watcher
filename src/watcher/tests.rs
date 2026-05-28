@@ -1606,7 +1606,12 @@ async fn not_found_does_not_remove_repo_before_threshold() {
 }
 
 #[tokio::test]
-async fn not_found_removes_repo_at_threshold() {
+async fn not_found_quarantines_repo_at_threshold_without_deleting() {
+    // Regression for the 2026-05-28 incident: a multi-minute auth/API flake
+    // caused 6 user-curated repos to be permanently deleted in under 5 min
+    // because hitting NOT_FOUND_THRESHOLD nuked them immediately. The repo
+    // must instead be quarantined (kept in config, marked unreachable) and
+    // only removed after a much longer continuous-failure window.
     let gh = MockGitHub::not_found();
     let mut cfg = Config::default();
     cfg.repos
@@ -1622,9 +1627,79 @@ async fn not_found_removes_repo_at_threshold() {
 
     let w = h.watches.lock().await;
     assert!(
+        w.contains_key(&WatchKey::new("alice/app", "main")),
+        "repo MUST NOT be removed at threshold — quarantine instead"
+    );
+    drop(w);
+
+    let cfg = h.config.read().await;
+    assert!(
+        cfg.repos["alice/app"].quarantined_at.is_some(),
+        "repo should be flagged as quarantined"
+    );
+}
+
+#[tokio::test]
+async fn quarantine_cleared_on_successful_poll() {
+    // A repo that 404'd long enough to be quarantined should clear the flag
+    // the moment a normal response comes back, without losing config or
+    // history.
+    use crate::config::RepoConfig;
+    let gh = MockGitHub::with_runs(vec![]);
+    let mut cfg = Config::default();
+    cfg.repos.insert(
+        "alice/app".to_string(),
+        RepoConfig {
+            quarantined_at: Some(crate::config::unix_now() - 60),
+            ..Default::default()
+        },
+    );
+    let h = TestHarness::with_config(gh, cfg);
+    h.seed(WatchKey::new("alice/app", "main"), WatchEntry::default())
+        .await;
+
+    let mut poller = h.poller("alice/app");
+    poller.check_for_new_runs_repo_wide(None).await;
+
+    let cfg = h.config.read().await;
+    assert!(
+        cfg.repos["alice/app"].quarantined_at.is_none(),
+        "successful poll should clear quarantine"
+    );
+}
+
+#[tokio::test]
+async fn quarantine_deletes_repo_after_grace_window_elapses() {
+    // After QUARANTINE_DELETE_SECS of continuous failure the repo is finally
+    // removed. Simulated by seeding `quarantined_at` to a time far enough in
+    // the past that one more 404 trips the deletion branch.
+    use crate::config::RepoConfig;
+    let gh = MockGitHub::not_found();
+    let mut cfg = Config::default();
+    let stale = crate::config::unix_now() - repo_poller::QUARANTINE_DELETE_SECS - 1;
+    cfg.repos.insert(
+        "alice/app".to_string(),
+        RepoConfig {
+            quarantined_at: Some(stale),
+            ..Default::default()
+        },
+    );
+    let h = TestHarness::with_config(gh, cfg);
+    h.seed(WatchKey::new("alice/app", "main"), WatchEntry::default())
+        .await;
+
+    let mut poller = h.poller("alice/app");
+    // Burn through the threshold so `handle_not_found` enters its
+    // post-threshold branch, then `quarantined_at` triggers deletion.
+    for _ in 0..repo_poller::NOT_FOUND_THRESHOLD {
+        poller.check_for_new_runs_repo_wide(None).await;
+    }
+
+    let w = h.watches.lock().await;
+    assert!(
         !w.contains_key(&WatchKey::new("alice/app", "main")),
-        "repo should be removed after {} consecutive 404s",
-        repo_poller::NOT_FOUND_THRESHOLD
+        "repo should be removed once quarantine has lasted {}s",
+        repo_poller::QUARANTINE_DELETE_SECS
     );
 }
 

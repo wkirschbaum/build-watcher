@@ -7,8 +7,8 @@ use crate::history::push_build;
 use crate::watcher::{ActiveRun, WatchKey, collect_persisted};
 
 use super::{
-    BACKFILL_WINDOW_SECS, MAX_BACKFILL_CALLS, MAX_FALLBACK_CALLS, NOT_FOUND_THRESHOLD, RepoPoller,
-    RunChange,
+    BACKFILL_WINDOW_SECS, MAX_BACKFILL_CALLS, MAX_FALLBACK_CALLS, NOT_FOUND_THRESHOLD,
+    QUARANTINE_DELETE_SECS, RepoPoller, RunChange,
 };
 
 impl RepoPoller {
@@ -321,25 +321,12 @@ impl RepoPoller {
         let all_runs = match self.github.recent_runs_for_repo(&self.repo, limit).await {
             Ok(r) => {
                 self.not_found_count = 0;
+                self.clear_quarantine_if_set().await;
                 r
             }
             Err(e) if e.is_repo_not_found() => {
                 self.not_found_count += 1;
-                if self.not_found_count >= NOT_FOUND_THRESHOLD {
-                    tracing::warn!(
-                        repo = %self.repo, count = self.not_found_count,
-                        "Repo not found on {} consecutive polls, removing watches",
-                        NOT_FOUND_THRESHOLD
-                    );
-                    self.remove_dead_repo().await;
-                } else {
-                    tracing::warn!(
-                        repo = %self.repo, count = self.not_found_count,
-                        error = %e,
-                        "Repo not found (attempt {}/{}), will retry",
-                        self.not_found_count, NOT_FOUND_THRESHOLD
-                    );
-                }
+                self.handle_not_found(&e).await;
                 return changes;
             }
             Err(e) => {
@@ -675,5 +662,113 @@ impl RepoPoller {
         }
 
         changes
+    }
+
+    /// React to a "repo not found" response from the runs endpoint.
+    ///
+    /// Below the threshold this is a no-op beyond logging: the counter is
+    /// already incremented at the call site, and a single successful poll
+    /// resets it. At or above the threshold the repo enters quarantine
+    /// (still polled, but flagged in the UI). If the quarantine has lasted
+    /// `QUARANTINE_DELETE_SECS` the repo is finally removed.
+    ///
+    /// Quarantine prevents transient outages, rate limits, or a temporary
+    /// auth blip from silently deleting user-curated watches. See incident
+    /// 2026-05-28: a multi-minute GitHub auth glitch caused 6 repos to be
+    /// deleted in under 5 minutes under the old hair-trigger logic.
+    async fn handle_not_found(&self, err: &crate::github::GhError) {
+        if self.not_found_count < NOT_FOUND_THRESHOLD {
+            tracing::warn!(
+                repo = %self.repo, count = self.not_found_count,
+                error = %err,
+                "Repo not found (attempt {}/{}), will retry",
+                self.not_found_count, NOT_FOUND_THRESHOLD
+            );
+            return;
+        }
+
+        let now = unix_now();
+        let existing_quarantine = {
+            let cfg = self.config.read().await;
+            cfg.repos.get(&self.repo).and_then(|rc| rc.quarantined_at)
+        };
+
+        match existing_quarantine {
+            None => {
+                // First time crossing the threshold — enter quarantine.
+                let repo = self.repo.clone();
+                if let Err(e) = self
+                    .config
+                    .modify(|cfg| {
+                        if let Some(rc) = cfg.repos.get_mut(&repo) {
+                            rc.quarantined_at = Some(now);
+                        }
+                    })
+                    .await
+                {
+                    tracing::error!(
+                        repo = %self.repo, error = %e,
+                        "Failed to persist quarantine flag"
+                    );
+                }
+                tracing::warn!(
+                    repo = %self.repo, count = self.not_found_count,
+                    error = %err,
+                    "Repo not found on {} consecutive polls; quarantined (will delete after {}h of continuous failure)",
+                    NOT_FOUND_THRESHOLD,
+                    QUARANTINE_DELETE_SECS / 3600,
+                );
+            }
+            Some(since) if now.saturating_sub(since) >= QUARANTINE_DELETE_SECS => {
+                // Quarantined for long enough — give up and delete.
+                tracing::warn!(
+                    repo = %self.repo,
+                    "Repo quarantined for {}h with no recovery, removing",
+                    QUARANTINE_DELETE_SECS / 3600
+                );
+                self.remove_dead_repo().await;
+            }
+            Some(since) => {
+                let elapsed = now.saturating_sub(since);
+                let remaining = QUARANTINE_DELETE_SECS.saturating_sub(elapsed);
+                tracing::debug!(
+                    repo = %self.repo,
+                    elapsed_secs = elapsed,
+                    remaining_secs = remaining,
+                    "Repo still quarantined; continuing to poll"
+                );
+            }
+        }
+    }
+
+    /// Clear `quarantined_at` if it was set, after a successful poll. No-op
+    /// (no config write) when the repo was already healthy.
+    async fn clear_quarantine_if_set(&self) {
+        let was_quarantined = {
+            let cfg = self.config.read().await;
+            cfg.repos
+                .get(&self.repo)
+                .and_then(|rc| rc.quarantined_at)
+                .is_some()
+        };
+        if !was_quarantined {
+            return;
+        }
+        let repo = self.repo.clone();
+        if let Err(e) = self
+            .config
+            .modify(|cfg| {
+                if let Some(rc) = cfg.repos.get_mut(&repo) {
+                    rc.quarantined_at = None;
+                }
+            })
+            .await
+        {
+            tracing::error!(
+                repo = %self.repo, error = %e,
+                "Failed to clear quarantine flag"
+            );
+        }
+        tracing::info!(repo = %self.repo, "Repo recovered from quarantine");
     }
 }

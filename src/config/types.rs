@@ -407,6 +407,13 @@ pub struct RepoConfig {
     /// inside a pinned repo are redundant (the repo pin wins).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub pinned: bool,
+    /// Unix-seconds timestamp at which this repo first started returning 404
+    /// on every poll. The daemon keeps polling a quarantined repo (so a
+    /// transient GitHub outage or temporary auth issue self-heals), but if it
+    /// is still unreachable after `QUARANTINE_DELETE_SECS` the repo is
+    /// removed. Cleared on the next successful poll.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quarantined_at: Option<u64>,
 }
 
 impl Default for RepoConfig {
@@ -424,6 +431,7 @@ impl Default for RepoConfig {
             branch_filter: None,
             compiled_branch_filter: None,
             pinned: false,
+            quarantined_at: None,
         }
     }
 }

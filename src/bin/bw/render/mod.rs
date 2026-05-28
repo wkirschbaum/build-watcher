@@ -1248,6 +1248,26 @@ pub(crate) fn render_body<'a>(
 
     let mute_indicator = |muted: bool| -> &'static str { if muted { " 🔇" } else { "" } };
 
+    // Repos currently in quarantine (continuously 404ing). The snapshot
+    // already carries `quarantined_secs` per branch row; collapse to one
+    // entry per repo (the max elapsed) so the badge is rendered once on the
+    // repo header and the whole row group is dimmed. See incident
+    // 2026-05-28: flaky 404s used to instantly delete user config, now they
+    // surface as visibly quarantined instead.
+    let quarantined_secs: std::collections::HashMap<&str, u64> =
+        app.status
+            .watches
+            .iter()
+            .fold(std::collections::HashMap::new(), |mut m, w| {
+                if let Some(s) = w.quarantined_secs {
+                    m.entry(w.repo.as_str())
+                        .and_modify(|cur| *cur = (*cur).max(s))
+                        .or_insert(s);
+                }
+                m
+            });
+    let quarantined_for = |repo: &str| -> Option<u64> { quarantined_secs.get(repo).copied() };
+
     let rows: Vec<Row> = flat
         .rows
         .iter()
@@ -1255,9 +1275,20 @@ pub(crate) fn render_body<'a>(
         .skip(scroll_offset)
         .take(body_height)
         .map(|(i, dr)| {
-            let row = render_display_row(dr, cw, &mute_indicator);
-            if i == selected_display_idx {
-                row.style(highlight_style)
+            let row = render_display_row(dr, cw, &mute_indicator, &quarantined_for);
+            let is_quarantined = dr
+                .repo_branch_run()
+                .is_some_and(|(repo, _, _, _)| quarantined_secs.contains_key(repo));
+            let is_selected = i == selected_display_idx;
+            let mut row_style = Style::default();
+            if is_quarantined {
+                row_style = row_style.add_modifier(Modifier::DIM);
+            }
+            if is_selected {
+                row_style = row_style.patch(highlight_style);
+            }
+            if is_quarantined || is_selected {
+                row.style(row_style)
             } else {
                 row
             }
@@ -1428,7 +1459,17 @@ fn render_repo_header<'a>(
     failing_workflows: &[String],
     cw: &ColWidths,
     mute_indicator: &dyn Fn(bool) -> &'static str,
+    quarantined_secs: Option<u64>,
 ) -> Row<'a> {
+    // A quarantined repo overrides the per-branch/per-workflow status display
+    // with a single `⊘ unreachable Xh` badge so the reason for the dimming is
+    // visible. The recent-builds info is stale anyway while the repo is
+    // continuously 404ing; the badge tells you the elapsed time and the
+    // detail bar (when selected) shows the deletion-grace remaining.
+    let quarantine_badge = quarantined_secs.map(|s| format!("⊘ unreachable {}", format::age(s)));
+    let quarantine_style = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
     let name = if single_branch.is_some() {
         format!("  {}{}", short_repo(repo), mute_indicator(*muted))
     } else {
@@ -1464,10 +1505,14 @@ fn render_repo_header<'a>(
         let branch_cell = format_branch_with_pr(sb.branch, sb.pr_badge.clone());
         let author = sb.commit_author.as_deref().or(sb.actor.as_deref());
         let title = title_line(&sb.title, sb.failing_steps.as_deref(), author, cw.title);
+        let (status_text, status_style) = match &quarantine_badge {
+            Some(badge) => (badge.as_str(), quarantine_style),
+            None => (inline_status.as_str(), style),
+        };
         Row::new(vec![
             Cell::from(format::truncate(&name, cw.repo)).style(repo_style),
             Cell::from(branch_cell),
-            Cell::from(format::truncate(&inline_status, cw.status)).style(style),
+            Cell::from(format::truncate(status_text, cw.status)).style(status_style),
             Cell::from(format::truncate(&sb.workflows, cw.workflow)),
             Cell::from(title),
             Cell::from(age).style(style),
@@ -1485,7 +1530,11 @@ fn render_repo_header<'a>(
         };
 
         // Color-coded status: active/passing/failing/idle — dimmed when zero.
-        let status_cell = {
+        // Replaced by the quarantine badge when the repo is unreachable so
+        // the user doesn't read the stale counts as live state.
+        let status_cell = if let Some(badge) = &quarantine_badge {
+            Cell::from(format::truncate(badge, cw.status)).style(quarantine_style)
+        } else {
             let dim = |v: usize, s: Style| {
                 if v > 0 {
                     s
@@ -1700,6 +1749,7 @@ fn render_display_row<'a>(
     dr: &DisplayRow<'_>,
     cw: &ColWidths,
     mute_indicator: &dyn Fn(bool) -> &'static str,
+    quarantined_for: &dyn Fn(&str) -> Option<u64>,
 ) -> Row<'a> {
     match dr {
         DisplayRow::GroupHeader { label } => render_group_header(label),
@@ -1730,6 +1780,7 @@ fn render_display_row<'a>(
             failing_workflows,
             cw,
             mute_indicator,
+            quarantined_for(repo),
         ),
         DisplayRow::ActiveRun {
             branch,
@@ -2033,6 +2084,22 @@ fn render_detail_bar(
         .copied()
         .and_then(|i| flat.rows.get(i));
 
+    // If the selected row belongs to a quarantined repo, prepend the
+    // unreachable badge + remaining-grace countdown so it's obvious why the
+    // row is dimmed and when the daemon will give up. Pulled from the
+    // snapshot (max elapsed across the repo's branch entries — they all share
+    // the same `quarantined_at`, but max is robust to staggered updates).
+    let quarantined_selected_secs: Option<u64> = sel_idx
+        .and_then(|dr| dr.repo_branch_run())
+        .and_then(|(repo, _, _, _)| {
+            app.status
+                .watches
+                .iter()
+                .filter(|w| w.repo == repo)
+                .filter_map(|w| w.quarantined_secs)
+                .max()
+        });
+
     let spans: Vec<Span<'_>> = match sel_idx {
         Some(DisplayRow::RepoHeader {
             branch_count,
@@ -2135,6 +2202,21 @@ fn render_detail_bar(
 
     // Pad with a leading space to align with the body panel's inner content.
     let mut all_spans = vec![Span::raw(" ")];
+    if let Some(secs) = quarantined_selected_secs {
+        const SIX_HOURS: u64 = 6 * 60 * 60;
+        let remaining = SIX_HOURS.saturating_sub(secs);
+        all_spans.push(Span::styled(
+            format!("⊘ unreachable {}", format::age(secs)),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+        all_spans.push(Span::styled(
+            format!(" · deletes in {}", format::age(remaining)),
+            dim,
+        ));
+        all_spans.push(detail_sep());
+    }
     all_spans.extend(spans);
 
     // Right-align repos/branches counts and the "? help" hint with version.

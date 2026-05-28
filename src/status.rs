@@ -120,6 +120,11 @@ pub struct WatchStatus {
     /// pinned repo — the repo pin must be lifted instead.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub repo_pinned: bool,
+    /// Seconds the repo has been quarantined (continuously 404ing). `None`
+    /// when healthy. The TUI dims quarantined rows and shows the elapsed
+    /// time so a temporary outage is visible without nuking the entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quarantined_secs: Option<u64>,
 }
 
 /// Compact PR view for the TUI status display.
