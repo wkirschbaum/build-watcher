@@ -1065,63 +1065,6 @@ impl App {
         });
     }
 
-    /// Open the auto-discover rule form (singleton: edits the first/only rule).
-    /// Multi-rule support is intentionally hidden from the UI — the underlying
-    /// list-based config is preserved as a baseline but only the first entry is
-    /// surfaced for editing.
-    ///
-    /// Currently unreachable — auto-discover lives inside the `C` config form.
-    /// Kept as a hook for revisiting multi-rule UI later.
-    #[allow(dead_code)]
-    pub(crate) fn open_auto_discover_rules(&mut self, daemon: &DaemonClient) {
-        let d = daemon.clone();
-        let tx = self.bg_tx.clone();
-        self.set_flash("Loading auto-discover rule…");
-        tokio::spawn(async move {
-            match d.get_auto_discover_rules().await {
-                Ok(rules) => {
-                    let existing = rules.into_iter().next();
-                    let (existing_id, repo_filter, recency, title) = match existing {
-                        Some(r) => (
-                            Some(r.id),
-                            r.repo_pattern.or(r.org_pattern).unwrap_or_default(),
-                            r.recently_updated,
-                            "Edit Auto-Discover Rule".to_string(),
-                        ),
-                        None => (
-                            None,
-                            String::new(),
-                            "any".to_string(),
-                            "New Auto-Discover Rule".to_string(),
-                        ),
-                    };
-                    let _ = tx
-                        .send(SseUpdate::EnterForm {
-                            title,
-                            kind: FormKind::AutoDiscoverRule { existing_id },
-                            fields: vec![
-                                FormField::text("Repo filter", repo_filter),
-                                FormField::cycle(
-                                    "Updated filter",
-                                    recency,
-                                    vec!["any", "week", "month", "year"],
-                                ),
-                            ],
-                        })
-                        .await;
-                }
-                Err(e) => {
-                    let _ = tx
-                        .send(SseUpdate::BackgroundResult {
-                            flash: e,
-                            resync: false,
-                        })
-                        .await;
-                }
-            }
-        });
-    }
-
     /// Submit the auto-discover rule form. Reuses the existing rule's ID when
     /// editing, or falls back to a fixed `"default"` ID for the singleton case.
     pub(crate) fn submit_auto_discover_rule_form(&mut self, daemon: &DaemonClient) {

@@ -537,6 +537,32 @@ impl NotificationPipeline {
     }
 }
 
+/// Build the body for a run notification. Starts with `[branch] title`, then
+/// appends optional `in <duration>`, `\nFailed: <steps>`, and `\nby <actor>`
+/// lines — each segment shared between RunStarted (no duration/steps) and
+/// RunCompleted.
+fn build_run_body(
+    run: &build_watcher::events::RunSnapshot,
+    elapsed: Option<f64>,
+    failing_steps: Option<&str>,
+) -> String {
+    let mut body = format!("[{}] {}", run.branch, run.display_title());
+    if let Some(secs) = elapsed {
+        let _ = write!(
+            body,
+            " in {}",
+            format::duration(Duration::from_secs_f64(secs))
+        );
+    }
+    if let Some(steps) = failing_steps {
+        let _ = write!(body, "\nFailed: {steps}");
+    }
+    if let Some(actor) = &run.actor {
+        let _ = write!(body, "\nby {actor}");
+    }
+    body
+}
+
 /// Format and send a single-event notification.
 async fn dispatch_single(
     event: WatchEvent,
@@ -546,10 +572,7 @@ async fn dispatch_single(
 ) {
     match event {
         WatchEvent::RunStarted(run) => {
-            let mut body = format!("[{}] {}", run.branch, run.display_title());
-            if let Some(actor) = &run.actor {
-                let _ = write!(body, "\nby {actor}");
-            }
+            let body = build_run_body(&run, None, None);
             notifier
                 .send(&Notification {
                     title: format!("\u{1f528} started: {} | {}", repo_label, run.workflow),
@@ -578,20 +601,7 @@ async fn dispatch_single(
             } else {
                 ("\u{274c}", "failed")
             };
-            let mut body = format!("[{}] {}", run.branch, run.display_title());
-            if let Some(secs) = elapsed {
-                let _ = write!(
-                    body,
-                    " in {}",
-                    format::duration(Duration::from_secs_f64(secs))
-                );
-            }
-            if let Some(steps) = &failing_steps {
-                let _ = write!(body, "\nFailed: {steps}");
-            }
-            if let Some(actor) = &run.actor {
-                let _ = write!(body, "\nby {actor}");
-            }
+            let body = build_run_body(&run, elapsed, failing_steps.as_deref());
 
             notifier
                 .send(&Notification {

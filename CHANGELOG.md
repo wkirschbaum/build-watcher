@@ -1,5 +1,15 @@
 # Changelog
 
+## [1.2.1] - 2026-05-28
+
+### Changed
+
+- **Internal restructure, no user-visible behavior change.** `src/bin/bw/render.rs` (3427 lines) split into `render/{mod,popups,sparkline}.rs` — popup overlays (PR picker, help, form, notification picker, history, auto-discover rules, build times) and the sparkline renderer are now their own modules. `src/bin/build-watcher/server/rest.rs` (1924 lines) split into `rest/{mod,watches,notifications,repo_config,history,auto_discover}.rs` — handlers cluster by domain; the route table in `server/mod.rs` is unchanged. The `dispatch_single` notification path no longer duplicates the `[branch] title …` body assembly between `RunStarted` and `RunCompleted`; both now go through a shared `build_run_body` helper.
+
+### Removed
+
+- Dead `forms::FormState::open_auto_discover_rules` (carried `#[allow(dead_code)]`, unreachable since auto-discover moved into the config form).
+
 ## [1.2.0] - 2026-05-27
 
 ### Added
@@ -453,6 +463,7 @@ Config files, watch-state files, and the REST API are fully compatible with 1.0.
 
 - Avoid unnecessary config re-save on reads; improve persistence error logging
 
+[1.2.1]: https://github.com/wkirschbaum/build-watcher/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/wkirschbaum/build-watcher/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/wkirschbaum/build-watcher/compare/v1.0.7...v1.1.0
 [1.0.7]: https://github.com/wkirschbaum/build-watcher/compare/v1.0.6...v1.0.7
